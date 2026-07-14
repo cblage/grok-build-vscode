@@ -33,7 +33,10 @@ import {
 } from "./cli-locator";
 import { TerminalManager, setTerminalShellPreference, type ShellPreference } from "./terminal-manager";
 import { SeatbeltBroker } from "./seatbelt-broker";
-import { resolveAndCompileSeatbeltPolicy } from "./seatbelt-policy";
+import {
+  resolveAndCompileSeatbeltPolicy,
+  sandboxStartupFailureDisposition,
+} from "./seatbelt-policy";
 import {
   FileChip,
   MAX_VISION_IMAGE_BYTES,
@@ -54,7 +57,7 @@ import {
 import { buildPromptWithImages, type PromptImageInput } from "./prompt-builder";
 import { matchSlashCommand } from "./slash-filter";
 import {
-  collectAvailableSandboxProfiles,
+  collectAvailableSandboxProfileOptions,
   configDisablesBypassPermissions,
   configForcesAlwaysApprove,
   isProjectOnlySandboxProfile,
@@ -62,7 +65,7 @@ import {
   mergeWorkspaceEnv,
   normalizeSandboxProfile,
   readGlobalConfigurationValue,
-  resolveSandboxProfile,
+  resolveNewSessionSandboxProfile,
 } from "./grok-config";
 import { parseFileRef, shouldReadFileInline } from "./file-ref";
 import { pickRejectOption, shouldRejectPermission } from "./plan-gate";
@@ -542,19 +545,20 @@ See design doc for the full state machine diagram.`;
       SANDBOX_PROFILE_WORKSPACE_FALLBACK_KEY,
       "",
     );
-    // Project-only custom profiles live in extension workspaceState rather than
-    // `.vscode/settings.json`, so choosing one never dirties the repository.
-    if (workspaceChoice.trim()) return normalizeSandboxProfile(workspaceChoice);
     const fallbackSetting = this.context.globalState.get<string>(
       SANDBOX_PROFILE_FALLBACK_KEY,
       "",
     );
     const configs = this.readGrokConfigs(env);
-    return resolveSandboxProfile({
+    const tomls = this.readSandboxTomls(undefined, env);
+    return resolveNewSessionSandboxProfile({
+      workspaceChoice,
       setting,
       fallbackSetting,
       env: env["GROK_SANDBOX"],
-      global: configs.global,
+      globalConfig: configs.global,
+      projectSandbox: tomls.project,
+      globalSandbox: tomls.global,
     });
   }
 
@@ -631,7 +635,7 @@ See design doc for the full state machine diagram.`;
     }
     const e = env ?? process.env;
     const tomls = this.readSandboxTomls(undefined, e);
-    const profiles = collectAvailableSandboxProfiles({
+    const profiles = collectAvailableSandboxProfileOptions({
       projectSandbox: tomls.project,
       globalSandbox: tomls.global,
     });
@@ -687,7 +691,7 @@ See design doc for the full state machine diagram.`;
   private async setSandboxProfile(profile: string): Promise<void> {
     if (process.platform !== "darwin") return;
     const raw = (profile || "off").trim();
-    const next = raw.toLowerCase() === "off" || raw === "" ? "off" : raw;
+    const next = raw === "off" || raw === "" ? "off" : raw;
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     const env = process.env;
     // A resumed conversation keeps the profile frozen in its summary even when
@@ -1830,15 +1834,22 @@ See design doc for the full state machine diagram.`;
         );
       } catch (error) {
         broker?.dispose();
+        broker = undefined;
         const message = (error as Error).message || String(error);
-        this.output.appendLine(`[sandbox] refusing unsandboxed fallback: ${message}`);
-        session.priming = false;
-        session.client = undefined;
-        this.pool.delete(session);
-        this.setStatus(session, "error");
-        this.emit(session, { type: "setBusy", value: false });
-        this.emit(session, { type: "error", text: `Failed to start sandbox: ${message}` });
-        return undefined;
+        if (sandboxStartupFailureDisposition(sandbox) === "warn-and-continue") {
+          const warning = `Built-in sandbox "${sandbox}" could not be applied to host-side ACP operations; continuing with Grok's native built-in handling: ${message}`;
+          this.output.appendLine(`[sandbox] ${warning}`);
+          void vscode.window.showWarningMessage(warning);
+        } else {
+          this.output.appendLine(`[sandbox] refusing unsandboxed custom-profile fallback: ${message}`);
+          session.priming = false;
+          session.client = undefined;
+          this.pool.delete(session);
+          this.setStatus(session, "error");
+          this.emit(session, { type: "setBusy", value: false });
+          this.emit(session, { type: "error", text: `Failed to start sandbox: ${message}` });
+          return undefined;
+        }
       }
     }
     const client = new AcpClient({

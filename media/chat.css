@@ -1633,6 +1633,12 @@ textarea#input {
 }
 /* Same 16px glyph as the toolbar buttons (the raw lucide markup is 13px). */
 .mode-item-icon svg { width: 16px; height: 16px; }
+.mode-item-icon.sandbox-profile-icons {
+  width: 38px;
+  justify-content: flex-start;
+  gap: 4px;
+}
+.mode-item-icon.sandbox-profile-icons svg { flex: 0 0 16px; }
 .mode-item-body {
   display: flex;
   flex-direction: column;

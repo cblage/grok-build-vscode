@@ -23,6 +23,7 @@
 
 import type { ModelInfo, PromptResultMeta, PermissionRequest, ExitPlanRequest, QuestionRequest } from "./acp";
 import type { FileChip } from "./chips";
+import type { SandboxProfileOption } from "./grok-config";
 import type { SessionListEntry } from "./sessions";
 import type { Dot } from "./session-pool";
 
@@ -61,7 +62,7 @@ export type HostMsg =
   /** YOLO/Auto-accept blocked when config has disable_bypass_permissions_mode. */
   | { type: "modePolicy"; yoloDisabled: boolean; yoloDisabledReason?: string }
   /** Effective sandbox for the next spawn + profiles available in the dropdown. */
-  | { type: "sandboxState"; current: string; profiles: string[]; supported: boolean }
+  | { type: "sandboxState"; current: string; profiles: SandboxProfileOption[]; supported: boolean }
   | { type: "openModePopover" }
   | { type: "voiceState"; status: "listening" | "transcribing" | "idle" }
   | { type: "voiceConfigured"; value: boolean; sendPhrase?: string }

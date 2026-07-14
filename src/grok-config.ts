@@ -68,16 +68,15 @@ export function readSandboxProfile(toml: string): string | undefined {
 }
 
 /**
- * Normalize a sandbox profile name. Empty / "off" / "none" / "false" mean
- * "no sandbox flag" (CLI default). Other non-empty strings are returned
- * trimmed (e.g. `workspace`, `strict`, custom `lumina`).
+ * Normalize a sandbox profile name. Empty and the exact built-in name `off`
+ * mean "no sandbox flag" (CLI default). All other non-empty strings are
+ * case-sensitive custom/built-in names, matching Grok itself.
  */
 export function normalizeSandboxProfile(value: string | undefined | null): string | undefined {
   if (value == null) return undefined;
   const v = value.trim();
   if (!v) return undefined;
-  const lower = v.toLowerCase();
-  if (lower === "off" || lower === "none" || lower === "false") return undefined;
+  if (v === "off") return undefined;
   return v;
 }
 
@@ -104,8 +103,8 @@ export function readGlobalConfigurationValue<T>(
  * definitions live in `.grok/sandbox.toml`; the caller handles a project-local
  * workspace-state selection before invoking this fallback.
  *
- * Empty / "off" / "none" at any higher layer stops the search and means no
- * sandbox (explicit disable). A missing higher layer falls through.
+ * Exact `off` at any higher layer stops the search and means no sandbox
+ * (explicit disable). A missing or empty higher layer falls through.
  */
 export function resolveSandboxProfile(input: {
   setting?: string;
@@ -127,6 +126,56 @@ export function resolveSandboxProfile(input: {
   const globalProfile = input.global != null ? readSandboxProfile(input.global) : undefined;
   if (globalProfile != null) return normalizeSandboxProfile(globalProfile);
   return undefined;
+}
+
+/**
+ * Resolve the sandbox for a new session while containing the legacy extension
+ * fallback. Older builds could save a project-only name there globally when a
+ * VS Code-derived host rejected the contributed setting. Accept that fallback
+ * only when it is built in or currently defined by the project/user sandbox
+ * files; otherwise skip it and continue through environment/global config.
+ *
+ * Workspace choices and real User settings are explicit and remain unfiltered
+ * so unknown names fail closed in the policy compiler. Cold resumes do not use
+ * this resolver at all; their frozen summary profile remains authoritative.
+ */
+export function resolveNewSessionSandboxProfile(input: {
+  workspaceChoice?: string;
+  setting?: string;
+  fallbackSetting?: string;
+  env?: string;
+  globalConfig?: string;
+  projectSandbox?: string;
+  globalSandbox?: string;
+}): string | undefined {
+  if (input.workspaceChoice != null && input.workspaceChoice.trim() !== "") {
+    return normalizeSandboxProfile(input.workspaceChoice);
+  }
+  if (input.setting != null && input.setting.trim() !== "") {
+    return normalizeSandboxProfile(input.setting);
+  }
+  if (input.fallbackSetting != null && input.fallbackSetting.trim() !== "") {
+    const fallback = normalizeSandboxProfile(input.fallbackSetting);
+    if (!fallback) return undefined;
+    if ((BUILTIN_SANDBOX_PROFILES as readonly string[]).includes(fallback)) {
+      return fallback;
+    }
+    try {
+      const project = new Set(listSandboxProfilesFromToml(input.projectSandbox ?? ""));
+      const global = new Set(listSandboxProfilesFromToml(input.globalSandbox ?? ""));
+      if (project.has(fallback) || global.has(fallback)) return fallback;
+      // This is the one known-bad state: a project-only name persisted globally
+      // by an older host. Ignore it outside projects that define it.
+    } catch {
+      // Preserve fail-closed behavior: the policy compiler will report the
+      // malformed sandbox.toml rather than silently choosing a weaker profile.
+      return fallback;
+    }
+  }
+  return resolveSandboxProfile({
+    env: input.env,
+    global: input.globalConfig,
+  });
 }
 
 /** Workspace `.env` files are repository-controlled input. They may provide
@@ -202,7 +251,16 @@ export function configDisablesBypassPermissions(input: {
 }
 
 /** Built-in sandbox profile names (always selectable in the UI). */
-export const BUILTIN_SANDBOX_PROFILES = ["workspace", "strict", "read-only"] as const;
+export const BUILTIN_SANDBOX_PROFILES = ["workspace", "devbox", "read-only", "strict"] as const;
+
+/** Where a selectable sandbox profile is defined. */
+export type SandboxProfileScope = "workspace" | "user" | "builtin";
+
+/** A sandbox profile together with the source the picker should communicate. */
+export interface SandboxProfileOption {
+  name: string;
+  scope: SandboxProfileScope;
+}
 
 /**
  * Parse `[profiles.<name>]` table headers from a `sandbox.toml` body.
@@ -233,30 +291,43 @@ export function isProjectOnlySandboxProfile(input: {
 }
 
 /**
- * Available named sandbox profiles for the dropdown: custom profiles from
- * project then global `sandbox.toml`, then built-ins not already listed.
+ * Available sandbox profiles and their definition source. Custom workspace
+ * profiles are discovered before user profiles so a same-name project
+ * definition keeps the same project-over-user precedence as the policy
+ * resolver. Built-ins follow custom profiles and cannot be redefined by TOML.
  * Does **not** include `"off"` — the UI always offers that separately.
  */
-export function collectAvailableSandboxProfiles(input: {
+export function collectAvailableSandboxProfileOptions(input: {
   projectSandbox?: string;
   globalSandbox?: string;
-}): string[] {
-  const out: string[] = [];
+}): SandboxProfileOption[] {
+  const out: SandboxProfileOption[] = [];
   const seen = new Set<string>();
-  const add = (name: string) => {
+  const add = (name: string, scope: SandboxProfileScope) => {
     if (!name || seen.has(name)) return;
     seen.add(name);
-    out.push(name);
+    out.push({ name, scope });
   };
-  for (const toml of [input.projectSandbox, input.globalSandbox]) {
+  for (const [toml, scope] of [
+    [input.projectSandbox, "workspace"],
+    [input.globalSandbox, "user"],
+  ] as const) {
     if (!toml) continue;
     try {
-      for (const n of listSandboxProfilesFromToml(toml)) add(n);
+      for (const n of listSandboxProfilesFromToml(toml)) add(n, scope);
     } catch {
       // Keep built-ins selectable; startup surfaces the precise parser error if
       // the user selects a profile from the malformed source.
     }
   }
-  for (const n of BUILTIN_SANDBOX_PROFILES) add(n);
+  for (const n of BUILTIN_SANDBOX_PROFILES) add(n, "builtin");
   return out;
+}
+
+/** Backward-compatible name-only view used by non-UI callers and tests. */
+export function collectAvailableSandboxProfiles(input: {
+  projectSandbox?: string;
+  globalSandbox?: string;
+}): string[] {
+  return collectAvailableSandboxProfileOptions(input).map(({ name }) => name);
 }

@@ -502,6 +502,77 @@ describe("sandbox picker", () => {
     click(window, sandboxBtn);
     expect((popover as any).hidden).toBe(false);
   });
+
+  it("labels and icons profiles by their definition source", () => {
+    const { window, posted, doc } = bootWebview();
+    const sandboxBtn = $(doc, "sandbox-btn") as HTMLButtonElement;
+    const popover = $(doc, "sandbox-popover");
+
+    dispatch(window, { type: "initialState", platform: "darwin" });
+    dispatch(window, {
+      type: "sandboxState",
+      current: "off",
+      profiles: [
+        { name: "project-profile", scope: "workspace" },
+        { name: "personal-profile", scope: "user" },
+        { name: "workspace", scope: "builtin" },
+        { name: "devbox", scope: "builtin" },
+        { name: "read-only", scope: "builtin" },
+        { name: "strict", scope: "builtin" },
+      ],
+      supported: true,
+    });
+    click(window, sandboxBtn);
+
+    const rows = Array.from(popover.querySelectorAll<HTMLElement>(".mode-popover-item"));
+    const byScope = (scope: string) => rows.find((row) => row.dataset.sandboxScope === scope)!;
+    const byName = (name: string) => rows.find(
+      (row) => row.querySelector(".mode-item-label")?.textContent === name,
+    )!;
+    expect(byScope("off").querySelector(".mode-item-desc")?.textContent)
+      .toBe("No OS sandbox — agent process is unsandboxed");
+    expect(byScope("off").querySelectorAll(".mode-item-icon svg")).toHaveLength(1);
+
+    expect(byScope("workspace").querySelector(".mode-item-desc")?.textContent)
+      .toBe("Workspace-defined sandbox profile");
+    expect(byScope("user").querySelector(".mode-item-desc")?.textContent)
+      .toBe("User-defined sandbox profile");
+    expect(byScope("builtin").querySelector(".mode-item-desc")?.textContent)
+      .toBe("Built-in sandbox profile");
+    for (const scope of ["workspace", "user", "builtin"]) {
+      expect(byScope(scope).querySelectorAll(".mode-item-icon svg")).toHaveLength(2);
+    }
+    for (const name of ["workspace", "devbox", "read-only", "strict"]) {
+      expect(byName(name).dataset.sandboxScope).toBe("builtin");
+      expect(byName(name).querySelector(".mode-item-desc")?.textContent)
+        .toBe("Built-in sandbox profile");
+      expect(byName(name).querySelectorAll(".mode-item-icon svg")).toHaveLength(2);
+    }
+
+    click(window, byScope("user"));
+    expect(posted).toContainEqual({ type: "setSandbox", profile: "personal-profile" });
+  });
+
+  it("classifies devbox as built-in for legacy name-only host messages", () => {
+    const { window, doc } = bootWebview();
+    const sandboxBtn = $(doc, "sandbox-btn") as HTMLButtonElement;
+    const popover = $(doc, "sandbox-popover");
+
+    dispatch(window, { type: "initialState", platform: "darwin" });
+    dispatch(window, {
+      type: "sandboxState",
+      current: "devbox",
+      profiles: ["workspace", "devbox", "read-only", "strict"],
+      supported: true,
+    });
+    click(window, sandboxBtn);
+
+    const devbox = Array.from(popover.querySelectorAll<HTMLElement>(".mode-popover-item"))
+      .find((row) => row.querySelector(".mode-item-label")?.textContent === "devbox")!;
+    expect(devbox.dataset.sandboxScope).toBe("builtin");
+    expect(devbox.querySelector(".mode-item-desc")?.textContent)
+      .toBe("Built-in sandbox profile");
+  });
 });
 
 describe("context donut (token usage)", () => {

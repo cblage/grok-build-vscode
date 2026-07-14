@@ -47,7 +47,12 @@
     yoloDisabled: false,
     yoloDisabledReason: "",
     sandboxCurrent: "off",
-    sandboxProfiles: ["workspace", "strict", "read-only"],
+    sandboxProfiles: [
+      { name: "workspace", scope: "builtin" },
+      { name: "devbox", scope: "builtin" },
+      { name: "read-only", scope: "builtin" },
+      { name: "strict", scope: "builtin" },
+    ],
     platform: "",
     sandboxSupported: false,
     effort: "",
@@ -284,6 +289,12 @@
     // Codicon-style lock / unlock (VS Code $(lock) / $(unlock))
     lock: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 7V5a3 3 0 0 1 6 0v2h.5A1.5 1.5 0 0 1 13 8.5v5A1.5 1.5 0 0 1 11.5 15h-7A1.5 1.5 0 0 1 3 13.5v-5A1.5 1.5 0 0 1 4.5 7H5zm1.5-2a1.5 1.5 0 0 1 3 0v2h-3V5zM4.5 8.5v5h7v-5h-7z"/></svg>`,
     unlock: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 7V5a3 3 0 0 1 5.905-.7l-.98.2A2 2 0 0 0 6.5 5v2H11.5A1.5 1.5 0 0 1 13 8.5v5A1.5 1.5 0 0 1 11.5 15h-7A1.5 1.5 0 0 1 3 13.5v-5A1.5 1.5 0 0 1 4.5 7H5zm-1 1.5v5h7v-5h-7z"/></svg>`,
+    // Source badges for sandbox profiles (VS Code $(folder), $(account), and
+    // $(terminal-secure)). The webview does not load the Codicon font, so keep
+    // the official SVG paths inline like the lock/unlock glyphs above.
+    folder: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 4.5V6H5.58579C5.71839 6 5.84557 5.94732 5.93934 5.85355L7.29289 4.5L5.93934 3.14645C5.84557 3.05268 5.71839 3 5.58579 3H3.5C2.67157 3 2 3.67157 2 4.5ZM1 4.5C1 3.11929 2.11929 2 3.5 2H5.58579C5.98361 2 6.36514 2.15804 6.64645 2.43934L8.20711 4H12.5C13.8807 4 15 5.11929 15 6.5V11.5C15 12.8807 13.8807 14 12.5 14H3.5C2.11929 14 1 12.8807 1 11.5V4.5ZM2 7V11.5C2 12.3284 2.67157 13 3.5 13H12.5C13.3284 13 14 12.3284 14 11.5V6.5C14 5.67157 13.3284 5 12.5 5H8.20711L6.64645 6.56066C6.36514 6.84197 5.98361 7 5.58579 7H2Z"/></svg>`,
+    account: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 2C4.686 2 2 4.686 2 8C2 11.314 4.686 14 8 14C11.314 14 14 11.314 14 8C14 4.686 11.314 2 8 2ZM1 8C1 4.134 4.134 1 8 1C11.866 1 15 4.134 15 8C15 11.866 11.866 15 8 15C4.134 15 1 11.866 1 8ZM8 12.25C9.933 12.25 11.5 11.036 11.5 9.214C11.5 8.543 10.956 8 10.286 8H5.715C5.044 8 4.501 8.544 4.501 9.214C4.501 11.035 6.068 12.25 8.001 12.25H8ZM8 7.25C9.036 7.25 9.875 6.411 9.875 5.375C9.875 4.339 9.036 3.5 8 3.5C6.964 3.5 6.125 4.339 6.125 5.375C6.125 6.411 6.964 7.25 8 7.25Z"/></svg>`,
+    terminalSecure: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M15 3H14.5V2C14.5 0.895 13.605 0 12.5 0C11.395 0 10.5 0.895 10.5 2V3H10C9.448 3 9 3.448 9 4V8C9 8.552 9.448 9 10 9H15C15.552 9 16 8.552 16 8V4C16 3.448 15.552 3 15 3ZM12.5 6.75C12.086 6.75 11.75 6.414 11.75 6C11.75 5.586 12.086 5.25 12.5 5.25C12.914 5.25 13.25 5.586 13.25 6C13.25 6.414 12.914 6.75 12.5 6.75ZM13.5 3H11.5V2C11.5 1.448 11.948 1 12.5 1C13.052 1 13.5 1.448 13.5 2V3ZM14 10H15V12.5C15 13.879 13.879 15 12.5 15H3.5C2.121 15 1 13.879 1 12.5V3.5C1 2.122 2.121 1 3.5 1H9V2H3.5C2.673 2 2 2.673 2 3.5V12.5C2 13.327 2.673 14 3.5 14H12.5C13.327 14 14 13.327 14 12.5V10ZM7 11.5C7 11.224 7.224 11 7.5 11H12.5C12.776 11 13 11.224 13 11.5C13 11.776 12.776 12 12.5 12H7.5C7.224 12 7 11.776 7 11.5ZM3.146 11.147L5.792 8.501L3.146 5.855C2.951 5.66 2.951 5.343 3.146 5.148C3.341 4.953 3.658 4.953 3.853 5.148L6.853 8.148C7.048 8.343 7.048 8.66 6.853 8.855L3.854 11.854C3.756 11.952 3.628 12 3.5 12C3.372 12 3.244 11.951 3.146 11.854C2.951 11.659 2.951 11.342 3.146 11.147Z"/></svg>`,
   };
 
   function modeMeta() {
@@ -1401,24 +1412,37 @@
     closePopovers();
     sandboxPopover.innerHTML = "";
     const cur = state.sandboxCurrent || "off";
-    const options = ["off", ...(state.sandboxProfiles || [])];
+    const options = [{ name: "off", scope: "off" }, ...(state.sandboxProfiles || [])];
     // Dedupe while preserving order
     const seen = new Set();
-    for (const id of options) {
+    for (const option of options) {
+      const id = typeof option === "string" ? option : option && option.name;
       if (!id || seen.has(id)) continue;
       seen.add(id);
       const el = document.createElement("div");
       const active = id === cur;
       const off = id === "off";
+      const requestedScope = typeof option === "object" && option ? option.scope : "";
+      const scope = off
+        ? "off"
+        : (["workspace", "user", "builtin"].includes(requestedScope)
+            ? requestedScope
+            : (["workspace", "devbox", "read-only", "strict"].includes(id) ? "builtin" : "user"));
+      const scopeMeta = {
+        workspace: { icon: ICON.folder, description: "Workspace-defined sandbox profile" },
+        user: { icon: ICON.account, description: "User-defined sandbox profile" },
+        builtin: { icon: ICON.terminalSecure, description: "Built-in sandbox profile" },
+      }[scope];
       el.className = "toolbar-popover-item mode-popover-item" + (active ? " active" : "");
+      el.dataset.sandboxScope = scope;
       el.innerHTML =
-        `<span class="mode-item-icon">${off ? ICON.unlock : ICON.lock}</span>` +
+        `<span class="mode-item-icon${off ? "" : " sandbox-profile-icons"}">${off ? ICON.unlock : ICON.lock + scopeMeta.icon}</span>` +
         `<span class="mode-item-body">` +
           `<span class="mode-item-label">${escapeHtml(off ? "off" : id)}</span>` +
           `<span class="mode-item-desc">${escapeHtml(
             off
               ? "No OS sandbox — agent process is unsandboxed"
-              : `Apply OS sandbox profile "${id}" (session restart)`,
+              : scopeMeta.description,
           )}</span>` +
         `</span>` +
         (active ? '<span class="popover-check">✓</span>' : "");
@@ -4453,7 +4477,19 @@
         break;
       case "sandboxState":
         state.sandboxCurrent = msg.current || "off";
-        state.sandboxProfiles = Array.isArray(msg.profiles) ? msg.profiles : [];
+        state.sandboxProfiles = Array.isArray(msg.profiles)
+          ? msg.profiles.map((profile) => {
+              const raw = profile && typeof profile === "object" ? profile : { name: profile };
+              const name = String(raw.name || "");
+              const requestedScope = raw.scope;
+              return {
+                name,
+                scope: ["workspace", "user", "builtin"].includes(requestedScope)
+                  ? requestedScope
+                  : (["workspace", "devbox", "read-only", "strict"].includes(name) ? "builtin" : "user"),
+              };
+            }).filter((profile) => profile.name)
+          : [];
         state.sandboxSupported = state.platform === "darwin" && msg.supported !== false;
         updateSandboxBtn();
         break;
