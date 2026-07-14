@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  collectAvailableSandboxProfileOptions,
   collectAvailableSandboxProfiles,
   configDisablesBypassPermissions,
   configForcesAlwaysApprove,
@@ -12,6 +13,7 @@ import {
   readGlobalConfigurationValue,
   readSandboxProfile,
   readUiPermissionMode,
+  resolveNewSessionSandboxProfile,
   resolveSandboxProfile,
 } from "../src/grok-config";
 
@@ -153,18 +155,18 @@ describe("readSandboxProfile", () => {
 });
 
 describe("normalizeSandboxProfile", () => {
-  it("treats off/none/false/empty as no sandbox", () => {
+  it("treats only exact lowercase off and empty as no sandbox", () => {
     expect(normalizeSandboxProfile("off")).toBeUndefined();
-    expect(normalizeSandboxProfile("OFF")).toBeUndefined();
-    expect(normalizeSandboxProfile("none")).toBeUndefined();
-    expect(normalizeSandboxProfile("false")).toBeUndefined();
     expect(normalizeSandboxProfile("")).toBeUndefined();
     expect(normalizeSandboxProfile(undefined)).toBeUndefined();
   });
 
-  it("preserves real profile names", () => {
+  it("preserves case-sensitive custom profile names, including none and false", () => {
     expect(normalizeSandboxProfile("workspace")).toBe("workspace");
     expect(normalizeSandboxProfile("  lumina  ")).toBe("lumina");
+    expect(normalizeSandboxProfile("OFF")).toBe("OFF");
+    expect(normalizeSandboxProfile("none")).toBe("none");
+    expect(normalizeSandboxProfile("false")).toBe("false");
   });
 });
 
@@ -236,6 +238,66 @@ describe("resolveSandboxProfile", () => {
 
   it("returns undefined when nothing is configured", () => {
     expect(resolveSandboxProfile({})).toBeUndefined();
+  });
+});
+
+describe("resolveNewSessionSandboxProfile", () => {
+  const projectLumina = `[profiles.lumina]\nextends = "workspace"\n`;
+  const globalBoris = `[profiles.boris]\nextends = "workspace"\n`;
+
+  it("uses a legacy global fallback when this project defines it", () => {
+    expect(resolveNewSessionSandboxProfile({
+      fallbackSetting: "lumina",
+      projectSandbox: projectLumina,
+      globalSandbox: globalBoris,
+      globalConfig: SANDBOX_CONFIG("boris"),
+    })).toBe("lumina");
+  });
+
+  it("ignores that project-only fallback in another project", () => {
+    expect(resolveNewSessionSandboxProfile({
+      fallbackSetting: "lumina",
+      projectSandbox: `[profiles.other]\nextends = "workspace"\n`,
+      globalSandbox: globalBoris,
+      globalConfig: SANDBOX_CONFIG("boris"),
+    })).toBe("boris");
+  });
+
+  it("accepts globally defined custom and built-in persisted choices everywhere", () => {
+    expect(resolveNewSessionSandboxProfile({
+      fallbackSetting: "boris",
+      globalSandbox: globalBoris,
+    })).toBe("boris");
+    expect(resolveNewSessionSandboxProfile({
+      setting: "strict",
+    })).toBe("strict");
+    expect(resolveNewSessionSandboxProfile({
+      setting: "devbox",
+    })).toBe("devbox");
+  });
+
+  it("keeps an unavailable workspace choice fail-closed", () => {
+    expect(resolveNewSessionSandboxProfile({
+      workspaceChoice: "removed-project-profile",
+      fallbackSetting: "strict",
+    })).toBe("removed-project-profile");
+  });
+
+  it("keeps real User settings and explicit env choices fail-closed", () => {
+    expect(resolveNewSessionSandboxProfile({
+      setting: "old-project-only-profile",
+      env: "unknown-explicit-profile",
+    })).toBe("old-project-only-profile");
+    expect(resolveNewSessionSandboxProfile({
+      env: "unknown-explicit-profile",
+    })).toBe("unknown-explicit-profile");
+  });
+
+  it("keeps explicit off as a terminal persisted choice", () => {
+    expect(resolveNewSessionSandboxProfile({
+      fallbackSetting: "off",
+      env: "strict",
+    })).toBeUndefined();
   });
 });
 
@@ -326,19 +388,44 @@ describe("listSandboxProfilesFromToml / collectAvailableSandboxProfiles", () => 
     )).toEqual(["my profile"]);
   });
 
-  it("ignores built-in profile redefinitions", () => {
-    expect(listSandboxProfilesFromToml(`[profiles.workspace]\nread_write = ["."]\n`)).toEqual([]);
+  it("ignores every built-in profile redefinition", () => {
+    expect(listSandboxProfilesFromToml([
+      `[profiles.off]\nread_write = ["."]`,
+      `[profiles.workspace]\nread_write = ["."]`,
+      `[profiles.devbox]\nread_write = ["."]`,
+      `[profiles.read-only]\nread_write = ["."]`,
+      `[profiles.strict]\nread_write = ["."]`,
+    ].join("\n\n"))).toEqual([]);
   });
 
-  it("merges customs then built-ins", () => {
+  it("merges customs then all Grok built-ins in documented order", () => {
     const profiles = collectAvailableSandboxProfiles({
       projectSandbox: `[profiles.lumina]\nextends = "workspace"\n\n[profiles.devbox]\nextends = "workspace"\n`,
     });
-    expect(profiles[0]).toBe("lumina");
-    expect(profiles[1]).toBe("devbox");
-    expect(profiles).toContain("workspace");
-    expect(profiles).toContain("strict");
-    expect(profiles).toContain("read-only");
+    expect(profiles).toEqual(["lumina", "workspace", "devbox", "read-only", "strict"]);
+  });
+
+  it("reports whether each profile is workspace-defined, user-defined, or built-in", () => {
+    const profiles = collectAvailableSandboxProfileOptions({
+      projectSandbox: [
+        `[profiles.shared]\nextends = "workspace"`,
+        `[profiles.project-only]\nextends = "strict"`,
+      ].join("\n\n"),
+      globalSandbox: [
+        `[profiles.shared]\nextends = "read-only"`,
+        `[profiles.personal]\nextends = "workspace"`,
+      ].join("\n\n"),
+    });
+
+    expect(profiles).toEqual([
+      { name: "shared", scope: "workspace" },
+      { name: "project-only", scope: "workspace" },
+      { name: "personal", scope: "user" },
+      { name: "workspace", scope: "builtin" },
+      { name: "devbox", scope: "builtin" },
+      { name: "read-only", scope: "builtin" },
+      { name: "strict", scope: "builtin" },
+    ]);
   });
 
   it("identifies project-only profile names for workspace-scoped persistence", () => {
@@ -353,5 +440,6 @@ describe("listSandboxProfilesFromToml / collectAvailableSandboxProfiles", () => 
       globalSandbox: `[profiles.shared]\nextends = "strict"`,
     })).toBe(false);
     expect(isProjectOnlySandboxProfile({ name: "workspace" })).toBe(false);
+    expect(isProjectOnlySandboxProfile({ name: "devbox" })).toBe(false);
   });
 });

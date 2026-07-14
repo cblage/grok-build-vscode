@@ -97,18 +97,22 @@ These actually spawn real shell children (real `/bin/sh`, or real PowerShell on 
 - **`resolveTerminalShell` (#46)** — POSIX → `/bin/sh` (no PATH probe); Windows → `pwsh.exe`→`powershell.exe`→cmd.exe, in that order
 - **Windows PowerShell host (#46, Windows-only, skipped on CI)** — real PowerShell pipeline (`… | Measure-Object`), a non-builtin cmdlet (`Get-Date`), `$PSVersionTable`, and a `Format-List` pipeline all run through `TerminalManager` (cmd.exe would fail these); the resolved host shell is never cmd.exe
 
-### `test/seatbelt-policy.test.ts` — macOS Seatbelt policy compiler (14 tests)
+### `test/seatbelt-policy.test.ts` — macOS Seatbelt policy compiler (18 tests)
 
 - Parses multiline consumer `sandbox.toml` profile fields and quoted names
-- Applies user → project replacement and recursively resolves custom parents
-- Rejects duplicate fields, malformed arrays, missing parents, cycles, unknown
-  fields, and unsupported deny-glob syntax before launch
-- Compiles built-in/custom filesystem containment, sensitive-path write guards,
-  macOS `/tmp`/`/var` canonical paths, deny globs, and child-network policy
-- Permits only session `plan.md` writes beneath `$GROK_HOME`, even when a custom
-  profile grants that directory
-- Grants only shell-compatible `/dev/null` and inherited `/dev/fd/*` writes,
-  without opening persistent devices or the rest of `/dev`
+- Applies user → project replacement and direct inheritance from one built-in
+- Rejects duplicate fields, malformed arrays/booleans, custom or missing
+  parents, unknown fields, and unsupported deny-glob syntax before launch
+- Locks Grok's built-in matrix: `workspace`, reserved `devbox`, `read-only`, and
+  `strict`, including full `$GROK_HOME` and trusted-temp writes where granted
+- Confirms `devbox` snapshots actual top-level directories and never silently
+  degrades to a narrower policy if that enumeration fails
+- Verifies direct built-in inheritance, project-over-user definitions, additive
+  `read_only`/`read_write`, macOS path aliases, and airtight exact/glob denies
+- Confirms `restrict_network` remains profile intent but is not enforced on
+  macOS, matching Grok's documented platform no-op
+- Confirms built-ins ignore unrelated malformed custom definitions and use
+  Grok's warn-and-continue startup disposition; custom profiles remain fatal
 
 ### `test/seatbelt-broker.test.ts` — sandbox execution helpers (6 tests)
 

@@ -246,28 +246,38 @@ Or edit the config via gear → *Open global / project config*, then click **+**
 ### macOS sandbox profiles
 
 The sandbox button is available on macOS when `/usr/bin/sandbox-exec` exists.
-Built-in choices are `workspace`, `read-only`, and `strict`. Define consumer
-custom profiles in either location:
+Its built-ins match Grok's own macOS behavior:
+
+| Profile | Reads | Writes | Child network on macOS |
+|---|---|---|---|
+| `workspace` | Everywhere | Project/CWD, all of `$GROK_HOME`, and temp roots | Allowed |
+| `devbox` | Everywhere | Existing top-level directories except `/data`, `/proc`, `/sys`, and `/dev` | Allowed |
+| `read-only` | Everywhere | All of `$GROK_HOME` and temp roots | Allowed |
+| `strict` | Project/CWD, `$GROK_HOME`, temp, Grok's exact system roots, and broker runtime files | Project/CWD, all of `$GROK_HOME`, and temp roots | Allowed |
+
+`devbox` is reserved and shadows a same-named TOML profile. On macOS,
+`restrict_network` is a documented no-op, including for custom profiles.
+
+Define custom profiles in either location:
 
 - `$GROK_HOME/sandbox.toml` (normally `~/.grok/sandbox.toml`) — user profiles
 - `.grok/sandbox.toml` in the open project — project profiles; a matching name
   replaces the user definition
 
-Custom profiles may recursively use `extends` to inherit a built-in or another
-custom profile.
-The supported fields are `extends`, `restrict_network`, `read_only`,
-`read_write`, and `deny`. A malformed definition, missing parent, inheritance
-cycle, unreadable saved-session profile, or broker failure aborts startup rather
-than falling back to unsandboxed execution. Project `.env` and project
-`.grok/config.toml` do not control sandbox selection or `GROK_HOME`. The broker
-permits Grok's session `plan.md` write but protects every other `$GROK_HOME`
-path and the project's `.grok/sandbox.toml` from delegated writes. The built-in
-contained profiles retain narrow write exceptions for `/dev/null` and inherited
-`/dev/fd/*` descriptors; a custom `read_write` grant may widen that deliberately.
-The broker initializes `TMPDIR`, `TMP`, and `TEMP` to the trusted macOS temp root
-compiled into the policy, and filters repository `.env` plus ACP terminal
-environment overrides at ingress. Seatbelt remains the authority if a command
-later mutates its own environment.
+Custom profiles may use `extends` with exactly one built-in base: `workspace`,
+`devbox`, `read-only`, or `strict` (omitting it defaults to `workspace`). Grok
+rejects custom-to-custom inheritance and `extends = "off"`. Profile names are
+case-sensitive; only exact lowercase `off` disables sandboxing, so `OFF`,
+`none`, and `false` remain valid custom names. The supported fields are
+`extends`, `restrict_network`, `read_only`, `read_write`, and `deny`. Malformed
+or unknown custom-profile data and custom broker startup failures abort rather
+than silently weakening the selected profile. Built-in application failures
+warn and continue, matching Grok; a live broker failure remains fatal.
+Project `.env` and project `.grok/config.toml` do not control sandbox selection
+or `GROK_HOME`. The broker initializes `TMPDIR`, `TMP`, and `TEMP` to the trusted
+macOS temp root compiled into the policy and filters repository `.env` plus ACP
+terminal environment overrides at ingress. Seatbelt remains the authority if a
+command later mutates its own environment.
 
 See [macOS sandbox architecture](docs/macos-sandbox-architecture.md) for the
 complete process topology, trust boundary, profile-resolution rules, broker

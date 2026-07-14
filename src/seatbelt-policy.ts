@@ -1,9 +1,11 @@
 import os from "node:os";
+import fs from "node:fs";
 import { posix as path } from "node:path";
 
 export const SEATBELT_BUILTIN_PROFILES = [
   "off",
   "workspace",
+  "devbox",
   "read-only",
   "strict",
 ] as const;
@@ -41,6 +43,9 @@ export interface SeatbeltPolicyContext {
   tempDir?: string;
   runtimeReadPaths?: string[];
   systemReadPaths?: string[];
+  /** Test seam for Grok's devbox behavior, which snapshots writable top-level
+   * directories when the policy is compiled. */
+  topLevelWritePaths?: string[];
 }
 
 export interface CompiledSeatbeltPolicy {
@@ -62,25 +67,71 @@ export class SandboxProfileError extends Error {
 
 const BUILTIN_SET = new Set<string>(SEATBELT_BUILTIN_PROFILES);
 
+export function isSeatbeltBuiltinProfile(name: string): name is SeatbeltBuiltinProfile {
+  return BUILTIN_SET.has(name.trim());
+}
+
+export type SandboxStartupFailureDisposition = "warn-and-continue" | "fatal";
+
+/** Grok falls back only when applying one of its built-ins fails. An explicitly
+ * selected custom profile remains fail-closed. */
+export function sandboxStartupFailureDisposition(
+  name: string,
+): SandboxStartupFailureDisposition {
+  return isSeatbeltBuiltinProfile(name) ? "warn-and-continue" : "fatal";
+}
+
 const BUILTIN_NETWORK: Record<SeatbeltBuiltinProfile, boolean> = {
   off: false,
   workspace: false,
+  devbox: false,
   "read-only": true,
   strict: true,
 };
 
 const DEFAULT_SYSTEM_READ_PATHS = [
-  "/System",
-  "/Library",
   "/usr",
   "/bin",
   "/sbin",
-  "/opt",
+  "/etc",
   "/dev",
-  "/private/etc",
-  "/private/var/db",
-  "/private/var/run",
+  "/tmp",
+  "/var",
+  "/System",
+  "/Library",
+  "/private",
+  "~/Library",
 ];
+
+const SAFE_DEVICE_WRITE_LITERALS = [
+  "/dev/null",
+  "/dev/zero",
+  "/dev/random",
+  "/dev/urandom",
+  "/dev/ptmx",
+];
+const DEVBOX_EXCLUDED_TOP_LEVEL_PATHS = new Set(["/data", "/proc", "/sys", "/dev"]);
+
+function writableTopLevelDirectories(): string[] {
+  try {
+    return fs.readdirSync("/", { withFileTypes: true })
+      .filter((entry) => {
+        if (DEVBOX_EXCLUDED_TOP_LEVEL_PATHS.has(path.join("/", entry.name))) return false;
+        if (entry.isDirectory()) return true;
+        if (!entry.isSymbolicLink()) return false;
+        try {
+          return fs.statSync(path.join("/", entry.name)).isDirectory();
+        } catch {
+          return false;
+        }
+      })
+      .map((entry) => path.join("/", entry.name));
+  } catch (error) {
+    throw new SandboxProfileError(
+      `Unable to enumerate top-level directories for the devbox profile: ${(error as Error).message}`,
+    );
+  }
+}
 
 function stripTomlComment(line: string): string {
   let quote: "\"" | "'" | undefined;
@@ -285,7 +336,7 @@ export function parseSandboxProfiles(
         current.extends = parseTomlString(value, field);
         break;
       case "restrict_network": {
-        const normalized = value.trim().toLowerCase();
+        const normalized = value.trim();
         if (normalized !== "true" && normalized !== "false") {
           throw new SandboxProfileError(`${field} must be a boolean`);
         }
@@ -344,53 +395,40 @@ function builtinProfile(name: SeatbeltBuiltinProfile): ResolvedSandboxProfile {
   };
 }
 
-/** Resolve a built-in or recursively inherited custom profile. */
+/** Resolve a built-in or a custom profile derived directly from one built-in. */
 export function resolveSeatbeltProfile(
   name: string,
   sources: SandboxProfileSources | Map<string, SandboxProfileDefinition>,
 ): ResolvedSandboxProfile {
   const profileName = name.trim();
   if (!profileName) throw new SandboxProfileError("Sandbox profile name cannot be empty");
+  // Built-ins are self-contained and shadow same-named TOML tables. Native
+  // Grok does not let an unrelated malformed custom definition break one.
+  if (isSeatbeltBuiltinProfile(profileName)) {
+    return builtinProfile(profileName);
+  }
   const definitions =
     sources instanceof Map ? sources : collectSandboxProfileDefinitions(sources);
-  const resolved = new Map<string, ResolvedSandboxProfile>();
-
-  const visit = (currentName: string, stack: string[]): ResolvedSandboxProfile => {
-    if (BUILTIN_SET.has(currentName)) {
-      return builtinProfile(currentName as SeatbeltBuiltinProfile);
-    }
-    const cached = resolved.get(currentName);
-    if (cached) return cached;
-    const cycleAt = stack.indexOf(currentName);
-    if (cycleAt >= 0) {
-      const cycle = [...stack.slice(cycleAt), currentName].join(" -> ");
-      throw new SandboxProfileError(`Sandbox profile inheritance cycle: ${cycle}`);
-    }
-    const definition = definitions.get(currentName);
-    if (!definition) {
-      const child = stack.at(-1);
-      throw new SandboxProfileError(
-        child
-          ? `Sandbox profile '${child}' extends missing profile '${currentName}'`
-          : `Unknown sandbox profile '${currentName}'`,
-      );
-    }
-    const baseName = definition.extends?.trim() || "workspace";
-    const parent = visit(baseName, [...stack, currentName]);
-    const value: ResolvedSandboxProfile = {
-      name: currentName,
-      builtin: parent.builtin,
-      lineage: [...parent.lineage, currentName],
-      restrictNetwork: definition.restrictNetwork ?? parent.restrictNetwork,
-      readOnly: unique([...parent.readOnly, ...definition.readOnly]),
-      readWrite: unique([...parent.readWrite, ...definition.readWrite]),
-      deny: unique([...parent.deny, ...definition.deny]),
-    };
-    resolved.set(currentName, value);
-    return value;
+  const definition = definitions.get(profileName);
+  if (!definition) {
+    throw new SandboxProfileError(`Unknown sandbox profile '${profileName}'`);
+  }
+  const baseName = definition.extends?.trim() || "workspace";
+  if (baseName === "off" || !isSeatbeltBuiltinProfile(baseName)) {
+    throw new SandboxProfileError(
+      `Sandbox profile '${profileName}' may extend only workspace, devbox, read-only, or strict`,
+    );
+  }
+  const parent = builtinProfile(baseName);
+  return {
+    name: profileName,
+    builtin: parent.builtin,
+    lineage: [...parent.lineage, profileName],
+    restrictNetwork: definition.restrictNetwork ?? parent.restrictNetwork,
+    readOnly: unique(definition.readOnly),
+    readWrite: unique(definition.readWrite),
+    deny: unique(definition.deny),
   };
-
-  return visit(profileName, []);
 }
 
 function canonicalizeMacPath(value: string): string {
@@ -542,20 +580,12 @@ function globDenyRule(regex: string): string {
   return `(deny file-read* file-write* (regex #${quoteSeatbeltRegex(regex)}))`;
 }
 
-function grokHomeWriteGuard(grokHome: string, planRegex: string): string {
-  return `(deny file-write*
-  (require-all
-    (subpath ${quoteSeatbelt(grokHome)})
-    (require-not (regex #${quoteSeatbeltRegex(planRegex)}))
-  )
-)`;
-}
-
 function baseAccess(profile: SeatbeltBuiltinProfile, input: {
   cwd: string;
   grokHome: string;
   tempPaths: string[];
   systemReadPaths: string[];
+  topLevelWritePaths: string[];
 }): {
   readEverywhere: boolean;
   writeEverywhere: boolean;
@@ -577,7 +607,15 @@ function baseAccess(profile: SeatbeltBuiltinProfile, input: {
         readEverywhere: true,
         writeEverywhere: false,
         readPaths: [],
-        writePaths: [input.cwd, ...input.tempPaths],
+        writePaths: [input.cwd, input.grokHome, ...input.tempPaths],
+        writeDeniedPaths: [],
+      };
+    case "devbox":
+      return {
+        readEverywhere: true,
+        writeEverywhere: false,
+        readPaths: [],
+        writePaths: [input.cwd, ...input.topLevelWritePaths],
         writeDeniedPaths: [],
       };
     case "read-only":
@@ -585,7 +623,7 @@ function baseAccess(profile: SeatbeltBuiltinProfile, input: {
         readEverywhere: true,
         writeEverywhere: false,
         readPaths: [],
-        writePaths: [],
+        writePaths: [input.grokHome, ...input.tempPaths],
         writeDeniedPaths: [],
       };
     case "strict":
@@ -593,7 +631,7 @@ function baseAccess(profile: SeatbeltBuiltinProfile, input: {
         readEverywhere: false,
         writeEverywhere: false,
         readPaths: [input.cwd, input.grokHome, ...input.tempPaths, ...input.systemReadPaths],
-        writePaths: [input.cwd, ...input.tempPaths],
+        writePaths: [input.cwd, input.grokHome, ...input.tempPaths],
         writeDeniedPaths: [],
       };
   }
@@ -608,7 +646,7 @@ export function compileSeatbeltPolicyDetails(
   const home = resolveSandboxPath(context.home ?? os.homedir(), "/", context.home ?? os.homedir());
   const grokHome = resolveSandboxPath(context.grokHome ?? "~/.grok", cwd, home);
   const tempPaths = unique(
-    ["/tmp", "/var/tmp", context.tempDir ?? os.tmpdir()].map((value) =>
+    ["/tmp", "/var/tmp", "/var/folders", context.tempDir ?? os.tmpdir()].map((value) =>
       resolveSandboxPath(value, cwd, home),
     ),
   );
@@ -617,12 +655,20 @@ export function compileSeatbeltPolicyDetails(
       (value) => resolveSandboxPath(value, cwd, home),
     ),
   );
-  const base = baseAccess(profile.builtin, { cwd, grokHome, tempPaths, systemReadPaths });
-  const planWriteRegex = denyGlobToSeatbeltRegex(
-    path.join(grokHome, "sessions", "**", "plan.md"),
+  const topLevelWritePaths = profile.builtin === "devbox"
+    ? unique(
+      (context.topLevelWritePaths ?? writableTopLevelDirectories()).map((value) =>
+        resolveSandboxPath(value, cwd, home),
+      ).filter((value) => !DEVBOX_EXCLUDED_TOP_LEVEL_PATHS.has(value)),
+    )
+    : [];
+  const base = baseAccess(profile.builtin, {
     cwd,
-    home,
-  );
+    grokHome,
+    tempPaths,
+    systemReadPaths,
+    topLevelWritePaths,
+  });
   const customReadOnly = profile.readOnly.map((value) => resolveSandboxPath(value, cwd, home));
   const customReadWrite = profile.readWrite.map((value) => resolveSandboxPath(value, cwd, home));
   const writePaths = unique([...base.writePaths, ...customReadWrite]);
@@ -636,10 +682,9 @@ export function compileSeatbeltPolicyDetails(
   const deniedGlobs: string[] = [];
   const rules = ["(version 1)", "(allow default)"];
 
-  // The Grok model process remains separate and online. The broker only owns
-  // delegated filesystem and terminal operations, so denying its network
-  // operations blocks shell/script network access without cutting off the LLM.
-  if (profile.restrictNetwork) rules.push("(deny network*)");
+  // Grok documents child-network restriction as a Linux-only seccomp feature.
+  // The extension's sandbox surface is macOS Seatbelt, where it is intentionally
+  // a no-op so the built-ins and custom profiles behave exactly like Grok.
 
   if (!base.readEverywhere) {
     const rule = containmentRule("file-read*", readPaths);
@@ -648,13 +693,11 @@ export function compileSeatbeltPolicyDetails(
   if (!base.writeEverywhere) {
     const rule = containmentRule(
       "file-write*",
-      // `/dev/fd/N` exposes only descriptors already inherited or opened by
-      // the sandboxed process. The broker gives commands pipes for stdio, so
-      // this restores shell output process substitution without opening any
-      // persistent device or filesystem path.
-      [...writePaths, "/dev/fd"],
-      profile.name === "off" ? [] : [planWriteRegex],
-      profile.name === "off" ? [] : ["/dev/null"],
+      // Grok's native macOS policy special-cases only these exact character
+      // devices. `/dev/fd/*` is intentionally not writable.
+      writePaths,
+      [],
+      SAFE_DEVICE_WRITE_LITERALS,
     );
     if (rule) rules.push(rule);
   }
@@ -662,26 +705,10 @@ export function compileSeatbeltPolicyDetails(
     const resolved = resolveSandboxPath(value, cwd, home);
     rules.push(exactWriteDenyRule(resolved));
   }
-  // The delegated broker only needs Grok's plan.md write. Protect every other
-  // GROK_HOME path—even from a custom read_write grant—so it cannot weaken the
-  // next start/cold resume by editing config, profiles, or session summaries.
-  if (profile.name !== "off") {
-    rules.push(grokHomeWriteGuard(grokHome, planWriteRegex));
-    rules.push(exactWriteDenyRule(path.join(cwd, ".grok", "sandbox.toml")));
-  }
-  // Keep credential stores protected regardless of additional read_write
-  // grants. A broad custom parent cannot turn credentials into a write sink.
-  for (const value of [
-    "~/.ssh",
-    "~/.gnupg",
-    "~/.aws",
-    "~/.config/gcloud",
-    "~/.azure",
-    path.join(grokHome, "auth"),
-    path.join(grokHome, "auth.json"),
-    path.join(grokHome, "auth.json.lock"),
-  ]) {
-    rules.push(exactWriteDenyRule(resolveSandboxPath(value, cwd, home)));
+  // `read_only` is additive and must still remove write access when the base is
+  // broad (especially `devbox`), not merely add a readable path.
+  for (const value of customReadOnly) {
+    rules.push(exactWriteDenyRule(value));
   }
   for (const entry of profile.deny) {
     if (hasGlob(entry)) {
@@ -702,7 +729,7 @@ export function compileSeatbeltPolicyDetails(
     writePaths,
     deniedPaths,
     deniedGlobs,
-    networkRestrictionApplied: profile.restrictNetwork,
+    networkRestrictionApplied: false,
   };
 }
 

@@ -1,18 +1,24 @@
 # Changelog
 
-## 1.5.14-sandbox - 2026-07-14
+## 1.15.14-sandbox.1 - 2026-07-14
 
 ### Added
 
-- **Real macOS Seatbelt enforcement for ACP tools.** Each sandboxed conversation now gets a dedicated helper process launched under `/usr/bin/sandbox-exec`; every delegated filesystem request and every terminal command (including its descendants) runs inside that irreversible policy. The Grok model process remains online outside the helper, so `restrict_network = true` blocks command/script networking without severing the model connection. Broker startup or runtime failure is fail-closed—there is no direct extension-host fallback.
-- Custom profiles load from `$GROK_HOME/sandbox.toml` and project `.grok/sandbox.toml`, support recursive `extends`, and use project-over-user replacement for matching names. Built-ins are `workspace`, `read-only`, and `strict`; `devbox` remains an ordinary custom-profile example.
+- **Real macOS Seatbelt enforcement for ACP tools.** The Grok CLI still receives `--sandbox <profile>` and runs inside Grok's native process-lifetime boundary. Each sandboxed conversation also gets a dedicated helper under `/usr/bin/sandbox-exec`, mirroring that profile for delegated filesystem requests and terminal commands (including descendants). A built-in application failure warns and continues exactly like Grok; malformed or unapplied custom profiles refuse to start, and a live broker failure remains fatal.
+- Custom profiles load from `$GROK_HOME/sandbox.toml` and project `.grok/sandbox.toml`, inherit directly from exactly one built-in (default `workspace`), and use project-over-user replacement for matching names. Custom-to-custom inheritance and `extends = "off"` are rejected. Names are case-sensitive and only exact lowercase `off` disables the sandbox. The reserved built-ins are `workspace`, `devbox`, `read-only`, and `strict`.
+- The macOS built-ins preserve Grok's documented access contract one-for-one: `workspace` writes CWD, all of `~/.grok`, and temp; `devbox` writes every top-level tree except `/data` and virtual filesystems; `read-only` writes all of `~/.grok` and temp; and `strict` writes CWD, all of `~/.grok`, and temp while narrowing reads to CWD and essential system paths. As in Grok itself, `restrict_network` is a no-op on macOS.
 - Added a dedicated [macOS sandbox architecture guide](docs/macos-sandbox-architecture.md) covering the ACP containment gap, process topology, profile selection and inheritance, broker protocol, trust boundary, and fail-closed lifecycle.
+
+### Changed
+
+- The sandbox picker now identifies each profile's definition source explicitly. Built-in profiles show a lock plus `$(terminal-secure)` and “Built-in sandbox profile”; user profiles from `~/.grok/sandbox.toml` show a lock plus `$(account)` and “User-defined sandbox profile”; workspace profiles from `.grok/sandbox.toml` show a lock plus `$(folder)` and “Workspace-defined sandbox profile”. Same-name workspace definitions retain their resolver precedence over user definitions.
 
 ### Fixed
 
 - Session mode is now sticky per conversation: reopening history after a window reload restores that session's Agent, Plan, or Auto accept selection before the first paint, instead of falling back to the current new-session default. The selection also survives transparent empty-session restarts for model, effort, and sandbox changes. Legacy saved plans retain their verdict-driven restore behavior, and current Auto-accept policy restrictions are still enforced.
-- Sandbox selection now follows the consumer configuration surface only: extension choice → `GROK_SANDBOX` → global `$GROK_HOME/config.toml`; project `.grok/config.toml` and repository VS Code settings cannot override it. Project-only toolbar choices are workspace-local without writing `.vscode/settings.json`, while project `.env` files cannot redirect `GROK_HOME`, override `HOME`, or disable `GROK_SANDBOX`. Delegated writes preserve Grok's session `plan.md` but cannot mutate sandbox config or persisted session control state.
-- Malformed, duplicate, cyclic, or missing custom-profile fields fail before launch; project definitions override user definitions deterministically. Quoted profile names, macOS `/var`/`/tmp` aliases, deny globs, sensitive credential paths, and recursive custom inheritance now resolve consistently.
+- A project-only sandbox selected by an older build can no longer leak through extension-global fallback state into another project and prevent Grok from starting with `Unknown sandbox profile`. Legacy fallback names are used only where the profile exists; otherwise resolution continues to the configured environment or global sandbox profile. Explicit workspace, User, environment, and cold-resume selections remain fail-closed.
+- Sandbox selection now follows the consumer configuration surface only: extension choice → `GROK_SANDBOX` → global `$GROK_HOME/config.toml`; project `.grok/config.toml` and repository VS Code settings cannot override it. Project-only toolbar choices are workspace-local without writing `.vscode/settings.json`, while project `.env` files cannot redirect `GROK_HOME`, override `HOME`, or disable `GROK_SANDBOX`. The selected built-in retains Grok's standard writable roots rather than applying extension-specific restrictions to `~/.grok` or the project.
+- Malformed, duplicate, unknown-field, invalid-boolean, or unsupported-parent custom profiles fail before launch; project definitions override user definitions deterministically. Quoted profile names, macOS `/var`/`/tmp` aliases, deny globs, and direct built-in inheritance now resolve consistently.
 - Cold resume reuses the profile frozen in `summary.json`; an unreadable or malformed summary now aborts rather than silently resuming unsandboxed. Legacy summaries with no sandbox field remain explicitly unsandboxed.
 - Stop, restart, and broker teardown now terminate the full POSIX process group (TERM then KILL), preventing terminal grandchildren from surviving after their shell exits.
 - Generated media forwarding now accepts only real files beneath the active session's `images/` or `videos/` directories, including symlink-safe realpath containment.
@@ -20,7 +26,7 @@
 - The sandbox-profile button is now functionally and visually disabled whenever Send is in its locked loading state, including after a sandbox-state refresh during startup.
 - Sandbox selections no longer fail when a VS Code-derived host temporarily reports `grok.sandboxProfile` as unregistered; the extension preserves the choice in its own global state until User Settings accepts the key.
 - Changing sandbox profile in an existing conversation now presents the required Summarize/Just Restart decision as a modal dialog instead of an easy-to-miss transient notification.
-- Sandboxed shell commands can write to the inert `/dev/null` device and inherited file descriptors, restoring ordinary redirects and shell output process substitution without granting write access to persistent devices or the rest of `/dev`.
+- Sandboxed commands can write Grok's exact safe-device literals—`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, and `/dev/ptmx`—without granting `/dev/fd/*`, persistent devices, or the rest of `/dev`.
 - Sandboxed child runtimes now use the same trusted temporary directory admitted by the compiled policy; neither repository `.env` files nor ACP terminal-request environment overrides can redirect `TMPDIR`, `TMP`, or `TEMP` to a denied or persistent location.
 
 ## 1.5.13 — 2026-07-13
