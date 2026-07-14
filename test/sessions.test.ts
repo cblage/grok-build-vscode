@@ -14,6 +14,7 @@ import {
   listSessions,
   readContextUsage,
   readSessionEntries,
+  resolveGrokHome,
   sessionsDirFor,
 } from "../src/sessions";
 
@@ -178,6 +179,15 @@ describe("sessionsDirFor", () => {
   it("URL-encodes a nested cwd path", () => {
     const out = sessionsDirFor("/h/.grok", "/work/space");
     expect(out).toBe(path.join("/h/.grok", "sessions", "%2Fwork%2Fspace"));
+  });
+});
+
+describe("resolveGrokHome", () => {
+  it("honors GROK_HOME before the default ~/.grok location", () => {
+    expect(resolveGrokHome({ GROK_HOME: "/custom/grok", HOME: "/home/me" })).toBe(
+      path.resolve("/custom/grok"),
+    );
+    expect(resolveGrokHome({ HOME: "/home/me" })).toBe(path.join("/home/me", ".grok"));
   });
 });
 

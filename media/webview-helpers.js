@@ -15,7 +15,7 @@
   // directions (and that chat.js actually handles every host type).
   const HOST_MESSAGE_TYPES = [
     "initialState", "showThinking", "fontScale", "grokUpdateStatus", "initialized",
-    "cliUpdating", "session", "modelChanged", "modeChanged", "openModePopover",
+    "cliUpdating", "session", "modelChanged", "modeChanged", "modePolicy", "sandboxState", "openModePopover",
     "voiceState", "voiceConfigured", "voicePartial", "voiceSubmit", "voiceTranscript",
     "voiceError", "chips", "commandsUpdate", "userMessage", "agentStart", "thoughtChunk",
     "messageChunk", "media", "userMessageChunk", "historyReplay", "permissionHistoryQueue",
@@ -26,7 +26,7 @@
     "sessionDot", "queuedSends",
   ];
   const WEBVIEW_MESSAGE_TYPES = [
-    "ready", "send", "newSession", "cancel", "pickModel", "setMode", "removeChip",
+    "ready", "send", "newSession", "cancel", "pickModel", "setMode", "setSandbox", "removeChip",
     "toggleChip", "openFile", "openUrl", "openDiff", "exportExpr", "setEffort",
     "openGlobalConfig", "openProjectConfig", "runMcpList", "showLogs", "moveView",
     "setShowThinking", "setExpandCommandOutputs",

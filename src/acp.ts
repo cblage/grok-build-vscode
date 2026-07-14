@@ -37,6 +37,13 @@ export interface AcpClientOptions {
   cliPath: string;
   cwd: string;
   effort?: EffortLevel;
+  /**
+   * Sandbox profile for the top-level `grok --sandbox <profile>` flag.
+   * Must precede the `agent` subcommand. Omit / undefined = no flag (CLI
+   * default for `agent stdio` is unsandboxed — config.toml alone is NOT
+   * applied by the stdio path).
+   */
+  sandbox?: string;
   env?: NodeJS.ProcessEnv;
   log: (msg: string) => void;
 }
@@ -111,22 +118,38 @@ export interface FsReadHandler {
 export interface FsWriteHandler {
   (path: string, content: string): Promise<void>;
 }
+type MaybePromise<T> = T | Promise<T>;
 export interface TerminalHandler {
-  create(params: { command: string; env?: Array<{ name: string; value: string }>; cwd?: string; outputByteLimit?: number }): { terminalId: string };
-  output(terminalId: string): { output: string; exitStatus: { exitCode: number } | null; truncated: boolean };
+  create(params: { command: string; env?: Array<{ name: string; value: string }>; cwd?: string; outputByteLimit?: number }): MaybePromise<{ terminalId: string }>;
+  output(terminalId: string): MaybePromise<{ output: string; exitStatus: { exitCode: number } | null; truncated: boolean }>;
   waitForExit(terminalId: string): Promise<{ exitCode: number }>;
-  kill(terminalId: string): void;
-  release(terminalId: string): void;
+  kill(terminalId: string): MaybePromise<void>;
+  release(terminalId: string): MaybePromise<void>;
+}
+
+export interface ExecutionBackend {
+  dispose(): MaybePromise<void>;
 }
 
 type Pending = { resolve: (v: any) => void; reject: (e: any) => void; timer?: ReturnType<typeof setTimeout> };
 
-export function buildGrokAgentArgs(effort?: EffortLevel): string[] {
-  // `--reasoning-effort` is an `agent`-level flag, so it must precede the `stdio`
-  // subcommand (after `stdio` the CLI errors "unexpected argument"). Only the
-  // values grok actually accepts are offered (none|minimal|low|medium|high|xhigh);
-  // the bogus `max` we used to expose made grok exit with code 2 (see #3/#4).
-  return effort ? ["agent", "--reasoning-effort", effort, "stdio"] : ["agent", "stdio"];
+export function buildGrokAgentArgs(effort?: EffortLevel, sandbox?: string): string[] {
+  // Flag order matters:
+  // - `--sandbox` is a *top-level* `grok` option (env: GROK_SANDBOX). It must
+  //   precede the `agent` subcommand. `grok agent stdio` does not honor
+  //   `[sandbox] profile` from config.toml on its own — without this flag,
+  //   ACP sessions run with `sandbox_profile: "off"`.
+  // - `--reasoning-effort` is an `agent`-level flag, so it must precede the
+  //   `stdio` subcommand (after `stdio` the CLI errors "unexpected argument").
+  //   Only the values grok actually accepts are offered
+  //   (none|minimal|low|medium|high|xhigh); the bogus `max` we used to expose
+  //   made grok exit with code 2 (see #3/#4).
+  const args: string[] = [];
+  if (sandbox) args.push("--sandbox", sandbox);
+  args.push("agent");
+  if (effort) args.push("--reasoning-effort", effort);
+  args.push("stdio");
+  return args;
 }
 
 export class AcpClient extends EventEmitter {
@@ -173,15 +196,23 @@ export class AcpClient extends EventEmitter {
   fsWrite?: FsWriteHandler;
   /** Set by the host to satisfy server→client terminal/* requests. */
   terminal?: TerminalHandler;
+  /** Optional per-client execution backend (for example the macOS Seatbelt
+   * broker). It is owned by this ACP client and torn down with the Grok
+   * process, so terminals cannot leak across session restarts or pool reaps. */
+  executionBackend?: ExecutionBackend;
+  private backendDisposePromise?: Promise<void>;
 
   constructor(private opts: AcpClientOptions) {
     super();
   }
 
   async start(): Promise<void> {
-    const args = buildGrokAgentArgs(this.opts.effort);
+    const args = buildGrokAgentArgs(this.opts.effort, this.opts.sandbox);
 
-    this.opts.log(`spawning ${this.opts.cliPath} ${args.join(" ")} (cwd=${this.opts.cwd})`);
+    this.opts.log(
+      `spawning ${this.opts.cliPath} ${args.join(" ")} (cwd=${this.opts.cwd}` +
+        `${this.opts.sandbox ? `, sandbox=${this.opts.sandbox}` : ", sandbox=off"})`,
+    );
     // Node 18+ refuses to spawn .cmd/.bat without `shell: true` on Windows
     // (CVE-2024-27980). Enable shell mode for those so installs that resolve to
     // a .cmd shim (e.g. some package managers, our test fake-CLI) still work.
@@ -219,6 +250,7 @@ export class AcpClient extends EventEmitter {
         p.reject(new Error(`Grok process exited (code ${code})`));
       }
       this.emit("exit", code);
+      void this.disposeExecutionBackend();
     });
     this.proc.on("error", (err) => {
       this.opts.log(`spawn error: ${err.message}`);
@@ -389,9 +421,9 @@ export class AcpClient extends EventEmitter {
     const proc = this.proc;
     if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
       try { proc?.kill(); } catch { /* already gone */ }
-      return Promise.resolve();
+      return this.disposeExecutionBackend();
     }
-    return new Promise<void>((resolve) => {
+    const processExit = new Promise<void>((resolve) => {
       let done = false;
       const finish = () => {
         if (done) return;
@@ -416,6 +448,19 @@ export class AcpClient extends EventEmitter {
         fallbackKill();
       }
     });
+    return Promise.all([processExit, this.disposeExecutionBackend()]).then(() => undefined);
+  }
+
+  private disposeExecutionBackend(): Promise<void> {
+    if (this.backendDisposePromise) return this.backendDisposePromise;
+    const backend = this.executionBackend;
+    this.executionBackend = undefined;
+    this.backendDisposePromise = backend
+      ? Promise.resolve(backend.dispose()).catch((error) => {
+          this.opts.log(`[acp] execution backend dispose failed: ${(error as Error).message}`);
+        })
+      : Promise.resolve();
+    return this.backendDisposePromise;
   }
 
   // ---------- internals ----------
@@ -574,14 +619,14 @@ export class AcpClient extends EventEmitter {
           this.respondError(id, PLAN_BLOCKED_CODE, PLAN_BLOCKED_TERMINAL_MSG);
           return;
         }
-        const created = this.terminal.create(params);
+        const created = await this.terminal.create(params);
         this.terminalCommands.set(created.terminalId, params.command);
         this.respondOk(id, created);
         return;
       }
       if (method === "terminal/output") {
         if (!this.terminal) throw new Error("terminal handler not registered");
-        this.respondOk(id, this.terminal.output(params.terminalId));
+        this.respondOk(id, await this.terminal.output(params.terminalId));
         return;
       }
       if (method === "terminal/wait_for_exit") {
@@ -592,7 +637,7 @@ export class AcpClient extends EventEmitter {
       }
       if (method === "terminal/kill") {
         if (!this.terminal) throw new Error("terminal handler not registered");
-        this.terminal.kill(params.terminalId);
+        await this.terminal.kill(params.terminalId);
         this.respondOk(id, {});
         return;
       }
@@ -604,7 +649,7 @@ export class AcpClient extends EventEmitter {
         if (cmd !== undefined) {
           this.terminalCommands.delete(params.terminalId);
           try {
-            const snap = this.terminal.output(params.terminalId);
+            const snap = await this.terminal.output(params.terminalId);
             this.emit("commandDone", {
               command: cmd,
               output: snap.output,
@@ -613,7 +658,7 @@ export class AcpClient extends EventEmitter {
             });
           } catch { /* terminal already gone — nothing to report */ }
         }
-        this.terminal.release(params.terminalId);
+        await this.terminal.release(params.terminalId);
         this.respondOk(id, {});
         return;
       }

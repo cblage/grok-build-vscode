@@ -10,6 +10,7 @@
   const newBtn = $("new-btn");
   const historyBtn = $("history-btn");
   const modeBtn = $("mode-btn");
+  const sandboxBtn = $("sandbox-btn");
   const gearBtn = $("gear-btn");
   const addBtn = $("add-btn");
   const chipsEl = $("chips");
@@ -20,6 +21,7 @@
   const contextPopover = $("context-popover");
   const slashPopover = $("slash-popover");
   const modePopover = $("mode-popover");
+  const sandboxPopover = $("sandbox-popover");
   const gearPopover = $("gear-popover");
   const addPopover = $("add-popover");
   const historyPopover = $("history-popover");
@@ -42,6 +44,12 @@
     currentModelId: null,
     availableModels: [],
     currentModeId: "agent",
+    yoloDisabled: false,
+    yoloDisabledReason: "",
+    sandboxCurrent: "off",
+    sandboxProfiles: ["workspace", "strict", "read-only"],
+    platform: "",
+    sandboxSupported: false,
     effort: "",
     cwd: "",
     contextWindow: 200000,
@@ -273,25 +281,34 @@
     mic: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>`,
     // Animated equalizer bars shown while listening (CSS drives the bounce).
     micWaves: `<span class="mic-waves" aria-hidden="true"><i></i><i></i><i></i><i></i></span>`,
+    // Codicon-style lock / unlock (VS Code $(lock) / $(unlock))
+    lock: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 7V5a3 3 0 0 1 6 0v2h.5A1.5 1.5 0 0 1 13 8.5v5A1.5 1.5 0 0 1 11.5 15h-7A1.5 1.5 0 0 1 3 13.5v-5A1.5 1.5 0 0 1 4.5 7H5zm1.5-2a1.5 1.5 0 0 1 3 0v2h-3V5zM4.5 8.5v5h7v-5h-7z"/></svg>`,
+    unlock: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 7V5a3 3 0 0 1 5.905-.7l-.98.2A2 2 0 0 0 6.5 5v2H11.5A1.5 1.5 0 0 1 13 8.5v5A1.5 1.5 0 0 1 11.5 15h-7A1.5 1.5 0 0 1 3 13.5v-5A1.5 1.5 0 0 1 4.5 7H5zm-1 1.5v5h7v-5h-7z"/></svg>`,
   };
 
-  const MODE_META = {
-    agent: {
-      icon: ICON.bot,
-      label: "Agent mode",
-      desc: "Grok acts directly, asking approval only for changes it judges sensitive",
-    },
-    plan: {
-      icon: ICON.listTree,
-      label: "Plan mode",
-      desc: "Grok explores and proposes a plan; file writes and commands are blocked until you approve it",
-    },
-    yolo: {
-      icon: ICON.zap,
-      label: "Auto accept",
-      desc: "Grok automatically approves all permission requests (YOLO)",
-    },
-  };
+  function modeMeta() {
+    return {
+      agent: {
+        icon: ICON.bot,
+        label: "Agent mode",
+        desc: "Grok acts directly, asking approval only for changes it judges sensitive",
+      },
+      plan: {
+        icon: ICON.listTree,
+        label: "Plan mode",
+        desc: "Grok explores and proposes a plan; file writes and commands are blocked until you approve it",
+      },
+      yolo: {
+        icon: ICON.zap,
+        label: "Auto accept",
+        desc: "Grok automatically approves all permission requests (YOLO)",
+        disabled: !!state.yoloDisabled,
+        disabledNote: state.yoloDisabled
+          ? (state.yoloDisabledReason || "Disabled by disable_bypass_permissions_mode")
+          : "",
+      },
+    };
+  }
 
   // Three blinking dots — the tool rows' in-progress animation, reused by every
   // progress indicator (Grokking / Thinking) so they all pulse the same way
@@ -331,10 +348,42 @@
   }
 
   function updateModeBtn(modeId) {
-    const meta = MODE_META[modeId] || MODE_META.agent;
+    const meta = modeMeta()[modeId] || modeMeta().agent;
     modeBtn.innerHTML = `${meta.icon}<span class="btn-label">${escapeHtml(meta.label)}</span>`;
     modeBtn.classList.toggle("plan-active", modeId === "plan");
     modeBtn.classList.toggle("yolo-active", modeId === "yolo");
+  }
+
+  function updateSandboxBtn() {
+    if (!sandboxBtn) return;
+    const supported = state.platform === "darwin" && state.sandboxSupported;
+    sandboxBtn.hidden = !supported;
+    // .toolbar-btn has an author-level display rule, which beats the browser's
+    // built-in [hidden] rule. Keep the platform gate authoritative in either
+    // host by setting the inline display as well.
+    sandboxBtn.style.display = supported ? "" : "none";
+    if (!supported) {
+      sandboxBtn.disabled = true;
+      sandboxBtn.classList.add("disabled");
+      sandboxBtn.title = "";
+      if (sandboxPopover) sandboxPopover.hidden = true;
+      return;
+    }
+    const cur = state.sandboxCurrent || "off";
+    const off = cur === "off";
+    const disabled = state.busy;
+    const icon = off ? ICON.unlock : ICON.lock;
+    const label = off ? "off" : cur;
+    sandboxBtn.innerHTML = `${icon}<span class="btn-label">${escapeHtml(label)}</span>`;
+    sandboxBtn.classList.toggle("sandbox-off", off);
+    sandboxBtn.classList.toggle("sandbox-on", !off);
+    sandboxBtn.disabled = disabled;
+    sandboxBtn.classList.toggle("disabled", disabled);
+    sandboxBtn.title = disabled
+      ? "Sandbox — available once the session is ready"
+      : off
+        ? "Sandbox: off (unsandboxed) — click to pick a profile"
+        : `Sandbox: ${cur} — click to change profile`;
   }
 
   newBtn.innerHTML = ICON.squarePen;
@@ -344,6 +393,7 @@
   addBtn.innerHTML = ICON.plus;
   scrollBottomBtn.innerHTML = `${ICON.arrowDown}<span class="scroll-bottom-label">Scroll to bottom</span>`;
   updateModeBtn("agent");
+  updateSandboxBtn();
 
   // ---------- markdown ----------
 
@@ -952,6 +1002,7 @@
 
   function closePopovers() {
     modePopover.hidden = true;
+    if (sandboxPopover) sandboxPopover.hidden = true;
     gearPopover.hidden = true;
     addPopover.hidden = true;
     historyPopover.hidden = true;
@@ -1317,7 +1368,8 @@
   function openModePopover() {
     if (!modePopover.hidden) { closePopovers(); return; }
     modePopover.innerHTML = "";
-    for (const [id, meta] of Object.entries(MODE_META)) {
+    const metas = modeMeta();
+    for (const [id, meta] of Object.entries(metas)) {
       const el = document.createElement("div");
       const active = id === state.currentModeId;
       el.className = "toolbar-popover-item mode-popover-item" +
@@ -1341,6 +1393,45 @@
     }
     positionPopover(modePopover, modeBtn);
     modePopover.hidden = false;
+  }
+
+  function openSandboxPopover() {
+    if (!sandboxPopover || !sandboxBtn || state.platform !== "darwin" || !state.sandboxSupported || state.busy) return;
+    if (!sandboxPopover.hidden) { closePopovers(); return; }
+    closePopovers();
+    sandboxPopover.innerHTML = "";
+    const cur = state.sandboxCurrent || "off";
+    const options = ["off", ...(state.sandboxProfiles || [])];
+    // Dedupe while preserving order
+    const seen = new Set();
+    for (const id of options) {
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const el = document.createElement("div");
+      const active = id === cur;
+      const off = id === "off";
+      el.className = "toolbar-popover-item mode-popover-item" + (active ? " active" : "");
+      el.innerHTML =
+        `<span class="mode-item-icon">${off ? ICON.unlock : ICON.lock}</span>` +
+        `<span class="mode-item-body">` +
+          `<span class="mode-item-label">${escapeHtml(off ? "off" : id)}</span>` +
+          `<span class="mode-item-desc">${escapeHtml(
+            off
+              ? "No OS sandbox — agent process is unsandboxed"
+              : `Apply OS sandbox profile "${id}" (session restart)`,
+          )}</span>` +
+        `</span>` +
+        (active ? '<span class="popover-check">✓</span>' : "");
+      el.onclick = (e) => {
+        e.stopPropagation();
+        if (state.platform !== "darwin" || !state.sandboxSupported) return;
+        vscode.postMessage({ type: "setSandbox", profile: id });
+        closePopovers();
+      };
+      sandboxPopover.appendChild(el);
+    }
+    positionPopover(sandboxPopover, sandboxBtn);
+    sandboxPopover.hidden = false;
   }
 
   function openAddPopover() {
@@ -3964,6 +4055,7 @@
     modeBtn.disabled = state.busy;
     modeBtn.classList.toggle("disabled", state.busy);
     modeBtn.title = state.busy ? "Mode — available once the session is ready" : "Pick mode";
+    updateSandboxBtn();
     if (!state.busy) {
       sendBtn.innerHTML = ICON.arrowUp;
       sendBtn.title = "Send";
@@ -4270,9 +4362,12 @@
         state.effort = msg.effort || "";
         state.cwd = msg.cwd || "";
         state.extVersion = msg.extVersion || "";
+        state.platform = msg.platform || "";
+        state.sandboxSupported = state.platform === "darwin";
         if (typeof msg.showThinking === "boolean") state.showThinking = msg.showThinking;
         if (typeof msg.expandCommandOutputs === "boolean") state.expandCommandOutputs = msg.expandCommandOutputs;
         applyThinkingVisibility();
+        updateSandboxBtn();
         break;
       case "showThinking":
         // Live toggle (grok.showThinking). Initial value also arrives via
@@ -4349,6 +4444,18 @@
       case "modeChanged":
         state.currentModeId = msg.modeId;
         updateModeBtn(msg.modeId);
+        break;
+      case "modePolicy":
+        state.yoloDisabled = !!msg.yoloDisabled;
+        state.yoloDisabledReason = msg.yoloDisabledReason || "";
+        // Refresh mode button (yolo label unchanged) and popover next open.
+        updateModeBtn(state.currentModeId);
+        break;
+      case "sandboxState":
+        state.sandboxCurrent = msg.current || "off";
+        state.sandboxProfiles = Array.isArray(msg.profiles) ? msg.profiles : [];
+        state.sandboxSupported = state.platform === "darwin" && msg.supported !== false;
+        updateSandboxBtn();
         break;
       case "openModePopover":
         openModePopover();
@@ -4919,6 +5026,13 @@
     vscode.postMessage({ type: "newSession" });
   };
   modeBtn.onclick = (e) => { e.stopPropagation(); if (state.busy) return; openModePopover(); };
+  if (sandboxBtn) {
+    sandboxBtn.onclick = (e) => {
+      e.stopPropagation();
+      if (state.busy || state.platform !== "darwin" || !state.sandboxSupported) return;
+      openSandboxPopover();
+    };
+  }
   gearBtn.onclick = (e) => { e.stopPropagation(); openGearPopover(); };
 
   // Welcome screen's "about" link → open the gear popover's Version & about panel.
@@ -4931,6 +5045,7 @@
     if (contextPopover.hidden) openContextPopover(); else closePopovers();
   };
   modePopover.addEventListener("click", (e) => e.stopPropagation());
+  if (sandboxPopover) sandboxPopover.addEventListener("click", (e) => e.stopPropagation());
   gearPopover.addEventListener("click", (e) => e.stopPropagation());
   contextPopover.addEventListener("click", (e) => e.stopPropagation());
   addPopover.addEventListener("click", (e) => e.stopPropagation());

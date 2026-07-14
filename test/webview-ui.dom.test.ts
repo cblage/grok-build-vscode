@@ -397,6 +397,113 @@ describe("mode picker (the plan-gate entry path)", () => {
   });
 });
 
+describe("sandbox picker", () => {
+  const enableDarwinSandbox = (window: any) => {
+    dispatch(window, { type: "initialState", platform: "darwin" });
+    dispatch(window, {
+      type: "sandboxState",
+      current: "off",
+      profiles: ["workspace", "strict", "read-only"],
+      supported: true,
+    });
+  };
+
+  it("starts hidden and is revealed only for a supported macOS host", () => {
+    const { window, doc } = bootWebview();
+    const sandboxBtn = $(doc, "sandbox-btn") as HTMLButtonElement;
+
+    expect(sandboxBtn.hidden).toBe(true);
+    expect(sandboxBtn.style.display).toBe("none");
+
+    dispatch(window, { type: "initialState", platform: "linux" });
+    dispatch(window, {
+      type: "sandboxState",
+      current: "strict",
+      profiles: ["workspace", "strict"],
+      supported: true,
+    });
+    expect(sandboxBtn.hidden).toBe(true);
+    expect(sandboxBtn.style.display).toBe("none");
+
+    enableDarwinSandbox(window);
+    expect(sandboxBtn.hidden).toBe(false);
+    expect(sandboxBtn.style.display).toBe("");
+  });
+
+  it("does not open or post a sandbox change on non-macOS even after a forged supported state", () => {
+    const { window, posted, doc } = bootWebview();
+    const sandboxBtn = $(doc, "sandbox-btn") as HTMLButtonElement;
+    const popover = $(doc, "sandbox-popover");
+
+    dispatch(window, { type: "initialState", platform: "linux" });
+    dispatch(window, {
+      type: "sandboxState",
+      current: "strict",
+      profiles: ["workspace", "strict"],
+      supported: true,
+    });
+    click(window, sandboxBtn);
+
+    expect((popover as any).hidden).toBe(true);
+    expect(posted.some((msg) => msg.type === "setSandbox")).toBe(false);
+  });
+
+  it("hides and closes the picker when host support is withdrawn", () => {
+    const { window, doc } = bootWebview();
+    const sandboxBtn = $(doc, "sandbox-btn") as HTMLButtonElement;
+    const popover = $(doc, "sandbox-popover");
+    enableDarwinSandbox(window);
+
+    click(window, sandboxBtn);
+    expect((popover as any).hidden).toBe(false);
+
+    dispatch(window, {
+      type: "sandboxState",
+      current: "off",
+      profiles: [],
+      supported: false,
+    });
+    expect(sandboxBtn.hidden).toBe(true);
+    expect((popover as any).hidden).toBe(true);
+  });
+
+  it("is disabled for the entire Send loading state, including sandbox-state refreshes", () => {
+    const { window, posted, doc } = bootWebview({ ready: false });
+    const sandboxBtn = $(doc, "sandbox-btn") as HTMLButtonElement;
+    const loadingSendBtn = $(doc, "send-btn") as HTMLButtonElement;
+    const popover = $(doc, "sandbox-popover");
+
+    expect(loadingSendBtn.classList.contains("initializing")).toBe(true);
+    expect(loadingSendBtn.disabled).toBe(true);
+    expect(sandboxBtn.disabled).toBe(true);
+    expect(sandboxBtn.className).toContain("disabled");
+
+    enableDarwinSandbox(window);
+    dispatch(window, { type: "sandboxState", current: "strict", profiles: ["workspace", "strict", "read-only"], supported: true });
+    expect(sandboxBtn.disabled).toBe(true);
+    expect(sandboxBtn.className).toContain("disabled");
+    expect(sandboxBtn.title).toContain("available once the session is ready");
+
+    click(window, sandboxBtn);
+    expect((popover as any).hidden).toBe(true);
+    expect(posted.some((msg) => msg.type === "setSandbox")).toBe(false);
+  });
+
+  it("enables the sandbox picker when Send leaves the loading state", () => {
+    const { window, doc } = bootWebview({ ready: false });
+    const sandboxBtn = $(doc, "sandbox-btn") as HTMLButtonElement;
+    const popover = $(doc, "sandbox-popover");
+
+    enableDarwinSandbox(window);
+    dispatch(window, { type: "setBusy", value: false });
+    expect(sandboxBtn.disabled).toBe(false);
+    expect(sandboxBtn.className).not.toContain("disabled");
+
+    click(window, sandboxBtn);
+    expect((popover as any).hidden).toBe(false);
+  });
+});
+
 describe("context donut (token usage)", () => {
   const boot = () => {
     const h = bootWebview();

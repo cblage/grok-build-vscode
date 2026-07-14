@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
 import { TerminalManager, resolveExitCode, buildKillPlan, resolveTerminalShell } from "../src/terminal-manager";
 
 // Use `node -e` everywhere so tests are deterministic on Windows, macOS, and Linux.
@@ -146,6 +148,29 @@ describe("TerminalManager", () => {
     expect(exitCode).not.toBe(0);
     m.release(terminalId);
   });
+
+  const itPosix = process.platform === "win32" ? it.skip : it;
+  itPosix("kills POSIX command descendants, not only the shell wrapper", async () => {
+    const m = new TerminalManager();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "grok-terminal-tree-"));
+    const marker = path.join(root, "orphan-wrote.txt");
+    try {
+      const child = `setTimeout(() => require('fs').writeFileSync(${JSON.stringify(marker)}, 'escaped'), 800); setInterval(() => {}, 1000)`;
+      const { terminalId } = m.create({
+        command: `node -e ${JSON.stringify(child)} & wait`,
+        cwd: root,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      m.kill(terminalId);
+      await m.waitForExit(terminalId);
+      m.release(terminalId);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      m.disposeAll();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // Real-shell integration for #46: on Windows the agent's `terminal/*` commands
@@ -239,7 +264,7 @@ describe("buildKillPlan", () => {
 
   it("uses a SIGTERM signal on POSIX", () => {
     const plan = buildKillPlan(1234, "linux");
-    expect(plan).toEqual({ kind: "signal", signal: "SIGTERM" });
+    expect(plan).toEqual({ kind: "signal", signal: "SIGTERM", target: -1234 });
   });
 });
 

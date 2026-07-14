@@ -1423,6 +1423,32 @@ textarea#input {
   overflow: hidden;
   max-width: 120px;
 }
+#sandbox-btn {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  max-width: 110px;
+}
+#sandbox-btn.sandbox-off {
+  color: var(--vscode-descriptionForeground);
+}
+#sandbox-btn.sandbox-on {
+  color: var(--vscode-charts-green, #4ec9b0);
+}
+.toolbar-popover-item.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.toolbar-popover-item.disabled:hover {
+  background: transparent;
+}
+.mode-item-disabled-note {
+  display: block;
+  font-size: 10px;
+  opacity: 0.8;
+  margin-top: 2px;
+  color: var(--vscode-errorForeground, #f48771);
+}
 /* Same 28px hit-target + 8px radius as .icon-btn so the mode button's icon
    size and highlight height match the gear/history/new buttons exactly. */
 .toolbar-btn {
@@ -1539,6 +1565,7 @@ textarea#input {
    disabled send button). No pointer, no hover affordance. */
 .model-name-btn.disabled,
 #mode-btn.disabled,
+#sandbox-btn.disabled,
 .effort-dot.disabled {
   opacity: 0.45;
   cursor: not-allowed;

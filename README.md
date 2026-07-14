@@ -229,6 +229,7 @@ Or edit the config via gear → *Open global / project config*, then click **+**
 | `grok.cliPath` | `""` | Path to the `grok` binary. Empty = auto-discover (`~/.grok/bin/grok` → PATH). |
 | `grok.defaultModel` | `""` | Model ID for new sessions. Empty = CLI default. |
 | `grok.defaultEffort` | `""` | Reasoning effort forwarded as `--reasoning-effort` (`none` / `minimal` / `low` / `medium` / `high` / `xhigh`). Empty = CLI default. Changing it restarts the session. |
+| `grok.sandboxProfile` | `""` | **macOS only, User-scoped.** Seatbelt profile for ACP filesystem + terminal operations. Empty = `GROK_SANDBOX`, then global `$GROK_HOME/config.toml`; `off` disables it. Repository settings cannot override it. Changing it restarts the session. |
 | `grok.defaultMode` | `""` | Mode for new sessions, remembered automatically from your last Agent / Auto accept switch (Plan is never remembered). Empty = Agent. |
 | `grok.includeActiveFileByDefault` | `true` | Auto-add the active editor as a context chip. |
 | `grok.useCtrlEnterToSend` | `false` | When true, Enter inserts a newline and Ctrl/Cmd+Enter sends. |
@@ -241,6 +242,36 @@ Or edit the config via gear → *Open global / project config*, then click **+**
 | `grok.voiceInputDevice` | `""` | Microphone device override. Empty = system default (Windows auto-detects the first DirectShow audio device). |
 | `grok.voiceSendPhrase` | `"grok send"` | Spoken phrase that auto-submits when it ends a transcription. Empty = disable hands-free sending. |
 | `grok.voiceStreaming` | `true` | Stream transcription live as you speak. `false` = one-shot batch mode. Streaming costs $0.20/hr vs $0.10/hr batch. |
+
+### macOS sandbox profiles
+
+The sandbox button is available on macOS when `/usr/bin/sandbox-exec` exists.
+Built-in choices are `workspace`, `read-only`, and `strict`. Define consumer
+custom profiles in either location:
+
+- `$GROK_HOME/sandbox.toml` (normally `~/.grok/sandbox.toml`) — user profiles
+- `.grok/sandbox.toml` in the open project — project profiles; a matching name
+  replaces the user definition
+
+Custom profiles may recursively use `extends` to inherit a built-in or another
+custom profile.
+The supported fields are `extends`, `restrict_network`, `read_only`,
+`read_write`, and `deny`. A malformed definition, missing parent, inheritance
+cycle, unreadable saved-session profile, or broker failure aborts startup rather
+than falling back to unsandboxed execution. Project `.env` and project
+`.grok/config.toml` do not control sandbox selection or `GROK_HOME`. The broker
+permits Grok's session `plan.md` write but protects every other `$GROK_HOME`
+path and the project's `.grok/sandbox.toml` from delegated writes. The built-in
+contained profiles retain narrow write exceptions for `/dev/null` and inherited
+`/dev/fd/*` descriptors; a custom `read_write` grant may widen that deliberately.
+The broker initializes `TMPDIR`, `TMP`, and `TEMP` to the trusted macOS temp root
+compiled into the policy, and filters repository `.env` plus ACP terminal
+environment overrides at ingress. Seatbelt remains the authority if a command
+later mutates its own environment.
+
+See [macOS sandbox architecture](docs/macos-sandbox-architecture.md) for the
+complete process topology, trust boundary, profile-resolution rules, broker
+protocol, and fail-closed lifecycle.
 
 </details>
 

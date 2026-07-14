@@ -124,6 +124,10 @@ export class Session {
   /** grok's id for this session (set on session/new or session/load). */
   activeSessionId?: string;
 
+  /** Process-lifetime sandbox profile for this live/saved conversation.
+   * `off` means no sandbox; cold resumes restore summary.json's saved value. */
+  sandboxProfile?: string;
+
   /**
    * Session-scoped `[Image #N]` counter — the highest index used so far.
    * Incremented per attached image and NEVER reset on send, so every image in

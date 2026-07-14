@@ -187,21 +187,24 @@ The full pedagogical write-up lives in
 | File | Role |
 |---|---|
 | [src/extension.ts](../src/extension.ts) | Entry point — registers commands, keybindings, output channel |
-| [src/sidebar.ts](../src/sidebar.ts) | Webview provider, message routing, fs handlers, diff preview, logout, generated-media serving (`postGeneratedMedia` → `asWebviewUri`, base64 fallback) |
-| [src/acp.ts](../src/acp.ts) | ACP client — spawns CLI, manages session lifecycle, emits events |
+| [src/sidebar.ts](../src/sidebar.ts) | Webview provider, message routing, diff preview, logout, sandbox orchestration, and symlink-safe generated-media serving |
+| [src/acp.ts](../src/acp.ts) | ACP client — spawns CLI, manages session lifecycle, emits events, and awaits its per-client execution backend |
 | [src/session.ts](../src/session.ts) | Per-session state bag — one `Session` per live `grok agent stdio` process (the sidebar holds a *pool* of these + one focused) |
 | [src/session-pool.ts](../src/session-pool.ts) | Pure reaping policy (`selectReapable`) — idle-TTL + LRU cap over the live-session pool |
 | [src/acp-dispatch.ts](../src/acp-dispatch.ts) | Pure protocol helpers — line parsing, update routing, response + generated-media extraction (`isMediaGenToolCall`/`extractGeneratedMediaPaths`) |
 | [src/protocol.ts](../src/protocol.ts) | Single source of truth for the host↔webview message contract — `HostMsg`/`WebviewMsg` unions + the runtime `HOST_MESSAGE_TYPES`/`WEBVIEW_MESSAGE_TYPES` arrays (kept exhaustive by compile-time `Record` maps). Pure types + two arrays, no runtime deps |
 | [src/cli-locator.ts](../src/cli-locator.ts) | Locate the `grok` binary; cross-platform |
-| [src/terminal-manager.ts](../src/terminal-manager.ts) | Headless shells for the agent's `terminal/*` calls |
+| [src/terminal-manager.ts](../src/terminal-manager.ts) | Headless shells for the agent's `terminal/*` calls; POSIX commands run in killable process groups |
+| [src/seatbelt-policy.ts](../src/seatbelt-policy.ts) | Pure parser/resolver/compiler for built-in + recursively inherited user/project sandbox profiles |
+| [src/seatbelt-broker.ts](../src/seatbelt-broker.ts) | Per-session `sandbox-exec` process + correlated NDJSON execution client |
+| [src/seatbelt-broker-child.ts](../src/seatbelt-broker-child.ts) | Sandboxed filesystem/terminal executor whose child commands inherit Seatbelt |
 | [src/plan-gate.ts](../src/plan-gate.ts) | Plan-mode policy (pure) — workspace-write containment + read-only command allowlist |
 | [src/plan-restore.ts](../src/plan-restore.ts) | Plan persist + restore decision (pure) |
 | [src/grok-primer.ts](../src/grok-primer.ts) | The hidden primer text + replay-detection helper (pure) |
 | [src/chips.ts](../src/chips.ts) | File-chip CRUD (pure) |
 | [src/prompt-builder.ts](../src/prompt-builder.ts) | Chip → prompt-string with `@path` refs and fenced blocks (pure) |
 | [src/slash-filter.ts](../src/slash-filter.ts) | Slash-command autocomplete filter + `matchSlashCommand` dispatch gate + hidden-command filter (`filterAdvertisedCommands` drops the config-mutating `/always-approve`) (pure) |
-| [src/grok-config.ts](../src/grok-config.ts) | Reads grok's `config.toml` to detect `permission_mode = "always-approve"` so the mode button shows Auto accept (pure) |
+| [src/grok-config.ts](../src/grok-config.ts) | Reads permission/sandbox selection config, filters repository `.env` control-plane overrides, and discovers custom profiles (pure) |
 | [src/mode-prefs.ts](../src/mode-prefs.ts) | Remembered-mode policy (pure) — persist Agent/Auto-accept (never Plan), apply on new sessions only |
 | [src/view-move.ts](../src/view-move.ts) | View placement (pure) — maps the gear-menu "Move view" destinations to the extension-owned per-location view containers targeted via `vscode.moveViews` (view default-homes in the Secondary Side Bar) |
 | [src/sessions.ts](../src/sessions.ts) | Disk-driven session listing/delete + name overrides (pure) — `indexSessions` (stat-only ordering), `readSessionEntries` (windowed read), `listSessions` (whole-list), `clearSessions` |
@@ -266,6 +269,16 @@ the steady-state fix.
   standalone grok CLI (#46 — cmd couldn't run the user's PowerShell profile
   functions or pipelines); elsewhere `shell:true` → `/bin/sh`. `cli-locator.ts`
   prefers `HOME`/`USERPROFILE` env over `os.homedir()` so tests can override paths.
+- **macOS ACP sandboxing is a per-session helper, not a shared-host promise.**
+  `grok agent stdio` delegates its filesystem and terminal operations to the
+  extension over ACP, so sandboxing only the Grok model process misses the
+  operations that matter. Every non-off session routes those calls exclusively
+  through its own `SeatbeltBroker`; command descendants inherit the immutable
+  policy, while the separate Grok process keeps its model connection. Policy
+  compilation, broker startup, protocol failure, and broker death fail closed
+  with no extension-host execution fallback. See
+  [macOS sandbox architecture](macos-sandbox-architecture.md) for the complete
+  topology, trust model, profile semantics, broker protocol, and lifecycle.
 - **Streaming is rAF-coalesced.** Message and thought chunks buffer into a raw
   string and re-render at most once per animation frame — long responses stay
   smooth under fast chunk rates.
@@ -303,8 +316,10 @@ the steady-state fix.
 - **Generated media is path-based, not an ACP image block.** `/imagine` and
   `/imagine-video` write a file into the session dir and report its *path* as
   JSON-in-text on the completed tool result. The host parses the path, classifies
-  image-vs-video by extension, and serves it to the webview via `asWebviewUri`
-  (streamed from disk) so even a multi-MB video renders. See
+  image-vs-video by extension, realpaths it beneath the active session's
+  `images/` or `videos/` root, and only then serves it via `asWebviewUri`. This
+  rejects arbitrary-host paths and symlink escapes while still streaming a
+  multi-MB video. See
   [research/image-generation.md](../research/image-generation.md).
 - **Math renders via vendored MathJax (SVG), extracted before HTML-escaping.** Grok
   answers with TeX (inline `\(…\)`, display `\[…\]`, `\begin{pmatrix}` matrices).

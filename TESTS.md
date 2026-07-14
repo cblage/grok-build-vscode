@@ -2,7 +2,7 @@
 
 Three layers:
 
-1. **Grok-free automated tests** (Vitest) — pure-logic unit tests plus happy-dom DOM tests that drive the real `media/chat.js`, plus a fast TerminalManager suite that spawns real `/bin/sh` children. **881 tests, all passing in a few seconds.** The per-file list below is **non-exhaustive** and its counts predate several feature releases (voice, ask-question, plan-mode, v1.4.0 media/subagent/logout, v1.4.19 card-collapse/background-task, the Agent Dashboard/session-pool, telemetry, vision input, and the typed host↔webview message contract) — it's indicative, not exact. `npm test` is the source of truth. **None of them spawn the `grok` binary**, so the whole suite runs in CI on a clean Ubuntu box (`.github/workflows/ci.yml`'s `test` job runs `npm ci && npm run compile && npm test && npm run package` and never installs grok). **CI's `test` job runs this exact suite — `npm test` locally ≡ that job, verbatim.**
+1. **Grok-free automated tests** (Vitest) — pure-logic unit tests plus happy-dom DOM tests that drive the real `media/chat.js`, plus a fast TerminalManager suite that spawns real `/bin/sh` children. **938 passing + 5 skipped in a few seconds.** The per-file list below is **non-exhaustive** and its counts predate several feature releases (voice, ask-question, plan-mode, v1.4.0 media/subagent/logout, v1.4.19 card-collapse/background-task, the Agent Dashboard/session-pool, telemetry, vision input, and the typed host↔webview message contract) — it's indicative, not exact. `npm test` is the source of truth. **None of them spawn the `grok` binary**, so the whole suite runs in CI on a clean Ubuntu box (`.github/workflows/ci.yml`'s `test` job runs `npm ci && npm run compile && npm test && npm run package` and never installs grok). **CI's `test` job runs this exact suite — `npm test` locally ≡ that job, verbatim.**
 2. **Real-grok pre-release suite** (`npm run test:live`, `scripts/live-tests.cjs`) — an **on-demand, run-on-request** gate that spawns the real `grok` binary and drives it over ACP end-to-end: handshake, a **capability-drift probe** (`capabilities` — snapshots advertised `promptCapabilities` and asserts the documented `image:false` baseline; with `vision-prompt` pinning that vision *actually* works, the pair is an advertised-vs-actual drift detector), prompt round-trip, a **mid-turn cancel** (`cancel-mid-turn` — the Stop-button contract: an id-less `session/cancel` settles the in-flight prompt with a cancelled stopReason and the session stays usable, #37), **concurrent sessions** (`parallel-sessions` — two CLI processes on one workspace answer overlapping prompts independently, no cross-talk), session restore, the **plan-mode gate modeled as the two real flows** (primer → plan → `[Plan rejected]` (gate up, 0 workspace mutations + a byte-identical-seed-file containment canary) → `[Plan approved]` (gate down, implementation can land)), image gen, video gen, and subagent delegation on BOTH agent families — `subagent` (default model / grok-build agent) and `subagent-composer` (first `*composer*` model; asserts the Task delegation completes on the tool channel, and reports whether the CLI has started transmitting the `subagent_spawned`/`subagent_finished` lifecycle events it currently only logs) — each **SKIP**s when grok doesn't delegate or the model isn't available. It **reuses the real compiled modules** (`out/acp-dispatch.js`, `out/plan-gate.js`, `out/grok-primer.js`, `media/webview-helpers.js`) so it tests shipped logic, not re-implementations. Non-deterministic / entitlement-gated outcomes **SKIP** (don't fail the gate); only a real regression **FAILS**. It is **never run by `npm test` or CI** — it needs an authenticated `grok` + network + subscription. The **`release.*` scripts now run it by default** (`-SkipLive`/`--skip-live` opts out). Flags: `--smoke` (handshake + capability-drift only), `--quick` (skip slow tests incl. the 4-turn plan-mode), `--only=<name>`, `--skip=<name>`, `GROK_BIN=<path>`. See [CLAUDE.md § Test taxonomy](CLAUDE.md).
 3. **VS Code integration smoke** (`npm run test:integration`, `@vscode/test-electron`) — boots a real VS Code, activates the extension, asserts the contributed commands are registered, and resolves the webview via the **missing-CLI onboarding path** (needs no grok binary), covering host glue the unit suite can't (activation, `getHtml`/CSP, `localResourceRoots`, command registration). Compiles in isolation (`integration/tsconfig.json` → `out-integration/`); `.vscode-test.mjs` drives it. Runs in CI as a **required** job under `xvfb` (validated passing against a real VS Code Extension Host). Still grok-free. Not part of `npm test` (needs a headed/`xvfb` VS Code + an Electron download).
 
@@ -14,7 +14,7 @@ The goal of layers (1)+(2) is to make the protocol surface and UI logic regressi
 
 ## What we test
 
-### `test/acp-dispatch.test.ts` — protocol primitives (56 tests)
+### `test/acp-dispatch.test.ts` — protocol primitives (76 tests)
 
 Includes v1.4.0 generated-media extraction: `isMediaGenToolCall` / `extractGeneratedMediaPaths` covering **both** wire forms — the Linux/macOS JSON-in-text (`image_gen`, `image_to_video`) and the **native-Windows prose-in-text** (`Image/Video generated and saved to \\?\C:\…`, tool names `image_gen` / `video_gen`, variants `ImageGen` / `VideoGen`) — with image-vs-video classification, `\\?\` extended-path stripping, the trailing-period-not-swallowed guard, and the collapsed-resume shape. Plus the ACP-standard `extractImageContent`/`collectToolImages` fallback.
 
@@ -39,14 +39,14 @@ The wire format is the highest-value test surface: ACP changes break everything 
 - **`extractPromptMeta`** — pulls token counts out of `_meta` for the donut and handles missing `_meta` gracefully
 - **Response builders** — `makePermissionResponse`, `makeExitPlanResponse`, `makeAckResponse`, `makeRequest`. These encode the exact shapes the agent expects. Bugs here are silent.
 
-### `test/chips.test.ts` — file-chip CRUD (6 tests)
+### `test/chips.test.ts` — file-chip CRUD (14 tests)
 
 - Implicit chips have stable ids (so the active-editor watcher can replace them)
 - Explicit chips have unique ids even when created in the same millisecond (regression: original `Date.now()` impl collided)
 - `removeChip` / `toggleChip` are pure (don't mutate inputs)
 - `clearImplicitChips` leaves explicit chips intact
 
-### `test/prompt-builder.test.ts` — final prompt assembly (7 tests)
+### `test/prompt-builder.test.ts` — final prompt assembly (23 tests)
 
 - Bare text passes through
 - File-only chip → `@relPath` reference
@@ -65,13 +65,20 @@ The wire format is the highest-value test surface: ACP changes break everything 
 - `matchSlashCommand` recognizes an advertised command only at position 0 (rejects Unix paths / mid-line slashes)
 - `filterAdvertisedCommands` drops the config-mutating `/always-approve` from both the autocomplete list and the dispatch gate (#31)
 
-### `test/grok-config.test.ts` — config.toml permission-mode reader (15 tests)
+### `test/grok-config.test.ts` — config + sandbox selection helpers (38 tests)
 
 - `readUiPermissionMode` reads `permission_mode` from the `[ui]` table only (ignores other tables, the `[[marketplace.sources]]` array table, comments, CRLF)
 - `isAlwaysApprovePermission` matches the hyphen/underscore spellings grok writes
 - `configForcesAlwaysApprove` applies project-over-global precedence (#31)
+- Sandbox selection uses setting/fallback → `GROK_SANDBOX` → global config and
+  deliberately ignores project `.grok/config.toml`
+- Custom-profile discovery shares the policy parser (including quoted names),
+  recognizes project-only choices, and keeps built-ins available
+- Workspace `.env` credentials merge normally, but `HOME`, `USERPROFILE`,
+  `GROK_HOME`, and `GROK_SANDBOX` cannot override the trusted control plane
+- The User/global sandbox setting reader ignores repository and folder values
 
-### `test/terminal-manager.test.ts` — terminal handler (30 tests)
+### `test/terminal-manager.test.ts` — terminal handler (31 tests)
 
 These actually spawn real shell children (real `/bin/sh`, or real PowerShell on Windows) — fast enough to keep in the unit suite.
 
@@ -85,10 +92,33 @@ These actually spawn real shell children (real `/bin/sh`, or real PowerShell on 
 - Throws on unknown terminalId
 - `kill` / `release` on missing id is a no-op
 - `disposeAll` kills outstanding terminals
+- POSIX Stop/release kills the dedicated process group, including descendants
+  that would otherwise survive their shell wrapper
 - **`resolveTerminalShell` (#46)** — POSIX → `/bin/sh` (no PATH probe); Windows → `pwsh.exe`→`powershell.exe`→cmd.exe, in that order
 - **Windows PowerShell host (#46, Windows-only, skipped on CI)** — real PowerShell pipeline (`… | Measure-Object`), a non-builtin cmdlet (`Get-Date`), `$PSVersionTable`, and a `Format-List` pipeline all run through `TerminalManager` (cmd.exe would fail these); the resolved host shell is never cmd.exe
 
-### `test/cli-locator.test.ts` — CLI discovery + upgrade detection (9 tests)
+### `test/seatbelt-policy.test.ts` — macOS Seatbelt policy compiler (14 tests)
+
+- Parses multiline consumer `sandbox.toml` profile fields and quoted names
+- Applies user → project replacement and recursively resolves custom parents
+- Rejects duplicate fields, malformed arrays, missing parents, cycles, unknown
+  fields, and unsupported deny-glob syntax before launch
+- Compiles built-in/custom filesystem containment, sensitive-path write guards,
+  macOS `/tmp`/`/var` canonical paths, deny globs, and child-network policy
+- Permits only session `plan.md` writes beneath `$GROK_HOME`, even when a custom
+  profile grants that directory
+- Grants only shell-compatible `/dev/null` and inherited `/dev/fd/*` writes,
+  without opening persistent devices or the rest of `/dev`
+
+### `test/seatbelt-broker.test.ts` — sandbox execution helpers (6 tests)
+
+- Builds a shell-free `sandbox-exec` argv and strips Node/DYLD injection vars
+- Pins child temp variables to the root admitted by the compiled policy
+- Filters ACP terminal-request overrides of the pinned temp variables
+- Anchors relative ACP filesystem paths to the workspace
+- Exercises broker-child fs read/write and concurrent terminal wait/kill/release
+
+### `test/cli-locator.test.ts` — CLI discovery + upgrade detection (27 tests)
 
 - Configured path wins if it exists
 - Returns `undefined` when configured path is missing
@@ -96,7 +126,7 @@ These actually spawn real shell children (real `/bin/sh`, or real PowerShell on 
 - Returns `undefined` when nothing is found
 - **`extensionWasUpgraded`** — true on any version change (incl. a downgrade), false on a fresh install / unchanged version / empty stored version; gates the silent `grok update` the extension runs once when its own version changes
 
-### `test/sessions.test.ts` — session listing & naming (15 tests)
+### `test/sessions.test.ts` — session listing & naming (53 tests)
 
 - Lists sessions from grok's on-disk layout (`~/.grok/sessions/<urlencoded-cwd>/<id>/`) for the current cwd only
 - Display name falls back to the first user message, then to the id, when no customName override exists
@@ -104,7 +134,7 @@ These actually spawn real shell children (real `/bin/sh`, or real PowerShell on 
 - Sorts by most-recently-updated; tolerates malformed/missing session files without throwing
 - Delete removes the right entry and leaves others intact
 
-### `test/plan-gate.test.ts` — plan-mode policy (38 tests)
+### `test/plan-gate.test.ts` — plan-mode policy (40 tests)
 
 The pure heart of client-side plan enforcement. No spawn, no fs — just the classification logic the two choke points call.
 
@@ -113,7 +143,7 @@ The pure heart of client-side plan enforcement. No spawn, no fs — just the cla
 - **Shell-metachar rejection** — redirection (`>`), chaining (`;`, `&&`, `||`), background (`&`), command substitution (`$(…)`, backticks), process substitution (`<(…)`), and script-block braces (`{}`) are rejected outright, so a read-only head can't smuggle a side effect
 - **Permission / plan-file classification** — recognizes grok's plan-file write so it can be allowed-and-snooped rather than blocked
 
-### `test/webview-helpers.test.ts` — pure webview helpers (49 tests)
+### `test/webview-helpers.test.ts` — pure webview helpers (130 tests)
 
 Includes the **deferred/research-only** subagent classifier `isSubagentToolCall` / `subagentLabel` (the forward-compat `spawn_subagent` + `subagent_type` shape, name/kind/rawInput fallbacks, **and the regression guard that grok's `get_command_or_subagent_output` poller is NOT carded** — its name contains "subagent" but it's a background-task output reader, not a delegation). The classifier is kept tested as forward-compat scaffolding, but grok 0.2.x doesn't emit `spawn_subagent` over ACP so the card rarely fires; see `research/subagents.md`.
 
@@ -123,7 +153,7 @@ Shared between the shipped webview and the tests (`media/webview-helpers.js`).
 - File-ref detection: recognizes `@path` mentions and bare path-looking tokens, ignores prose
 - Relative-time formatting: "just now" / "Nm" / "Nh" / "Nd" buckets, singular/plural, far-future and far-past edges
 
-### `test/plan-card.dom.test.ts` — plan card in a real DOM (12 tests)
+### `test/plan-card.dom.test.ts` — plan card in a real DOM (15 tests)
 
 happy-dom test (see [Webview DOM tests](#webview-dom-tests) below). Drives the shipped `media/chat.js`, dispatches the messages `sidebar.ts` posts, clicks the rendered buttons, asserts on the `postMessage` payload that goes back to the host.
 
@@ -134,12 +164,14 @@ happy-dom test (see [Webview DOM tests](#webview-dom-tests) below). Drives the s
 - `planNotice` / `planBlocked` (command + write variants) render a `.plan-notice` with the right text
 - Read-only plan-history card renders with the persisted verdict label
 
-### `test/acp.test.ts` — ACP client helpers (3 tests)
+### `test/acp.test.ts` — ACP client helpers (7 tests)
 
 - **Request timer lifecycle** — a resolved `request()` clears its timeout (no leaked timer).
 - **Spawn argv** — `buildGrokAgentArgs()` returns `["agent", "stdio"]` with no effort, and `["agent", "--reasoning-effort", <value>, "stdio"]` (flag before the subcommand) for a valid effort.
+- Async terminal backends are awaited before ACP acknowledges the request, and
+  each execution backend is disposed exactly once with its client.
 
-### `test/acp-integration.test.ts` — ACP wire layer + plan-mode gate (13 tests)
+### `test/acp-integration.test.ts` — ACP wire layer + plan-mode gate (14 tests)
 
 Spawns the fake `grok agent stdio` from `test/fixtures/fake-grok-acp.cjs` (a ~190-line ACP server encoding only what the protocol requires, not grok version quirks), and drives `src/acp.ts` AcpClient against it over real JSON-RPC stdio. Cross-platform: `.cmd` wrapper on Windows, `.sh` wrapper elsewhere; subprocess startup adds ~50–100ms per test (same order as terminal-manager).
 
@@ -151,7 +183,7 @@ Spawns the fake `grok agent stdio` from `test/fixtures/fake-grok-acp.cjs` (a ~19
 - **Terminal-create gate (mutating)** — with `planActive=true`, `terminal/create` for `rm -rf` is refused; the host's terminal handler is never called.
 - **Terminal-create gate (read-only)** — with `planActive=true`, `terminal/create` for `ls -la` is allowed and reaches the terminal handler.
 
-### `test/plan-restore.test.ts` — plan persist + restore decision (15 tests)
+### `test/plan-restore.test.ts` — plan persist + restore decision (17 tests)
 
 Pure helpers extracted into [src/plan-restore.ts](src/plan-restore.ts) specifically for unit testing: no `vscode`, no fs, no ACP client to mock.
 
@@ -176,7 +208,7 @@ happy-dom test driving the shipped webview through a `planHistoryQueue` + `sessi
 - `agentReset` removes the in-flight agent bubble
 - Subsequent `messageChunk` after `agentReset` creates a fresh bubble (the false-approval text doesn't leak through)
 
-### `test/webview-ui.dom.test.ts` — webview regressions in a real DOM (28 tests)
+### `test/webview-ui.dom.test.ts` — webview regressions in a real DOM (125 tests)
 
 happy-dom test locking in the native-Windows regressions this build fixed (plus later busy/version/dedup behavior), so they can't silently come back:
 
@@ -201,13 +233,13 @@ happy-dom test locking in the native-Windows regressions this build fixed (plus 
 - API-key resolution order (`grok.voiceApiKey` → `GROK_VOICE_API_KEY` → `XAI_API_KEY`)
 - `parseVoiceCommand` / trailing send-phrase detection — the two-word "grok send", tolerant of the "send"→"sent" mishearing, with trailing punctuation kept-not-doubled
 
-### `test/voice-ui.dom.test.ts` — mic button + composer in a real DOM (28 tests)
+### `test/voice-ui.dom.test.ts` — mic button + composer in a real DOM (27 tests)
 
 - The mic-button state machine (idle → connecting → listening → stopped), animated waves, and the brief "connecting…" spinner
 - A live partial transcript accumulates into the composer; the trailing send-phrase is highlighted via the backdrop overlay
 - "grok send" submits and flushes messages dictated while Grok was responding (hands-free continuous listening)
 
-### `test/grok-primer.test.ts` — primer replay detection (6 tests)
+### `test/grok-primer.test.ts` — primer replay detection (14 tests)
 
 - `isPrimerText` matches the marker at the **start** of a message for any primer version (v1, v2, …), tolerates leading whitespace, and rejects normal text / a marker pasted mid-message — used on restore to hide the lazily-sent primer and keep it out of the plan-position count
 
@@ -215,7 +247,7 @@ happy-dom test locking in the native-Windows regressions this build fixed (plus 
 
 - `planReviewFileBaseName` / `sanitizePlanReviewFilePart` generate a safe Markdown filename for the "open plan as an editor tab" action (strips path-hostile chars, bounds length)
 
-### `test/media-subagent.dom.test.ts` — generated media + subagent card in a real DOM (10 tests)
+### `test/media-subagent.dom.test.ts` — generated media + subagent card in a real DOM (14 tests)
 
 - `addGeneratedMedia` renders an image as `<img>` and a video as `<video controls>` from the host's `media` message, wires the Copy-path / Open-in-VS-Code hover actions (pinned to the media), and falls back to an open-link button for a remote URL
 - the (deferred) subagent classifier renders a *Subagent: \<type\>* card when fed a delegation shape

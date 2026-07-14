@@ -32,6 +32,8 @@ import {
   GROK_STDIO_DOWNGRADE_TARGET,
 } from "./cli-locator";
 import { TerminalManager, setTerminalShellPreference, type ShellPreference } from "./terminal-manager";
+import { SeatbeltBroker } from "./seatbelt-broker";
+import { resolveAndCompileSeatbeltPolicy } from "./seatbelt-policy";
 import {
   FileChip,
   MAX_VISION_IMAGE_BYTES,
@@ -51,7 +53,17 @@ import {
 } from "./chips";
 import { buildPromptWithImages, type PromptImageInput } from "./prompt-builder";
 import { matchSlashCommand } from "./slash-filter";
-import { configForcesAlwaysApprove } from "./grok-config";
+import {
+  collectAvailableSandboxProfiles,
+  configDisablesBypassPermissions,
+  configForcesAlwaysApprove,
+  isProjectOnlySandboxProfile,
+  isUnregisteredConfigurationError,
+  mergeWorkspaceEnv,
+  normalizeSandboxProfile,
+  readGlobalConfigurationValue,
+  resolveSandboxProfile,
+} from "./grok-config";
 import { parseFileRef, shouldReadFileInline } from "./file-ref";
 import { pickRejectOption, shouldRejectPermission } from "./plan-gate";
 import { appendPlanEntry, countsAsUserBubble, decideRestoreState } from "./plan-restore";
@@ -79,6 +91,10 @@ import {
 // imported above. See that file for why.
 
 const SESSION_META_KEY = "grok.sessionMeta";
+/** Fallback for VS Code-derived hosts whose live configuration schema briefly
+ * rejects the contributed `grok.sandboxProfile` key during an upgrade. */
+const SANDBOX_PROFILE_FALLBACK_KEY = "grok.sandboxProfileFallback";
+const SANDBOX_PROFILE_WORKSPACE_FALLBACK_KEY = "grok.sandboxProfileWorkspaceFallback";
 /** globalState key for the anonymous per-install telemetry GUID (survives updates). */
 const INSTALL_ID_KEY = "grok.installId";
 
@@ -184,7 +200,6 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   /** Attachment-staging ops still in flight — see trackAttach. */
   private readonly pendingAttach = new Set<Promise<void>>();
   private editorWatcher?: vscode.Disposable;
-  private terminalManager = new TerminalManager();
   private voiceRecorder = new VoiceRecorder();
   private voiceTempPath?: string;
   private voiceStreamer?: VoiceStreamer;
@@ -193,6 +208,7 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   // message = one clean utterance) without re-resolving the mic device.
   private voiceStreamCtx?: { key: string; ffmpegPath: string; device?: string; phrase: string; keyterms: string[] };
   private configWatcher?: vscode.Disposable;
+  private lastUserSandboxSetting = "";
   private cliPath?: string;
   // Guards the silent grok-CLI auto-update so it runs at most once per activation.
   private cliUpdateChecked = false;
@@ -221,6 +237,7 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
     output: vscode.OutputChannel,
   ) {
     this.output = output;
+    this.lastUserSandboxSetting = this.readUserSandboxSetting();
     context.subscriptions.push(
       vscode.workspace.registerTextDocumentContentProvider(GROK_DIFF_SCHEME, this.diffProvider),
     );
@@ -287,6 +304,17 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
       }
       if (e.affectsConfiguration("grok.terminalShell")) {
         this.applyTerminalShellPref();
+      }
+      if (e.affectsConfiguration("grok.sandboxProfile")) {
+        const nextUserSetting = this.readUserSandboxSetting();
+        // Only a User-level edit supersedes a project-only toolbar choice. A
+        // repository setting must never be able to clear or disable it.
+        if (nextUserSetting !== this.lastUserSandboxSetting) {
+          this.lastUserSandboxSetting = nextUserSetting;
+          void this.context.workspaceState
+            .update(SANDBOX_PROFILE_WORKSPACE_FALLBACK_KEY, undefined)
+            .then(() => this.postSandboxState(process.env));
+        }
       }
     });
     this.applyTerminalShellPref();
@@ -459,11 +487,8 @@ See design doc for the full state machine diagram.`;
     this.post({ type: "modeChanged", modeId: this.displayMode() });
   }
 
-  /** Whether grok's config.toml forces always-approve (#31). Project
-   *  `.grok/config.toml` overrides global `~/.grok/config.toml`. Read fresh on
-   *  each session start — it's a couple of small file reads, and the user may
-   *  edit the config between sessions. Any read error → false (treat as normal). */
-  private configForcesAutoApprove(): boolean {
+  /** Read project + global grok config.toml (missing file → undefined). */
+  private readGrokConfigs(env: NodeJS.ProcessEnv = process.env): { project?: string; global?: string } {
     const readSafe = (p?: string): string | undefined => {
       if (!p) return undefined;
       try {
@@ -472,11 +497,239 @@ See design doc for the full state machine diagram.`;
         return undefined;
       }
     };
-    const home = process.env.HOME || process.env.USERPROFILE || "";
-    const globalPath = home ? path.join(home, ".grok", "config.toml") : undefined;
+    const grokHome = resolveGrokHome(env);
+    const globalPath = grokHome ? path.join(grokHome, "config.toml") : undefined;
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const projectPath = cwd ? path.join(cwd, ".grok", "config.toml") : undefined;
-    return configForcesAlwaysApprove({ project: readSafe(projectPath), global: readSafe(globalPath) });
+    return { project: readSafe(projectPath), global: readSafe(globalPath) };
+  }
+
+  /** Whether grok's config.toml forces always-approve (#31). Project
+   *  `.grok/config.toml` overrides global `~/.grok/config.toml`. Read fresh on
+   *  each session start — it's a couple of small file reads, and the user may
+   *  edit the config between sessions. Any read error → false (treat as normal). */
+  private configForcesAutoApprove(): boolean {
+    return configForcesAlwaysApprove(this.readGrokConfigs());
+  }
+
+  /** `[ui] disable_bypass_permissions_mode` — hide/block Auto accept in the UI. */
+  private configDisablesYolo(): boolean {
+    return configDisablesBypassPermissions(this.readGrokConfigs());
+  }
+
+  private postModePolicy(): void {
+    const disabled = this.configDisablesYolo();
+    this.post({
+      type: "modePolicy",
+      yoloDisabled: disabled,
+      yoloDisabledReason: disabled
+        ? "Disabled by [ui] disable_bypass_permissions_mode in grok config.toml"
+        : undefined,
+    });
+  }
+
+  /**
+   * Sandbox profile for the next ACP spawn. `grok agent stdio` does not apply
+   * `[sandbox] profile` from config on its own — we must pass top-level
+   * `--sandbox <profile>`. Resolution: project-only extension workspace state →
+   * registered VS Code setting → global extension fallback → `GROK_SANDBOX` →
+   * global `$GROK_HOME/config.toml`. Project `.grok/config.toml` does not select
+   * a profile; project definitions live in `.grok/sandbox.toml`.
+   */
+  private resolveSpawnSandbox(env: NodeJS.ProcessEnv): string | undefined {
+    const setting = this.readUserSandboxSetting();
+    const workspaceChoice = this.context.workspaceState.get<string>(
+      SANDBOX_PROFILE_WORKSPACE_FALLBACK_KEY,
+      "",
+    );
+    // Project-only custom profiles live in extension workspaceState rather than
+    // `.vscode/settings.json`, so choosing one never dirties the repository.
+    if (workspaceChoice.trim()) return normalizeSandboxProfile(workspaceChoice);
+    const fallbackSetting = this.context.globalState.get<string>(
+      SANDBOX_PROFILE_FALLBACK_KEY,
+      "",
+    );
+    const configs = this.readGrokConfigs(env);
+    return resolveSandboxProfile({
+      setting,
+      fallbackSetting,
+      env: env["GROK_SANDBOX"],
+      global: configs.global,
+    });
+  }
+
+  private readUserSandboxSetting(): string {
+    const inspected = vscode.workspace
+      .getConfiguration("grok")
+      .inspect<string>("sandboxProfile");
+    return readGlobalConfigurationValue(inspected, "");
+  }
+
+  /** Read the process-lifetime sandbox saved by Grok for a cold resume. A
+   * missing/malformed legacy field is reported as not found; callers must not
+   * substitute today's broader default for an old conversation. */
+  private readSavedSandboxProfile(
+    cwd: string,
+    sessionId: string,
+    env: NodeJS.ProcessEnv,
+  ):
+    | { status: "found"; profile?: string }
+    | { status: "legacy" }
+    | { status: "error"; error: Error } {
+    try {
+      const summaryPath = path.join(
+        sessionsDirFor(resolveGrokHome(env), cwd),
+        sessionId,
+        "summary.json",
+      );
+      const raw: unknown = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new Error("summary.json must contain an object");
+      }
+      const summary = raw as Record<string, unknown>;
+      if (!("sandbox_profile" in summary)) return { status: "legacy" };
+      if (typeof summary.sandbox_profile !== "string") {
+        throw new Error("summary.json sandbox_profile must be a string");
+      }
+      return {
+        status: "found",
+        profile: normalizeSandboxProfile(summary.sandbox_profile),
+      };
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.output.appendLine(
+        `[sandbox] could not read saved profile for ${sessionId}: ${failure.message}`,
+      );
+      return { status: "error", error: failure };
+    }
+  }
+
+  private readSandboxTomls(
+    cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+    env: NodeJS.ProcessEnv = process.env,
+  ): { project?: string; global?: string } {
+    const readSafe = (p?: string): string | undefined => {
+      if (!p) return undefined;
+      try {
+        return fs.readFileSync(p, "utf8");
+      } catch {
+        return undefined;
+      }
+    };
+    const grokHome = resolveGrokHome(env);
+    return {
+      project: cwd ? readSafe(path.join(cwd, ".grok", "sandbox.toml")) : undefined,
+      global: grokHome ? readSafe(path.join(grokHome, "sandbox.toml")) : undefined,
+    };
+  }
+
+  /** Push current sandbox + available profiles to the webview toolbar. */
+  private postSandboxState(env?: NodeJS.ProcessEnv): void {
+    if (process.platform !== "darwin" || !fs.existsSync("/usr/bin/sandbox-exec")) {
+      this.post({ type: "sandboxState", current: "off", profiles: [], supported: false });
+      return;
+    }
+    const e = env ?? process.env;
+    const tomls = this.readSandboxTomls(undefined, e);
+    const profiles = collectAvailableSandboxProfiles({
+      projectSandbox: tomls.project,
+      globalSandbox: tomls.global,
+    });
+    const current = this.focused.sandboxProfile ?? this.resolveSpawnSandbox(e) ?? "off";
+    this.post({ type: "sandboxState", current, profiles, supported: true });
+  }
+
+  /**
+   * Persist sandbox choice. Project-only custom profiles use extension
+   * workspaceState (not `.vscode/settings.json`, which would dirty the repo);
+   * built-ins and user-defined profiles are User-scoped. A few VS Code-derived hosts can
+   * temporarily reject a newly-contributed key during an extension upgrade;
+   * keep the choice in matching extension state in that case instead of blocking
+   * the sandbox switch. A later successful settings write clears the fallback.
+   */
+  private async persistSandboxSetting(next: string, env: NodeJS.ProcessEnv): Promise<void> {
+    const cfg = vscode.workspace.getConfiguration("grok");
+    const tomls = this.readSandboxTomls(undefined, env);
+    const workspaceOnly = isProjectOnlySandboxProfile({
+      name: next,
+      projectSandbox: tomls.project,
+      globalSandbox: tomls.global,
+    });
+    if (workspaceOnly) {
+      await this.context.workspaceState.update(SANDBOX_PROFILE_WORKSPACE_FALLBACK_KEY, next);
+      return;
+    }
+    try {
+      await cfg.update("sandboxProfile", next, vscode.ConfigurationTarget.Global);
+      await this.context.globalState.update(SANDBOX_PROFILE_FALLBACK_KEY, undefined);
+      await this.context.workspaceState.update(
+        SANDBOX_PROFILE_WORKSPACE_FALLBACK_KEY,
+        undefined,
+      );
+    } catch (error) {
+      if (!isUnregisteredConfigurationError(error)) throw error;
+      await this.context.workspaceState.update(
+        SANDBOX_PROFILE_WORKSPACE_FALLBACK_KEY,
+        undefined,
+      );
+      await this.context.globalState.update(SANDBOX_PROFILE_FALLBACK_KEY, next);
+      this.output.appendLine(
+        "[sandbox] host rejected grok.sandboxProfile as unregistered; saved the choice in global extension state",
+      );
+    }
+  }
+
+  /**
+   * User picked a sandbox profile from the toolbar. Persists via
+   * `grok.sandboxProfile` and restarts the session — sandbox is process-lifetime
+   * and cannot change on an existing grok agent process.
+   */
+  private async setSandboxProfile(profile: string): Promise<void> {
+    if (process.platform !== "darwin") return;
+    const raw = (profile || "off").trim();
+    const next = raw.toLowerCase() === "off" || raw === "" ? "off" : raw;
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const env = process.env;
+    // A resumed conversation keeps the profile frozen in its summary even when
+    // today's global default differs. Compare the click against the live
+    // session, not the default for the next new conversation.
+    const current = this.focused.sandboxProfile ?? this.resolveSpawnSandbox(env) ?? "off";
+    if (current === next) {
+      this.postSandboxState(env);
+      return;
+    }
+
+    // Welcome / empty / mid-prime: no summarize dialog — just restart under the
+    // new profile. (Do not gate on priming: the welcome toolbar is usable then.)
+    if (this.focused.priming || !this.focused.hasHistory || !this.focused.client) {
+      const wasEmpty = !this.focused.hasHistory;
+      const discardId = this.focused.activeSessionId;
+      try {
+        await this.persistSandboxSetting(next, env);
+      } catch (e) {
+        void vscode.window.showErrorMessage(
+          `Couldn't save sandbox setting: ${(e as Error).message}`,
+        );
+        return;
+      }
+      await this.startSession();
+      if (wasEmpty) this.discardRestartedEmptySession(discardId);
+      return;
+    }
+
+    const mode = await this.pickRestartMode(
+      `Changing sandbox to ${next === "off" ? "off (unsandboxed)" : `"${next}"`} requires restarting the session.`,
+    );
+    if (!mode) return;
+    try {
+      await this.persistSandboxSetting(next, env);
+    } catch (e) {
+      void vscode.window.showErrorMessage(
+        `Couldn't save sandbox setting: ${(e as Error).message}`,
+      );
+      return;
+    }
+    await this.restartSession(mode);
   }
 
   private alwaysApproveNoticeShown = false;
@@ -534,6 +787,14 @@ See design doc for the full state machine diagram.`;
         .update("defaultMode", remember, vscode.ConfigurationTarget.Global);
     }
     if (modeId === "yolo") {
+      if (this.configDisablesYolo()) {
+        void vscode.window.showWarningMessage(
+          "Auto accept is disabled by [ui] disable_bypass_permissions_mode in grok config.toml.",
+        );
+        this.postMode();
+        this.postModePolicy();
+        return;
+      }
       session.autoApprove = true;
       this.setPlanActive(session, false); // posts displayMode → "yolo"
       if (session.client) {
@@ -865,8 +1126,10 @@ See design doc for the full state machine diagram.`;
    * webview streams the file straight from disk. That matters for video: a
    * multi-MB clip base64-inlined into a single `postMessage` was silently
    * dropped, which is why `/imagine-video` never rendered. Files outside the
-   * served roots fall back to a base64 `data:` URI. Best-effort: a failure just
-   * drops the media rather than breaking the turn.
+   * served roots fall back to a base64 `data:` URI. Agent-reported file paths
+   * are accepted only from this session's `images/` or `videos/` directory;
+   * realpath checks prevent a symlink there from becoming a read bypass.
+   * Best-effort: a failure just drops the media rather than breaking the turn.
    */
   private async postGeneratedMedia(m: MediaRef, session: Session, gen: number): Promise<void> {
     try {
@@ -878,23 +1141,58 @@ See design doc for the full state machine diagram.`;
         this.emit(session, { type: "media", media: m.media, url: m.uri });
         return;
       }
-      const mime = m.mimeType || guessMediaMime(m.path);
+      const safePath = this.resolveGeneratedMediaPath(m.path, session);
+      if (!safePath) {
+        this.output.appendLine(`[media] rejected generated-media path outside this session: ${m.path}`);
+        return;
+      }
+      const mime = m.mimeType || guessMediaMime(safePath);
       // Served from disk when the file is under a localResourceRoot (grok home):
       // the webview pulls bytes lazily, so even a big video renders.
       const webview = this.view?.webview;
-      if (webview && this.isServableFromDisk(m.path)) {
-        const src = webview.asWebviewUri(vscode.Uri.file(m.path)).toString();
-        this.emit(session, { type: "media", media: m.media, src, mimeType: mime, path: m.path });
+      if (webview && this.isServableFromDisk(safePath)) {
+        const src = webview.asWebviewUri(vscode.Uri.file(safePath)).toString();
+        this.emit(session, { type: "media", media: m.media, src, mimeType: mime, path: safePath });
         return;
       }
-      // Outside the served roots — inline as base64 so it still renders.
-      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(m.path));
+      // A custom GROK_HOME may not be among this webview's resource roots yet;
+      // inline the already-validated session file so it still renders.
+      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(safePath));
       if (gen !== session.gen) return;
       const b64 = Buffer.from(bytes).toString("base64");
-      this.emit(session, { type: "media", media: m.media, src: `data:${mime};base64,${b64}`, path: m.path });
+      this.emit(session, { type: "media", media: m.media, src: `data:${mime};base64,${b64}`, path: safePath });
     } catch (e) {
       this.output.appendLine(`[media] failed to forward generated media: ${(e as Error).message}`);
     }
+  }
+
+  /** Resolve a generated-media file only when it is a real file inside the
+   * active session's images/ or videos/ directory. Both sides are realpathed so
+   * an agent-created symlink cannot make the extension host disclose another
+   * readable file through the webview. */
+  private resolveGeneratedMediaPath(p: string, session: Session): string | undefined {
+    const sid = session.activeSessionId ?? session.client?.sessionId;
+    if (!sid) return undefined;
+    try {
+      const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+      const sessionRoot = path.join(sessionsDirFor(resolveGrokHome(process.env), cwd), sid);
+      const candidate = fs.realpathSync(p);
+      if (!fs.statSync(candidate).isFile()) return undefined;
+      for (const directory of ["images", "videos"]) {
+        let mediaRoot: string;
+        try {
+          mediaRoot = fs.realpathSync(path.join(sessionRoot, directory));
+        } catch {
+          continue;
+        }
+        const rel = path.relative(mediaRoot, candidate);
+        if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return candidate;
+      }
+    } catch {
+      // Missing/unreadable paths are treated exactly like paths outside the
+      // session media roots: ignored without affecting the turn.
+    }
+    return undefined;
   }
 
   /** True when `p` resolves inside the grok home — the localResourceRoot grok
@@ -1014,7 +1312,6 @@ See design doc for the full state machine diagram.`;
     void this.disposePool();
     this.editorWatcher?.dispose();
     this.configWatcher?.dispose();
-    this.terminalManager.disposeAll();
     this.voiceRecorder.cancel();
     this.voiceStreamer?.cancel();
     try { if (this.voiceTempPath) fs.unlinkSync(this.voiceTempPath); } catch { /* best effort */ }
@@ -1274,6 +1571,7 @@ See design doc for the full state machine diagram.`;
   private async pickRestartMode(message: string): Promise<"clear" | "summarize" | undefined> {
     const choice = await vscode.window.showInformationMessage(
       message,
+      { modal: true },
       "Summarize & Restart",
       "Just Restart",
     );
@@ -1364,15 +1662,21 @@ See design doc for the full state machine diagram.`;
     // toolbar shows the right one from the first paint — no Agent → Auto accept
     // flash while the session spins up and primes. Resumed sessions stay
     // verdict-driven (plan-restore decides), so they don't pre-apply it.
-    const rememberedYolo = startsInYolo(
-      vscode.workspace.getConfiguration("grok").get<string>("defaultMode", ""),
-      !!resumeId,
-    );
+    const yoloLockedOut = this.configDisablesYolo();
+    const rememberedYolo =
+      !yoloLockedOut &&
+      startsInYolo(
+        vscode.workspace.getConfiguration("grok").get<string>("defaultMode", ""),
+        !!resumeId,
+      );
     // grok's own `permission_mode = "always-approve"` (config.toml, set via
     // Shift+Tab or `/always-approve`) auto-approves every session server-side
     // and is invisible over ACP — the CLI still reports plain agent mode. Detect
     // it so the button shows "Auto accept" instead of a misleading "Agent" (#31).
     // Applies to resumed sessions too (the config is global, not per-session).
+    // When disable_bypass_permissions_mode is set, do not *start* YOLO from the
+    // remembered preference; config-forced always-approve still surfaces as YOLO
+    // for honesty (CLI will auto-approve anyway).
     const configAutoApprove = this.configForcesAutoApprove();
     session.autoApprove = rememberedYolo || configAutoApprove;
     session.planActive = false;
@@ -1391,6 +1695,8 @@ See design doc for the full state machine diagram.`;
     session.firstUserMessageForTitle = undefined;
     session.priming = true;
     this.emit(session, { type: "modeChanged", modeId: session.autoApprove ? "yolo" : "agent" });
+    this.postModePolicy();
+    this.postSandboxState(process.env);
     if (configAutoApprove) this.noticeAlwaysApproveOnce();
     if (resumeId) this.emit(session, { type: "clearMessages" });
 
@@ -1427,39 +1733,160 @@ See design doc for the full state machine diagram.`;
 
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     const env = this.buildEnv(cwd);
+    // Sandbox selection, definitions, and persistence are user-controlled. A
+    // repository `.env` is allowed to feed the Grok process credentials, but
+    // never to redirect GROK_HOME or disable GROK_SANDBOX.
+    const sandboxEnv = process.env;
     const effortStr = cfg.get<string>("defaultEffort", "");
     const effort = effortStr ? (effortStr as EffortLevel) : undefined;
+    // A cold resume must reuse the profile frozen into its summary. New macOS
+    // sessions resolve the explicit setting/env/global config. Other platforms
+    // keep this UI feature off because the ACP broker is Seatbelt-specific.
+    let sandbox: string | undefined;
+    if (process.platform === "darwin") {
+      if (resumeId) {
+        const saved = this.readSavedSandboxProfile(cwd, resumeId, sandboxEnv);
+        if (saved.status === "error") {
+          const message = `Cannot determine the saved sandbox profile: ${saved.error.message}`;
+          this.output.appendLine(`[sandbox] refusing unsandboxed resume: ${message}`);
+          session.priming = false;
+          session.client = undefined;
+          this.pool.delete(session);
+          this.setStatus(session, "error");
+          this.emit(session, { type: "setBusy", value: false });
+          this.emit(session, { type: "error", text: message });
+          return undefined;
+        }
+        sandbox = saved.status === "found" ? saved.profile : undefined;
+        if (saved.status === "legacy") {
+          this.output.appendLine(
+            `[sandbox] session ${resumeId} has no saved profile; resuming without a sandbox override`,
+          );
+        }
+      } else {
+        sandbox = this.resolveSpawnSandbox(sandboxEnv);
+      }
+    }
+    session.sandboxProfile = sandbox ?? "off";
+    if (sandbox) {
+      this.output.appendLine(`[sandbox] applying profile "${sandbox}" via --sandbox`);
+    } else {
+      this.output.appendLine(
+        "[sandbox] no macOS profile configured (setting/env/global config.toml) — agent stdio runs unsandboxed",
+      );
+    }
+    this.postSandboxState(sandboxEnv);
+    let broker: SeatbeltBroker | undefined;
+    let brokerClient: AcpClient | undefined;
+    if (sandbox) {
+      try {
+        const workspace = vscode.workspace.workspaceFolders?.[0];
+        if (workspace && workspace.uri.scheme !== "file") {
+          throw new Error(
+            `Seatbelt requires a local file workspace (got ${workspace.uri.scheme})`,
+          );
+        }
+        const tomls = this.readSandboxTomls(cwd, sandboxEnv);
+        const execPath = path.resolve(process.execPath);
+        const appMarker = execPath.indexOf(".app/");
+        const appRoot = appMarker >= 0
+          ? execPath.slice(0, appMarker + ".app".length)
+          : path.dirname(execPath);
+        const trustedTempDir = os.tmpdir();
+        const compiled = resolveAndCompileSeatbeltPolicy(
+          sandbox,
+          {
+            projectSandbox: tomls.project,
+            globalSandbox: tomls.global,
+          },
+          {
+            cwd,
+            home: sandboxEnv.HOME || sandboxEnv.USERPROFILE || os.homedir(),
+            grokHome: resolveGrokHome(sandboxEnv),
+            tempDir: trustedTempDir,
+            runtimeReadPaths: [appRoot, this.context.extensionPath],
+          },
+        );
+        broker = new SeatbeltBroker({
+          policy: compiled.policy,
+          workspaceRoot: cwd,
+          childScriptPath: path.join(this.context.extensionPath, "out", "seatbelt-broker-child.js"),
+          env,
+          trustedTempDir,
+          onLog: (message) => this.output.appendLine(message),
+          onFatal: (error) => {
+            if (!brokerClient || gen !== session.gen) return;
+            this.output.appendLine(`[sandbox] broker failed closed: ${error.message}`);
+            this.emit(session, {
+              type: "error",
+              text: `Sandbox broker stopped unexpectedly: ${error.message}`,
+            });
+            void brokerClient.dispose();
+          },
+        });
+        await broker.start();
+        this.output.appendLine(
+          `[sandbox] Seatbelt broker ready (${compiled.profile.lineage.join(" → ")})`,
+        );
+      } catch (error) {
+        broker?.dispose();
+        const message = (error as Error).message || String(error);
+        this.output.appendLine(`[sandbox] refusing unsandboxed fallback: ${message}`);
+        session.priming = false;
+        session.client = undefined;
+        this.pool.delete(session);
+        this.setStatus(session, "error");
+        this.emit(session, { type: "setBusy", value: false });
+        this.emit(session, { type: "error", text: `Failed to start sandbox: ${message}` });
+        return undefined;
+      }
+    }
     const client = new AcpClient({
       cliPath,
       cwd,
       env,
       effort,
+      sandbox,
       log: (msg) => this.output.appendLine(msg),
     });
+    brokerClient = client;
     session.client = client;
 
-    // fs handlers (mandatory — the agent calls these to read/write files)
-    client.fsRead = async (p: string) => {
-      try {
-        const uri = vscode.Uri.file(p);
-        const bytes = await vscode.workspace.fs.readFile(uri);
-        return Buffer.from(bytes).toString("utf8");
-      } catch {
-        return fs.readFileSync(p, "utf8");
-      }
-    };
-    client.fsWrite = async (p: string, content: string) => {
-      try {
-        const uri = vscode.Uri.file(p);
-        const dir = vscode.Uri.file(path.dirname(p));
-        await vscode.workspace.fs.createDirectory(dir);
-        await vscode.workspace.fs.writeFile(uri, Buffer.from(content, "utf8"));
-      } catch {
-        fs.mkdirSync(path.dirname(p), { recursive: true });
-        fs.writeFileSync(p, content, "utf8");
-      }
-    };
-    client.terminal = this.terminalManager;
+    if (broker) {
+      // The sandboxed broker owns both ACP filesystem calls and every shell
+      // child. There is deliberately no extension-host fallback on errors.
+      client.fsRead = broker.fsRead;
+      client.fsWrite = broker.fsWrite;
+      client.terminal = broker;
+      client.executionBackend = broker;
+    } else {
+      // Unsandboxed/off sessions keep the normal VS Code filesystem path, but
+      // their terminals are still per client so a restart/reap cannot leak or
+      // kill another conversation's processes.
+      client.fsRead = async (p: string) => {
+        try {
+          const uri = vscode.Uri.file(p);
+          const bytes = await vscode.workspace.fs.readFile(uri);
+          return Buffer.from(bytes).toString("utf8");
+        } catch {
+          return fs.readFileSync(p, "utf8");
+        }
+      };
+      client.fsWrite = async (p: string, content: string) => {
+        try {
+          const uri = vscode.Uri.file(p);
+          const dir = vscode.Uri.file(path.dirname(p));
+          await vscode.workspace.fs.createDirectory(dir);
+          await vscode.workspace.fs.writeFile(uri, Buffer.from(content, "utf8"));
+        } catch {
+          fs.mkdirSync(path.dirname(p), { recursive: true });
+          fs.writeFileSync(p, content, "utf8");
+        }
+      };
+      const terminalManager = new TerminalManager();
+      client.terminal = terminalManager;
+      client.executionBackend = { dispose: () => terminalManager.disposeAll() };
+    }
 
     client.on("initialized", (init) => {
       if (gen !== session.gen) return;
@@ -1935,6 +2362,10 @@ See design doc for the full state machine diagram.`;
         break;
       case "setMode":
         await this.setMode(msg.modeId);
+        break;
+      case "setSandbox":
+        if (process.platform !== "darwin") break;
+        await this.setSandboxProfile(msg.profile);
         break;
       case "removeChip": {
         // A removed image chip's staged file has no other reference — reclaim
@@ -3283,11 +3714,14 @@ See design doc for the full state machine diagram.`;
       extVersion: (this.context.extension.packageJSON as { version?: string })?.version ?? "",
       showThinking: cfg.get("showThinking", false),
       expandCommandOutputs: cfg.get("expandCommandOutputs", false),
+      platform: process.platform,
     });
     // Sync the active-editor context chip into the fresh webview (the config
     // gate + no-editor case live inside refreshImplicitChip).
     this.refreshImplicitChip(true);
     this.postVoiceConfigured();
+    this.postModePolicy();
+    this.postSandboxState();
     // Sweep stale empty primer sessions once the first session is live (so the
     // newly-focused session is excluded from the sweep).
     void this.startSession().then(() => this.sweepEmptyPrimerSessions());
@@ -3761,7 +4195,7 @@ See design doc for the full state machine diagram.`;
 
   private buildEnv(cwd: string): NodeJS.ProcessEnv {
     const dotEnv = this.readDotEnv(cwd);
-    const env: NodeJS.ProcessEnv = { ...process.env, ...dotEnv };
+    const env = mergeWorkspaceEnv(process.env, dotEnv);
 
     // XAI_API_KEY is the generic xAI key name; grok CLI needs GROK_CODE_XAI_API_KEY.
     // Map from either source (workspace .env or the user's shell environment).
@@ -3841,11 +4275,13 @@ See design doc for the full state machine diagram.`;
           <div id="chips"></div>
         </div>
         <div class="toolbar-right">
+          <button id="sandbox-btn" class="toolbar-btn sandbox-btn" title="Sandbox profile" hidden style="display:none"></button>
           <button id="mode-btn" class="toolbar-btn" title="Pick mode"></button>
           <button id="send-btn" class="send"></button>
         </div>
       </div>
     </div>
+    <div id="sandbox-popover" class="toolbar-popover" hidden></div>
     <div id="mode-popover" class="toolbar-popover" hidden></div>
     <div id="gear-popover" class="toolbar-popover gear-popover" hidden></div>
     <div id="add-popover" class="toolbar-popover" hidden></div>

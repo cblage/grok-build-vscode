@@ -427,8 +427,11 @@ export const defaultFs: FsLike = {
   rmdirSync: (p, opts) => nodeFs.rmdirSync(p, opts as any),
 };
 
-/** Resolve the grok home directory honoring HOME/USERPROFILE (matching cli-locator semantics). */
+/** Resolve Grok's data/config root. GROK_HOME is the CLI's explicit override;
+ *  otherwise it defaults to ~/.grok via HOME/USERPROFILE. */
 export function resolveGrokHome(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = env.GROK_HOME?.trim();
+  if (explicit) return path.resolve(explicit);
   const home = env.HOME || env.USERPROFILE || "";
   return path.join(home, ".grok");
 }

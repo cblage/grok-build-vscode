@@ -43,9 +43,11 @@ export const BODY = `
       <button id="gear-btn"></button>
       <div id="donut"><svg><circle id="donut-arc"/></svg><span id="donut-label"></span></div>
       <div id="chips"></div>
+      <button id="sandbox-btn" hidden style="display:none"></button>
       <button id="mode-btn"></button>
       <button id="send-btn"></button>
     </div>
+    <div id="sandbox-popover" hidden></div>
     <div id="mode-popover" hidden></div>
     <div id="gear-popover" hidden></div>
     <div id="add-popover" hidden></div>

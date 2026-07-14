@@ -27,6 +27,7 @@ interface TerminalEntry {
   // Buffers incomplete multi-byte UTF-8 sequences across chunk boundaries so a
   // character split by streaming (or by truncation) never becomes a U+FFFD.
   decoder: StringDecoder;
+  killTimer?: ReturnType<typeof setTimeout>;
 }
 
 const DEFAULT_BYTE_LIMIT = 40_000;
@@ -47,21 +48,22 @@ export function resolveExitCode(code: number | null, signal: NodeJS.Signals | nu
 }
 
 export type KillPlan =
-  | { kind: "signal"; signal: NodeJS.Signals }
+  | { kind: "signal"; signal: NodeJS.Signals; target: number }
   | { kind: "taskkill"; file: string; args: string[] };
 
 /**
  * On Windows `spawn(..., { shell: true })` wraps the command in `cmd.exe`, and
  * `proc.kill("SIGTERM")` only terminates that wrapper — long-running descendants
  * (npm, node, …) survive as orphans holding file locks. `taskkill /T /F` kills
- * the whole tree. POSIX keeps the direct signal. (Args, not a shell string, so
- * there's no shell to interpret anything — pid is numeric anyway.)
+ * the whole tree. POSIX commands live in a dedicated process group and the
+ * negative pgid targets the shell plus every descendant. (Args, not a shell
+ * string, so there's no shell to interpret anything — pid is numeric anyway.)
  */
 export function buildKillPlan(pid: number, platform: NodeJS.Platform = process.platform): KillPlan {
   if (platform === "win32") {
     return { kind: "taskkill", file: "taskkill", args: ["/pid", String(pid), "/T", "/F"] };
   }
-  return { kind: "signal", signal: "SIGTERM" };
+  return { kind: "signal", signal: "SIGTERM", target: -pid };
 }
 
 /**
@@ -166,7 +168,14 @@ export class TerminalManager {
     const env = this.envFromParams(params.env);
     const cwd = params.cwd || process.cwd();
     const byteLimit = params.outputByteLimit ?? DEFAULT_BYTE_LIMIT;
-    const proc = spawn(params.command, { cwd, env, shell: terminalShell() });
+    const proc = spawn(params.command, {
+      cwd,
+      env,
+      shell: terminalShell(),
+      // Stop/restart must be able to terminate the entire POSIX command tree,
+      // not only the shell wrapper that Node returns.
+      detached: process.platform !== "win32",
+    });
 
     const entry: TerminalEntry = {
       proc,
@@ -238,12 +247,23 @@ export class TerminalManager {
     if (!t) return;
     const pid = t.proc.pid;
     try {
-      const plan: KillPlan = pid != null ? buildKillPlan(pid) : { kind: "signal", signal: "SIGTERM" };
+      const plan: KillPlan = pid != null
+        ? buildKillPlan(pid)
+        : { kind: "signal", signal: "SIGTERM", target: 0 };
       if (plan.kind === "taskkill") {
         // Fire-and-forget; the tree may already be gone (ignore the error).
         execFile(plan.file, plan.args, () => { /* best-effort */ });
       } else {
-        t.proc.kill(plan.signal);
+        if (plan.target !== 0) process.kill(plan.target, plan.signal);
+        else t.proc.kill(plan.signal);
+        // Give cooperative descendants a moment to clean up, then guarantee
+        // that a signal-ignoring member of the process group cannot survive.
+        if (pid != null && process.platform !== "win32" && !t.killTimer) {
+          t.killTimer = setTimeout(() => {
+            try { process.kill(-pid, "SIGKILL"); } catch { /* group already gone */ }
+          }, 500);
+          t.killTimer.unref?.();
+        }
       }
     } catch {
       /* ignore */

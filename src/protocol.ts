@@ -49,7 +49,7 @@ export interface PlanHistoryItem {
 
 /** host -> webview */
 export type HostMsg =
-  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean }
+  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform }
   | { type: "showThinking"; value: boolean }
   | { type: "fontScale"; value: number }
   | { type: "grokUpdateStatus"; current?: string | null; latest?: string | null; updateAvailable?: boolean; policy?: unknown; error?: string }
@@ -58,6 +58,10 @@ export type HostMsg =
   | { type: "session"; sessionId: string; models: ModelInfo[]; currentModelId: string | undefined }
   | { type: "modelChanged"; modelId: string }
   | { type: "modeChanged"; modeId: string }
+  /** YOLO/Auto-accept blocked when config has disable_bypass_permissions_mode. */
+  | { type: "modePolicy"; yoloDisabled: boolean; yoloDisabledReason?: string }
+  /** Effective sandbox for the next spawn + profiles available in the dropdown. */
+  | { type: "sandboxState"; current: string; profiles: string[]; supported: boolean }
   | { type: "openModePopover" }
   | { type: "voiceState"; status: "listening" | "transcribing" | "idle" }
   | { type: "voiceConfigured"; value: boolean; sendPhrase?: string }
@@ -141,6 +145,8 @@ export type WebviewMsg =
   | { type: "cancel" }
   | { type: "pickModel" }
   | { type: "setMode"; modeId: "agent" | "plan" | "yolo" }
+  /** Pick a sandbox profile ("off" = unsandboxed). Requires session restart. */
+  | { type: "setSandbox"; profile: string }
   | { type: "removeChip"; id: string }
   | { type: "toggleChip"; id: string }
   | { type: "openFile"; path: string }
@@ -189,7 +195,8 @@ export type WebviewMsg =
 const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   initialState: true, showThinking: true, fontScale: true, grokUpdateStatus: true,
   initialized: true, cliUpdating: true, session: true, modelChanged: true,
-  modeChanged: true, openModePopover: true, voiceState: true, voiceConfigured: true,
+  modeChanged: true, modePolicy: true, sandboxState: true, openModePopover: true,
+  voiceState: true, voiceConfigured: true,
   voicePartial: true, voiceSubmit: true, voiceTranscript: true, voiceError: true,
   chips: true, commandsUpdate: true, userMessage: true, agentStart: true,
   thoughtChunk: true, messageChunk: true, media: true, userMessageChunk: true,
@@ -205,7 +212,7 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
 
 const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   ready: true, send: true, newSession: true, cancel: true, pickModel: true,
-  setMode: true, removeChip: true, toggleChip: true, openFile: true, openUrl: true,
+  setMode: true, setSandbox: true, removeChip: true, toggleChip: true, openFile: true, openUrl: true,
   openDiff: true, exportExpr: true, setEffort: true, openGlobalConfig: true,
   openProjectConfig: true, runMcpList: true, showLogs: true, moveView: true,
   setShowThinking: true, setExpandCommandOutputs: true,

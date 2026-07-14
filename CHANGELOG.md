@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.5.14-sandbox - 2026-07-14
+
+### Added
+
+- **Real macOS Seatbelt enforcement for ACP tools.** Each sandboxed conversation now gets a dedicated helper process launched under `/usr/bin/sandbox-exec`; every delegated filesystem request and every terminal command (including its descendants) runs inside that irreversible policy. The Grok model process remains online outside the helper, so `restrict_network = true` blocks command/script networking without severing the model connection. Broker startup or runtime failure is fail-closed—there is no direct extension-host fallback.
+- Custom profiles load from `$GROK_HOME/sandbox.toml` and project `.grok/sandbox.toml`, support recursive `extends`, and use project-over-user replacement for matching names. Built-ins are `workspace`, `read-only`, and `strict`; `devbox` remains an ordinary custom-profile example.
+- Added a dedicated [macOS sandbox architecture guide](docs/macos-sandbox-architecture.md) covering the ACP containment gap, process topology, profile selection and inheritance, broker protocol, trust boundary, and fail-closed lifecycle.
+
+### Fixed
+
+- Sandbox selection now follows the consumer configuration surface only: extension choice → `GROK_SANDBOX` → global `$GROK_HOME/config.toml`; project `.grok/config.toml` and repository VS Code settings cannot override it. Project-only toolbar choices are workspace-local without writing `.vscode/settings.json`, while project `.env` files cannot redirect `GROK_HOME`, override `HOME`, or disable `GROK_SANDBOX`. Delegated writes preserve Grok's session `plan.md` but cannot mutate sandbox config or persisted session control state.
+- Malformed, duplicate, cyclic, or missing custom-profile fields fail before launch; project definitions override user definitions deterministically. Quoted profile names, macOS `/var`/`/tmp` aliases, deny globs, sensitive credential paths, and recursive custom inheritance now resolve consistently.
+- Cold resume reuses the profile frozen in `summary.json`; an unreadable or malformed summary now aborts rather than silently resuming unsandboxed. Legacy summaries with no sandbox field remain explicitly unsandboxed.
+- Stop, restart, and broker teardown now terminate the full POSIX process group (TERM then KILL), preventing terminal grandchildren from surviving after their shell exits.
+- Generated media forwarding now accepts only real files beneath the active session's `images/` or `videos/` directories, including symlink-safe realpath containment.
+- Sandbox controls are shown only on supported macOS hosts and remain disabled while the conversation is starting or busy.
+- The sandbox-profile button is now functionally and visually disabled whenever Send is in its locked loading state, including after a sandbox-state refresh during startup.
+- Sandbox selections no longer fail when a VS Code-derived host temporarily reports `grok.sandboxProfile` as unregistered; the extension preserves the choice in its own global state until User Settings accepts the key.
+- Changing sandbox profile in an existing conversation now presents the required Summarize/Just Restart decision as a modal dialog instead of an easy-to-miss transient notification.
+- Sandboxed shell commands can write to the inert `/dev/null` device and inherited file descriptors, restoring ordinary redirects and shell output process substitution without granting write access to persistent devices or the rest of `/dev`.
+- Sandboxed child runtimes now use the same trusted temporary directory admitted by the compiled policy; neither repository `.env` files nor ACP terminal-request environment overrides can redirect `TMPDIR`, `TMP`, or `TEMP` to a denied or persistent location.
+
 ## 1.5.13 — 2026-07-13
 
 ### Fixed
