@@ -144,7 +144,7 @@ To keep a pile of background sessions from each pinning a live process, a sessio
 <details>
 <summary><strong>Session history</strong> — resume, rename, delete, or clear past sessions</summary>
 
-The clock icon lists this project's sessions, newest first. Click a row to resume — Grok replays the conversation, with inline images, plans, and reasoning intact — or hover to rename or delete it. The list loads the **most recent 100** and pulls in older ones as you **scroll**; the **search box** filters by name across your whole history, so it stays fast even with thousands of sessions. **Clear all history** (bottom of the dropdown) removes every session for this project except the current one, after a confirm. Renames are stored by the extension and never touch Grok's own files.
+The clock icon lists this project's sessions, newest first. Click a row to resume — Grok replays the conversation, restores that session's Agent / Plan / Auto accept mode, and keeps inline images, plans, and reasoning intact — or hover to rename or delete it. The list loads the **most recent 100** and pulls in older ones as you **scroll**; the **search box** filters by name across your whole history, so it stays fast even with thousands of sessions. **Clear all history** (bottom of the dropdown) removes every session for this project except the current one, after a confirm. Names and host-owned mode metadata are stored by the extension and never modify Grok's own session files.
 
 ![Session history dropdown — resume, rename, delete, search, or clear past sessions](docs/screenshots/session_history.png)
 

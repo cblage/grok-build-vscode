@@ -1,6 +1,7 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { isPrimerText, isPrimerSummary } from "./grok-primer";
+import type { ModeId } from "./mode-prefs";
 
 /** A session with at most this many recorded messages is cheap to confirm as empty
  *  (a primer-only session has ~4). The sweep only reads `chat_history.jsonl` for
@@ -26,6 +27,9 @@ export interface SessionListEntry {
 export interface SessionMetaOverride {
   customName?: string;
   pinnedAt?: number;
+  /** Last effective mode selected for this session. Auto accept is host-only,
+   *  so the CLI's persisted session cannot reconstruct it on its own. */
+  mode?: ModeId;
   /** Last verdict the user gave to an exit_plan_mode card in this session, for the restore-card label. */
   lastPlanVerdict?: "approved" | "rejected" | "abandoned";
   /** Every plan the user resolved in this session, in chronological order. grok's plan.md only
@@ -50,21 +54,43 @@ export interface SessionMetaOverride {
 }
 export type SessionMetaOverrides = Record<string, SessionMetaOverride>;
 
-/** Move a renamed session's `customName` from one id to another and drop the source entry. Used when
+/** Immutably merge a mode into one session's metadata without disturbing its
+ *  name, plan/permission history, or unread state. */
+export function setSessionModeOverride(
+  overrides: SessionMetaOverrides,
+  sessionId: string,
+  mode: ModeId,
+): SessionMetaOverrides {
+  return {
+    ...overrides,
+    [sessionId]: { ...(overrides[sessionId] ?? {}), mode },
+  };
+}
+
+/** Move a restarted session's lightweight identity (`customName` + `mode`) from one id to another
+ *  and drop the source entry. Used when
  *  a primer-only session is discarded and restarted under a new grok id (a model/effort switch on an
- *  empty session): the user's rename should follow to the new session, and the abandoned id's
- *  override must not linger. Only `customName` carries — a fresh session has no plans/unread/etc.
- *  worth keeping. Pure: removing the on-disk dir is the caller's job. Returns a new map; the input is
- *  left untouched. No-op carry when the source has no `customName` or `toId` is undefined. */
+ *  empty session): the user's rename and selected mode should follow to the new session, and the
+ *  abandoned id's override must not linger. Plans/unread/etc. do not carry because the replacement
+ *  is a fresh session. Pure: removing the on-disk dir is the caller's job. Returns a new map; the
+ *  input is left untouched. */
 export function carrySessionName(
   overrides: SessionMetaOverrides,
   fromId: string,
   toId: string | undefined,
 ): SessionMetaOverrides {
   const next: SessionMetaOverrides = { ...overrides };
-  const carried = next[fromId]?.customName?.trim();
+  const source = next[fromId];
+  const carried = source?.customName?.trim();
+  const mode = source?.mode;
   delete next[fromId];
-  if (carried && toId) next[toId] = { ...(next[toId] ?? {}), customName: carried };
+  if (toId && (carried || mode)) {
+    next[toId] = {
+      ...(next[toId] ?? {}),
+      ...(mode ? { mode } : {}),
+      ...(carried ? { customName: carried } : {}),
+    };
+  }
   return next;
 }
 

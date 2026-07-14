@@ -15,6 +15,7 @@ import {
   readContextUsage,
   readSessionEntries,
   resolveGrokHome,
+  setSessionModeOverride,
   sessionsDirFor,
 } from "../src/sessions";
 
@@ -526,21 +527,32 @@ describe("carrySessionName", () => {
     expect(next).not.toBe(overrides);
   });
 
-  it("only carries customName, not plans/unread, from the abandoned session", () => {
+  it("carries lightweight identity but not plans/unread from the abandoned session", () => {
     const overrides: SessionMetaOverrides = {
-      old: { customName: "Named", unread: true, plans: [{ text: "p", verdict: "approved" }] },
+      old: {
+        customName: "Named",
+        mode: "plan",
+        unread: true,
+        plans: [{ text: "p", verdict: "approved" }],
+      },
     };
     const next = carrySessionName(overrides, "old", "new");
-    expect(next.new).toEqual({ customName: "Named" });
+    expect(next.new).toEqual({ customName: "Named", mode: "plan" });
   });
 
-  it("merges the carried name into an existing override on the new id", () => {
+  it("carries a mode even when the old session was never renamed", () => {
+    const overrides: SessionMetaOverrides = { old: { mode: "yolo", unread: true } };
+    const next = carrySessionName(overrides, "old", "new");
+    expect(next.new).toEqual({ mode: "yolo" });
+  });
+
+  it("merges the carried identity into an existing override on the new id", () => {
     const overrides: SessionMetaOverrides = {
-      old: { customName: "Carried" },
+      old: { customName: "Carried", mode: "plan" },
       new: { unread: true },
     };
     const next = carrySessionName(overrides, "old", "new");
-    expect(next.new).toEqual({ unread: true, customName: "Carried" });
+    expect(next.new).toEqual({ unread: true, mode: "plan", customName: "Carried" });
   });
 
   it("just drops the old entry when there is no customName to carry", () => {
@@ -562,6 +574,36 @@ describe("carrySessionName", () => {
     const overrides: SessionMetaOverrides = { old: { customName: "   " } };
     const next = carrySessionName(overrides, "old", "new");
     expect(next.new).toBeUndefined();
+  });
+});
+
+describe("setSessionModeOverride", () => {
+  it("adds a mode without mutating the input", () => {
+    const overrides: SessionMetaOverrides = { other: { customName: "Other" } };
+    const next = setSessionModeOverride(overrides, "session-1", "yolo");
+    expect(next).not.toBe(overrides);
+    expect(overrides["session-1"]).toBeUndefined();
+    expect(next).toEqual({
+      other: { customName: "Other" },
+      "session-1": { mode: "yolo" },
+    });
+  });
+
+  it("preserves every other field on the session metadata", () => {
+    const overrides: SessionMetaOverrides = {
+      s: {
+        customName: "Review",
+        pinnedAt: 12,
+        mode: "agent",
+        unread: true,
+        unreadError: false,
+        plans: [{ text: "p", verdict: "rejected", afterUserMessage: 2 }],
+        permissions: [{ title: "write", outcome: "rejected", afterUserMessage: 2 }],
+      },
+    };
+    const next = setSessionModeOverride(overrides, "s", "plan");
+    expect(next.s).toEqual({ ...overrides.s, mode: "plan" });
+    expect(next.s).not.toBe(overrides.s);
   });
 });
 

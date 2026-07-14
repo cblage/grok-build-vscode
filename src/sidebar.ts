@@ -11,7 +11,7 @@ import { resolveVoiceKey, parseVoiceCommand, DEFAULT_SEND_PHRASE } from "./voice
 import { VoiceRecorder, transcribeAudio, resolveWindowsAudioDevice } from "./voice-recorder";
 import { VoiceStreamer } from "./voice-streamer";
 import { MediaRef, gateZeroTokenMeta, isIncompatibleAgentError, parseSessionInfoContext, permissionOutcomeFor, summarizeBackgroundCommand } from "./acp-dispatch";
-import { modeToRemember, startsInYolo } from "./mode-prefs";
+import { type ModeId, modeToRemember, resolveRestoredMode, startsInYolo } from "./mode-prefs";
 import { GROK_VIEW_ID, moveViewContainerFor } from "./view-move";
 import {
   APTABASE_APP_KEY_PROD,
@@ -83,6 +83,7 @@ import {
   readContextUsage,
   readSessionEntries,
   resolveGrokHome,
+  setSessionModeOverride,
   sessionsDirFor,
 } from "./sessions";
 
@@ -407,10 +408,10 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
         // Primer-only session (no real conversation): a cross-agent switch restarts it with a fresh
         // grok id. There's nothing to summarize, so we never prompt here — and we don't leave the
         // abandoned primer-only session cluttering history (repeated switches would pile them up).
-        // Drop it after the restart, carrying over any rename the user made.
+        // Drop it after the restart, carrying over its rename and selected mode.
         const discardId = this.focused.activeSessionId;
         await cfg.update("defaultModel", modelId, vscode.ConfigurationTarget.Global);
-        await this.startSession();
+        await this.startSession(undefined, this.modeForSession(this.focused));
         this.discardRestartedEmptySession(discardId);
         return;
       }
@@ -477,14 +478,32 @@ See design doc for the full state machine diagram.`;
    * doesn't model (the CLI only knows agent/plan), so we derive the button label
    * here rather than echoing the CLI's raw mode id.
    */
-  private displayMode(): "agent" | "plan" | "yolo" {
-    if (this.focused.planActive) return "plan";
-    if (this.focused.autoApprove) return "yolo";
+  private modeForSession(session: Session): ModeId {
+    if (session.planActive) return "plan";
+    if (session.autoApprove) return "yolo";
     return "agent";
+  }
+
+  private displayMode(): ModeId {
+    return this.modeForSession(this.focused);
   }
 
   private postMode(): void {
     this.post({ type: "modeChanged", modeId: this.displayMode() });
+  }
+
+  /** Persist the host's effective mode alongside the extension's other
+   *  per-session metadata. The CLI cannot save Auto accept because it is a
+   *  host-owned permission flag, so cold restore must use this sidecar. */
+  private async persistSessionMode(session: Session, mode: ModeId = this.modeForSession(session)): Promise<void> {
+    const sid = session.activeSessionId ?? session.client?.sessionId;
+    if (!sid) return;
+    const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    if (overrides[sid]?.mode === mode) return;
+    await this.context.globalState.update(
+      SESSION_META_KEY,
+      setSessionModeOverride(overrides, sid, mode),
+    );
   }
 
   /** Read project + global grok config.toml (missing file → undefined). */
@@ -712,7 +731,7 @@ See design doc for the full state machine diagram.`;
         );
         return;
       }
-      await this.startSession();
+      await this.startSession(undefined, this.modeForSession(this.focused));
       if (wasEmpty) this.discardRestartedEmptySession(discardId);
       return;
     }
@@ -797,6 +816,7 @@ See design doc for the full state machine diagram.`;
       }
       session.autoApprove = true;
       this.setPlanActive(session, false); // posts displayMode → "yolo"
+      await this.persistSessionMode(session, "yolo");
       if (session.client) {
         try { await session.client.setMode(ACT_MODE_ID); } catch { /* CLI stays put; gate is what matters */ }
       }
@@ -805,6 +825,7 @@ See design doc for the full state machine diagram.`;
     session.autoApprove = false;
     if (modeId === "plan") {
       this.setPlanActive(session, true); // posts displayMode → "plan"
+      await this.persistSessionMode(session, "plan");
       if (session.client) {
         try { await session.client.setMode("plan"); }
         catch (e) { vscode.window.showErrorMessage(`Couldn't switch mode: ${(e as Error).message}`); }
@@ -813,6 +834,7 @@ See design doc for the full state machine diagram.`;
     }
     // agent
     this.setPlanActive(session, false); // posts displayMode → "agent"
+    await this.persistSessionMode(session, "agent");
     if (session.client) {
       try { await session.client.setMode(ACT_MODE_ID); }
       catch (e) { vscode.window.showErrorMessage(`Couldn't switch mode: ${(e as Error).message}`); }
@@ -1063,7 +1085,12 @@ See design doc for the full state machine diagram.`;
     });
     const next: SessionMetaOverrides = {
       ...overrides,
-      [sid]: { ...cur, lastPlanVerdict: verdict, plans },
+      [sid]: {
+        ...cur,
+        lastPlanVerdict: verdict,
+        plans,
+        mode: verdict === "rejected" ? "plan" : "agent",
+      },
     };
     void this.context.globalState.update(SESSION_META_KEY, next);
   }
@@ -1583,9 +1610,10 @@ See design doc for the full state machine diagram.`;
    *  captures a one-paragraph summary of the conversation and re-injects it as
    *  hidden context after the restart so the new session keeps the thread. */
   private async restartSession(mode: "clear" | "summarize"): Promise<void> {
+    const restartMode = this.modeForSession(this.focused);
     if (mode === "clear") {
       this.emit(this.focused, { type: "clearMessages" });
-      await this.startSession();
+      await this.startSession(undefined, restartMode);
       return;
     }
     const currentClient = this.focused.client;
@@ -1604,7 +1632,7 @@ See design doc for the full state machine diagram.`;
     }
     const summary = chunks.join("").trim();
 
-    await this.startSession(); // resets suppressContent + eagerly kicks off the primer
+    await this.startSession(undefined, restartMode); // resets suppressContent + eagerly kicks off the primer
 
     if (summary && this.focused.client) {
       // Await the eager primer FIRST (it manages its own suppression and ends with
@@ -1625,7 +1653,7 @@ See design doc for the full state machine diagram.`;
   /** A model/effort switch on a primer-only session (no real conversation) restarts it with a new
    *  grok session id. grok already persisted the abandoned one, so without this each repeated switch
    *  would pile another empty session into history. Drop the old session's on-disk dir and carry any
-   *  user rename (`customName`) onto the new session so the chosen name survives the restart. The
+   *  user rename (`customName`) and selected mode onto the new session so both survive the restart. The
    *  caller must only invoke this when the prior session genuinely had no history. No-op if the ids
    *  match or the old session was never persisted. */
   private discardRestartedEmptySession(oldId: string | undefined): void {
@@ -1644,7 +1672,7 @@ See design doc for the full state machine diagram.`;
     this.postSessionsList();
   }
 
-  private async startSession(resumeId?: string): Promise<AcpClient | undefined> {
+  private async startSession(resumeId?: string, replacementMode?: ModeId): Promise<AcpClient | undefined> {
     // The session this start (re)builds. Today always the focused one (pool-of-1);
     // Step D passes a pool member. Its handlers close over `session`/`gen` so a
     // backgrounded session's events stay bound to it even after focus moves.
@@ -1658,10 +1686,12 @@ See design doc for the full state machine diagram.`;
     this.stopVoiceInput();
     session.client?.dispose();
     session.client = undefined;
-    // A brand-new session starts in the remembered mode (#25) immediately, so the
-    // toolbar shows the right one from the first paint — no Agent → Auto accept
-    // flash while the session spins up and primes. Resumed sessions stay
-    // verdict-driven (plan-restore decides), so they don't pre-apply it.
+    // Resolve the effective mode before the first paint. New sessions use the
+    // global Agent/Auto-accept default; cold resumes use their own sidecar mode,
+    // with the old plan-verdict rule as a compatibility fallback. Reassert the
+    // same result after loadSession because replayed CLI mode events can flap.
+    const sessionMetaOverrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const savedSessionMeta = resumeId ? sessionMetaOverrides[resumeId] : undefined;
     const yoloLockedOut = this.configDisablesYolo();
     const rememberedYolo =
       !yoloLockedOut &&
@@ -1678,8 +1708,27 @@ See design doc for the full state machine diagram.`;
     // remembered preference; config-forced always-approve still surfaces as YOLO
     // for honesty (CLI will auto-approve anyway).
     const configAutoApprove = this.configForcesAutoApprove();
-    session.autoApprove = rememberedYolo || configAutoApprove;
-    session.planActive = false;
+    const initialMode: ModeId = resumeId
+      ? resolveRestoredMode({
+          savedMode: savedSessionMeta?.mode,
+          legacyPlanActive: decideRestoreState(savedSessionMeta?.plans).planActive,
+          configAutoApprove,
+          yoloDisabled: yoloLockedOut,
+        })
+      : replacementMode
+        ? resolveRestoredMode({
+            savedMode: replacementMode,
+            legacyPlanActive: false,
+            configAutoApprove,
+            yoloDisabled: yoloLockedOut,
+          })
+        : rememberedYolo || configAutoApprove
+          ? "yolo"
+          : "agent";
+    // Keep the honest global auto-approve state underneath a restored Plan gate,
+    // so approving/abandoning that plan reveals Auto accept again.
+    session.autoApprove = initialMode === "yolo" || (initialMode === "plan" && configAutoApprove);
+    session.planActive = initialMode === "plan";
     session.afterTurn = undefined;
     session.hasHistory = false;
     session.primed = false;
@@ -1694,7 +1743,7 @@ See design doc for the full state machine diagram.`;
     session.titleGenerated = false;
     session.firstUserMessageForTitle = undefined;
     session.priming = true;
-    this.emit(session, { type: "modeChanged", modeId: session.autoApprove ? "yolo" : "agent" });
+    this.emit(session, { type: "modeChanged", modeId: initialMode });
     this.postModePolicy();
     this.postSandboxState(process.env);
     if (configAutoApprove) this.noticeAlwaysApproveOnce();
@@ -1916,11 +1965,22 @@ See design doc for the full state machine diagram.`;
     });
     client.on("modeChanged", (id) => {
       if (gen !== session.gen) return;
+      // Startup/load mode notifications describe the CLI's partial view. The
+      // host has already resolved the real session mode (including host-only
+      // Auto accept), so accepting these here would cause a visible mode flash
+      // and could erase the Auto-accept flag underneath a restored Plan gate.
+      if (session.priming || session.replaying) {
+        if (session === this.focused) this.postMode();
+        return;
+      }
       if (id === "plan") {
         // CLI entered plan mode (covers the agent self-initiating it from a
         // natural-language request). Raise our gate so the exit is enforced.
-        session.autoApprove = false;
+        session.autoApprove = this.configForcesAutoApprove();
         this.setPlanActive(session, true);
+        // This is a real agent-initiated transition (startup/replay events were
+        // filtered above), so it must survive a reload too.
+        void this.persistSessionMode(session, "plan");
       } else if (session === this.focused) {
         // CLI reports a non-plan mode. Do NOT auto-drop the gate here: the buggy
         // exit_plan_mode emits "default" even when the user chose to keep
@@ -2141,14 +2201,13 @@ See design doc for the full state machine diagram.`;
         // Queue any saved plans BEFORE replay starts so the webview can interleave
         // them inline with user messages as they replay (instead of dumping all
         // cards at the bottom).
-        const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
         // Answered permission cards (collapsed) for this session, interleaved
         // inline during replay like the plan cards below.
-        const savedPerms = overrides[resumeId]?.permissions ?? [];
+        const savedPerms = savedSessionMeta?.permissions ?? [];
         if (savedPerms.length > 0) {
           this.emit(session, { type: "permissionHistoryQueue", permissions: savedPerms });
         }
-        const saved = overrides[resumeId]?.plans ?? [];
+        const saved = savedSessionMeta?.plans ?? [];
         if (saved.length > 0) {
           this.emit(session, { type: "planHistoryQueue", plans: await this.withPlanReviewPaths(saved, resumeId) });
           session.lastPlanText = saved[saved.length - 1].text;
@@ -2206,14 +2265,12 @@ See design doc for the full state machine diagram.`;
         session.titleGenerated = true; // existing session, name already in storage
         session.hasHistory = true;
 
-        // Plan-gate restoration: the CLI replays its own current_mode_update
-        // events during loadSession, which our modeChanged handler honors by
-        // raising the gate. Override that here with the actual verdict-driven
-        // decision (see plan-restore.ts) so a Cancelled or Approved session
-        // doesn't come back stuck in Plan mode.
-        const decision = decideRestoreState(saved);
-        this.setPlanActive(session, decision.planActive);
-        const targetMode = decision.cliMode === "plan" ? "plan" : ACT_MODE_ID;
+        // The CLI replays current_mode_update events during loadSession. Its
+        // state cannot represent host-owned Auto accept and may reflect a stale
+        // plan transition, so reassert the sidecar-resolved mode after replay.
+        session.autoApprove = initialMode === "yolo" || (initialMode === "plan" && configAutoApprove);
+        this.setPlanActive(session, initialMode === "plan");
+        const targetMode = initialMode === "plan" ? "plan" : ACT_MODE_ID;
         try { await client.setMode(targetMode); } catch { /* best-effort */ }
 
         // Seed the context donut from grok's persisted signals.json — no turn
@@ -2224,6 +2281,9 @@ See design doc for the full state machine diagram.`;
       } else {
         await client.newSession(defaultModel || undefined);
         session.activeSessionId = client.sessionId;
+        // Capture the effective starting mode even if the user never touches
+        // the selector; otherwise a default-YOLO session would reopen as Agent.
+        await this.persistSessionMode(session, initialMode);
       }
       if (gen !== session.gen) { client.dispose(); session.client = undefined; return undefined; }
 
@@ -2284,7 +2344,7 @@ See design doc for the full state machine diagram.`;
           try {
             const detected = parseGrokVersion(version)?.join(".") ?? version;
             if (await this.downgradeBrokenCli(cliPath, detected, "reactive")) {
-              return await this.startSession(resumeId); // retry the spawn on the supported build
+              return await this.startSession(resumeId, replacementMode); // retry without losing the selected mode
             }
           } finally {
             this.reactiveDowngradeInFlight = false;
@@ -2459,7 +2519,7 @@ See design doc for the full state machine diagram.`;
           const wasEmpty = !this.focused.hasHistory;
           const discardId = this.focused.activeSessionId;
           await cfg2.update("defaultEffort", newLevel, vscode.ConfigurationTarget.Global);
-          await this.startSession();
+          await this.startSession(undefined, this.modeForSession(this.focused));
           if (wasEmpty) this.discardRestartedEmptySession(discardId);
           break;
         }

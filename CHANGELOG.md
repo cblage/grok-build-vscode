@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- Session mode is now sticky per conversation: reopening history after a window reload restores that session's Agent, Plan, or Auto accept selection before the first paint, instead of falling back to the current new-session default. The selection also survives transparent empty-session restarts for model, effort, and sandbox changes. Legacy saved plans retain their verdict-driven restore behavior, and current Auto-accept policy restrictions are still enforced.
 - Sandbox selection now follows the consumer configuration surface only: extension choice → `GROK_SANDBOX` → global `$GROK_HOME/config.toml`; project `.grok/config.toml` and repository VS Code settings cannot override it. Project-only toolbar choices are workspace-local without writing `.vscode/settings.json`, while project `.env` files cannot redirect `GROK_HOME`, override `HOME`, or disable `GROK_SANDBOX`. Delegated writes preserve Grok's session `plan.md` but cannot mutate sandbox config or persisted session control state.
 - Malformed, duplicate, cyclic, or missing custom-profile fields fail before launch; project definitions override user definitions deterministically. Quoted profile names, macOS `/var`/`/tmp` aliases, deny globs, sensitive credential paths, and recursive custom inheritance now resolve consistently.
 - Cold resume reuses the profile frozen in `summary.json`; an unreadable or malformed summary now aborts rather than silently resuming unsandboxed. Legacy summaries with no sandbox field remain explicitly unsandboxed.
