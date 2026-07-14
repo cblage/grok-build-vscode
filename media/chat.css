@@ -1282,6 +1282,10 @@ textarea#input,
   letter-spacing: normal;
   tab-size: 4;
 }
+.composer-input-wrap.voice-unavailable textarea#input,
+.composer-input-wrap.voice-unavailable .input-highlight {
+  padding-right: 8px;
+}
 textarea#input {
   display: block;
   width: 100%;
@@ -1337,20 +1341,9 @@ textarea#input {
   opacity: 0.75;
   transition: background 0.12s, color 0.12s, opacity 0.12s;
 }
+.mic-btn[hidden] { display: none; }
 .mic-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
 .mic-btn:disabled { cursor: default; }
-/* Subtle "needs setup" dot when no voice API key is configured. */
-.mic-btn.needs-setup::after {
-  content: "";
-  position: absolute;
-  top: 1px;
-  right: 1px;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--vscode-charts-blue, #3794ff);
-  border: 1px solid var(--vscode-editor-background, #1e1e1e);
-}
 /* Listening: blue, with an expanding "wave" ring pulsing outward. */
 .mic-btn.listening {
   opacity: 1;

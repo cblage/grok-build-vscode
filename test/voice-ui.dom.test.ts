@@ -298,41 +298,49 @@ describe("voice control: 'grok send' command highlight", () => {
   });
 });
 
-describe("voice control: API-key setup hint", () => {
-  it("shows a 'needs setup' hint when the host reports no key", () => {
-    const { window, doc } = bootWebview();
+describe("voice control: API-key visibility", () => {
+  it("starts hidden before the host reports whether a key exists", () => {
+    const { doc } = bootWebview({ voiceConfigured: null });
     const mic = $(doc, "mic-btn");
-    expect(mic.classList.contains("needs-setup")).toBe(false); // optimistic default
-
-    dispatch(window, { type: "voiceConfigured", value: false });
-
-    expect(mic.classList.contains("needs-setup")).toBe(true);
-    expect(mic.title.toLowerCase()).toContain("set up");
+    expect((mic as HTMLButtonElement).hidden).toBe(true);
+    expect(mic.closest(".composer-input-wrap")?.classList.contains("voice-unavailable")).toBe(true);
   });
 
-  it("does NOT flash listening on click when unconfigured, but still asks the host (for setup guidance)", () => {
-    const { window, posted, doc } = bootWebview();
+  it("stays hidden and ignores programmatic clicks when no key resolves", () => {
+    const { window, posted, doc } = bootWebview({ voiceConfigured: false });
     const mic = $(doc, "mic-btn");
-    dispatch(window, { type: "voiceConfigured", value: false });
 
     click(window, mic);
 
-    expect(mic.classList.contains("listening")).toBe(false); // no misleading flash
-    expect(types(posted)).toContain("voiceStart"); // host still decides + shows guidance
+    expect((mic as HTMLButtonElement).hidden).toBe(true);
+    expect(types(posted)).not.toContain("voiceStart");
   });
 
-  it("clears the hint and records normally once a key is configured", () => {
-    const { window, doc } = bootWebview();
+  it("reveals the mic and records normally once a key is configured", () => {
+    const { window, doc } = bootWebview({ voiceConfigured: false });
     const mic = $(doc, "mic-btn");
-    dispatch(window, { type: "voiceConfigured", value: false });
-    expect(mic.classList.contains("needs-setup")).toBe(true);
+    expect((mic as HTMLButtonElement).hidden).toBe(true);
 
     dispatch(window, { type: "voiceConfigured", value: true });
-    expect(mic.classList.contains("needs-setup")).toBe(false);
+    expect((mic as HTMLButtonElement).hidden).toBe(false);
 
     click(window, mic);
     expect(mic.classList.contains("connecting")).toBe(true);
     dispatch(window, { type: "voiceState", status: "listening" });
     expect(mic.classList.contains("listening")).toBe(true);
+  });
+
+  it("hides and resets an active mic when the configured key disappears", () => {
+    const { window, doc } = bootWebview();
+    const mic = $(doc, "mic-btn");
+    click(window, mic);
+    dispatch(window, { type: "voiceState", status: "listening" });
+    expect(mic.classList.contains("listening")).toBe(true);
+
+    dispatch(window, { type: "voiceConfigured", value: false });
+
+    expect((mic as HTMLButtonElement).hidden).toBe(true);
+    expect(mic.classList.contains("listening")).toBe(false);
+    expect((mic as HTMLButtonElement).disabled).toBe(true);
   });
 });

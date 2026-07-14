@@ -37,7 +37,7 @@ export const BODY = `
       <div class="composer-input-wrap">
         <div id="input-highlight"></div>
         <textarea id="input"></textarea>
-        <button id="mic-btn"></button>
+        <button id="mic-btn" hidden></button>
       </div>
       <button id="add-btn"></button>
       <button id="gear-btn"></button>
@@ -63,7 +63,7 @@ export interface Harness {
   doc: Document;
 }
 
-export function bootWebview(opts: { ready?: boolean } = {}): Harness {
+export function bootWebview(opts: { ready?: boolean; voiceConfigured?: boolean | null } = {}): Harness {
   const window = new Window({ url: "https://localhost/" });
   const posted: Posted[] = [];
   (window as any).acquireVsCodeApi = () => ({
@@ -75,6 +75,11 @@ export function bootWebview(opts: { ready?: boolean } = {}): Harness {
   doc.body.innerHTML = BODY;
   (window as any).eval(helperSrc);
   (window as any).eval(chatSrc);
+  // Most DOM tests model an installation with voice configured. Pass false to
+  // model a resolved missing key, or null to inspect the pre-host first paint.
+  if (opts.voiceConfigured !== null) {
+    dispatch(window, { type: "voiceConfigured", value: opts.voiceConfigured ?? true });
+  }
   // The webview now boots busy+locked (startup spinner) and only goes idle once
   // the host posts setBusy:false after the session is live. Most tests exercise
   // that ready state, so simulate it by default; pass { ready: false } to assert

@@ -68,9 +68,9 @@
     busy: true,
     // Voice-input button: "idle" | "listening" | "transcribing" (see nextMicState).
     mic: "idle",
-    // Whether the host found a voice API key. Optimistic until the host says
-    // otherwise; drives the mic button's "needs setup" hint.
-    voiceConfigured: true,
+    // Whether the host resolved a nonblank voice API key. Start pessimistically
+    // so the optional mic control never flashes before the host sync arrives.
+    voiceConfigured: false,
     // Streaming dictation: text typed before the mic started ("base"), and
     // whether live partials have begun replacing the tail.
     voiceBase: "",
@@ -4169,9 +4169,18 @@
   // setup failure (no API key, ffmpeg missing), sends "voiceError" to reset us.
   function renderMic() {
     if (!micBtn) return;
+    const available = state.voiceConfigured;
+    micBtn.hidden = !available;
+    micBtn.closest(".composer-input-wrap")?.classList.toggle("voice-unavailable", !available);
     micBtn.classList.toggle("listening", state.mic === "listening");
     micBtn.classList.toggle("transcribing", state.mic === "transcribing");
     micBtn.classList.toggle("connecting", state.mic === "connecting");
+    if (!available) {
+      micBtn.innerHTML = "";
+      micBtn.title = "";
+      micBtn.disabled = true;
+      return;
+    }
     if (state.mic === "listening") {
       micBtn.innerHTML = ICON.micWaves;
       micBtn.title = "Listening — say 'grok send' to submit, or click to stop";
@@ -4186,13 +4195,9 @@
       micBtn.disabled = true;
     } else {
       micBtn.innerHTML = ICON.mic;
-      micBtn.title = state.voiceConfigured
-        ? "Voice control"
-        : "Voice control — click to set up (needs an xAI API key)";
+      micBtn.title = "Voice control";
       micBtn.disabled = false;
     }
-    // "needs setup" dot only when idle and no key is configured.
-    micBtn.classList.toggle("needs-setup", state.mic === "idle" && !state.voiceConfigured);
   }
 
   function setMic(event) {
@@ -4201,16 +4206,12 @@
   }
 
   function toggleMic() {
+    if (!state.voiceConfigured) return;
     if (state.mic === "idle") {
-      // Skip the optimistic "listening" flash when we know no key is set — the
-      // host will pop the setup guidance instead of recording. Still send
-      // voiceStart so the host (the authority on the key) makes the call.
-      if (state.voiceConfigured) {
-        // Remember what's already typed; live partials replace only the tail.
-        state.voiceBase = input.value;
-        state.voiceLive = false;
-        setMic("start");
-      }
+      // Remember what's already typed; live partials replace only the tail.
+      state.voiceBase = input.value;
+      state.voiceLive = false;
+      setMic("start");
       vscode.postMessage({ type: "voiceStart" });
     } else if (state.mic === "listening" || state.mic === "connecting") {
       setMic("stop");
@@ -4512,6 +4513,10 @@
         break;
       case "voiceConfigured":
         state.voiceConfigured = !!msg.value;
+        if (!state.voiceConfigured) {
+          state.mic = "idle";
+          state.voiceLive = false;
+        }
         if (typeof msg.sendPhrase === "string") state.voiceSendPhrase = msg.sendPhrase;
         renderMic();
         renderInputHighlight();

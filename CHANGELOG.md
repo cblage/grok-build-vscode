@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.15.14-develop.1 - 2026-07-14
+
+### Fixed
+
+- The composer microphone is now hidden when no nonblank voice API credential resolves from `grok.voiceApiKey`, `GROK_VOICE_API_KEY`, or `XAI_API_KEY`; it no longer flashes on first paint or remains visible as a setup-only control, and it updates when the setting or workspace `.env` changes.
+- Session mode is now sticky per conversation: reopening history after a window reload restores that session's Agent, Plan, or Auto accept selection before the first paint, instead of falling back to the current new-session default. The selection also survives transparent empty-session restarts for model, effort, and sandbox changes. Legacy saved plans retain their verdict-driven restore behavior, and current Auto-accept policy restrictions are still enforced.
+
 ## 1.15.14-sandbox.1 - 2026-07-14
 
 ### Added
@@ -15,7 +22,6 @@
 
 ### Fixed
 
-- Session mode is now sticky per conversation: reopening history after a window reload restores that session's Agent, Plan, or Auto accept selection before the first paint, instead of falling back to the current new-session default. The selection also survives transparent empty-session restarts for model, effort, and sandbox changes. Legacy saved plans retain their verdict-driven restore behavior, and current Auto-accept policy restrictions are still enforced.
 - A project-only sandbox selected by an older build can no longer leak through extension-global fallback state into another project and prevent Grok from starting with `Unknown sandbox profile`. Legacy fallback names are used only where the profile exists; otherwise resolution continues to the configured environment or global sandbox profile. Explicit workspace, User, environment, and cold-resume selections remain fail-closed.
 - Sandbox selection now follows the consumer configuration surface only: extension choice → `GROK_SANDBOX` → global `$GROK_HOME/config.toml`; project `.grok/config.toml` and repository VS Code settings cannot override it. Project-only toolbar choices are workspace-local without writing `.vscode/settings.json`, while project `.env` files cannot redirect `GROK_HOME`, override `HOME`, or disable `GROK_SANDBOX`. The selected built-in retains Grok's standard writable roots rather than applying extension-specific restrictions to `~/.grok` or the project.
 - Malformed, duplicate, unknown-field, invalid-boolean, or unsupported-parent custom profiles fail before launch; project definitions override user definitions deterministically. Quoted profile names, macOS `/var`/`/tmp` aliases, deny globs, and direct built-in inheritance now resolve consistently.

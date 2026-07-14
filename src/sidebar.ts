@@ -212,6 +212,7 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   // message = one clean utterance) without re-resolving the mic device.
   private voiceStreamCtx?: { key: string; ffmpegPath: string; device?: string; phrase: string; keyterms: string[] };
   private configWatcher?: vscode.Disposable;
+  private voiceEnvWatcher?: vscode.FileSystemWatcher;
   private lastUserSandboxSetting = "";
   private cliPath?: string;
   // Guards the silent grok-CLI auto-update so it runs at most once per activation.
@@ -278,8 +279,8 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
     if (!this.reaper) {
       this.reaper = setInterval(() => this.reapPool(), GrokSidebar.REAP_INTERVAL_MS);
     }
-    // Re-tell the webview whether voice is set up when the relevant settings
-    // change, so the mic button's "needs setup" hint updates without a reload.
+    // Re-tell the webview whether voice is available when relevant settings
+    // change, so the optional mic appears/disappears without a reload.
     this.configWatcher?.dispose();
     this.configWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
       if (
@@ -321,6 +322,18 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
         }
       }
     });
+    this.voiceEnvWatcher?.dispose();
+    this.voiceEnvWatcher = undefined;
+    const voiceEnvFolder = vscode.workspace.workspaceFolders?.[0];
+    if (voiceEnvFolder) {
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(voiceEnvFolder, ".env"),
+      );
+      watcher.onDidCreate(() => this.postVoiceConfigured());
+      watcher.onDidChange(() => this.postVoiceConfigured());
+      watcher.onDidDelete(() => this.postVoiceConfigured());
+      this.voiceEnvWatcher = watcher;
+    }
     this.applyTerminalShellPref();
   }
 
@@ -1343,6 +1356,7 @@ See design doc for the full state machine diagram.`;
     void this.disposePool();
     this.editorWatcher?.dispose();
     this.configWatcher?.dispose();
+    this.voiceEnvWatcher?.dispose();
     this.voiceRecorder.cancel();
     this.voiceStreamer?.cancel();
     try { if (this.voiceTempPath) fs.unlinkSync(this.voiceTempPath); } catch { /* best effort */ }
@@ -3081,9 +3095,11 @@ See design doc for the full state machine diagram.`;
   private postVoiceConfigured(): void {
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     const cfg = vscode.workspace.getConfiguration("grok");
+    const configured = !!this.resolveVoiceApiKey(cwd);
+    if (!configured) this.stopVoiceInput();
     this.post({
       type: "voiceConfigured",
-      value: !!this.resolveVoiceApiKey(cwd),
+      value: configured,
       sendPhrase: cfg.get<string>("voiceSendPhrase", DEFAULT_SEND_PHRASE),
     });
   }
@@ -3110,6 +3126,7 @@ See design doc for the full state machine diagram.`;
     const key = this.resolveVoiceApiKey(cwd);
     if (!key) {
       void this.promptVoiceKeySetup();
+      this.postVoiceConfigured();
       this.post({ type: "voiceError" });
       return;
     }
@@ -4330,7 +4347,7 @@ See design doc for the full state machine diagram.`;
       <div class="composer-input-wrap">
         <div id="input-highlight" class="input-highlight" aria-hidden="true" dir="auto"></div>
         <textarea id="input" placeholder="Ask Grok..." rows="2" dir="auto"></textarea>
-        <button id="mic-btn" class="mic-btn" title="Voice control"></button>
+        <button id="mic-btn" class="mic-btn" title="Voice control" hidden></button>
       </div>
       <div class="composer-toolbar">
         <div class="toolbar-left">
