@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.15.14-sandbox.1 - 2026-07-14
+## 1.15.14-sandbox.1 - 2026-07-15
 
 ### Added
 
@@ -8,7 +8,7 @@
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive directly from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Session behavior:** the chosen profile is fixed for the life of a conversation and restored when that conversation resumes. Built-in application failures warn and continue like Grok; invalid or unapplied custom profiles refuse to start; and loss of the live delegated-operation sandbox ends the affected session instead of silently weakening it.
-  - **New sandbox controls:** supported macOS hosts get a sandbox picker with distinct icons and source labels for built-in, user-defined, and workspace-defined profiles. The control is disabled while a conversation is starting or busy, and changing the profile of an existing conversation opens the Summarize or Just Restart flow required to start a new session under the new boundary.
+  - **New sandbox controls:** supported macOS hosts get a sandbox picker with distinct icons and source labels for built-in, user-defined, and workspace-defined profiles. The control stays disabled from session startup through the full active turn, in lockstep with Agent Mode, and changing the profile of an existing conversation opens the Summarize or Just Restart flow required to start a new session under the new boundary.
   - See the [macOS sandbox architecture guide](docs/macos-sandbox-architecture.md) for the full access matrix, profile resolution rules, process topology, and enforcement boundary.
 
 ## 1.5.13 — 2026-07-13
