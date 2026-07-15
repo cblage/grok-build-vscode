@@ -503,6 +503,28 @@ describe("sandbox picker", () => {
     expect((popover as any).hidden).toBe(false);
   });
 
+  it("locks the sandbox picker for a live turn exactly like the mode picker", () => {
+    const { window, posted, doc } = bootWebview();
+    const sandboxBtn = $(doc, "sandbox-btn") as HTMLButtonElement;
+    const modeBtn = $(doc, "mode-btn") as HTMLButtonElement;
+    const popover = $(doc, "sandbox-popover");
+    enableDarwinSandbox(window);
+
+    dispatch(window, { type: "agentStart" });
+    expect(sandboxBtn.disabled).toBe(true);
+    expect(sandboxBtn.className).toContain("disabled");
+    expect(modeBtn.disabled).toBe(true);
+
+    click(window, sandboxBtn);
+    expect((popover as any).hidden).toBe(true);
+    expect(posted.some((msg) => msg.type === "setSandbox")).toBe(false);
+
+    dispatch(window, { type: "agentEnd" });
+    expect(sandboxBtn.disabled).toBe(false);
+    expect(sandboxBtn.className).not.toContain("disabled");
+    expect(modeBtn.disabled).toBe(false);
+  });
+
   it("labels and icons profiles by their definition source", () => {
     const { window, posted, doc } = bootWebview();
     const sandboxBtn = $(doc, "sandbox-btn") as HTMLButtonElement;
