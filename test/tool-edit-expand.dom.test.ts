@@ -207,3 +207,543 @@ describe("single-edit tool group stays expandable + reviewable (#30, #45)", () =
     expect(label.querySelector(".diff-stat-del")!.textContent).toBe("−1");
   });
 });
+
+// The diff data is on the wire per-edit, ~2.2–3.3s before the turn ends
+// (research/edit-diff-timing.log), so the header roll-up must track each edit as it
+// lands rather than waiting for closeToolGroup. The trap: addToToolGroup rebuilds the
+// header's innerHTML for every new call in the batch, which wipes any painted totals.
+describe("edit totals paint mid-turn, before the batch closes (#45 follow-up)", () => {
+  const edit = (window: any, id: string, file: string, oldText: string, newText: string) => {
+    dispatch(window, { type: "toolCall", call: { toolCallId: id, kind: "edit", title: `Edit ${file}`, rawInput: { file_path: file } } });
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: id, kind: "edit", title: `Edit \`${file}\``, content: [{ type: "diff", path: file, oldText, newText }] } });
+  };
+
+  it("shows totals on the IN-PROGRESS header and grows them per edit — no promptComplete", () => {
+    const { window, doc } = bootWebview();
+    const label = () => doc.querySelector(".tool-group-label")!;
+
+    edit(window, "e1", "alpha.txt", "W1", "G1"); // +1 −1
+    expect(doc.querySelector(".tool-group")!.classList.contains("in-progress")).toBe(true);
+    expect(label().querySelector(".diff-stat-add")!.textContent).toBe("+1");
+    expect(label().querySelector(".diff-stat-del")!.textContent).toBe("−1");
+
+    // The 2nd call rebuilds the header — the totals must survive that clobber.
+    edit(window, "e2", "bravo.txt", "W2", "G2"); // cumulative +2 −2
+    expect(label().querySelector(".diff-stat-add")!.textContent).toBe("+2");
+    expect(label().querySelector(".diff-stat-del")!.textContent).toBe("−2");
+
+    edit(window, "e3", "charlie.txt", "W3", "G3"); // cumulative +3 −3
+    expect(label().querySelector(".diff-stat-add")!.textContent).toBe("+3");
+    expect(label().querySelector(".diff-stat-del")!.textContent).toBe("−3");
+    // Still mid-batch: nothing has closed the group.
+    expect(doc.querySelector(".tool-group")!.classList.contains("in-progress")).toBe(true);
+    // Exactly one totals slot — re-painting replaces, never appends a second copy.
+    expect(label().querySelectorAll(".diff-stat")).toHaveLength(1);
+
+    dispatch(window, { type: "promptComplete", meta: {} });
+    expect(label().textContent).toContain("Edited 3 files");
+    expect(label().querySelector(".diff-stat-add")!.textContent).toBe("+3");
+    expect(label().querySelectorAll(".diff-stat")).toHaveLength(1);
+  });
+
+  it("a running batch with a landed edit diff stays COLLAPSED (only the setting/latch expand it)", () => {
+    const { window, doc } = bootWebview();
+    edit(window, "e1", "alpha.txt", "W1", "G1");
+    // Totals are visible on the header, but nothing auto-opened.
+    expect(doc.querySelector(".tool-group-label")!.querySelector(".diff-stat")).not.toBeNull();
+    expect((doc.querySelector(".tool-group-body") as HTMLElement).hidden).toBe(true);
+    expect((doc.querySelector(".tool-item-details") as HTMLElement).hidden).toBe(true);
+    expect(doc.querySelector(".tool-group")!.classList.contains("expanded")).toBe(false);
+  });
+});
+
+// Wire fact (research/edit-diff-timing.log, grok 0.2.99): every edit reports its diff
+// TWICE — an optimistic pre-write echo, then the authoritative completed update. For a
+// search_replace both are byte-identical, but a whole-file Write's echo carries
+// oldText:"" while the completed one carries the real prior content. The echo lands
+// first, so a first-wins guard renders an overwrite as pure adds forever.
+describe("the authoritative completed diff corrects the optimistic echo (#45 follow-up)", () => {
+  const OLD = '{\n  "name": "old-name",\n  "version": "1.0.0",\n  "debug": false\n}\n';
+  const NEW = '{\n  "name": "new-name",\n  "version": "2.0.0",\n  "debug": true,\n  "added": "field"\n}\n';
+
+  it("re-renders a whole-file overwrite when the real oldText arrives", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "toolCall", call: { toolCallId: "w1", title: "write", rawInput: { file_path: "config.json", content: NEW } } });
+    // 1) echo: oldText "" → reads as a brand-new file (+7 −0).
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "w1", kind: "edit", title: "Write `config.json`", content: [{ type: "diff", path: "config.json", oldText: "", newText: NEW }] } });
+    const row = () => doc.querySelector(".tool-item")!;
+    expect(row().querySelector(".diff-stat-del")!.textContent).toBe("−0");
+
+    // 2) authoritative: the real prior content → a true old→new diff.
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "w1", status: "completed", content: [{ type: "diff", path: "config.json", oldText: OLD, newText: NEW }] } });
+    expect(row().querySelector(".diff-stat-add")!.textContent).toBe("+4");
+    expect(row().querySelector(".diff-stat-del")!.textContent).toBe("−3");
+    expect(row().querySelectorAll(".diff-stat")).toHaveLength(1); // replaced, not doubled
+    // The group roll-up follows the correction rather than summing both renders.
+    dispatch(window, { type: "promptComplete", meta: {} });
+    const label = doc.querySelector(".tool-group-label")!;
+    expect(label.querySelector(".diff-stat-add")!.textContent).toBe("+4");
+    expect(label.querySelector(".diff-stat-del")!.textContent).toBe("−3");
+
+    // The corrected diff is what "open diff →" hands to the native editor.
+    (doc.querySelector(".tool-item-details .preview-link") as HTMLElement).click();
+  });
+
+  it("the corrected row keeps ONE working toggle (no listener bound to a stale node)", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "toolCall", call: { toolCallId: "w1", kind: "edit", title: "Write config.json", rawInput: { file_path: "config.json" } } });
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "w1", content: [{ type: "diff", path: "config.json", oldText: "", newText: NEW }] } });
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "w1", status: "completed", content: [{ type: "diff", path: "config.json", oldText: OLD, newText: NEW }] } });
+
+    const item = doc.querySelector(".tool-item") as HTMLElement;
+    const details = () => doc.querySelector(".tool-item-details") as HTMLElement;
+    expect(details().hidden).toBe(true);
+    click(window, item); // one click → open (a double-bound listener would toggle twice = no-op)
+    expect(details().hidden).toBe(false);
+    click(window, item);
+    expect(details().hidden).toBe(true);
+  });
+
+  it("an identical repaint is still a no-op (buffer replay stays idempotent)", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "toolCall", call: EDIT_CALL });
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "tc1", content: [DIFF] } });
+    const item = doc.querySelector(".tool-item")!;
+    click(window, item); // user opens the diff
+    expect((doc.querySelector(".tool-item-details") as HTMLElement).hidden).toBe(false);
+
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "tc1", content: [DIFF] } }); // replay
+    expect(item.querySelectorAll(".diff-stat")).toHaveLength(1);
+    expect(item.querySelectorAll(".tool-item-details")).toHaveLength(1);
+    expect((doc.querySelector(".tool-item-details") as HTMLElement).hidden).toBe(false); // stays open
+    dispatch(window, { type: "promptComplete", meta: {} });
+    expect(doc.querySelector(".tool-group-label")!.querySelector(".diff-stat-add")!.textContent).toBe("+2"); // not doubled
+  });
+});
+
+// The diff block carries the region's REAL position in the file on its own `_meta`
+// (`old_line`/`new_line`, 1-based). We used to drop `_meta` entirely and restart the
+// gutter at 1 for every edit, so a one-line replace at line 147 rendered as "1".
+// Wire shape (grok 0.2.101): {type:"diff", path, oldText, newText, _meta:{old_line, new_line}}
+// Expanding a RUNNING tool group to watch it must survive the batch finishing.
+// closeToolGroup settles every group to its default expand state, which silently
+// threw away a mid-execution manual expand (shipped since #41; only reachable now
+// that totals/diffs paint during the turn and give a reason to expand early).
+describe("a manual expand of a running tool group survives the batch closing", () => {
+  const startBatch = () => {
+    const h = bootWebview();
+    dispatch(h.window, { type: "toolCall", call: EDIT_CALL });
+    dispatch(h.window, { type: "toolCallUpdate", call: { toolCallId: "tc1", content: [DIFF] } });
+    return h;
+  };
+  const groupBody = (doc: Document) => doc.querySelector(".tool-group-body") as HTMLElement;
+
+  it("stays expanded when the user opened it mid-execution", () => {
+    const { window, doc } = startBatch();
+    click(window, doc.querySelector(".tool-group-header")!); // user expands mid-run
+    expect(groupBody(doc).hidden).toBe(false);
+
+    dispatch(window, { type: "promptComplete", meta: {} }); // batch closes
+    expect(groupBody(doc).hidden).toBe(false); // must NOT snap shut
+    expect(doc.querySelector(".tool-group")!.classList.contains("expanded")).toBe(true);
+  });
+
+  it("stays collapsed when the user closed it mid-execution, even with the setting on", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "initialState",
+      effort: "", cwd: "/w", useCtrlEnter: false, extVersion: "0",
+      showThinking: false, expandCommandOutputs: true, // would auto-open this group at close
+    });
+    dispatch(window, { type: "toolCall", call: EDIT_CALL });
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "tc1", content: [DIFF] } });
+    // A running group is collapsed even with the setting on (it only auto-opens at
+    // close), so reaching "the user deliberately closed it" takes open-then-close.
+    const hdr = doc.querySelector(".tool-group-header")!;
+    click(window, hdr); // open
+    expect(groupBody(doc).hidden).toBe(false);
+    click(window, hdr); // and deliberately close again
+    expect(groupBody(doc).hidden).toBe(true);
+
+    dispatch(window, { type: "promptComplete", meta: {} });
+    expect(groupBody(doc).hidden).toBe(true); // user intent beats the setting's auto-open
+  });
+
+  it("still settles to the default when the user never touched it", () => {
+    const { window, doc } = startBatch();
+    dispatch(window, { type: "promptComplete", meta: {} });
+    expect(groupBody(doc).hidden).toBe(true); // unchanged default behavior
+  });
+
+  it("an explicit Collapse All still overrides a manual expand", () => {
+    const { window, doc } = startBatch();
+    click(window, doc.querySelector(".tool-group-header")!);
+    dispatch(window, { type: "promptComplete", meta: {} });
+    expect(groupBody(doc).hidden).toBe(false);
+
+    dispatch(window, { type: "setAllToolDetails", expand: false }); // the latch wins
+    expect(groupBody(doc).hidden).toBe(true);
+  });
+});
+
+describe("inline diff gutter shows real file line numbers (_meta.old_line/new_line)", () => {
+  const numsIn = (doc: Document) =>
+    [...doc.querySelectorAll(".tool-item-details .tdl .tdl-num")].map((s) => s.textContent);
+
+  // Drives one edit through the live path and returns the rendered gutter numbers.
+  const renderWith = (meta?: Record<string, unknown>) => {
+    const { window, doc } = bootWebview();
+    const content = [meta ? { ...DIFF, _meta: meta } : DIFF];
+    dispatch(window, { type: "toolCall", call: EDIT_CALL });
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "tc1", content } });
+    dispatch(window, { type: "promptComplete", meta: {} });
+    return numsIn(doc);
+  };
+
+  it("seeds the gutter from the wire's file position", () => {
+    // Same row shape as the region-relative [1,2,2,3], just anchored at the real line.
+    expect(renderWith({ old_line: 147, new_line: 147 })).toEqual(["147", "148", "148", "149"]);
+  });
+
+  it("falls back to 1 when _meta is absent (older builds, hand-built fixtures)", () => {
+    expect(renderWith()).toEqual(["1", "2", "2", "3"]);
+  });
+
+  it("tracks the old and new sides independently when the region shifted", () => {
+    // old_line 10 / new_line 40: a del reads the OLD side, an add/context the NEW side.
+    expect(renderWith({ old_line: 10, new_line: 40 })).toEqual(["40", "11", "41", "42"]);
+  });
+
+  it("ignores a nonsense line number instead of rendering it", () => {
+    // A 0/negative/non-integer line must never reach the gutter as "0" or "-3".
+    expect(renderWith({ old_line: 0, new_line: 0 })).toEqual(["1", "2", "2", "3"]);
+    expect(renderWith({ old_line: -3, new_line: -3 })).toEqual(["1", "2", "2", "3"]);
+    expect(renderWith({ old_line: "147", new_line: "147" })).toEqual(["1", "2", "2", "3"]);
+  });
+
+  // The two updates per edit spell the position differently on the same block `_meta`:
+  // the echo sends {old_line,new_line}; the COMPLETED sends {details:[{old_line,…}]}.
+  // Reading only the echo's shape made the completed repaint silently revert to 1.
+  // On the real wire a SINGLE-site details[] entry's old_string/new_string equal the
+  // block's own oldText/newText (research/edit-diff-lines.log), so expanding details[]
+  // renders the same 4 rows — only the seed differs.
+  it("reads the position from the completed update's _meta.details[] too", () => {
+    const details = [{ old_string: "a\nb", old_line: 147, new_string: "a\nB\nc", new_line: 147, line_prefix: "" }];
+    expect(renderWith({ details })).toEqual(["147", "148", "148", "149"]);
+  });
+
+  // Defensive: a details[] entry naming NO strings can't be expanded into a site, only
+  // positioned. Keep the block's own region rather than rendering an empty diff.
+  it("falls back to the block's region when details[] has positions but no strings", () => {
+    expect(renderWith({ details: [{ old_line: 147, new_line: 147 }] })).toEqual(["147", "148", "148", "149"]);
+  });
+
+  // The third delivery shape: session/load replays a completed `tool_call` carrying
+  // the diff inline — details[] only, no block _meta. A restored session must still
+  // show real line numbers, not 1.
+  it("shows real line numbers on a session/load replay (details[] only)", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "historyReplay", active: true });
+    dispatch(window, {
+      type: "toolCall",
+      call: {
+        ...EDIT_CALL,
+        status: "completed",
+        content: [{
+          ...DIFF,
+          _meta: { details: [{ old_string: "a\nb", old_line: 147, new_string: "a\nB\nc", new_line: 147, line_prefix: "" }] },
+        }],
+      },
+    });
+    dispatch(window, { type: "historyReplay", active: false });
+    expect(numsIn(doc)).toEqual(["147", "148", "148", "149"]);
+  });
+
+  it("does not revert to 1 when the completed update repaints the echo", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "toolCall", call: EDIT_CALL });
+    // 1. echo — block _meta carries {old_line,new_line}
+    dispatch(window, {
+      type: "toolCallUpdate",
+      call: { toolCallId: "tc1", content: [{ ...DIFF, _meta: { old_line: 147, new_line: 147 } }] },
+    });
+    expect(numsIn(doc)).toEqual(["147", "148", "148", "149"]);
+    // 2. completed — same region, position now under details[]; must NOT fall back to 1
+    dispatch(window, {
+      type: "toolCallUpdate",
+      call: {
+        toolCallId: "tc1",
+        status: "completed",
+        content: [{
+          ...DIFF,
+          _meta: { details: [{ old_string: "a\nb", old_line: 147, new_string: "a\nB\nc", new_line: 147, line_prefix: "" }] },
+        }],
+      },
+    });
+    dispatch(window, { type: "promptComplete", meta: {} });
+    expect(numsIn(doc)).toEqual(["147", "148", "148", "149"]);
+  });
+});
+
+// Real file line numbers made 4+ digit gutters reachable, so the track sizes to the
+// widest number in each region (+1ch slack) instead of being fixed at 4ch — which
+// would clip 5 digits into the +/- glyph. Through 999 it must stay exactly 4ch.
+describe("inline diff gutter width adapts to the line numbers it renders", () => {
+  const widthFor = (line: number) => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "toolCall", call: EDIT_CALL });
+    dispatch(window, {
+      type: "toolCallUpdate",
+      call: { toolCallId: "tc1", content: [{ ...DIFF, _meta: { old_line: line, new_line: line } }] },
+    });
+    dispatch(window, { type: "promptComplete", meta: {} });
+    const region = doc.querySelector(".tool-item-details .tool-diff-region") as HTMLElement;
+    return region.style.getPropertyValue("--tdl-num-w");
+  };
+
+  it("stays 4ch for anything up to 999 (today's look is unchanged)", () => {
+    expect(widthFor(1)).toBe("4ch");
+    expect(widthFor(147)).toBe("4ch");
+    expect(widthFor(996)).toBe("4ch"); // renders up to 998 — still 3 digits
+  });
+
+  it("grows once the numbers pass 999", () => {
+    expect(widthFor(1000)).toBe("5ch"); // 4 digits + 1ch slack
+    expect(widthFor(10000)).toBe("6ch"); // 5 digits + 1ch slack
+  });
+
+  it("sizes from the widest number actually rendered, not the region's first line", () => {
+    // starts at 998, renders through 1000 → must widen for the 4-digit tail
+    expect(widthFor(998)).toBe("5ch");
+  });
+});
+
+// A replace_all's diff BLOCK is token-sized by design — oldText/newText are the search
+// *pattern*, so the block alone renders a 148-occurrence rename as one meaningless
+// "+1 −1" hunk. `_meta.details[]` carries the per-site truth (one entry per replaced
+// site, real 1-based post-edit file lines), verified 12/12 against ground truth in
+// research/edit-diff-lines.log. Expand it: N sites → N hunks in ONE region, +N −N.
+describe("a replace_all renders one hunk per replaced site (_meta.details[])", () => {
+  // The exact wire shape of research/edit-diff-lines.log's A-replace-all case:
+  // PLACEHOLDER → REPLACED at non-contiguous lines, each entry carrying the text
+  // BEFORE the match on its line (line_prefix). There is no line_suffix on the wire,
+  // so the rendered line is prefix+token — the real line's tail (" here") is
+  // unavailable and deliberately not reconstructed.
+  const site = (line: number, n: number) => ({
+    old_string: "PLACEHOLDER",
+    old_line: line,
+    new_string: "REPLACED",
+    new_line: line,
+    context_before: "intro filler line\n",
+    context_after: "  filler after item\n",
+    line_prefix: `item ${n}: the token is `,
+  });
+  const replaceAll = (sites: unknown[]) => ({
+    type: "diff",
+    path: "placeholders.txt",
+    oldText: "PLACEHOLDER", // token-sized: the pattern, NOT the change
+    newText: "REPLACED",
+    _meta: { details: sites },
+  });
+  const boot = (sites: unknown[]) => {
+    const h = bootWebview();
+    dispatch(h.window, {
+      type: "toolCall",
+      call: { toolCallId: "ra", kind: "edit", title: "Edit placeholders.txt", rawInput: { file_path: "placeholders.txt" } },
+    });
+    dispatch(h.window, {
+      type: "toolCallUpdate",
+      call: { toolCallId: "ra", status: "completed", content: [replaceAll(sites)] },
+    });
+    return h;
+  };
+  const three = [site(3, 1), site(5, 2), site(7, 3)];
+
+  it("renders every site as its own hunk at its real, non-contiguous file line", () => {
+    const { doc } = boot(three);
+    const regions = doc.querySelectorAll(".tool-item-details .tool-diff-region");
+    expect(regions).toHaveLength(1); // ONE region per BLOCK — not one scroll box per site
+
+    // 3 sites × (1 del + 1 add), each anchored at its own line — not 1, not 3,4,5.
+    expect([...regions[0].querySelectorAll(".tdl .tdl-num")].map((s) => s.textContent))
+      .toEqual(["3", "3", "5", "5", "7", "7"]);
+    // line_prefix rides the rendered text: the bare "PLACEHOLDER" would be useless.
+    expect([...regions[0].querySelectorAll(".tdl-del .tdl-code")].map((s) => s.textContent)).toEqual([
+      "item 1: the token is PLACEHOLDER",
+      "item 2: the token is PLACEHOLDER",
+      "item 3: the token is PLACEHOLDER",
+    ]);
+    expect([...regions[0].querySelectorAll(".tdl-add .tdl-code")].map((s) => s.textContent)).toEqual([
+      "item 1: the token is REPLACED",
+      "item 2: the token is REPLACED",
+      "item 3: the token is REPLACED",
+    ]);
+  });
+
+  it("counts EVERY site: +3 −3, not the block-level +1 −1", () => {
+    const { window, doc } = boot(three);
+    const item = doc.querySelector(".tool-item") as HTMLElement;
+    expect(item.querySelector(".diff-stat-add")!.textContent).toBe("+3");
+    expect(item.querySelector(".diff-stat-del")!.textContent).toBe("−3");
+    dispatch(window, { type: "promptComplete", meta: {} });
+    const label = doc.querySelector(".tool-group-label")!;
+    expect(label.textContent).toContain("Edited 1 file");
+    expect(label.querySelector(".diff-stat-add")!.textContent).toBe("+3");
+    expect(label.querySelector(".diff-stat-del")!.textContent).toBe("−3");
+  });
+
+  it("separates non-contiguous hunks, but not contiguous ones and never before the first", () => {
+    // Sites at 3/5/7 skip lines → a separator between each pair, none leading.
+    const gapped = boot(three).doc.querySelector(".tool-diff-region")!;
+    expect(gapped.querySelectorAll(".tdl-sep")).toHaveLength(2);
+    expect(gapped.firstElementChild!.classList.contains("tdl-sep")).toBe(false);
+
+    // Sites on adjacent lines (3, then 4) are one continuous run → no separator.
+    expect(boot([site(3, 1), site(4, 2)]).doc.querySelectorAll(".tdl-sep")).toHaveLength(0);
+    // A single site is never separated either.
+    expect(boot([site(3, 1)]).doc.querySelectorAll(".tdl-sep")).toHaveLength(0);
+  });
+
+  it("still ONE 'open diff →' per block, carrying the block's own region", () => {
+    const { doc, window, posted } = boot(three);
+    const links = doc.querySelectorAll(".tool-item-details .preview-link");
+    expect(links).toHaveLength(1); // not one per site
+    click(window, links[0] as HTMLElement);
+    expect(posted.filter((m: any) => m.type === "openDiff")[0]).toMatchObject({
+      path: "placeholders.txt",
+      oldText: "PLACEHOLDER",
+      newText: "REPLACED",
+    });
+  });
+
+  it("stays COLLAPSED with a multi-site diff (only the setting/latch expand it)", () => {
+    const { window, doc } = boot(three);
+    dispatch(window, { type: "promptComplete", meta: {} });
+    expect((doc.querySelector(".tool-group-body") as HTMLElement).hidden).toBe(true);
+    expect((doc.querySelector(".tool-item-details") as HTMLElement).hidden).toBe(true);
+    expect(doc.querySelector(".tool-group")!.classList.contains("expanded")).toBe(false);
+  });
+
+  // The echo can only ever paint ONE approximate hunk (no details[], and its block
+  // _meta names the FIRST site only). The completed update must upgrade it to the full
+  // per-site render — and the group roll-up must follow the correction, not sum both.
+  it("upgrades the echo's single approximate hunk to N hunks without double-counting", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "toolCall",
+      call: { toolCallId: "ra", kind: "edit", title: "Edit placeholders.txt", rawInput: { file_path: "placeholders.txt" } },
+    });
+    // 1) echo: block _meta = first site only → the misleading "+1 −1" single hunk.
+    dispatch(window, {
+      type: "toolCallUpdate",
+      call: {
+        toolCallId: "ra", kind: "edit", title: "Edit `placeholders.txt`",
+        content: [{ type: "diff", path: "placeholders.txt", oldText: "PLACEHOLDER", newText: "REPLACED", _meta: { old_line: 3, new_line: 3 } }],
+      },
+    });
+    const item = () => doc.querySelector(".tool-item") as HTMLElement;
+    expect(item().querySelector(".diff-stat-add")!.textContent).toBe("+1");
+    expect(doc.querySelectorAll(".tdl-del")).toHaveLength(1);
+
+    // 2) completed: details[] → 3 real hunks, +3 −3.
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "ra", status: "completed", content: [replaceAll(three)] } });
+    expect(item().querySelector(".diff-stat-add")!.textContent).toBe("+3");
+    expect(item().querySelectorAll(".diff-stat")).toHaveLength(1); // replaced, not appended
+    expect(doc.querySelectorAll(".tdl-del")).toHaveLength(3);
+    expect(doc.querySelectorAll(".tool-item-details")).toHaveLength(1);
+    expect(doc.querySelectorAll(".tool-diff-region")).toHaveLength(1);
+
+    dispatch(window, { type: "promptComplete", meta: {} });
+    const label = doc.querySelector(".tool-group-label")!;
+    expect(label.querySelector(".diff-stat-add")!.textContent).toBe("+3"); // not 1+3=4
+    expect(label.querySelector(".diff-stat-del")!.textContent).toBe("−3");
+
+    // The upgraded row keeps ONE working toggle (the detail node was REUSED, so no
+    // listener is stranded on a detached node and none is double-bound).
+    const details = () => doc.querySelector(".tool-item-details") as HTMLElement;
+    click(window, doc.querySelector(".tool-group-header")!);
+    expect(details().hidden).toBe(true);
+    click(window, item());
+    expect(details().hidden).toBe(false);
+  });
+
+  it("an identical multi-site repaint is a no-op (replay stays idempotent)", () => {
+    const { window, doc } = boot(three);
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "ra", status: "completed", content: [replaceAll(three)] } });
+    expect(doc.querySelectorAll(".tool-diff-region")).toHaveLength(1);
+    expect(doc.querySelectorAll(".tdl-del")).toHaveLength(3);
+    expect(doc.querySelector(".tool-item")!.querySelectorAll(".diff-stat")).toHaveLength(1);
+  });
+
+  // MAX_INLINE_DIFF_LINES (400) is a budget ACROSS the block's hunks — 250 sites must
+  // not paint 500 rows. The counts are computed over every site regardless, so a
+  // capped render still reports the true magnitude.
+  it("caps the rendered rows but still reports the true +N −M", () => {
+    const many = Array.from({ length: 250 }, (_, i) => site(3 + i * 2, i + 1));
+    const { doc } = boot(many);
+    expect(doc.querySelectorAll(".tdl")).toHaveLength(400); // 500 rows' worth, capped
+    const more = doc.querySelector(".tool-diff-more")!;
+    expect(more.textContent).toContain("100 more line(s)");
+    expect(more.textContent).toContain("open diff");
+    // The stat is NOT capped — that's the whole point.
+    const item = doc.querySelector(".tool-item") as HTMLElement;
+    expect(item.querySelector(".diff-stat-add")!.textContent).toBe("+250");
+    expect(item.querySelector(".diff-stat-del")!.textContent).toBe("−250");
+  });
+
+  // The single-site shapes must be untouched by the expansion: on the real wire a lone
+  // details[] entry's old_string/new_string ARE the block's oldText/newText
+  // (research/edit-diff-lines.log), including a whole-file Write's real prior content —
+  // which is what keeps the echo's oldText:"" overwrite correction working.
+  it("leaves a whole-file Write's single-site details[] rendering exactly as before", () => {
+    const OLD = '{\n  "theme": "old-theme"\n}\n';
+    const NEW = '{\n  "theme": "new-theme",\n  "extra": "added"\n}\n';
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "toolCall",
+      call: { toolCallId: "w1", kind: "edit", title: "Write settings.json", rawInput: { file_path: "settings.json" } },
+    });
+    dispatch(window, {
+      type: "toolCallUpdate",
+      call: {
+        toolCallId: "w1",
+        status: "completed",
+        content: [{
+          type: "diff", path: "settings.json", oldText: OLD, newText: NEW,
+          _meta: { details: [{ old_string: OLD, old_line: 1, new_string: NEW, new_line: 1, context_before: "", context_after: "", line_prefix: "" }] },
+        }],
+      },
+    });
+    const item = doc.querySelector(".tool-item") as HTMLElement;
+    expect(item.querySelector(".diff-stat-add")!.textContent).toBe("+2");
+    expect(item.querySelector(".diff-stat-del")!.textContent).toBe("−1");
+    expect(doc.querySelectorAll(".tdl-sep")).toHaveLength(0);
+    expect(doc.querySelectorAll(".tool-diff-region")).toHaveLength(1);
+  });
+
+  // The wire's newText ends in a trailing newline, so it is 4 lines to a line-splitter
+  // — exactly what the block-level render reports too (old_string:"" and line_prefix:""
+  // make the site byte-identical to the block). The point is the −0.
+  it("a new file's details[] (old_string:'') still reads as pure additions", () => {
+    const NEW = "first new line\nsecond new line\nthird new line\n";
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "toolCall",
+      call: { toolCallId: "n1", kind: "edit", title: "Write brandnew.txt", rawInput: { file_path: "brandnew.txt" } },
+    });
+    dispatch(window, {
+      type: "toolCallUpdate",
+      call: {
+        toolCallId: "n1",
+        status: "completed",
+        content: [{
+          type: "diff", path: "brandnew.txt", oldText: "", newText: NEW,
+          _meta: { details: [{ old_string: "", old_line: 1, new_string: NEW, new_line: 1, context_before: "", context_after: "", line_prefix: "" }] },
+        }],
+      },
+    });
+    const item = doc.querySelector(".tool-item") as HTMLElement;
+    expect(item.querySelector(".diff-stat-add")!.textContent).toBe("+4");
+    expect(item.querySelector(".diff-stat-del")!.textContent).toBe("−0"); // no phantom removal
+  });
+});

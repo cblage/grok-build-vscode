@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
-import { TerminalManager, resolveExitCode, buildKillPlan, resolveTerminalShell } from "../src/terminal-manager";
+import { TerminalManager, resolveExitCode, buildKillPlan, resolveTerminalShell, grokShellEnvValue } from "../src/terminal-manager";
 
 // Use `node -e` everywhere so tests are deterministic on Windows, macOS, and Linux.
 // Quoting strategy: single-quote the outer node script, escape inner single quotes if any.
@@ -325,5 +325,27 @@ describe("resolveTerminalShell", () => {
 
   it("pref 'auto' matches the default (PowerShell on Windows)", () => {
     expect(resolveTerminalShell("win32", has({ pwsh: PWSH }), "auto")).toBe(PWSH);
+  });
+});
+
+describe("grokShellEnvValue (GROK_SHELL derived from the shell we run)", () => {
+  const PWSH = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+  const POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+
+  it("maps a resolved pwsh path to 'pwsh' on Windows", () => {
+    expect(grokShellEnvValue(PWSH, "win32")).toBe("pwsh");
+  });
+  it("maps a resolved Windows PowerShell path to 'powershell'", () => {
+    expect(grokShellEnvValue(POWERSHELL, "win32")).toBe("powershell");
+  });
+  it("maps the cmd.exe fallback (true) to 'cmd' on Windows", () => {
+    expect(grokShellEnvValue(true, "win32")).toBe("cmd");
+  });
+  it("returns undefined on POSIX (grok's host detection is correct there)", () => {
+    expect(grokShellEnvValue(true, "linux")).toBeUndefined();
+    expect(grokShellEnvValue("/bin/bash", "darwin")).toBeUndefined();
+  });
+  it("returns undefined for an unrecognized Windows shell path", () => {
+    expect(grokShellEnvValue("C:\\weird\\thing.exe", "win32")).toBeUndefined();
   });
 });

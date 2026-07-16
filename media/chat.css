@@ -687,6 +687,21 @@ body.thinking-hidden .msg.thinking { display: none; }
   background: var(--vscode-textBlockQuote-background, rgba(177, 128, 215, 0.08));
   border-radius: 0 6px 6px 0;
 }
+/* A failed subagent reads as failed at a glance — red left border + red
+   label/marker — matching how a failed tool call (.tool-failed) signals. */
+.subagent-card.subagent-failed {
+  border-left-color: var(--vscode-errorForeground);
+}
+.subagent-card.subagent-failed .subagent-label,
+.subagent-card.subagent-failed .subagent-badge,
+.subagent-card.subagent-failed .subagent-time {
+  color: var(--vscode-errorForeground);
+}
+/* A cancelled subagent was a user stop, not a failure — reads muted, not red
+   (mirrors the command path's grey [Cancelled] marker). */
+.subagent-card.subagent-cancelled .subagent-time {
+  opacity: 0.7;
+}
 .subagent-card .subagent-row {
   display: flex;
   align-items: center;
@@ -921,7 +936,11 @@ body.vscode-light {
 }
 .tdl {
   display: grid;
-  grid-template-columns: 1.1ch 3ch 1fr;
+  /* sign | line# | code. The line# track sizes to the widest number in THIS region
+     (buildInlineDiffRegion sets --tdl-num-w = max(4ch, digits+1)): 4ch through 999
+     — digits >99 used to wrap under overflow-wrap:anywhere — and wider only for a
+     1000+ line file, which real file line numbers made reachable. */
+  grid-template-columns: 1.1ch var(--tdl-num-w, 4ch) 1fr;
   gap: 0 8px;
   padding-left: 7px;  /* breathing room between the colored border stripe and the +/- glyph */
   padding-right: 10px;
@@ -941,12 +960,22 @@ body.vscode-light {
   opacity: 0.75;
   user-select: none;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap; /* never wrap 3+ digit line numbers onto a second row */
 }
 .tdl-code { min-width: 0; }
 .tdl-add { background: var(--tdiff-add-bg); border-left-color: var(--tdiff-add-line); }
 .tdl-del { background: var(--tdiff-del-bg); border-left-color: var(--tdiff-del-line); }
 .tdl-add .tdl-sign { color: var(--tdiff-add-line); }
 .tdl-del .tdl-sign { color: var(--tdiff-del-line); }
+/* Hairline between two NON-CONTIGUOUS hunks of one edit — a replace_all's sites sit
+   at scattered file lines (3, 5, 7…), which would otherwise read as one run. The
+   gutter numbers say where we jumped to; this just breaks the eye's line. */
+.tdl-sep {
+  height: 0;
+  margin: 4px 0;
+  border-top: 1px dashed var(--vscode-panel-border, var(--vscode-editorLineNumber-foreground));
+  opacity: 0.6;
+}
 .tool-diff-more {
   padding: 2px 10px;
   color: var(--vscode-descriptionForeground);
