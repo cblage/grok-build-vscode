@@ -10,7 +10,8 @@ import { selectReapable, computeDot, Dot } from "./session-pool";
 import { resolveVoiceKey, extractGrokAuthKey, parseVoiceCommand, DEFAULT_SEND_PHRASE } from "./voice";
 import { VoiceRecorder, transcribeAudio, resolveWindowsAudioDevice } from "./voice-recorder";
 import { VoiceStreamer } from "./voice-streamer";
-import { MediaRef, autoCompactStartedNote, contextUsedFromCompactNotification, gateZeroTokenMeta, isAuthErrorText, isIncompatibleAgentError, isSubagentLifecycleUpdate, parseSessionInfoContext, permissionOutcomeFor, summarizeBackgroundCommand } from "./acp-dispatch";
+import type { PromptResultMeta } from "./acp-dispatch";
+import { MediaRef, addUsage, autoCompactStartedNote, contextUsedFromCompactNotification, gateZeroTokenMeta, isAuthErrorText, isIncompatibleAgentError, isRateLimitError, isSubagentLifecycleUpdate, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, summarizeBackgroundCommand, usageIsRealMeasurement } from "./acp-dispatch";
 import { modeToRemember, startsInYolo } from "./mode-prefs";
 import { GROK_VIEW_ID, moveViewContainerFor } from "./view-move";
 import {
@@ -19,6 +20,7 @@ import {
   osNameFromPlatform,
   postEvent,
   shouldSendTelemetry,
+  OFFICIAL_EXTENSION_ID,
 } from "./telemetry";
 import { randomUUID } from "node:crypto";
 import {
@@ -77,7 +79,7 @@ import { parseFileRef, shouldReadFileInline } from "./file-ref";
 import { pickRejectOption, shouldRejectPermission } from "./plan-gate";
 import { appendPlanEntry, countsAsUserBubble, decideRestoreState } from "./plan-restore";
 import { planReviewFileBaseName, sanitizePlanReviewFilePart } from "./plan-review";
-import { GROK_PRIMER, isPrimerText } from "./grok-primer";
+import { GROK_PRIMER, isPrimerText, isPrimerSummary } from "./grok-primer";
 import { HostMsg, WebviewMsg } from "./protocol";
 import {
   SessionListEntry,
@@ -87,6 +89,7 @@ import {
   defaultFs,
   deleteSessionDir,
   fallbackName,
+  forkDisplayName,
   indexSessions,
   isEmptyPrimerSession,
   readContextUsage,
@@ -309,6 +312,12 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
         this.post({
           type: "expandCommandOutputs",
           value: vscode.workspace.getConfiguration("grok").get<boolean>("expandCommandOutputs", false),
+        });
+      }
+      if (e.affectsConfiguration("grok.steerByDefault")) {
+        this.post({
+          type: "steerByDefault",
+          value: vscode.workspace.getConfiguration("grok").get<boolean>("steerByDefault", false),
         });
       }
       if (e.affectsConfiguration("grok.includeActiveFileByDefault")) {
@@ -913,8 +922,7 @@ See design doc for the full state machine diagram.`;
           this.setStatus(session, "done");
         } catch (err) {
           if (gen !== session.gen) return;
-          const e = err as any;
-          this.emit(session, { type: "agentError", text: e?.data?.message ?? e?.message ?? String(err) });
+          this.emit(session, { type: "agentError", text: promptErrorText(err) });
           this.setStatus(session, "error");
         }
       };
@@ -967,8 +975,7 @@ See design doc for the full state machine diagram.`;
           this.setStatus(session, "done");
         } catch (err) {
           if (gen !== session.gen) return;
-          const e = err as any;
-          this.emit(session, { type: "agentError", text: e?.data?.message ?? e?.message ?? String(err) });
+          this.emit(session, { type: "agentError", text: promptErrorText(err) });
           this.setStatus(session, "error");
         }
       };
@@ -1018,8 +1025,7 @@ See design doc for the full state machine diagram.`;
         this.setStatus(session, "done");
       } catch (err) {
         if (gen !== session.gen) return;
-        const e = err as any;
-        this.emit(session, { type: "agentError", text: e?.data?.message ?? e?.message ?? String(err) });
+        this.emit(session, { type: "agentError", text: promptErrorText(err) });
         this.setStatus(session, "error");
       }
     };
@@ -1131,6 +1137,105 @@ See design doc for the full state machine diagram.`;
     session.queuedSends = [];
     this.emit(session, { type: "queuedSends", items: [] });
     await this.handleSend(combined, false, session);
+  }
+
+  /**
+   * Steer (#52) — inject text into the RUNNING turn instead of waiting for it.
+   * Unlike a second `session/prompt` (which kills the in-flight turn), grok's
+   * `_x.ai/interject` queues into a buffer the agent drains at its next safe
+   * point, so no tool work is lost and the turn still ends normally.
+   *
+   * Steering carries plain text ONLY: it bypasses `prompt-builder`, so there is
+   * no context envelope, no chips, and no `/command` dispatch — the interjection
+   * reaches the model as-is. The bubble is painted optimistically before the RPC
+   * so the UI feels immediate; a failure re-queues the text rather than losing
+   * it, which is the whole point of the host owning this (#37).
+   */
+  private async steerSend(text: string): Promise<void> {
+    const session = this.focused;
+    const body = (text ?? "").trim();
+    if (!body) return;
+    if (!session.client || !session.activeSessionId) {
+      // No live turn to steer — fall back to the queue rather than drop it.
+      return void this.onMessage({ type: "queueSend", text: body });
+    }
+    this.emit(session, { type: "userMessage", text: body, chips: [] });
+    try {
+      const r = await session.client.interject(body);
+      if (r === "unsupported") {
+        // Pre-~0.2.96 CLI: latch the button off and hand the text to the queue,
+        // which is exactly the behavior Steer was offering to skip.
+        this.emit(session, { type: "steerUnavailable" });
+        this.emit(session, { type: "agentReset" });
+        session.queuedSends.length ? (session.queuedSends[0] += "\n\n" + body) : session.queuedSends.push(body);
+        this.emit(session, { type: "queuedSends", items: [...session.queuedSends] });
+        void vscode.window.showWarningMessage(
+          "Steering needs a newer Grok Build CLI — your message was queued instead. Update via the gear menu → Version & about.",
+        );
+        return;
+      }
+      this.output.appendLine(`[steer] interjected ${body.length} chars into the running turn`);
+    } catch (e: any) {
+      this.emit(session, { type: "agentReset" });
+      session.queuedSends.length ? (session.queuedSends[0] += "\n\n" + body) : session.queuedSends.push(body);
+      this.emit(session, { type: "queuedSends", items: [...session.queuedSends] });
+      this.emit(session, { type: "error", text: `Steer failed: ${e?.message ?? e}. Your message was queued instead.` });
+    }
+  }
+
+  /**
+   * Fork (#48) — branch this session's conversation into a new session and focus
+   * it. The source session is left completely untouched (verified: its history is
+   * byte-identical after a fork), and the workspace is never touched either —
+   * grok copies session files only, so **code is not rewound**. Whole-session
+   * only, deliberately: `targetPromptIndex` truncates `chat_history` without
+   * truncating `updates.jsonl`, so a partial fork would replay a conversation the
+   * model has forgotten (see research/grok-build-oss-findings.md § 3a).
+   */
+  private async forkFocusedSession(): Promise<void> {
+    const session = this.focused;
+    if (!session.client || !session.activeSessionId) {
+      return void vscode.window.showWarningMessage("Start a session before forking it.");
+    }
+    if (!session.hasHistory) {
+      return void vscode.window.showInformationMessage("Nothing to fork yet — this session has no conversation.");
+    }
+    // Resolve the parent's name BEFORE the fork — it names the fork, so it must
+    // be the name the user was looking at when they clicked. Reading it after the
+    // await risks a turn landing mid-fork and rewriting summary.json (and with it
+    // grok's generated title), naming the fork after something never on screen.
+    // forkDisplayName is idempotent, so forking a fork stays "Foo (Fork)".
+    const parentName = this.sessionDisplayName(session);
+    const forkName = forkDisplayName(parentName);
+    try {
+      const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+      const r = await session.client.forkSession(cwd);
+      if (r === "unsupported") {
+        return void vscode.window.showWarningMessage(
+          "Forking needs a newer Grok Build CLI. Update via the gear menu → Version & about.",
+        );
+      }
+      this.output.appendLine(`[fork] ${session.activeSessionId} → ${r.newSessionId} ("${forkName}")`);
+      // Stamp the name before focusing, so neither the history list nor the
+      // toolbar ever flashes grok's own generated title for the fork.
+      const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+      await this.context.globalState.update(SESSION_META_KEY, {
+        ...overrides,
+        [r.newSessionId]: { ...(overrides[r.newSessionId] ?? {}), customName: forkName },
+      });
+      this.sessionCache.delete(r.newSessionId); // customName changes displayName without touching mtime
+
+      // The fork is on disk but has no live process; openSession loads it into a
+      // fresh pool member and focuses it, exactly like clicking a history row.
+      await this.openSession(r.newSessionId);
+      void vscode.window.showInformationMessage(
+        `Forked into "${forkName}". The original conversation is unchanged and is in your session history` +
+          (parentName ? ` as "${parentName}"` : "") +
+          ". Files on disk were not touched.",
+      );
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`Fork failed: ${e?.message ?? e}`);
+    }
   }
 
   /**
@@ -2059,6 +2164,7 @@ See design doc for the full state machine diagram.`;
     client.on("promptComplete", (meta) => {
       if (gen !== session.gen) return;
       this.emit(session, { type: "promptComplete", meta: gateZeroTokenMeta(meta) });
+      this.accumulateUsage(session, meta);
       // A zero report (stripped above) is /compact or /session-info; neither
       // warrants a donut update here. /session-info leaves the context
       // untouched, and after /compact the fresh count comes from the live
@@ -2286,6 +2392,9 @@ See design doc for the full state machine diagram.`;
         // first prompt completes. Emitted after loadSession so it lands after
         // the donut-resetting `session` event in the replay buffer.
         this.emitContextUsage(session);
+        // Same reason, for the billing breakdown (#53) — but from OUR store, as
+        // grok persists no per-turn usage anywhere.
+        this.restoreUsage(session);
       } else {
         await client.newSession(defaultModel || undefined);
         session.activeSessionId = client.sessionId;
@@ -2295,12 +2404,23 @@ See design doc for the full state machine diagram.`;
       if (defaultModel && client.currentModelId && client.currentModelId !== defaultModel) {
         const hasModel = client.availableModels.some((m) => m.modelId === defaultModel);
         if (!hasModel) {
+          // The configured default isn't available — grok already fell back to an
+          // available model. Heal the (non-empty) setting silently to that model
+          // so it stops being stale, and just log it; no popup nag. An EMPTY
+          // default means "CLI default" and never reaches here (the `defaultModel &&`
+          // guard above), so a fresh install's empty default is left untouched.
           this.output.appendLine(
-            `[startup] Default model '${defaultModel}' is not available in the CLI. Using '${client.currentModelId}' instead.`,
+            `[startup] Default model '${defaultModel}' is not available; switching grok.defaultModel to '${client.currentModelId}'.`,
           );
-          vscode.window.showWarningMessage(
-            `Grok default model '${defaultModel}' is not available. Falling back to '${client.currentModelId}'. Please update your 'grok.defaultModel' setting.`,
-          );
+          const cfg = vscode.workspace.getConfiguration("grok");
+          const scope = cfg.inspect<string>("defaultModel");
+          const target =
+            scope?.workspaceFolderValue !== undefined
+              ? vscode.ConfigurationTarget.WorkspaceFolder
+              : scope?.workspaceValue !== undefined
+                ? vscode.ConfigurationTarget.Workspace
+                : vscode.ConfigurationTarget.Global;
+          void cfg.update("defaultModel", client.currentModelId, target);
         }
       }
 
@@ -2412,6 +2532,12 @@ See design doc for the full state machine diagram.`;
         }
         break;
       }
+      case "steerSend":
+        await this.steerSend(msg.text);
+        break;
+      case "forkSession":
+        await this.forkFocusedSession();
+        break;
       case "clearQueuedSends": {
         // Posted by the webview's Stop flow BEFORE the cancel — a halt must not
         // auto-fire queued sends into the cancelled turn's wake.
@@ -2622,6 +2748,11 @@ See design doc for the full state machine diagram.`;
           .getConfiguration("grok")
           .update("expandCommandOutputs", !!msg.value, vscode.ConfigurationTarget.Global);
         break;
+      case "setSteerByDefault":
+        await vscode.workspace
+          .getConfiguration("grok")
+          .update("steerByDefault", !!msg.value, vscode.ConfigurationTarget.Global);
+        break;
       case "runInstallCmd": {
         const term = vscode.window.createTerminal("Install Grok");
         term.show();
@@ -2808,6 +2939,41 @@ See design doc for the full state machine diagram.`;
    *  from history when the popover is opened the instant a session goes live. Uses the best name we
    *  have in memory: a generated/renamed `customName`, else the first user message, else a
    *  placeholder — all of which the next refresh replaces with grok's own summary once it lands. */
+  /** The name this session shows in the history list — what the user actually
+   *  reads, which is what a fork should be named after (#48).
+   *
+   *  Precedence mirrors the list itself: the rename/auto-generated `customName`
+   *  first (that IS the row's label for any session that has one), then grok's
+   *  own `session_summary` from disk, then the first user message.
+   *
+   *  The one deliberate departure: a **primer-derived** summary is skipped. We
+   *  prime every session with a hidden message, and grok titles the session from
+   *  it, so `session_summary` is routinely "… Primer v4 Plan Mode …" — an
+   *  internal name for a message the user cannot even see. Inheriting that into a
+   *  fork's name propagates the noise forever (fork-of-a-fork), so `isPrimerSummary`
+   *  rejects it and we fall through to something real. */
+  private sessionDisplayName(session: Session): string {
+    const id = session.activeSessionId;
+    if (!id) return "";
+    const custom = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]?.customName?.trim();
+    if (custom) return custom;
+    try {
+      const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+      const raw = fs.readFileSync(
+        path.join(sessionsDirFor(resolveGrokHome(process.env), cwd), id, "summary.json"),
+        "utf8",
+      );
+      const summary = (JSON.parse(raw)?.session_summary as string | undefined)?.trim();
+      if (summary && !isPrimerSummary(summary)) return fallbackName(summary, Date.now());
+    } catch {
+      // No summary yet (grok flushes it at turn end) — fall through.
+    }
+    // Same last resort the history list uses ("Untitled (<date>)"), so a fork of
+    // a nameless session reads like a row rather than a bare "(Fork)".
+    const first = (session.firstUserMessageForTitle || "").trim();
+    return fallbackName(first, Date.now());
+  }
+
   private liveSessionEntry(
     session: Session,
     id: string,
@@ -3069,6 +3235,7 @@ See design doc for the full state machine diagram.`;
       const enabled = shouldSendTelemetry(
         vscode.env.isTelemetryEnabled,
         vscode.workspace.getConfiguration("grok").get<boolean>("telemetry.enabled", true),
+        this.context.extension.id === OFFICIAL_EXTENSION_ID,
       );
       if (!enabled) return;
       const cfg = vscode.workspace.getConfiguration("grok");
@@ -3079,6 +3246,12 @@ See design doc for the full state machine diagram.`;
           mode: this.displayMode(),
           model: session.client?.currentModelId || cfg.get<string>("defaultModel", "") || "",
           effort: cfg.get<string>("defaultEffort", ""),
+          // The three feature flags + the host app. Config values only — the same
+          // class of anonymous property as mode/model/effort, never content.
+          showThinking: cfg.get<boolean>("showThinking", false),
+          expandToolDetails: cfg.get<boolean>("expandCommandOutputs", false),
+          steerByDefault: cfg.get<boolean>("steerByDefault", false),
+          host: vscode.env.appName || undefined,
         },
         {
           appVersion,
@@ -3796,6 +3969,15 @@ See design doc for the full state machine diagram.`;
     } catch (err) {
       if (gen !== session.gen) return; // prompt rejected because we disposed the old client — don't leak the error into the new session
       const e = err as any;
+      // A rate/usage-limit failure (ACP -32003, or limit phrasing) is not a
+      // credential problem: skip the auth recovery — its retry would end on
+      // the login screen, which can't fix a limit — and show a clear limit
+      // notice instead (#57).
+      if (isRateLimitError(e)) {
+        this.emit(session, { type: "agentError", text: rateLimitNoticeText(e) });
+        this.setStatus(session, "error");
+        return;
+      }
       const message = e?.data?.message ?? e?.message ?? String(err);
       // An expired-token error wedges only THIS long-lived process (the CLI shares
       // ~/.grok/auth.json across the pool + sibling `grok login`); transparently
@@ -3865,6 +4047,13 @@ See design doc for the full state machine diagram.`;
     } catch (err2) {
       if (gen !== session.gen) return true;
       const e2 = err2 as any;
+      // The resend ran into a usage limit — that's the real story, not auth
+      // (#57): a fresh process with a fresh token hit the same wall.
+      if (isRateLimitError(e2)) {
+        this.emit(session, { type: "agentError", text: rateLimitNoticeText(e2) });
+        this.setStatus(session, "error");
+        return true;
+      }
       const t2 = e2?.data?.message ?? e2?.message ?? String(err2);
       if (isAuthErrorText(t2)) {
         // A fresh process still can't auth → auth.json genuinely dead (or a real
@@ -3908,6 +4097,7 @@ See design doc for the full state machine diagram.`;
       showThinking: cfg.get("showThinking", false),
       expandCommandOutputs: cfg.get("expandCommandOutputs", false),
       platform: process.platform,
+      steerByDefault: cfg.get("steerByDefault", false),
     });
     // Sync the active-editor context chip into the fresh webview (the config
     // gate + no-editor case live inside refreshImplicitChip).
@@ -4186,6 +4376,41 @@ See design doc for the full state machine diagram.`;
       else next[id] = rest;
     }
     void this.context.globalState.update(SESSION_META_KEY, next);
+  }
+
+  /**
+   * Fold a finished turn's billing into the session total and push both to the
+   * webview (#53). Skips turns whose usage isn't a real measurement — a
+   * `/compact` replays the previous turn's numbers verbatim, so counting them
+   * would double-bill that turn into the total on every compact.
+   *
+   * The total is persisted per session id because nothing on disk can rebuild
+   * it: grok reports usage per prompt and `signals.json` keeps only context size.
+   */
+  private accumulateUsage(session: Session, meta: PromptResultMeta): void {
+    if (!usageIsRealMeasurement(meta)) return;
+    session.lastTurnUsage = meta.usage;
+    session.sessionUsage = addUsage(session.sessionUsage, meta.usage);
+    this.emit(session, { type: "usage", turn: session.lastTurnUsage, session: session.sessionUsage });
+    const id = session.activeSessionId;
+    if (!id || !session.sessionUsage) return;
+    const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    void this.context.globalState.update(SESSION_META_KEY, {
+      ...overrides,
+      [id]: { ...(overrides[id] ?? {}), usage: session.sessionUsage },
+    });
+  }
+
+  /** Seed a (re)opened session's cumulative billing from our own globalState and
+   *  push it, so the popover survives a reload. No stored total (an older session
+   *  or a pre-usage CLI) posts nothing — the popover shows context only. */
+  private restoreUsage(session: Session): void {
+    const id = session.activeSessionId;
+    if (!id) return;
+    const stored = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]?.usage;
+    if (!stored) return;
+    session.sessionUsage = stored;
+    this.emit(session, { type: "usage", session: stored });
   }
 
   /** Push the context size from grok's on-disk signals.json to the webview —

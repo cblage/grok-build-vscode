@@ -6,6 +6,9 @@ import {
   extractGeneratedMediaPaths,
   isMediaGenToolCall,
   extractPromptMeta,
+  isMethodNotFoundError,
+  type PromptResultMeta,
+  type PromptUsage,
   makeAckResponse,
   makeExitPlanResponse,
   makePermissionResponse,
@@ -71,14 +74,10 @@ export interface SlashCommand {
   input?: { hint?: string };
 }
 
-export interface PromptResultMeta {
-  totalTokens?: number;
-  inputTokens?: number;
-  outputTokens?: number;
-  cachedReadTokens?: number;
-  reasoningTokens?: number;
-  modelId?: string;
-}
+// Re-exported, not redeclared: `extractPromptMeta` (acp-dispatch) is what builds
+// these, so a second structurally-identical copy here silently drops any field
+// added on one side only — which is exactly what `usage` (#53) would have done.
+export type { PromptResultMeta, PromptUsage };
 
 export interface PermissionOption {
   optionId: string;
@@ -454,6 +453,64 @@ export class AcpClient extends EventEmitter {
     this.lastMeta = meta;
     this.emit("promptComplete", meta);
     return meta;
+  }
+
+  /**
+   * Mid-turn steering (#52) — "Steer". Queues `text` into the session's pending
+   * interjection buffer, which the agent drains at its next safe point. It does
+   * **not** cancel the turn and loses no in-flight tool work: probed on 0.2.101
+   * against a live turn, the model changed course mid-stream and the turn still
+   * ended `end_turn` (research/grok-build-oss-findings.md § 3a).
+   *
+   * `_x.ai/interject` is unadvertised, so a pre-~0.2.96 CLI answers -32601. That
+   * returns `"unsupported"` (not a throw) so the caller can fall back to queueing
+   * — the user's text must never be lost to a capability gap.
+   */
+  async interject(text: string): Promise<"ok" | "unsupported"> {
+    if (!this.sessionId) throw new Error("no session");
+    try {
+      await this.request("_x.ai/interject", { sessionId: this.sessionId, text });
+      return "ok";
+    } catch (e: any) {
+      if (isMethodNotFoundError(e)) {
+        this.opts.log("[interject] CLI does not support _x.ai/interject; falling back to queue");
+        return "unsupported";
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * Fork a session (#48) — copies the conversation into a NEW session id, leaving
+   * the source untouched (probe-verified: parent history byte-unchanged after
+   * forking + using the fork). Params are `ForkSessionRequest`'s three required
+   * camelCase fields; `{sessionId}` alone is -32602.
+   *
+   * This branches the CONVERSATION only — grok never touches the workspace here,
+   * so files stay exactly as they are (`/rewind` is the separate feature that
+   * restores file snapshots). We deliberately omit `targetPromptIndex`: it works
+   * on the wire but truncates `chat_history` without truncating `updates.jsonl`,
+   * so a partial fork would replay a conversation the model has forgotten.
+   * Returns the new session id, or `"unsupported"` on an older CLI.
+   */
+  async forkSession(cwd: string): Promise<{ newSessionId: string } | "unsupported"> {
+    if (!this.sessionId) throw new Error("no session");
+    try {
+      const r = await this.request("_x.ai/session/fork", {
+        sourceSessionId: this.sessionId,
+        sourceCwd: cwd,
+        newCwd: cwd,
+      });
+      const newSessionId = r?.newSessionId;
+      if (!newSessionId) throw new Error("fork returned no newSessionId");
+      return { newSessionId };
+    } catch (e: any) {
+      if (isMethodNotFoundError(e)) {
+        this.opts.log("[fork] CLI does not support _x.ai/session/fork");
+        return "unsupported";
+      }
+      throw e;
+    }
   }
 
   async cancel(reason = "unspecified"): Promise<void> {

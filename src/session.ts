@@ -1,4 +1,5 @@
 import { AcpClient } from "./acp";
+import type { PromptUsage } from "./acp";
 import type { HostMsg } from "./protocol";
 
 /** Live state for the dashboard dot. `cold` (no live process) is represented by
@@ -206,4 +207,15 @@ export class Session {
    * (maybeFlushQueuedSends) fires even while the session is backgrounded.
    */
   queuedSends: string[] = [];
+
+  /** The last completed prompt's billing usage (#53) — grok's `_meta.usage`. */
+  lastTurnUsage?: PromptUsage;
+
+  /**
+   * Session-cumulative billing (#53), summed by US across the session's turns.
+   * grok reports usage per prompt only and `signals.json` persists just context
+   * size, so nothing on disk can seed this — it is restored from our own
+   * globalState (`SessionMetaOverride.usage`) and re-persisted as turns land.
+   */
+  sessionUsage?: PromptUsage;
 }

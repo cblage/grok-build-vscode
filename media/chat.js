@@ -84,6 +84,12 @@
     // flushes it (one combined prompt) when the session's turn ends.
     sendQueue: [],
     queuedWrapEl: null, // the .queued-msgs container pinned to the end of the chat
+    // Steer (#52). Optimistic: `_x.ai/interject` is unadvertised, so we can't ask
+    // whether it works — we offer it and let the host latch this off the first
+    // time the CLI answers -32601 (the text falls back to the queue, never lost).
+    steerSupported: true,
+    lastTurnUsage: null, // last prompt's billing split (#53), for the donut popover
+    sessionUsage: null, // session-cumulative billing — summed by the host, not grok
     activeAgentEl: null,
     activeAgentRaw: "",
     activeUserEl: null,
@@ -219,6 +225,10 @@
     // new content — command IN/OUT details pre-open, and command-bearing groups
     // auto-open. Command scope only (explore/edit groups stay collapsed).
     expandCommandOutputs: false,
+    // grok.steerByDefault (persisted, global): when true a message sent while
+    // grok is working SKIPS the queue and is interjected into the running turn.
+    // False = today's behavior (queue, with an on-demand Steer button).
+    steerByDefault: false,
     // toolExpandOverride (per-session, in-memory): the Command Palette
     // Expand/Collapse All latch. null = follow the setting above; true/false =
     // force ALL groups + details open/closed for this session, and keep applying
@@ -284,6 +294,8 @@
     trash: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>`,
     pencil: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></svg>`,
     mic: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>`,
+    cornerDownRight: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 10 20 15 15 20"/><path d="M4 4v7a4 4 0 0 0 4 4h12"/></svg>`,
+    gitBranch: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>`,
     // Animated equalizer bars shown while listening (CSS drives the bounce).
     micWaves: `<span class="mic-waves" aria-hidden="true"><i></i><i></i><i></i><i></i></span>`,
     // Codicon-style lock / unlock (VS Code $(lock) / $(unlock))
@@ -1020,24 +1032,126 @@
     contextPopover.hidden = true;
   }
 
-  // Context details on demand (donut click). Deliberately minimal: the exact
-  // token line the donut abbreviates. Richer rows pending user feedback on #39.
+  // Context details on demand (donut click): what's in the window, what the turns
+  // cost, and the one action that changes either (#39, #53).
+  //
+  // Context and billing are DIFFERENT quantities and are deliberately kept in
+  // separate sections. `usedTokens` is how full the window is; `usage.*` is what
+  // the prompts billed (one probed turn: 16,371 context vs 32,488 billed). They
+  // don't decompose into each other, so the donut arc stays context-only and the
+  // usage rows never pretend to explain it.
+  // Webview-local UI state (VS Code's own getState/setState) — survives reloads
+  // and the view being hidden. Used for disclosure state that is UI memory, not a
+  // preference: a `grok.*` setting would put a collapse triangle in the Settings
+  // UI forever. Defensive: getState is undefined until something has been stored.
+  function uiState() {
+    try {
+      return vscode.getState() || {};
+    } catch {
+      return {};
+    }
+  }
+  function setUiState(patch) {
+    try {
+      vscode.setState({ ...uiState(), ...patch });
+    } catch {
+      // no-op: state persistence is a nicety, never a correctness dependency
+    }
+  }
+
   function openContextPopover() {
     closePopovers();
     contextPopover.innerHTML = "";
-    const info = (label, value) => {
+    // A `↳ ` label marks a sub-row (a component of the line above it) — indented
+    // via CSS rather than padding the string, so the value column stays aligned.
+    const info = (label, value, parent) => {
+      const sub = label.startsWith("↳");
       const el = document.createElement("div");
-      el.className = "popover-info";
-      el.innerHTML = `<span>${label}</span><span>${escapeHtml(value)}</span>`;
-      contextPopover.appendChild(el);
+      el.className = "popover-info" + (sub ? " popover-info-sub" : "");
+      el.innerHTML = `<span>${escapeHtml(label)}</span><span>${escapeHtml(value)}</span>`;
+      (parent || contextPopover).appendChild(el);
+      return el;
     };
+    const section = (label, parent) => {
+      const el = document.createElement("div");
+      el.className = "popover-section";
+      el.textContent = label;
+      (parent || contextPopover).appendChild(el);
+    };
+    const tok = (n) => Number(n).toLocaleString();
+
     const used = state.usedTokens || 0;
     const pct = Math.min(100, Math.round((used / state.contextWindow) * 100));
-    info("Context used", `${used.toLocaleString()} / ${state.contextWindow.toLocaleString()} (${pct}%)`);
+    info("Context used", `${tok(used)} / ${tok(state.contextWindow)} (${pct}%)`);
+
+    // Compact sits directly under the context line — it is the action ON that
+    // number, so it belongs to it, not stranded below the billing sections.
+    // Every popover row is a DIV: a <button> here drags in native chrome
+    // (background + border) that reads as a stray box in the popover.
+    const act = document.createElement("div");
+    act.className = "toolbar-popover-item popover-action context-compact" + (used ? "" : " disabled");
+    act.textContent = "Compact conversation";
+    act.title = used ? "Summarize the conversation so far to free up context" : "Nothing to compact yet";
+    if (used) {
+      act.onclick = (e) => {
+        e.stopPropagation();
+        vscode.postMessage({ type: "send", text: "/compact", bare: true });
+        closePopovers();
+      };
+    }
+    contextPopover.appendChild(act);
+
+    // Billing rows only when the CLI actually reported usage — an older build or
+    // a session with no completed turn shows the context row alone rather than a
+    // wall of zeros. Cache-CREATION is absent everywhere in the CLI, so it is
+    // simply not a row (no fake zero).
+    const turn = state.lastTurnUsage;
+    const sess = state.sessionUsage;
+    const row = (u, label, key, fmt, parent) => (u && u[key] != null ? info(label, (fmt || tok)(u[key]), parent) : null);
+
+    // Session total leads: it's the number you act on (what this conversation has
+    // cost). Last turn is diagnostics, so it's a collapsed disclosure below it —
+    // present when you want it, out of the way when you don't.
+    if (sess) {
+      section("Session total");
+      row(sess, "Input", "inputTokens");
+      row(sess, "↳ cache read", "cachedReadTokens");
+      row(sess, "Output", "outputTokens");
+    }
+    if (turn) {
+      const open = !!uiState().lastTurnOpen;
+      const hdr = document.createElement("div");
+      hdr.className = "popover-section popover-section-toggle" + (open ? " expanded" : "");
+      hdr.innerHTML = `<span>Last turn</span><span class="popover-chevron">›</span>`;
+      contextPopover.appendChild(hdr);
+      const body = document.createElement("div");
+      body.hidden = !open;
+      contextPopover.appendChild(body);
+      row(turn, "Input", "inputTokens", null, body);
+      row(turn, "↳ cache read", "cachedReadTokens", null, body);
+      row(turn, "Output", "outputTokens", null, body);
+      row(turn, "↳ reasoning", "reasoningTokens", null, body);
+      // The row that makes the arithmetic legible: a turn re-sends the whole
+      // conversation on EVERY model call, so billed input ≈ context × calls and
+      // routinely dwarfs "Context used". Without this the two numbers look like
+      // a bug (they aren't — they're different quantities).
+      row(turn, "Model calls", "modelCalls", String, body);
+      hdr.onclick = (e) => {
+        e.stopPropagation();
+        const next = body.hidden;
+        body.hidden = !next;
+        hdr.classList.toggle("expanded", next);
+        setUiState({ lastTurnOpen: next }); // remembered across opens + reloads
+      };
+    }
+
     const fine = document.createElement("div");
     fine.className = "popover-fineprint";
-    fine.textContent = "Counted by the CLI at the end of each turn.";
+    fine.textContent = turn || sess
+      ? "Context is how full the window is. Token counts are billed usage tracked by the extension — each model call re-sends the conversation, so a turn bills far more than the context it holds."
+      : "Counted by the CLI at the end of each turn.";
     contextPopover.appendChild(fine);
+
     positionPopover(contextPopover, donutEl);
     contextPopover.hidden = false;
   }
@@ -1165,9 +1279,11 @@
     gearPopover.appendChild(row);
 
     // ── Session ───────────────────────────────────────────────────────────
+    // Session-LIFECYCLE actions live here; context actions (Compact) live on the
+    // context donut, next to the number that motivates them.
     addSection("Session");
-    addGearItem("<span>Compact conversation</span>", () => {
-      vscode.postMessage({ type: "send", text: "/compact", bare: true });
+    addGearItem(`<span>Fork conversation</span>`, () => {
+      vscode.postMessage({ type: "forkSession" });
       closePopovers();
     });
 
@@ -1300,6 +1416,20 @@
         renderConfigDebugPanel();
       },
     );
+    // Steer by default (#52) — how a message sent mid-turn behaves. Off keeps
+    // the queue (and the per-message Steer button); on skips the queue entirely.
+    // Hidden when the CLI can't interject: offering a switch that silently does
+    // nothing is worse than not offering it.
+    if (state.steerSupported) {
+      addGearItem(
+        `<span title="Send straight into Grok's running turn instead of queueing until it finishes. Steering does not cancel the turn or discard work in progress. Plain text only — no attached files, editor context, or /commands.">Steer by default</span><span class="popover-switch${state.steerByDefault ? " on" : ""}" role="switch" aria-checked="${state.steerByDefault}"><span class="popover-switch-knob"></span></span>`,
+        () => {
+          state.steerByDefault = !state.steerByDefault;
+          vscode.postMessage({ type: "setSteerByDefault", value: state.steerByDefault });
+          renderConfigDebugPanel();
+        },
+      );
+    }
     addGearSep();
     addGearItem('<span>Open global config</span><span class="popover-external">↗</span>', () => {
       vscode.postMessage({ type: "openGlobalConfig" });
@@ -4340,6 +4470,11 @@
     //  - busy + empty composer: stop icon, click → cancel grok mid-stream.
     //    The only cancel affordance, mirroring Claude Code's model.
     sendBtn.classList.remove("stop", "initializing");
+    // Steer (#52) only makes sense while a turn is actually running. Driven as a
+    // body class rather than re-rendering the queued block: this runs on every
+    // keystroke, and rebuilding the block would churn its DOM (and fight the
+    // Edit/Remove buttons) for what is a pure visibility flip.
+    document.body.classList.toggle("turn-busy", !!state.busy);
     // The mode switch (Agent/Plan/Auto-accept) restarts the gate and calls the CLI,
     // so it's locked whenever busy — like the model/effort controls. Crucially this
     // covers the session-start window (busy is true through spawn → session/new),
@@ -4571,7 +4706,19 @@
   // chips): the webview posts queueSend and re-renders from the queuedSends
   // snapshot, so the queue survives focus switches and the HOST flushes it as
   // ONE combined prompt when the session's turn ends — even while backgrounded.
+  // The single choke point for "the user sent something while grok is working" —
+  // typed Enter/click AND a dictated utterance both land here.
+  //
+  // grok.steerByDefault flips it from "wait for the turn" to "go in now". Three
+  // guards, each for a case where there is nothing to steer INTO: a locked turn
+  // (session-start priming — no session id to interject against yet), a CLI that
+  // can't interject, and (defensively) not being busy at all. Any of those fall
+  // back to the queue, which is the safe home for the text either way.
   function queueOutgoing(text) {
+    if (state.steerByDefault && state.steerSupported && state.busy && !state.busyLocked) {
+      vscode.postMessage({ type: "steerSend", text });
+      return;
+    }
     vscode.postMessage({ type: "queueSend", text });
   }
 
@@ -4611,7 +4758,11 @@
     editBtn.className = "queued-action";
     editBtn.title = "Edit — back to the composer";
     editBtn.innerHTML = ICON.pencil;
-    editBtn.onclick = () => {
+    // pointerdown for the same reason as Steer below — this whole block moves
+    // under the cursor while the agent streams.
+    editBtn.onpointerdown = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
       vscode.postMessage({ type: "dequeueSend", index: 0 });
       input.value = input.value.trim() ? text + "\n\n" + input.value : text;
       renderInputHighlight();
@@ -4621,7 +4772,35 @@
     rmBtn.className = "queued-action";
     rmBtn.title = "Remove from queue";
     rmBtn.innerHTML = ICON.x;
-    rmBtn.onclick = () => vscode.postMessage({ type: "dequeueSend", index: 0 });
+    rmBtn.onpointerdown = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      vscode.postMessage({ type: "dequeueSend", index: 0 });
+    };
+    // Steer (#52): send this into the RUNNING turn instead of waiting for it.
+    // Rendered whenever the CLI supports it; `body.turn-busy` (updateSendButton)
+    // does the show/hide, so a replay that delivers queuedSends before agentStart
+    // still ends up with the button once busy lands.
+    if (state.steerSupported) {
+      const steerBtn = document.createElement("button");
+      steerBtn.className = "queued-action queued-steer";
+      steerBtn.title = "Steer — submit now without interrupting Grok";
+      steerBtn.innerHTML = `${ICON.cornerDownRight}<span>Steer</span>`;
+      // pointerdown, NOT click: the queued block is pinned to the end of the
+      // chat and every streamed chunk runs scrollToBottom, so while the agent is
+      // writing prose the button shifts under the cursor between mousedown and
+      // mouseup — and a `click` only fires when both land on the SAME element.
+      // That's why steering was a coin-flip mid-stream but fine during a tool
+      // call (nothing reflows then). pointerdown fires on press, before the
+      // reflow can move anything.
+      steerBtn.onpointerdown = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        vscode.postMessage({ type: "dequeueSend", index: 0 });
+        vscode.postMessage({ type: "steerSend", text });
+      };
+      actions.appendChild(steerBtn);
+    }
     actions.appendChild(editBtn);
     actions.appendChild(rmBtn);
     hdr.appendChild(tag);
@@ -4659,8 +4838,14 @@
         state.sandboxSupported = state.platform === "darwin";
         if (typeof msg.showThinking === "boolean") state.showThinking = msg.showThinking;
         if (typeof msg.expandCommandOutputs === "boolean") state.expandCommandOutputs = msg.expandCommandOutputs;
+        if (typeof msg.steerByDefault === "boolean") state.steerByDefault = msg.steerByDefault;
         applyThinkingVisibility();
         updateSandboxBtn();
+        break;
+      case "steerByDefault":
+        // Live toggle (grok.steerByDefault). Pure policy for the next send —
+        // nothing to re-render, the queued block's Steer button is unaffected.
+        state.steerByDefault = !!msg.value;
         break;
       case "showThinking":
         // Live toggle (grok.showThinking). Initial value also arrives via
@@ -5237,6 +5422,22 @@
         // re-focus like everything else, so queued blocks survive session swaps.
         state.sendQueue = Array.isArray(msg.items) ? msg.items : [];
         renderQueuedBlocks();
+        break;
+      case "steerUnavailable":
+        // This CLI can't interject (#52). Latch the button off — the queue,
+        // which already holds the text, is the fallback. Also force the policy
+        // off, so a steerByDefault user silently gets queueing rather than a
+        // failed send on every message.
+        state.steerSupported = false;
+        state.steerByDefault = false;
+        renderQueuedBlocks();
+        break;
+      case "usage":
+        // Billing split (#53). `turn` is absent on a restore (we only stored the
+        // session total), so keep whatever we have rather than blanking it.
+        if (msg.turn) state.lastTurnUsage = msg.turn;
+        if (msg.session) state.sessionUsage = msg.session;
+        if (!contextPopover.hidden) openContextPopover(); // live-refresh if open
         break;
       case "setBusy":
         // Host-driven busy state for flows where there's no natural agentEnd

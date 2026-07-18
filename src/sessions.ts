@@ -1,6 +1,7 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { isPrimerText, isPrimerSummary } from "./grok-primer";
+import type { PromptUsage } from "./acp-dispatch";
 
 /** A session with at most this many recorded messages is cheap to confirm as empty
  *  (a primer-only session has ~4). The sweep only reads `chat_history.jsonl` for
@@ -26,6 +27,11 @@ export interface SessionListEntry {
 export interface SessionMetaOverride {
   customName?: string;
   pinnedAt?: number;
+  /** Session-cumulative billing (#53). Ours, not grok's: the CLI reports usage
+   *  per prompt and persists only context size in `signals.json`, so this is the
+   *  only thing that survives a reload. Absent = never measured (an old session,
+   *  or a pre-usage CLI) — the popover then shows no breakdown rather than 0s. */
+  usage?: PromptUsage;
   /** Last verdict the user gave to an exit_plan_mode card in this session, for the restore-card label. */
   lastPlanVerdict?: "approved" | "rejected" | "abandoned";
   /** Every plan the user resolved in this session, in chronological order. grok's plan.md only
@@ -66,6 +72,26 @@ export function carrySessionName(
   delete next[fromId];
   if (carried && toId) next[toId] = { ...(next[toId] ?? {}), customName: carried };
   return next;
+}
+
+/** The `(Fork)` tag on a forked session's name (#48). */
+export const FORK_NAME_TAG = "(Fork)";
+
+/** Name a fork after its parent, tagged `(Fork)` so it's identifiable in history.
+ *
+ *  **Leading**, not trailing: history rows ellipsize at the panel edge (and
+ *  `fallbackName` truncates at 60 chars), so a trailing tag is the first thing to
+ *  disappear — exactly the marker you need to still see in a narrow sidebar.
+ *
+ *  Idempotent: forking a fork must not stack ("(Fork) (Fork) Foo"), so a name
+ *  already carrying the tag is returned unchanged. Matching ignores case but the
+ *  parent's own casing is preserved. A blank parent name yields just "(Fork)"
+ *  rather than a stray separator. Pure — persisting it is the caller's job. */
+export function forkDisplayName(parentName: string | undefined): string {
+  const base = (parentName ?? "").trim();
+  if (!base) return FORK_NAME_TAG;
+  if (base.toLowerCase().startsWith(FORK_NAME_TAG.toLowerCase())) return base;
+  return `${FORK_NAME_TAG} ${base}`;
 }
 
 export interface FsLike {

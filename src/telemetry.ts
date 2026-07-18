@@ -20,6 +20,13 @@ export const APTABASE_APP_KEY_DEV = "A-EU-5074036690";
 /** The label Aptabase shows as the SDK that sent the event. */
 export const TELEMETRY_SDK = "grok-vscode-phuryn";
 
+/** The publisher.name id of the official build. The Aptabase app key is a
+ *  write-only client key that necessarily ships in the vsix, so a fork that
+ *  rebuilds carries it too — but a fork can only be *published* under its own
+ *  publisher, so its `context.extension.id` differs. Gating telemetry on this id
+ *  keeps forks' usage out of the official project (they simply never send). */
+export const OFFICIAL_EXTENSION_ID = "PawelHuryn.grok-vscode-phuryn";
+
 export interface SystemProps {
   appVersion: string;
   osName: string;
@@ -34,6 +41,17 @@ export interface SessionStartProps {
   mode: string;
   model: string;
   effort: string;
+  /** The three webview-only feature flags, so we can see which defaults people
+   *  actually keep. Booleans, no content. Disclosed in docs/privacy.md. */
+  showThinking: boolean;
+  expandToolDetails: boolean;
+  steerByDefault: boolean;
+  /** Host application name (`vscode.env.appName`) — "Visual Studio Code",
+   *  "Cursor", "Antigravity", … The extension runs in several forks whose
+   *  behavior differs (see § Known limits: Cursor's Move-view gap, Antigravity's
+   *  engine floor), so knowing the mix is what makes those trade-offs decidable.
+   *  Omitted when the host doesn't report one. */
+  host?: string;
 }
 
 export interface AptabaseEvent {
@@ -64,10 +82,16 @@ export function osNameFromPlatform(platform: string): string {
   return platform;
 }
 
-/** Telemetry sends only when BOTH the VS Code global setting and our own opt-out
- *  allow it. Default-on, but the global setting always wins. */
-export function shouldSendTelemetry(globalEnabled: boolean, settingEnabled: boolean): boolean {
-  return globalEnabled && settingEnabled;
+/** Telemetry sends only when ALL gates allow: VS Code's global setting, our own
+ *  opt-out, AND this being the official build (so a republished fork never reports
+ *  into the official project — see OFFICIAL_EXTENSION_ID). Default-on for the first
+ *  two, but the global setting always wins. */
+export function shouldSendTelemetry(
+  globalEnabled: boolean,
+  settingEnabled: boolean,
+  isOfficialBuild: boolean,
+): boolean {
+  return globalEnabled && settingEnabled && isOfficialBuild;
 }
 
 /** Build the Aptabase `session_start` event body. Pure — no clock, no network;
@@ -95,6 +119,11 @@ export function buildSessionStartEvent(
       mode: props.mode,
       model: props.model,
       effort: props.effort,
+      showThinking: props.showThinking,
+      expandToolDetails: props.expandToolDetails,
+      steerByDefault: props.steerByDefault,
+      // Omitted, never sent as "" — an absent host is unknown, not blank.
+      ...(props.host ? { host: props.host } : {}),
     },
   };
 }

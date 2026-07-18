@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  addUsage,
   collectToolImages,
   contextUsedFromCompactNotification,
   autoCompactStartedNote,
@@ -7,10 +8,18 @@ import {
   extractGeneratedMediaPaths,
   extractImageContent,
   extractPromptMeta,
+  extractPromptUsage,
   gateZeroTokenMeta,
   isMediaGenToolCall,
   isIncompatibleAgentError,
+  isMethodNotFoundError,
   isAuthErrorText,
+  isRateLimitError,
+  isRateLimitErrorText,
+  promptErrorText,
+  rateLimitNoticeText,
+  RATE_LIMITED_ERROR_CODE,
+  usageIsRealMeasurement,
   makeAckResponse,
   makeExitPlanResponse,
   makePermissionResponse,
@@ -488,6 +497,80 @@ describe("isAuthErrorText (expired-token auto-recovery gate)", () => {
   });
 });
 
+describe("rate-limit classification (#57 — a usage limit is not an auth problem)", () => {
+  // The CLI's own copy strings (OSS sampling/error.rs + pager billing.rs).
+  const OAUTH_COPY = "You\u{2019}ve hit the rate limit for your plan. Upgrade your account or try again later.";
+  const API_KEY_COPY = "You\u{2019}ve hit your team\u{2019}s API rate limit. Ask a team admin to purchase more credits for higher limits, or try again later.";
+  const WEEKLY_COPY = "You hit your weekly limit.";
+  const FREE_USAGE_COPY = "You\u{2019}ve reached your free Grok Build usage limit for now. Get SuperGrok for much higher limits, or try again later.";
+
+  it("isRateLimitErrorText matches the CLI's known limit phrasings", () => {
+    expect(isRateLimitErrorText("Rate limited")).toBe(true);
+    expect(isRateLimitErrorText(OAUTH_COPY)).toBe(true);
+    expect(isRateLimitErrorText(API_KEY_COPY)).toBe(true);
+    expect(isRateLimitErrorText(WEEKLY_COPY)).toBe(true);
+    expect(isRateLimitErrorText(FREE_USAGE_COPY)).toBe(true);
+    expect(isRateLimitErrorText("subscription:free-usage-exhausted: no free usage left")).toBe(true);
+    expect(isRateLimitErrorText("You\u{2019}ve hit your spending cap.")).toBe(true);
+    expect(isRateLimitErrorText("HTTP 429 Too Many Requests")).toBe(true);
+  });
+
+  it("isRateLimitErrorText does NOT match auth faults or a context-window overflow", () => {
+    expect(isRateLimitErrorText("access token expired")).toBe(false);
+    expect(isRateLimitErrorText("401 Unauthorized")).toBe(false);
+    expect(isRateLimitErrorText("prompt exceeds the model's context limit")).toBe(false);
+    expect(isRateLimitErrorText("network timeout")).toBe(false);
+    expect(isRateLimitErrorText("")).toBe(false);
+    expect(isRateLimitErrorText(null)).toBe(false);
+  });
+
+  it("isRateLimitError: the structured -32003 code wins regardless of wording", () => {
+    expect(isRateLimitError({ code: RATE_LIMITED_ERROR_CODE, message: "Rate limited", data: "anything at all" })).toBe(true);
+    expect(isRateLimitError({ code: -32603, message: "Internal error", data: "boom" })).toBe(false);
+    expect(isRateLimitError(new Error("plain failure"))).toBe(false);
+  });
+
+  it("isRateLimitError: text fallback covers flattened surfaces and {message} data", () => {
+    expect(isRateLimitError(new Error(WEEKLY_COPY))).toBe(true);
+    expect(isRateLimitError({ code: -32603, data: { message: "subscription:free-usage-exhausted: out of free usage" } })).toBe(true);
+    expect(isRateLimitError({ code: -32603, data: FREE_USAGE_COPY })).toBe(true);
+  });
+
+  it("rateLimitNoticeText: leads with the not-a-sign-in clarification, keeps the wire detail", () => {
+    const notice = rateLimitNoticeText({ code: RATE_LIMITED_ERROR_CODE, message: "Rate limited", data: WEEKLY_COPY });
+    expect(notice).toMatch(/not a sign-in issue/i);
+    expect(notice).toContain(WEEKLY_COPY);
+  });
+
+  it("rateLimitNoticeText: strips the well-known code token, falls back to generic copy", () => {
+    const stripped = rateLimitNoticeText({
+      code: RATE_LIMITED_ERROR_CODE,
+      message: "Rate limited",
+      data: { message: "subscription:free-usage-exhausted: No free usage left." },
+    });
+    expect(stripped).not.toContain("free-usage-exhausted");
+    expect(stripped).toContain("No free usage left.");
+    // A bare "Rate limited" carries no information — use the CLI's generic copy.
+    const generic = rateLimitNoticeText({ code: RATE_LIMITED_ERROR_CODE, message: "Rate limited" });
+    expect(generic).toContain("rate limit for your plan");
+  });
+
+  it("isAuthErrorText yields to the limit classifier (the #57 login-redirect trap)", () => {
+    // Limit errors carry billing-flavored wording the broad auth fallback used
+    // to catch, sending the user to the login screen — which can't fix a limit.
+    expect(isAuthErrorText("subscription:free-usage-exhausted: You\u{2019}ve reached your free usage limit")).toBe(false);
+    expect(isAuthErrorText(FREE_USAGE_COPY)).toBe(false);
+    // Real entitlement phrasing without limit words still routes to auth recovery.
+    expect(isAuthErrorText("Your subscription is required")).toBe(true);
+  });
+
+  it("promptErrorText: friendly notice for limits, the error's own message otherwise", () => {
+    expect(promptErrorText({ code: RATE_LIMITED_ERROR_CODE, message: "Rate limited", data: WEEKLY_COPY })).toMatch(/Usage limit reached/);
+    expect(promptErrorText({ code: -32603, message: "Internal error", data: { message: "boom" } })).toBe("boom");
+    expect(promptErrorText(new Error("plain failure"))).toBe("plain failure");
+  });
+});
+
 describe("resolveModelId (grok's versioned set_model id vs availableModels)", () => {
   const models = [
     { modelId: "grok-composer-2.5-fast" },
@@ -755,5 +838,100 @@ describe("media generation (grok's real /imagine + /imagine-video wire shapes)",
       expect(extractGeneratedMediaPaths(completedWithText("Image generation failed: quota exceeded."))).toEqual([]);
       expect(extractGeneratedMediaPaths(completedWithText(String.raw`Saved a log to \\?\C:\out\run.txt.`))).toEqual([]);
     });
+  });
+});
+
+// #53 — the billing split. grok nests a whole-prompt `usage` inside `_meta`
+// alongside flat siblings that describe only the LAST model call; we dropped it
+// on the floor before. Shapes below are verbatim 0.2.101 captures
+// (research/oss-surfaces-probe.cjs --scenario=usage).
+describe("extractPromptUsage (#53)", () => {
+  it("pulls the nested usage off a real _meta", () => {
+    const meta = {
+      totalTokens: 16371, modelId: "grok-4.5", inputTokens: 16328, outputTokens: 42,
+      usage: {
+        inputTokens: 32330, outputTokens: 158, totalTokens: 32488, cachedReadTokens: 27264,
+        reasoningTokens: 128, modelCalls: 2, apiDurationMs: 3770, numTurns: 2,
+        modelUsage: { "grok-4.5": { inputTokens: 32330 } },
+      },
+    };
+    expect(extractPromptUsage(meta)).toEqual({
+      inputTokens: 32330, outputTokens: 158, totalTokens: 32488, cachedReadTokens: 27264,
+      reasoningTokens: 128, modelCalls: 2, apiDurationMs: 3770, numTurns: 2,
+    });
+  });
+
+  it("is undefined when the CLI sent no usage — 'no data' must not read as zero", () => {
+    expect(extractPromptUsage({ totalTokens: 100 })).toBeUndefined();
+    expect(extractPromptUsage({})).toBeUndefined();
+    expect(extractPromptUsage(undefined)).toBeUndefined();
+    expect(extractPromptUsage({ usage: "nonsense" })).toBeUndefined();
+    expect(extractPromptUsage({ usage: {} })).toBeUndefined();
+  });
+
+  it("extractPromptMeta carries usage through", () => {
+    const m = extractPromptMeta({ _meta: { totalTokens: 5, usage: { inputTokens: 9 } } });
+    expect(m.usage).toEqual({ inputTokens: 9 });
+  });
+});
+
+describe("addUsage (#53)", () => {
+  it("sums the session total field-wise", () => {
+    expect(addUsage({ inputTokens: 10, outputTokens: 2 }, { inputTokens: 5, outputTokens: 3 }))
+      .toEqual({ inputTokens: 15, outputTokens: 5 });
+  });
+
+  it("never invents a field neither side reported", () => {
+    const sum = addUsage({ inputTokens: 10 }, { inputTokens: 5 })!;
+    expect(sum.inputTokens).toBe(15);
+    expect("cachedReadTokens" in sum).toBe(false); // not 0 — absent
+  });
+
+  it("keeps a field only one side reported", () => {
+    expect(addUsage({ inputTokens: 10 }, { outputTokens: 4 })).toEqual({ inputTokens: 10, outputTokens: 4 });
+  });
+
+  it("handles the empty accumulator and copies (no aliasing)", () => {
+    const b = { inputTokens: 7 };
+    const out = addUsage(undefined, b)!;
+    expect(out).toEqual({ inputTokens: 7 });
+    out.inputTokens = 99;
+    expect(b.inputTokens).toBe(7);
+    expect(addUsage(undefined, undefined)).toBeUndefined();
+  });
+});
+
+describe("usageIsRealMeasurement (#53)", () => {
+  it("rejects a /compact turn — its siblings are the PREVIOUS turn replayed", () => {
+    // grok captures _meta before the slash-command match, so a compact turn
+    // reports totalTokens:0 with stale input/output. Counting it would
+    // double-bill the prior turn into the session total on every compact.
+    expect(usageIsRealMeasurement({ totalTokens: 0, usage: { inputTokens: 16394 } })).toBe(false);
+  });
+  it("rejects a turn with no usage at all", () => {
+    expect(usageIsRealMeasurement({ totalTokens: 500 })).toBe(false);
+  });
+  it("accepts a real inference turn", () => {
+    expect(usageIsRealMeasurement({ totalTokens: 16371, usage: { inputTokens: 9 } })).toBe(true);
+  });
+});
+
+// #52/#48 — both features ride UNADVERTISED `_x.ai/*` RPCs, so an older CLI
+// answers -32601 and the feature must hide itself rather than error at the user.
+describe("isMethodNotFoundError (#52, #48)", () => {
+  it("detects the JSON-RPC code (acp.ts rejects with the RAW error object)", () => {
+    expect(isMethodNotFoundError({ code: -32601, message: "Method not found" })).toBe(true);
+  });
+  it("falls back to the message when a wrapper ate the code", () => {
+    expect(isMethodNotFoundError(new Error("Method not found"))).toBe(true);
+  });
+  it("does NOT treat -32602 as a capability gap — that's our bug, not theirs", () => {
+    // Exactly what `{sessionId}`-only fork returns: the method EXISTS and we sent
+    // the wrong shape. Hiding the feature there would mask a real bug.
+    expect(isMethodNotFoundError({ code: -32602, message: "Invalid params" })).toBe(false);
+  });
+  it("is false for unrelated failures", () => {
+    expect(isMethodNotFoundError({ code: -32000, message: "boom" })).toBe(false);
+    expect(isMethodNotFoundError(undefined)).toBe(false);
   });
 });

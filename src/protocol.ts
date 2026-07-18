@@ -21,7 +21,7 @@
 // dependency on vscode/acp/etc. — it compiles to just the two arrays, and the
 // test can import it without a VS Code environment.
 
-import type { ModelInfo, PromptResultMeta, PermissionRequest, ExitPlanRequest, QuestionRequest } from "./acp";
+import type { ModelInfo, PromptResultMeta, PromptUsage, PermissionRequest, ExitPlanRequest, QuestionRequest } from "./acp";
 import type { FileChip } from "./chips";
 import type { SandboxProfileOption } from "./grok-config";
 import type { SessionListEntry } from "./sessions";
@@ -50,7 +50,7 @@ export interface PlanHistoryItem {
 
 /** host -> webview */
 export type HostMsg =
-  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform }
+  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform; steerByDefault: boolean }
   | { type: "showThinking"; value: boolean }
   | { type: "fontScale"; value: number }
   | { type: "grokUpdateStatus"; current?: string | null; latest?: string | null; updateAvailable?: boolean; policy?: unknown; error?: string }
@@ -122,6 +122,8 @@ export type HostMsg =
   | { type: "commandOutput"; command: string; output: string; exitCode: number | null; truncated: boolean }
   // grok.expandCommandOutputs — pre-expand every command's IN/OUT detail.
   | { type: "expandCommandOutputs"; value: boolean }
+  // grok.steerByDefault — send-while-busy skips the queue and steers (#52).
+  | { type: "steerByDefault"; value: boolean }
   // On-demand audit: expand (open:true) / collapse (open:false) EVERY tool group
   // and command IN/OUT box in the focused session at once. Ephemeral (not
   // persisted) — the Command Palette "Grok: Expand/Collapse All Tool Details".
@@ -137,7 +139,14 @@ export type HostMsg =
   | { type: "sessionDot"; id: string; dot: Dot }
   // Full snapshot of the focused session's host-owned send queue (#37) — the
   // webview renders pending user blocks from this; replay rebuilds them.
-  | { type: "queuedSends"; items: string[] };
+  | { type: "queuedSends"; items: string[] }
+  // Steer (#52) is unavailable on this CLI (`_x.ai/interject` → -32601). Latches
+  // the button off for the session; the queue stays as the fallback.
+  | { type: "steerUnavailable" }
+  // Session-cumulative billing (#53), summed by the host across the session's
+  // turns. `turn` is the last prompt's own usage. Both omitted when the CLI sent
+  // no `_meta.usage` — the popover then shows only the context row, never zeros.
+  | { type: "usage"; turn?: PromptUsage; session?: PromptUsage };
 
 /** webview -> host */
 export type WebviewMsg =
@@ -163,6 +172,7 @@ export type WebviewMsg =
   | { type: "moveView"; location: "panel" | "sidebar" | "auxiliarybar" }
   | { type: "setShowThinking"; value: boolean }
   | { type: "setExpandCommandOutputs"; value: boolean }
+  | { type: "setSteerByDefault"; value: boolean }
   | { type: "dropFile"; path: string; shift: boolean }
   | { type: "permissionAnswer"; requestId: number | string; optionId: string }
   | { type: "exitPlanAnswer"; requestId: number | string; verdict: "approved" | "abandoned" | "rejected"; comment?: string }
@@ -188,7 +198,13 @@ export type WebviewMsg =
   // mirror — it posts these and re-renders from the queuedSends snapshot.
   | { type: "queueSend"; text: string }
   | { type: "dequeueSend"; index: number }
-  | { type: "clearQueuedSends" };
+  | { type: "clearQueuedSends" }
+  // Steer (#52): inject the composed text into the RUNNING turn instead of
+  // waiting for it. Host-owned like the queue — the webview never sends the
+  // prompt itself, so a -32601 fallback can re-queue the text without losing it.
+  | { type: "steerSend"; text: string }
+  // Fork (#48): branch this session's conversation into a new one and focus it.
+  | { type: "forkSession" };
 
 // Exhaustive maps: `Record<Union["type"], true>` forces every discriminant to be
 // a key (missing -> tsc error) and forbids any extra (excess-property -> tsc
@@ -208,8 +224,9 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   planNotice: true, autoCompactNotice: true, planBlocked: true, promptComplete: true, contextUsage: true, agentReset: true,
   agentError: true, agentEnd: true, exit: true, setBusy: true, summarizing: true,
   sessionContext: true, clearMessages: true, onboarding: true, error: true,
-  xaiNotification: true, subagentUpdate: true, commandOutput: true, expandCommandOutputs: true,
+  xaiNotification: true, subagentUpdate: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true,
   setAllToolDetails: true, focusInput: true, sessions: true, sessionDot: true, queuedSends: true,
+  steerUnavailable: true, usage: true,
 };
 
 const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
@@ -217,13 +234,14 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   setMode: true, setSandbox: true, removeChip: true, toggleChip: true, openFile: true, openUrl: true,
   openDiff: true, exportExpr: true, setEffort: true, openGlobalConfig: true,
   openProjectConfig: true, runMcpList: true, showLogs: true, moveView: true,
-  setShowThinking: true, setExpandCommandOutputs: true,
+  setShowThinking: true, setExpandCommandOutputs: true, setSteerByDefault: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
   questionCancel: true, setModel: true, runInstallCmd: true, runGrokLogin: true,
   logout: true, checkGrokUpdate: true, updateGrok: true, recheckConnection: true,
   listSessions: true, resumeSession: true, renameSession: true, deleteSession: true,
   clearAllSessions: true, pickFile: true, pasteImage: true, voiceStart: true,
   voiceStop: true, queueSend: true, dequeueSend: true, clearQueuedSends: true,
+  steerSend: true, forkSession: true,
 };
 
 export const HOST_MESSAGE_TYPES: readonly HostMsg["type"][] = Object.keys(HOST_MESSAGE_TYPE_MAP) as HostMsg["type"][];

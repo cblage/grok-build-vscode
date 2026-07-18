@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
+import { isPrimerSummary } from "../src/grok-primer";
 import * as path from "node:path";
 import {
+  forkDisplayName,
   FsLike,
   SessionMetaOverrides,
   carrySessionName,
@@ -647,5 +649,58 @@ describe("readContextUsage", () => {
       const fs = buildFs({ [signalsPath("s1")]: { isDir: false, content } });
       expect(readContextUsage({ fs, grokHome, cwd, id: "s1" })).toEqual({ used: 1234, window: undefined });
     }
+  });
+});
+
+// #48 — a fork is named after its parent so it's recognisable in history.
+describe("forkDisplayName", () => {
+  it("tags the fork with the parent's name, LEADING", () => {
+    // Leading, not trailing: history rows ellipsize at the panel edge, so a
+    // trailing tag is the first thing to vanish in a narrow sidebar.
+    expect(forkDisplayName("Evaluate GitHub issues for implementation priorities"))
+      .toBe("(Fork) Evaluate GitHub issues for implementation priorities");
+  });
+
+  it("is idempotent — forking a fork must not stack tags", () => {
+    expect(forkDisplayName("(Fork) Refactor the parser")).toBe("(Fork) Refactor the parser");
+    expect(forkDisplayName(forkDisplayName(forkDisplayName("Foo")))).toBe("(Fork) Foo");
+  });
+
+  it("matches the tag case-insensitively but preserves the parent's casing", () => {
+    expect(forkDisplayName("(FORK) Thing")).toBe("(FORK) Thing");
+    expect(forkDisplayName("(fork) Thing")).toBe("(fork) Thing");
+  });
+
+  it("degrades cleanly with no parent name — no stray separator", () => {
+    expect(forkDisplayName("")).toBe("(Fork)");
+    expect(forkDisplayName("   ")).toBe("(Fork)");
+    expect(forkDisplayName(undefined)).toBe("(Fork)");
+  });
+
+  it("does not treat a trailing '(Fork)' as the tag — it re-tags at the front", () => {
+    // A name that merely ENDS with the tag isn't tagged in our scheme.
+    expect(forkDisplayName("experiments (Fork)")).toBe("(Fork) experiments (Fork)");
+  });
+});
+
+// The name a fork inherits must be the one the user SEES in history — never
+// grok's internal `session_summary`, which is primer-derived on every session we
+// prime ("… Primer v4 Plan Mode …") and would propagate forever through a
+// fork-of-a-fork. This pins the guard that rejects those.
+describe("isPrimerSummary guards fork naming (#48)", () => {
+  it("recognises the real primer titles grok generated on disk", () => {
+    for (const t of [
+      "Grok-build-vscode Primer v4 Plan Mode Handling",
+      "Grok Build VSCode Primer v4 Plan Mode",
+      "Grok Build VSCode Plan Mode Primer v4",
+      "Grok-Build-VSCode v4 Plan Mode Primer Instructions",
+    ]) {
+      expect(isPrimerSummary(t)).toBe(true);
+    }
+  });
+
+  it("leaves a real conversation title alone", () => {
+    expect(isPrimerSummary("Evaluate GitHub issues for implementation priorities")).toBe(false);
+    expect(isPrimerSummary("Analyze this solution in depth")).toBe(false);
   });
 });

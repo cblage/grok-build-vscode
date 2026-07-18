@@ -31,7 +31,7 @@ describe("postEvent never throws (telemetry can't impact the user)", () => {
   });
   it("is a no-op for an app key with no resolvable region (no network, no throw)", () => {
     const ev = buildSessionStartEvent(
-      { installId: "i", mode: "agent", model: "m", effort: "" },
+      { installId: "i", mode: "agent", model: "m", effort: "", showThinking: false, expandToolDetails: false, steerByDefault: false },
       { appVersion: "1", osName: "macOS", osVersion: "1", locale: "en", isDebug: true },
       "s",
       "2026-06-29T00:00:00.000Z",
@@ -57,12 +57,13 @@ describe("osNameFromPlatform", () => {
   });
 });
 
-describe("shouldSendTelemetry — both gates must allow", () => {
-  it("only sends when the global setting AND our own opt-in are both on", () => {
-    expect(shouldSendTelemetry(true, true)).toBe(true);
-    expect(shouldSendTelemetry(false, true)).toBe(false); // VS Code global off wins
-    expect(shouldSendTelemetry(true, false)).toBe(false); // our opt-out
-    expect(shouldSendTelemetry(false, false)).toBe(false);
+describe("shouldSendTelemetry — all gates must allow", () => {
+  it("only sends when global setting AND our opt-in AND official build are all on", () => {
+    expect(shouldSendTelemetry(true, true, true)).toBe(true);
+    expect(shouldSendTelemetry(false, true, true)).toBe(false); // VS Code global off wins
+    expect(shouldSendTelemetry(true, false, true)).toBe(false); // our opt-out
+    expect(shouldSendTelemetry(true, true, false)).toBe(false); // a fork build never reports
+    expect(shouldSendTelemetry(false, false, false)).toBe(false);
   });
 });
 
@@ -97,5 +98,48 @@ describe("buildSessionStartEvent", () => {
     expect(ev.systemProps.appVersion).toBe("1.4.24");
     expect(ev.systemProps.sdkVersion).toBe("grok-vscode-phuryn@1.4.24");
     expect(ev.systemProps.isDebug).toBe(false);
+  });
+});
+
+// The three webview feature flags + the host app ride session_start so we can see
+// which defaults people keep and which VS Code fork they're on (the extension
+// behaves differently across Cursor / Antigravity). Config values and an app
+// name — the same class of anonymous property as mode/model/effort, never content.
+describe("session_start — feature flags + host (analytics)", () => {
+  const sys = { appVersion: "1", osName: "Windows", osVersion: "10", locale: "en", isDebug: false };
+  const base = { installId: "i", mode: "agent", model: "grok-4.5", effort: "high" };
+
+  it("carries the three flags and the host name", () => {
+    const ev = buildSessionStartEvent(
+      { ...base, showThinking: true, expandToolDetails: false, steerByDefault: true, host: "Cursor" },
+      sys, "s", "2026-07-17T00:00:00.000Z",
+    );
+    expect(ev.props).toMatchObject({
+      showThinking: true,
+      expandToolDetails: false,
+      steerByDefault: true,
+      host: "Cursor",
+    });
+  });
+
+  it("omits host entirely when the app doesn't report one — never sends a blank", () => {
+    const ev = buildSessionStartEvent(
+      { ...base, showThinking: false, expandToolDetails: false, steerByDefault: false },
+      sys, "s", "2026-07-17T00:00:00.000Z",
+    );
+    expect("host" in ev.props).toBe(false);
+  });
+
+  it("sends false as false — a flag left at its default is a real data point", () => {
+    const ev = buildSessionStartEvent(
+      { ...base, showThinking: false, expandToolDetails: false, steerByDefault: false, host: "Visual Studio Code" },
+      sys, "s", "2026-07-17T00:00:00.000Z",
+    );
+    expect(ev.props.showThinking).toBe(false);
+    expect(ev.props.steerByDefault).toBe(false);
+    // Still no content, ever — only the anonymous install id and config values.
+    expect(Object.keys(ev.props).sort()).toEqual(
+      ["effort", "expandToolDetails", "host", "installId", "mode", "model", "showThinking", "steerByDefault"],
+    );
   });
 });

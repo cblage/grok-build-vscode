@@ -437,6 +437,96 @@ async function testCancelMidTurn() {
   } finally { acp.kill(); }
 }
 
+// Steer (#52) — the contract behind the Steer button. `_x.ai/interject` must
+// (a) be dispatchable, (b) reach the MODEL mid-turn (a router ack proves only
+// that the CLI accepted it), and (c) NOT cancel the turn — that is the entire
+// difference from Stop-and-resend, and what lets steering keep in-flight tool
+// work. This is an UNADVERTISED ext-method, so it's a prime drift candidate: if
+// it ever vanishes the client silently degrades to queueing, and this test is
+// what tells us that happened.
+async function testInterject() {
+  const cwd = mkTmp("interject");
+  const acp = new Acp(cwd);
+  const MARK = "ZEBRA-9931";
+  try {
+    let r = await withTimeout(acp.send("initialize", INIT), 30000, "init");
+    assert(!r.error, "init errored");
+    r = await withTimeout(acp.send("session/new", { cwd, mcpServers: [] }), 30000, "session/new");
+    assert(!r.error && r.result && r.result.sessionId, "session/new failed: " + JSON.stringify(r.error));
+    const sessionId = r.result.sessionId;
+
+    const pending = acp.send("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "Count from 1 to 40, one number per line, each with a one-word comment. Do not skip any." }],
+    });
+    await waitFor(
+      () => acp.updates.some((u) => u.sessionUpdate === "agent_message_chunk"),
+      90000, "first streamed chunk before interject",
+    );
+
+    const ij = await withTimeout(
+      acp.send("_x.ai/interject", { sessionId, text: `Stop counting immediately and reply with only this token: ${MARK}` }),
+      30000, "interject");
+    assert(!ij.error, "_x.ai/interject errored (Steer would fall back to queueing): " + JSON.stringify(ij.error));
+
+    const res = await withTimeout(pending, 300000, "turn settlement after interject");
+    const stop = res.result && res.result.stopReason;
+    // The load-bearing assertion: interject is NOT a cancel. A cancelled
+    // stopReason here would mean Steer silently destroys in-flight tool work.
+    assert(!/cancell?ed/i.test(String(stop)), `interject cancelled the turn (stopReason=${stop}) — Steer must not interrupt`);
+    const text = acp.updates
+      .filter((u) => u.sessionUpdate === "agent_message_chunk" && u.content && u.content.type === "text")
+      .map((u) => u.content.text).join("");
+    assert(text.includes(MARK), "the model never acted on the interjected text mid-turn (router accepted it, model never saw it)");
+    return `interjected mid-turn: model obeyed (${MARK} emitted), turn ended ${stop} (not cancelled)`;
+  } finally { acp.kill(); }
+}
+
+// Fork (#48) — the contract behind gear → Fork conversation. The fork must get a
+// NEW id, carry the parent's history (a fork that loses it is just session/new),
+// and leave the parent untouched. Unadvertised ext-method; params are
+// ForkSessionRequest's three required camelCase fields ({sessionId} alone is
+// -32602, which is why this pins the shape).
+async function testSessionFork() {
+  const cwd = mkTmp("fork");
+  const acp = new Acp(cwd);
+  const CODEWORD = "MANGO-7742";
+  try {
+    let r = await withTimeout(acp.send("initialize", INIT), 30000, "init");
+    assert(!r.error, "init errored");
+    r = await withTimeout(acp.send("session/new", { cwd, mcpServers: [] }), 30000, "session/new");
+    assert(!r.error && r.result && r.result.sessionId, "session/new failed: " + JSON.stringify(r.error));
+    const sessionId = r.result.sessionId;
+
+    const seed = await withTimeout(
+      acp.send("session/prompt", { sessionId, prompt: [{ type: "text", text: `Remember this codeword: ${CODEWORD}. Reply with just: stored. No tools.` }] }),
+      120000, "seed prompt");
+    assert(!seed.error, "seed prompt errored: " + JSON.stringify(seed.error));
+
+    const fk = await withTimeout(
+      acp.send("_x.ai/session/fork", { sourceSessionId: sessionId, sourceCwd: cwd, newCwd: cwd }),
+      60000, "fork");
+    assert(!fk.error, "_x.ai/session/fork errored: " + JSON.stringify(fk.error));
+    const newId = fk.result && fk.result.newSessionId;
+    assert(newId && newId !== sessionId, `fork returned no new id (${JSON.stringify(fk.result)})`);
+    assert(fk.result.chatMessagesCopied > 0, "fork copied no chat messages — the fork would start empty");
+
+    // The fork must actually be loadable AND remember the parent's conversation.
+    const ld = await withTimeout(acp.send("session/load", { sessionId: newId, cwd, mcpServers: [] }), 120000, "load fork");
+    assert(!ld.error, "session/load on the fork errored: " + JSON.stringify(ld.error));
+    const at = acp.updates.length;
+    const recall = await withTimeout(
+      acp.send("session/prompt", { sessionId: newId, prompt: [{ type: "text", text: "What codeword did I ask you to remember? Reply with just the codeword. No tools." }] }),
+      120000, "fork recall");
+    assert(!recall.error, "fork recall prompt errored: " + JSON.stringify(recall.error));
+    const said = acp.updates.slice(at)
+      .filter((u) => u.sessionUpdate === "agent_message_chunk" && u.content && u.content.type === "text")
+      .map((u) => u.content.text).join("");
+    assert(said.includes(CODEWORD), `the fork lost the parent's history (recall: ${JSON.stringify(said.slice(0, 80))})`);
+    return `forked ${sessionId.slice(0, 8)} → ${newId.slice(0, 8)} (${fk.result.chatMessagesCopied} msgs), fork recalled the parent's codeword`;
+  } finally { acp.kill(); }
+}
+
 // The Agent Dashboard runs a pool of live sessions — one `grok agent stdio`
 // process each, same workspace (#37's reporter ran several concurrently). Two
 // processes serving overlapping prompts must complete independently: no
@@ -982,6 +1072,8 @@ const TESTS = [
   { name: "terminal-shell", fn: testTerminalShell, slow: false, smoke: true },
   { name: "prompt-roundtrip", fn: testPrompt, slow: false },
   { name: "cancel-mid-turn", fn: testCancelMidTurn, slow: false },
+  { name: "interject", fn: testInterject, slow: false },
+  { name: "session-fork", fn: testSessionFork, slow: false },
   { name: "parallel-sessions", fn: testParallelSessions, slow: false },
   { name: "vision-prompt", fn: testVisionPrompt, slow: false },
   { name: "session-restore", fn: testRestore, slow: false },

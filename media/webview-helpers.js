@@ -23,7 +23,7 @@
     "permissionResolved", "exitPlanRequest", "planResolved", "questionRequest", "planNotice", "autoCompactNotice", "planBlocked",
     "promptComplete", "contextUsage", "commandOutput", "expandCommandOutputs", "setAllToolDetails", "focusInput", "agentReset", "agentError", "agentEnd", "exit", "setBusy", "summarizing",
     "sessionContext", "clearMessages", "onboarding", "error", "xaiNotification", "subagentUpdate", "sessions",
-    "sessionDot", "queuedSends",
+    "sessionDot", "queuedSends", "steerUnavailable", "usage", "steerByDefault",
   ];
   const WEBVIEW_MESSAGE_TYPES = [
     "ready", "send", "newSession", "cancel", "pickModel", "setMode", "setSandbox", "removeChip",
@@ -34,7 +34,7 @@
     "setModel", "runInstallCmd", "runGrokLogin", "logout", "checkGrokUpdate", "updateGrok",
     "recheckConnection", "listSessions", "resumeSession", "renameSession", "deleteSession",
     "clearAllSessions", "pickFile", "pasteImage", "voiceStart", "voiceStop",
-    "queueSend", "dequeueSend", "clearQueuedSends",
+    "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "forkSession", "setSteerByDefault",
   ];
   const HOST_MESSAGE_TYPE_SET = new Set(HOST_MESSAGE_TYPES);
   /** True when `type` is a host->webview message the contract knows about. A

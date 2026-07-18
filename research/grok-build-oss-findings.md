@@ -31,6 +31,9 @@ yet on the real CLI.
 | §2.1 plan verdict via success `{outcome:"cancelled"}` | ✅ mode stays `[plan]`, model reads it as "revise" not a tool failure, turn ends `end_turn` | ✅ **implement** — replace the JSON-RPC-error reject |
 | §2.6 primer → `session/new` `_meta.rules` | ✅ injected rule reached the model (nonce echoed verbatim) | ✅ **implement** (larger change) |
 | §2.9 `GROK_SHELL` env at spawn | ✅ sets the model's first-message `Shell:` line (`powershell`/`bash`/`cmd.exe`; unset → host-detected `powershell`) | ✅ **implement** (small) |
+| `_x.ai/interject` — mid-turn steering (#52) | ✅ **shipped + works** — `{sessionId,text}` → `{status:"queued"}`; the model changed course **mid-stream** and echoed the interjected token, turn still ended `end_turn` (**not** cancelled, no work lost) | ✅ **implement** — this is "Steer"; no cancel-and-resend needed |
+| `_x.ai/session/fork` (#48) | ✅ **shipped + works** — copied 17/17 messages, model recalled the parent's codeword after `session/load`, **parent untouched** | ✅ **implement** — don't hand-roll a dir copy |
+| `_meta.usage` / `turn_completed.usage` (#53) | ✅ **shipped** — full per-prompt billing split, incl. `modelUsage` per model. **No cache-creation field exists anywhere** | ⚠️ **partial** — it's per-prompt *billing*, not *context* composition; see § Token surfaces |
 
 Pure client-side, needing no probe: **§2.5 media `rawOutput.path`** parsing and **§2.11 permissions
 honesty** (note: issue #49 is **CLOSED** — the reporter had auto-approval enabled for one workspace
@@ -183,9 +186,90 @@ no feature gate, just never advertised in `initialize`. **Wire form is `_`-prefi
 **Implement (staged):** probe the request/response schemas, then adopt **rename/delete** first
 (kills the `grok.sessionMeta` rename-override store and our `deleteSessionDir`), then
 **list/search** (replaces `indexSessions`/`readSessionEntries`/`sessionCache` disk scraping — §
-History pagination). Keep the disk path as fallback for older builds. `fork` is a future feature.
+History pagination). Keep the disk path as fallback for older builds.
 The full router table (git, worktree, interject, rewind, task/scheduler, compact_conversation…)
 is in the same match — see "Roadmap unlocks" below.
+
+### 3a. `fork` + `interject` — probe-confirmed WORKING on 0.2.101 (2026-07-17)
+
+Both were parked as "future"/unprobed. Both ship and work **today**; params came from the OSS
+source, not guesswork (`--scenario=fork`, `--scenario=interject`).
+
+**`_x.ai/session/fork`** — `ForkSessionRequest` (`session/fork.rs:15-38`, camelCase serde). Three
+**required** fields; `{sessionId}` alone is the `-32602 Invalid params` you get if you guess:
+
+```jsonc
+// → {sourceSessionId, sourceCwd, newCwd, newSessionId?, newModelId?,
+//    targetPromptIndex?, sessionKind?, sourceWorkspaceDir?}
+// ← {newSessionId, chatMessagesCopied, updatesCopied, planStateCopied,
+//    newCwd, parentSessionId, newModelId?}
+{"newSessionId":"019f6fbd-07b7-…","chatMessagesCopied":17,"updatesCopied":25,
+ "planStateCopied":false,"parentSessionId":"019f6fbc-c636-…"}
+```
+
+Measured: new UUIDv7 id, **17/17** messages copied, `session/load` on the fork OK, the model
+**recalled the parent's codeword**, and the parent's history was **byte-unchanged** after forking +
+using the fork. `sessionKind` defaults to `"fork"` — our `buildEntry` (`sessions.ts:139`) only
+special-cases `"subagent"`, so a fork lands in the history list with no client change.
+
+**Fork branches the CONVERSATION, not the code.** `fork_session` only calls
+`copy_session_data_sync` under `grok_home()` (`fork.rs:64-113`) — it never touches the workspace.
+The TUI pairs `/fork` with an optional **git worktree** to separate code; `/rewind` is the separate
+feature that restores files (`rewind_points.jsonl` = file snapshots, one point per user prompt) and
+"modifies files on disk" (user-guide 17-sessions.md). Don't conflate them.
+
+**⚠️ `targetPromptIndex` works over ACP but leaves the replay DESYNCED — blocks per-message fork.**
+The TUI user-guide says `--at <turn>` "is not supported in this version", but the ACP field is live:
+forking a 14-message session at index 1 returned `chatMessagesCopied: 7`. **However
+`updatesCopied` was 20 for BOTH the full and the truncated fork** — and a disk diff confirms the
+split: in the at-1 fork the 2nd prompt is **absent from `chat_history.jsonl` (0 hits) but still
+present in `updates.jsonl` (2 hits)**. `chat_history` is what the model sees; `updates.jsonl` is the
+authoritative log that drives `session/load` replay — so a per-message fork renders the FULL
+conversation in the panel while the model has forgotten everything after the cut. Whole-session
+fork (no `targetPromptIndex`) is unaffected and safe. Per-message fork needs an upstream fix or
+client-side replay truncation — **ACP-feedback material**.
+
+**`_x.ai/interject`** — `InterjectRequest` (`extensions/interject.rs:13-24`, camelCase serde):
+
+```jsonc
+// → {sessionId, text, interjectionId?, content?}   ← content = [text|image] blocks
+// ← {status:"queued"}
+```
+
+It queues into the session's pending-interjection buffer, **drained at the next safe point in
+`process_conversation_turn`** — it does *not* cancel the turn. Measured mid-flight against a live
+40-item count: accepted `{status:"queued"}`, the model **abandoned the count mid-stream** and
+emitted the interjected token, the turn still ended `end_turn`, and the model confirmed it saw the
+text verbatim. A `_x.ai/session/interjection` notification echoes back on the rail (for rendering).
+`content` carries images, and its Text block overrides `text` when non-empty.
+
+**Control, same probe:** a plain second `session/prompt` mid-turn returned `stop=end_turn` rather
+than erroring — it does **not** cleanly queue, and repo lore (`test/send-queue.dom.test.ts:13-15`)
+says it kills the in-flight turn. `interject` is the sanctioned channel; don't race prompts.
+
+### 3b. Token surfaces — `_meta.usage` exists and we drop it (#53)
+
+`session/prompt`'s `result._meta` carries a **nested `usage`** object we never extract
+(`PromptResultMeta`, `acp-dispatch.ts:246-265`, stops at the flat siblings). The same object rides
+`turn_completed.usage` on the live rail. Verbatim, 0.2.101:
+
+```jsonc
+"_meta": { "totalTokens":16371, "inputTokens":16328, "outputTokens":42,      // ← LAST model call
+           "cachedReadTokens":16000, "reasoningTokens":15, "modelId":"grok-4.5",
+  "usage": { "inputTokens":32330, "outputTokens":158, "totalTokens":32488,   // ← WHOLE prompt
+             "cachedReadTokens":27264, "reasoningTokens":128,
+             "modelCalls":2, "apiDurationMs":3770, "numTurns":2,
+             "modelUsage": { "grok-4.5": { …same shape… } } } }
+```
+
+Three facts that decide the #53 UI:
+- **`usage` aggregates the whole prompt; the flat siblings are the last model call only.** Turn 1
+  above: flat `outputTokens:42` vs `usage.outputTokens:158` across `modelCalls:2`.
+- **`totalTokens` (flat) is CONTEXT size; `usage.totalTokens` is BILLING sum.** Different
+  quantities — 16371 vs 32488 in the same turn. Segmenting the donut arc by input/output would be
+  arithmetically wrong; they don't decompose the context window.
+- **No cache-*creation* field exists anywhere** (zero hits repo-wide and in the OSS tree). The
+  issue's `cache_creation_input_tokens` is unavailable — omit it, don't fake a zero.
 
 ---
 
@@ -376,8 +460,9 @@ From the full `ext_method` router (`acp_agent.rs:3164-3508`) and docs
   sessions, empty-primer sweeps, replay hiding, `/compact` re-priming, and the priming race,
   all at once. Probe on shipped build first (and verify rules survive `/compact` + `session/load`).
 - `x.ai/git/worktree/{create,remove,apply,list,gc}` + `x.ai/session/fork` — the "Worktree UI"
-  roadmap item has a full server-side API.
-- `x.ai/interject` — mid-turn interjection (the TUI's Ctrl+L) over ACP.
+  roadmap item has a full server-side API. **`session/fork` is probe-confirmed working** — § 3a.
+- `x.ai/interject` — mid-turn interjection (the TUI's Ctrl+L) over ACP. **Probe-confirmed
+  working** — the "Steer" primitive for #52; § 3a.
 - `x.ai/rewind/*` (+ `rewind_points.jsonl`), `x.ai/prompt_history`, `x.ai/suggest`,
   `x.ai/compact_conversation`, `x.ai/session_summaries/*`, `x.ai/task/*`, `x.ai/scheduler/*`.
 - `GROK_AGENT_METADATA` env merges arbitrary keys into `initialize._meta` (`acp_agent.rs:417`).

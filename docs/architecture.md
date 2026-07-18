@@ -188,11 +188,11 @@ The full pedagogical write-up lives in
 | File | Role |
 |---|---|
 | [src/extension.ts](../src/extension.ts) | Entry point — registers commands, keybindings, output channel |
-| [src/sidebar.ts](../src/sidebar.ts) | Webview provider, message routing, diff preview, logout, sandbox orchestration, and symlink-safe generated-media serving |
-| [src/acp.ts](../src/acp.ts) | ACP client — spawns CLI, manages session lifecycle, emits events, and awaits its per-client execution backend |
-| [src/session.ts](../src/session.ts) | Per-session state bag — one `Session` per live `grok agent stdio` process (the sidebar holds a *pool* of these + one focused) |
+| [src/sidebar.ts](../src/sidebar.ts) | Webview provider, message routing, diff preview, logout, sandbox orchestration, and symlink-safe generated-media serving (`postGeneratedMedia` → `asWebviewUri`, base64 fallback) |
+| [src/acp.ts](../src/acp.ts) | ACP client — spawns CLI, manages session lifecycle, emits events, and awaits its per-client execution backend so sandbox brokers own ACP fs/terminal teardown. `interject` (#52 Steer) and `forkSession` (#48) call the unadvertised `_x.ai/interject` / `_x.ai/session/fork`, returning `"unsupported"` on -32601 rather than throwing |
+| [src/session.ts](../src/session.ts) | Per-session state bag — one `Session` per live `grok agent stdio` process (the sidebar holds a *pool* of these + one focused); carries the send queue (#37) and the billing split + our cumulative total (#53) |
 | [src/session-pool.ts](../src/session-pool.ts) | Pure reaping policy (`selectReapable`) — idle-TTL + LRU cap over the live-session pool |
-| [src/acp-dispatch.ts](../src/acp-dispatch.ts) | Pure protocol helpers — line parsing, update routing, response + generated-media extraction (`isMediaGenToolCall`/`extractGeneratedMediaPaths`), and the live `_x.ai/session_notification` consumers (`contextUsedFromCompactNotification`, `autoCompactStartedNote`, `isSubagentLifecycleUpdate`) |
+| [src/acp-dispatch.ts](../src/acp-dispatch.ts) | Pure protocol helpers — line parsing, update routing, response + generated-media extraction (`isMediaGenToolCall`/`extractGeneratedMediaPaths`), and the live `_x.ai/session_notification` consumers (`contextUsedFromCompactNotification`, `autoCompactStartedNote`, `isSubagentLifecycleUpdate`), the billing-usage helpers (`extractPromptUsage`/`addUsage`/`usageIsRealMeasurement`, #53), and `isMethodNotFoundError` — the -32601 capability gate behind Steer/Fork |
 | [src/protocol.ts](../src/protocol.ts) | Single source of truth for the host↔webview message contract — `HostMsg`/`WebviewMsg` unions + the runtime `HOST_MESSAGE_TYPES`/`WEBVIEW_MESSAGE_TYPES` arrays (kept exhaustive by compile-time `Record` maps). Pure types + two arrays, no runtime deps |
 | [src/cli-locator.ts](../src/cli-locator.ts) | Locate the `grok` binary; cross-platform |
 | [src/terminal-manager.ts](../src/terminal-manager.ts) | Headless shells for the agent's `terminal/*` calls; POSIX commands run in killable process groups |

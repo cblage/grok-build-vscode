@@ -95,3 +95,13 @@ export function dispatch(window: Window, data: Posted): void {
 export function click(window: Window, el: Element): void {
   el.dispatchEvent(new (window as any).MouseEvent("click", { bubbles: true, cancelable: true }));
 }
+
+/** Press (pointerdown) rather than click. The queued-block actions bind
+ *  pointerdown on purpose: that block is pinned to the end of the chat and every
+ *  streamed chunk re-scrolls it, so a `click` (which needs mousedown and mouseup
+ *  on the SAME element) is unreliable mid-stream. Tests must exercise the event
+ *  the UI actually listens for. */
+export function press(window: Window, el: Element): void {
+  const Ctor = (window as any).PointerEvent || (window as any).MouseEvent;
+  el.dispatchEvent(new Ctor("pointerdown", { bubbles: true, cancelable: true }));
+}

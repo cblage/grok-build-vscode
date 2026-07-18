@@ -1764,10 +1764,92 @@ describe("context popover (donut click, #39)", () => {
     expect((pop as any).hidden).toBe(true);
   });
 
-  it("shows only the context line — no action rows", () => {
+  it("offers Compact, disabled until there is context to compact", () => {
     const { window, doc } = bootWebview();
     click(window, $(doc, "donut"));
-    expect($(doc, "context-popover").querySelector(".toolbar-popover-item")).toBeNull();
+    const pop = $(doc, "context-popover");
+    const act = pop.querySelector(".context-compact") as HTMLElement;
+    // Compact moved here from the gear menu: it's a CONTEXT action, so it lives
+    // on the surface showing the number that motivates it — and directly under
+    // the context line, not stranded below the billing sections.
+    expect(act).not.toBeNull();
+    expect(act.classList.contains("disabled")).toBe(true); // 0 tokens — nothing to compact
+    const rows = [...pop.children];
+    expect(rows.indexOf(act)).toBe(rows.findIndex((e) => e.textContent!.includes("Context used")) + 1);
+    // A <button> would drag native chrome into the popover; every row is a div.
+    expect(act.tagName).toBe("DIV");
+  });
+
+  it("Compact sends /compact bare once there is context", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "promptComplete", meta: { totalTokens: 44123 } });
+    click(window, $(doc, "donut"));
+    const act = $(doc, "context-popover").querySelector(".context-compact") as HTMLElement;
+    expect(act.classList.contains("disabled")).toBe(false);
+    click(window, act);
+    expect(posted).toContainEqual({ type: "send", text: "/compact", bare: true });
+  });
+});
+
+describe("context popover — usage breakdown (#53)", () => {
+  it("shows no usage rows until the CLI reports usage", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "promptComplete", meta: { totalTokens: 1000 } });
+    click(window, $(doc, "donut"));
+    const txt = $(doc, "context-popover").textContent!;
+    expect(txt).toContain("Context used");
+    // An older CLI sends no `usage` — show the context row alone rather than a
+    // wall of zeros ("cache fields only when the CLI reports them", #53).
+    expect(txt).not.toContain("Last turn");
+    expect(txt).not.toContain("Session total");
+  });
+
+  it("leads with Session total and never shows a cache-creation row", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "usage",
+      turn: { inputTokens: 16394, outputTokens: 160, cachedReadTokens: 16256, reasoningTokens: 127 },
+      session: { inputTokens: 32722, outputTokens: 202, cachedReadTokens: 32256 },
+    });
+    click(window, $(doc, "donut"));
+    const txt = $(doc, "context-popover").textContent!;
+    // Session total is the number you act on, so it leads; Last turn is detail.
+    expect(txt.indexOf("Session total")).toBeGreaterThan(-1);
+    expect(txt.indexOf("Session total")).toBeLessThan(txt.indexOf("Last turn"));
+    expect(txt).toContain("32,722");
+    expect(txt).toContain("cache read");
+    // No cache-CREATION field exists anywhere in the CLI — it must not be faked.
+    expect(txt.toLowerCase()).not.toContain("cache creation");
+  });
+
+  it("Last turn is collapsed by default and expands on click", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "usage",
+      turn: { inputTokens: 16394, outputTokens: 160, modelCalls: 3 },
+      session: { inputTokens: 32722, outputTokens: 202 },
+    });
+    click(window, $(doc, "donut"));
+    const hdr = $(doc, "context-popover").querySelector(".popover-section-toggle") as HTMLElement;
+    expect(hdr).not.toBeNull();
+    const body = hdr.nextElementSibling as HTMLElement;
+    expect(body.hidden).toBe(true); // diagnostics stay out of the way by default
+
+    click(window, hdr);
+    expect(body.hidden).toBe(false);
+    // "Model calls" is what makes billed input (which dwarfs context) make sense.
+    expect(body.textContent).toContain("Model calls");
+    expect(body.textContent).toContain("3");
+  });
+
+  it("a restore-only session total (no turn yet) shows the session section alone", () => {
+    const { window, doc } = bootWebview();
+    // Cold restore: the host seeds from ITS store, so there's no `turn`.
+    dispatch(window, { type: "usage", session: { inputTokens: 500, outputTokens: 40 } });
+    click(window, $(doc, "donut"));
+    const txt = $(doc, "context-popover").textContent!;
+    expect(txt).toContain("Session total");
+    expect(txt).not.toContain("Last turn");
   });
 });
 

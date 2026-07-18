@@ -180,7 +180,7 @@
         "grok.defaultModel": {
           "type": "string",
           "default": "",
-          "description": "Model ID to use on new sessions. Empty = CLI default."
+          "description": "Model ID to use on new sessions. Empty = CLI default. If a non-empty value isn't available for the session's agent, it's replaced with the model the CLI falls back to (no prompt)."
         },
         "grok.defaultMode": {
           "type": "string",
@@ -258,6 +258,11 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "Expand tool details by default — each shell command's IN/OUT block (full command text + captured output) and each edit's inline diff (useful for auditing Auto-accept sessions). Tool groups (\"Ran N commands\", \"Edited N files\") still need to be expanded first; a single command outside a group shows its details immediately. Off: click a row (›) to expand just that one — edit rows always show a `+N −M` change count regardless. Also toggleable live from the gear menu → **Config & debug → Expand tool details**."
+        },
+        "grok.steerByDefault": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Send straight into Grok's running turn instead of queueing it. Off (default): a message you send while Grok is working waits, and is sent as one prompt when the turn ends — you can still steer it on demand with the **Steer** button on the pending message. On: sending while Grok works **skips the queue** and injects the message into the turn immediately, so Grok changes course mid-answer. Steering never cancels the turn and never discards in-flight tool work — it is not a Stop. It carries plain text only: no attached files, no editor context, and no `/commands`. Needs a recent Grok Build CLI; where it's unsupported, messages fall back to the queue. Also toggleable live from the gear menu → **Config & debug → Steer by default**."
         },
         "grok.telemetry.enabled": {
           "type": "boolean",

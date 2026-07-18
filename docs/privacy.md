@@ -4,7 +4,7 @@
 
 ## Telemetry — what is sent
 
-A single, anonymous **`session_start`** event ([Aptabase](https://aptabase.com)), fired on the **first real message** of a session — never the hidden plan-mode primer, and never empty or abandoned sessions. Its only purpose is to gauge how many people use the extension and which models/modes are popular.
+A single, anonymous **`session_start`** event ([Aptabase](https://aptabase.com)), fired on the **first real message** of a session — never the hidden plan-mode primer, and never empty or abandoned sessions. Its only purpose is to gauge how many people use the extension, which models/modes are popular, and whether our default settings are the right ones.
 
 The event carries:
 
@@ -12,6 +12,8 @@ The event carries:
 |---|---|---|
 | Anonymous **install id** | a random GUID generated once on your machine | count distinct installs — **not** your account, email, or grok login |
 | **mode / model / effort** | `agent` / `grok-build` / `high` | which features are used |
+| **Feature flags** | `showThinking: false`, `expandToolDetails: false`, `steerByDefault: true` | whether the defaults we picked are the ones people keep — three on/off settings, nothing more |
+| **Host app** | `Visual Studio Code`, `Cursor` | the extension runs in several VS Code forks that behave differently; this shows which ones actually need supporting |
 | **OS** + extension **version** | `Windows` / `1.6.1` | platform/version split |
 | **Country** | derived by Aptabase from your IP | rough geography |
 

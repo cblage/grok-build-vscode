@@ -23,7 +23,7 @@
 // through the session buffer (agentStart sets it, agentEnd/agentError/exit
 // clear it, clearMessages resets it).
 import { describe, it, expect } from "vitest";
-import { bootWebview, dispatch, click, Posted } from "./webview-harness";
+import { bootWebview, dispatch, click, press, Posted } from "./webview-harness";
 
 const $ = (doc: Document, id: string) => doc.getElementById(id) as HTMLElement;
 const types = (posted: Posted[]) => posted.map((p) => p.type);
@@ -189,7 +189,7 @@ describe("queued blocks — host-owned per session (#37)", () => {
 
     input.value = "half-typed draft";
     const editBtn = doc.querySelector('.queued-action[title^="Edit"]') as HTMLElement;
-    click(window, editBtn);
+    press(window, editBtn);
 
     expect((posted.find((p) => p.type === "dequeueSend"))?.index).toBe(0);
     // Queued text is older than the current draft → it goes first.
@@ -206,7 +206,7 @@ describe("queued blocks — host-owned per session (#37)", () => {
     seedQueue(window, ["drop me"]);
 
     const removeBtn = doc.querySelector('.queued-action[title="Remove from queue"]') as HTMLElement;
-    click(window, removeBtn);
+    press(window, removeBtn);
 
     expect((posted.find((p) => p.type === "dequeueSend"))?.index).toBe(0);
   });
@@ -379,5 +379,138 @@ describe("the locked startup/priming window has no cancel at all (#37)", () => {
     expect(sendBtn.classList.contains("initializing")).toBe(true);
     expect(sendBtn.disabled).toBe(true);
     expect(sendBtn.classList.contains("stop")).toBe(false);
+  });
+});
+
+// Steer (#52) — the queue's sibling. A queued message waits for the turn to end;
+// steering injects it into the RUNNING turn via grok's `_x.ai/interject`, which
+// queues into a buffer the agent drains at its next safe point. It does NOT
+// cancel: probed live on 0.2.101, the model changed course mid-stream and the
+// turn still ended `end_turn`, losing no in-flight tool work.
+describe("Steer — submit into the running turn (#52)", () => {
+  const steerBtn = (doc: Document) => doc.querySelector(".queued-steer") as HTMLButtonElement | null;
+
+  it("steering posts steerSend and drops the message from the queue — never cancel", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "agentStart" });
+    seedQueue(window, ["actually, use async"]);
+
+    press(window, steerBtn(doc)!);
+
+    expect(types(posted)).toContain("steerSend");
+    expect(posted.find((p) => p.type === "steerSend")).toMatchObject({ text: "actually, use async" });
+    // The whole point of #52: steering is not a disguised Stop.
+    expect(types(posted)).not.toContain("cancel");
+    // It leaves the queue, or the host would ALSO flush it at turn end (double send).
+    expect(types(posted)).toContain("dequeueSend");
+  });
+
+  it("is hidden when no turn is running — there is nothing to steer", () => {
+    const { window, doc } = bootWebview();
+    seedQueue(window, ["later"]);
+    // Rendered but not visible: `body.turn-busy` gates it, so a replay ordering
+    // queuedSends before agentStart still lands the button once busy arrives.
+    expect(doc.body.classList.contains("turn-busy")).toBe(false);
+
+    dispatch(window, { type: "agentStart" });
+    expect(doc.body.classList.contains("turn-busy")).toBe(true);
+    expect(steerBtn(doc)).not.toBeNull();
+
+    dispatch(window, { type: "agentEnd" });
+    expect(doc.body.classList.contains("turn-busy")).toBe(false);
+  });
+
+  it("an older CLI (steerUnavailable) hides Steer and leaves the queue working", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "agentStart" });
+    seedQueue(window, ["hello"]);
+    expect(steerBtn(doc)).not.toBeNull();
+
+    // Host latches it off after `_x.ai/interject` answered -32601.
+    dispatch(window, { type: "steerUnavailable" });
+    expect(steerBtn(doc)).toBeNull();
+    // The queued block itself must survive — the text is the fallback's payload.
+    expect(queuedBlocks(doc)).toEqual(["hello"]);
+  });
+});
+
+// The queued block is appended to the END of the chat and every streamed chunk
+// runs scrollToBottom, so the block slides under the cursor while the agent
+// writes prose. A `click` needs mousedown AND mouseup on the same element, so
+// steering mid-stream was a coin flip (fine during a tool call — nothing
+// reflows then). The actions bind pointerdown, which fires on press.
+describe("queued-block actions survive mid-stream reflow (#52)", () => {
+  it("Steer/Edit/Remove act on pointerdown, not click", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "agentStart" });
+    seedQueue(window, ["steer me"]);
+
+    // A bare click must not be what the feature depends on.
+    click(window, doc.querySelector(".queued-steer") as HTMLElement);
+    expect(types(posted)).not.toContain("steerSend");
+
+    press(window, doc.querySelector(".queued-steer") as HTMLElement);
+    expect(types(posted)).toContain("steerSend");
+  });
+});
+
+// grok.steerByDefault (#52): flips send-while-busy from "wait for the turn" to
+// "go in now". False by default — today's queueing behavior is the safe one.
+describe("Steer by default — skip the queue (#52)", () => {
+  const typeAndEnter = (window: any, doc: Document, text: string) => {
+    const input = $(doc, "input") as HTMLTextAreaElement;
+    input.value = text;
+    pressEnter(window, input);
+  };
+
+  it("queues by default — the setting is off unless asked for", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "agentStart" });
+    typeAndEnter(window, doc, "follow-up");
+    expect(types(posted)).toContain("queueSend");
+    expect(types(posted)).not.toContain("steerSend");
+  });
+
+  it("steers instead of queueing when enabled", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "steerByDefault", value: true });
+    dispatch(window, { type: "agentStart" });
+    typeAndEnter(window, doc, "use async instead");
+    expect(types(posted)).toContain("steerSend");
+    expect(types(posted)).not.toContain("queueSend");
+    // Still never a cancel — steering is not a disguised Stop.
+    expect(types(posted)).not.toContain("cancel");
+  });
+
+  it("falls back to the queue during the locked startup window", () => {
+    // busy+locked = priming: there's no live turn to interject into yet, so the
+    // message must wait rather than fail.
+    const { window, doc, posted } = bootWebview({ ready: false });
+    dispatch(window, { type: "steerByDefault", value: true });
+    typeAndEnter(window, doc, "too early");
+    expect(types(posted)).not.toContain("steerSend");
+  });
+
+  it("falls back to the queue when the CLI can't interject", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "steerByDefault", value: true });
+    dispatch(window, { type: "steerUnavailable" }); // older CLI: -32601
+    dispatch(window, { type: "agentStart" });
+    typeAndEnter(window, doc, "hello");
+    // A capability gap must degrade to queueing, not fail every single send.
+    expect(types(posted)).toContain("queueSend");
+    expect(types(posted)).not.toContain("steerSend");
+  });
+
+  it("initialState carries the persisted setting", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, {
+      type: "initialState",
+      effort: "", cwd: "/w", useCtrlEnter: false, extVersion: "1.6.2",
+      showThinking: false, expandCommandOutputs: false, steerByDefault: true,
+    });
+    dispatch(window, { type: "agentStart" });
+    typeAndEnter(window, doc, "x");
+    expect(types(posted)).toContain("steerSend");
   });
 });
