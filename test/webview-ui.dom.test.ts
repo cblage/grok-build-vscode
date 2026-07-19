@@ -430,6 +430,26 @@ describe("sandbox picker", () => {
     expect(sandboxBtn.style.display).toBe("");
   });
 
+  it("keeps the base indicator icon-only while preserving the profile in its tooltip", () => {
+    const { window, doc } = bootWebview();
+    const sandboxBtn = $(doc, "sandbox-btn") as HTMLButtonElement;
+
+    enableDarwinSandbox(window);
+    expect(sandboxBtn.textContent).toBe("");
+    expect(sandboxBtn.querySelectorAll("svg")).toHaveLength(1);
+    expect(sandboxBtn.title).toContain("off (unsandboxed)");
+
+    dispatch(window, {
+      type: "sandboxState",
+      current: "strict",
+      profiles: ["workspace", "strict", "read-only"],
+      supported: true,
+    });
+    expect(sandboxBtn.textContent).toBe("");
+    expect(sandboxBtn.querySelectorAll("svg")).toHaveLength(1);
+    expect(sandboxBtn.title).toContain("Sandbox: strict");
+  });
+
   it("does not open or post a sandbox change on non-macOS even after a forged supported state", () => {
     const { window, posted, doc } = bootWebview();
     const sandboxBtn = $(doc, "sandbox-btn") as HTMLButtonElement;

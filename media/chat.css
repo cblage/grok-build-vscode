@@ -1253,6 +1253,7 @@ body.vscode-light {
    area — attachments row, textarea, and the bottom toolbar live INSIDE it, so
    they read as one control instead of three stacked strips. */
 .composer-card {
+  position: relative;
   display: flex;
   flex-direction: column;
   background: var(--vscode-input-background);
@@ -1330,6 +1331,7 @@ textarea#input,
 textarea#input {
   display: block;
   width: 100%;
+  min-height: 60px;
   resize: none;
   background: transparent;
   color: var(--vscode-input-foreground);
@@ -1469,10 +1471,15 @@ textarea#input {
   max-width: 120px;
 }
 #sandbox-btn {
-  flex-shrink: 1;
-  min-width: 0;
-  overflow: hidden;
-  max-width: 110px;
+  position: absolute;
+  right: 7px;
+  bottom: 38px;
+  z-index: 3;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  justify-content: center;
+  padding: 0;
 }
 #sandbox-btn.sandbox-off {
   color: var(--vscode-descriptionForeground);

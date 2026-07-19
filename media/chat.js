@@ -396,8 +396,7 @@
     const off = cur === "off";
     const disabled = state.busy;
     const icon = off ? ICON.unlock : ICON.lock;
-    const label = off ? "off" : cur;
-    sandboxBtn.innerHTML = `${icon}<span class="btn-label">${escapeHtml(label)}</span>`;
+    sandboxBtn.innerHTML = icon;
     sandboxBtn.classList.toggle("sandbox-off", off);
     sandboxBtn.classList.toggle("sandbox-on", !off);
     sandboxBtn.disabled = disabled;

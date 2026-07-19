@@ -4693,6 +4693,7 @@ See design doc for the full state machine diagram.`;
         <textarea id="input" placeholder="Ask Grok..." rows="2" dir="auto"></textarea>
         <button id="mic-btn" class="mic-btn" title="Voice control"></button>
       </div>
+      <button id="sandbox-btn" class="toolbar-btn sandbox-btn" title="Sandbox profile" hidden style="display:none"></button>
       <div class="composer-toolbar">
         <div class="toolbar-left">
           <button id="add-btn" class="icon-btn" title="Add context"></button>
@@ -4707,7 +4708,6 @@ See design doc for the full state machine diagram.`;
           <div id="chips"></div>
         </div>
         <div class="toolbar-right">
-          <button id="sandbox-btn" class="toolbar-btn sandbox-btn" title="Sandbox profile" hidden style="display:none"></button>
           <button id="mode-btn" class="toolbar-btn" title="Pick mode"></button>
           <button id="send-btn" class="send"></button>
         </div>
