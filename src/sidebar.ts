@@ -11,7 +11,7 @@ import { resolveVoiceKey, extractGrokAuthKey, parseVoiceCommand, DEFAULT_SEND_PH
 import { VoiceRecorder, transcribeAudio, resolveWindowsAudioDevice } from "./voice-recorder";
 import { VoiceStreamer } from "./voice-streamer";
 import type { PromptResultMeta } from "./acp-dispatch";
-import { MediaRef, addUsage, autoCompactStartedNote, contextUsedFromCompactNotification, gateZeroTokenMeta, isAuthErrorText, isIncompatibleAgentError, isRateLimitError, isSubagentLifecycleUpdate, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, summarizeBackgroundCommand, usageIsRealMeasurement } from "./acp-dispatch";
+import { MediaRef, addUsage, autoCompactStartedNote, contextUsedFromCompactNotification, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isRateLimitError, isSubagentLifecycleUpdate, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, summarizeBackgroundCommand, usageIsRealMeasurement } from "./acp-dispatch";
 import { modeToRemember, startsInYolo } from "./mode-prefs";
 import { GROK_VIEW_ID, moveViewContainerFor } from "./view-move";
 import {
@@ -81,6 +81,9 @@ import { appendPlanEntry, countsAsUserBubble, decideRestoreState } from "./plan-
 import { planReviewFileBaseName, sanitizePlanReviewFilePart } from "./plan-review";
 import { GROK_PRIMER, isPrimerText, isPrimerSummary } from "./grok-primer";
 import { HostMsg, WebviewMsg } from "./protocol";
+import { RemoteUplink } from "./remote-uplink";
+import { allowFromRemote, transformHostMsgForRemote, type MediaInlineDeps, type RemoteTier } from "./remote-policy";
+import { httpBaseFromRelayUrl } from "./remote-frames";
 import {
   SessionListEntry,
   SessionMetaOverrides,
@@ -221,6 +224,20 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   private voiceStreamCtx?: { key: string; ffmpegPath: string; device?: string; phrase: string; keyterms: string[] };
   private configWatcher?: vscode.Disposable;
   private lastUserSandboxSetting = "";
+  // Remote uplink — outbound wss to a relay, active only when
+  // grok.remoteControl.relayUrl is set AND a device token is stored (the
+  // "Grok: Link Remote Device" flow). The taps in post()/emit() are no-ops when
+  // it's off, so the shipping path is unaffected.
+  private uplink?: RemoteUplink;
+  // Last-seen "chrome" messages (labels, donut, lists, config echoes) that live
+  // OUTSIDE Session.buffer — the buffer replays the chat, this replays the shell.
+  // A new remote client's snapshot = these + clearMessages + the focused buffer.
+  private stickyChrome = new Map<HostMsg["type"], HostMsg>();
+  private static readonly STICKY_CHROME_TYPES = new Set<HostMsg["type"]>([
+    "initialState", "session", "modelChanged", "modeChanged", "chips",
+    "contextUsage", "sessions", "queuedSends", "onboarding", "commandsUpdate",
+    "grokUpdateStatus", "voiceConfigured", "fontScale", "showThinking", "expandCommandOutputs",
+  ]);
   private cliPath?: string;
   // Guards the silent grok-CLI auto-update so it runs at most once per activation.
   private cliUpdateChecked = false;
@@ -339,8 +356,15 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
             .then(() => this.postSandboxState(process.env));
         }
       }
+      if (e.affectsConfiguration("grok.remoteControl")) {
+        // relayUrl can change, so tear down and re-create rather than no-op.
+        this.uplink?.dispose();
+        this.uplink = undefined;
+        void this.maybeStartUplink();
+      }
     });
     this.applyTerminalShellPref();
+    void this.maybeStartUplink();
   }
 
   /** Push the `grok.terminalShell` preference (#46) into the shared shell
@@ -1429,6 +1453,8 @@ See design doc for the full state machine diagram.`;
 
   dispose(): void {
     if (this.reaper) { clearInterval(this.reaper); this.reaper = undefined; }
+    this.uplink?.dispose();
+    this.uplink = undefined;
     void this.disposePool();
     this.editorWatcher?.dispose();
     this.configWatcher?.dispose();
@@ -1814,6 +1840,10 @@ See design doc for the full state machine diagram.`;
     session.titleGenerated = false;
     session.firstUserMessageForTitle = undefined;
     session.priming = true;
+    // session.authRecoveryTried deliberately NOT reset here: recoverAuthAndResend
+    // calls startSession as its own retry, and a reset would let an entitlement
+    // failure (#58) pay a full restart+resend cycle on every prompt. Only a clean
+    // turn re-arms it.
     this.emit(session, { type: "modeChanged", modeId: session.autoApprove ? "yolo" : "agent" });
     this.postModePolicy();
     this.postSandboxState(process.env);
@@ -2450,7 +2480,10 @@ See design doc for the full state machine diagram.`;
       this.pool.delete(session);
       session.priming = false;
       this.emit(session, { type: "setBusy", value: false });
-      if (/auth|unauthor|forbidden|401|403|api[_\s-]?key|credential|sign.?in/i.test(msg)) {
+      // No `403`/`forbidden` here: the CLI deliberately does NOT map 403 to an
+      // auth failure (entitlement/policy, which sign-in can't fix — #58); a
+      // startup error carrying that wording surfaces as a plain error below.
+      if (/auth|unauthor|401|api[_\s-]?key|credential|sign.?in/i.test(msg)) {
         this.emit(session, { type: "onboarding", state: "auth-required" });
       } else if (process.platform === "win32" && /timed out: (initialize|session\/(new|load))|exited \(code null\)/i.test(msg)) {
         // The signature of the Windows stdio regression (issue #22): a startup request
@@ -3978,12 +4011,14 @@ See design doc for the full state machine diagram.`;
         this.setStatus(session, "error");
         return;
       }
-      const message = e?.data?.message ?? e?.message ?? String(err);
       // An expired-token error wedges only THIS long-lived process (the CLI shares
       // ~/.grok/auth.json across the pool + sibling `grok login`); transparently
       // reload the process and resend before surfacing the error (see method doc).
-      if (await this.recoverAuthAndResend(session, message, text, sentChips, promptBlocks)) return;
-      this.emit(session, { type: "agentError", text: message });
+      if (await this.recoverAuthAndResend(session, e, text, sentChips, promptBlocks)) return;
+      // Recovery declined (already retried this streak, or not auth-shaped):
+      // promptErrorText keeps the copy consistent — the entitlement notice for
+      // billing-flavored wording (#58), the raw detail otherwise.
+      this.emit(session, { type: "agentError", text: promptErrorText(e) });
       this.setStatus(session, "error");
     } finally {
       // If the user approved/declined a plan mid-turn, the follow-up action was
@@ -4001,23 +4036,29 @@ See design doc for the full state machine diagram.`;
    * Recover from an expired-token turn failure without a manual sign-out. A
    * pooled `grok agent stdio` process can wedge on an expired OAuth token when
    * its 401-refresh loses a rotation race with the sibling processes / `grok
-   * login` that share `~/.grok/auth.json`; the API then rejects it (often as a
-   * misleading "you need to pay"). A FRESH process re-reads the current disk
-   * token — exactly what re-login does, minus the sign-out — so we transparently
-   * restart the focused session (`startSession` respawns + `session/load`s to
-   * preserve history) and RE-SEND the failed prompt once. Guarded by
-   * `authRecoveryTried` (reset on any clean turn) so a genuine dead-auth / real
-   * billing error can't loop: the resend's own failure surfaces normally.
-   * Returns true when it handled the error (caller must not also show it).
+   * login` that share `~/.grok/auth.json`. A FRESH process re-reads the current
+   * disk token — exactly what re-login does, minus the sign-out — so we
+   * transparently restart the focused session (`startSession` respawns +
+   * `session/load`s to preserve history) and RE-SEND the failed prompt once.
+   * Guarded by `authRecoveryTried` (reset on any clean turn) so a genuine
+   * dead-auth / entitlement error can't loop. The resend's failure is the
+   * decision point (#58): only a CREDENTIAL failure (`isCredentialError` — the
+   * CLI's -32000 auth_required, or unambiguous credential wording) earns the
+   * sign-in overlay; billing/entitlement wording that a fresh process couldn't
+   * clear is NOT fixable by login (the CLI maps 403 to a plain error precisely
+   * because the credential was accepted) and shows the in-chat entitlement
+   * notice instead. Returns true when it handled the error (caller must not
+   * also show it).
    */
   private async recoverAuthAndResend(
     session: Session,
-    errorText: string,
+    err: unknown,
     displayText: string,
     chips: FileChip[],
     promptBlocks: Parameters<AcpClient["prompt"]>[0],
   ): Promise<boolean> {
-    if (!isAuthErrorText(errorText)) return false;
+    const errorText = errorDetail(err);
+    if (!isAuthErrorText(errorText) && !isCredentialError(err)) return false;
     if (session !== this.focused) return false;   // only the active session is safe to reload here
     if (!session.activeSessionId) return false;   // need an id to session/load history back
     if (session.authRecoveryTried) return false;  // already retried this streak → let it surface
@@ -4054,13 +4095,23 @@ See design doc for the full state machine diagram.`;
         this.setStatus(session, "error");
         return true;
       }
-      const t2 = e2?.data?.message ?? e2?.message ?? String(err2);
-      if (isAuthErrorText(t2)) {
-        // A fresh process still can't auth → auth.json genuinely dead (or a real
-        // billing block) → the honest ask is a re-login.
-        this.emit(session, { type: "onboarding", state: "auth-required" });
+      if (isCredentialError(e2)) {
+        // A fresh process still can't authenticate → auth.json genuinely dead →
+        // the honest ask is a re-login. The agentError FIRST: its webview
+        // handler is what clears the busy/"Grokking" indicator and leaves a
+        // truthful transcript (the overlay alone froze both — #58). The overlay
+        // itself is post()ed, not emit()ed: live-only, so it can't resurrect
+        // from the replay buffer on a later focus switch after the user has
+        // already re-authed.
+        this.emit(session, { type: "agentError", text: errorDetail(e2) });
+        this.setStatus(session, "error");
+        this.post({ type: "onboarding", state: "auth-required" });
       } else {
-        this.emit(session, { type: "agentError", text: t2 });
+        // Entitlement/billing wording (or anything else) on a fresh process is
+        // not a sign-in problem — promptErrorText shows the entitlement notice
+        // with the CLI's own actionable advice in chat (#58), never the login
+        // overlay, which can't fix it.
+        this.emit(session, { type: "agentError", text: promptErrorText(e2) });
         this.setStatus(session, "error");
       }
     }
@@ -4085,10 +4136,10 @@ See design doc for the full state machine diagram.`;
     void this.context.globalState.update(SESSION_META_KEY, next);
   }
 
-  private postInitialState(): void {
+  private buildInitialStateMsg(): HostMsg {
     const cfg = vscode.workspace.getConfiguration("grok");
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-    this.post({
+    return {
       type: "initialState",
       effort: cfg.get("defaultEffort", ""),
       cwd,
@@ -4098,7 +4149,11 @@ See design doc for the full state machine diagram.`;
       expandCommandOutputs: cfg.get("expandCommandOutputs", false),
       platform: process.platform,
       steerByDefault: cfg.get("steerByDefault", false),
-    });
+    };
+  }
+
+  private postInitialState(): void {
+    this.post(this.buildInitialStateMsg());
     // Sync the active-editor context chip into the fresh webview (the config
     // gate + no-editor case live inside refreshImplicitChip).
     this.refreshImplicitChip(true);
@@ -4136,6 +4191,7 @@ See design doc for the full state machine diagram.`;
     if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     if (this.focused.suppressPlanReject && GrokSidebar.PLAN_REJECT_SUPPRESS.has(message.type)) return;
     this.view?.webview.postMessage(message);
+    this.mirrorToRemote(message);
   }
 
   /**
@@ -4154,7 +4210,23 @@ See design doc for the full state machine diagram.`;
     if (session.suppressPlanReject && GrokSidebar.PLAN_REJECT_SUPPRESS.has(message.type)) return;
     if (message.type === "clearMessages") session.buffer = [];
     else session.buffer.push(message);
-    if (session === this.focused) this.view?.webview.postMessage(message);
+    if (session === this.focused) {
+      this.view?.webview.postMessage(message);
+      this.mirrorToRemote(message);
+    }
+  }
+
+  /** Record sticky chrome + fan the (already-un-suppressed, focused) message out
+   *  to remote clients. No-op unless the uplink is running. Shared focus:
+   *  remote mirrors exactly what the local webview sees. Outbound policy applies
+   *  here: host-local messages (voice) + video are suppressed, image `media` is
+   *  base64-inlined (an asWebviewUri src only resolves inside the local webview). */
+  private mirrorToRemote(message: HostMsg): void {
+    if (GrokSidebar.STICKY_CHROME_TYPES.has(message.type)) this.stickyChrome.set(message.type, message);
+    if (!this.uplink) return;
+    const out = transformHostMsgForRemote(message, GrokSidebar.REMOTE_MEDIA_DEPS);
+    if (!out) return;
+    this.uplink.broadcast(out);
   }
 
   // ---------- session pool ----------
@@ -4639,6 +4711,145 @@ See design doc for the full state machine diagram.`;
       this.output.appendLine(`[env] loaded ${Object.keys(dotEnv).length} var(s) from .env`);
     }
     return env;
+  }
+
+  // ---------- remote control (thin client only — the relay server and web
+  // client are a separate project) ----------
+
+  /** v1 ships one capability tier — every paired remote is fully trusted
+   *  (decision 2026-07-16). The policy module supports read-only/propose for a
+   *  later per-device setting. */
+  private static readonly REMOTE_TIER: RemoteTier = "full";
+
+  /** Impure half of the media inline transform (the decision logic is the pure
+   *  remote-policy). Sync read keeps broadcast ordering; media is rare + capped. */
+  private static readonly REMOTE_MEDIA_DEPS: MediaInlineDeps = {
+    readFile: (p) => {
+      try {
+        return fs.readFileSync(p);
+      } catch {
+        return null;
+      }
+    },
+    toBase64: (bytes) => Buffer.from(bytes).toString("base64"),
+  };
+
+  /** The single inbound choke point for remote clients: capability-gate, then
+   *  route into the normal onMessage switch. */
+  private handleRemoteMessage(m: WebviewMsg): void {
+    if (!allowFromRemote(m.type, GrokSidebar.REMOTE_TIER)) {
+      this.output.appendLine(`[remote] dropped ${m.type} (not allowed from a remote client)`);
+      return;
+    }
+    void this.onMessage(m).catch((e) =>
+      this.output.appendLine(`[remote] ${m.type} failed: ${(e as Error)?.message ?? String(e)}`),
+    );
+  }
+
+  private static readonly DEVICE_TOKEN_SECRET = "grok.remoteControl.deviceToken";
+
+  /** Start the relay uplink when grok.remoteControl.relayUrl is set and a device
+   *  token is stored (from the link flow). Idempotent; disposed by the config
+   *  watcher on any remoteControl.* change. */
+  private async maybeStartUplink(): Promise<void> {
+    const relayUrl = vscode.workspace.getConfiguration("grok").get<string>("remoteControl.relayUrl", "").trim();
+    if (!relayUrl || this.uplink) return;
+    const token = await this.context.secrets.get(GrokSidebar.DEVICE_TOKEN_SECRET);
+    if (!token) return; // not linked yet — the link command starts the uplink itself
+    this.uplink = new RemoteUplink({
+      relayUrl,
+      token,
+      deviceName: `${os.hostname()} — ${path.basename(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "no workspace")}`,
+      snapshot: () => this.buildRemoteSnapshot(),
+      onClientMessage: (m) => this.handleRemoteMessage(m),
+      log: (l) => this.output.appendLine(l),
+    });
+    this.uplink.start();
+  }
+
+  /** "Grok: Link Remote Device" — the device-code flow against the relay's REST
+   *  edge: start a link, open the browser for the (mock for now) approval, poll
+   *  until the relay hands back a long-lived device token, store it in secrets,
+   *  connect. Mirrors how a CLI links to a web account. */
+  async linkRemoteDevice(): Promise<void> {
+    const relayUrl = vscode.workspace.getConfiguration("grok").get<string>("remoteControl.relayUrl", "").trim();
+    if (!relayUrl) {
+      void vscode.window.showErrorMessage("Set grok.remoteControl.relayUrl first (e.g. ws://localhost:8787).");
+      return;
+    }
+    const base = httpBaseFromRelayUrl(relayUrl);
+    try {
+      const name = `${os.hostname()} — ${path.basename(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "no workspace")}`;
+      const startRes = await fetch(`${base}/api/link/start`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      if (!startRes.ok) throw new Error(`link/start ${startRes.status}`);
+      const { code } = (await startRes.json()) as { code: string };
+      void vscode.env.openExternal(vscode.Uri.parse(`${base}/link?code=${encodeURIComponent(code)}`));
+      const token = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `Approve this device in the browser (code ${code})…`, cancellable: true },
+        (_p, cancel) => this.pollLinkApproval(base, code, cancel),
+      );
+      if (!token) return; // cancelled / expired — poll loop already surfaced why
+      await this.context.secrets.store(GrokSidebar.DEVICE_TOKEN_SECRET, token);
+      this.uplink?.dispose();
+      this.uplink = undefined;
+      await this.maybeStartUplink();
+      void vscode.window.showInformationMessage("Remote device linked — this workspace is now reachable from the web client.");
+    } catch (e) {
+      void vscode.window.showErrorMessage(`Remote link failed: ${(e as Error)?.message ?? String(e)}`);
+    }
+  }
+
+  private async pollLinkApproval(base: string, code: string, cancel: vscode.CancellationToken): Promise<string | undefined> {
+    const deadline = Date.now() + 5 * 60_000;
+    while (Date.now() < deadline && !cancel.isCancellationRequested) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const res = await fetch(`${base}/api/link/poll`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code }),
+      });
+      if (!res.ok) continue;
+      const body = (await res.json()) as { status: string; token?: string };
+      if (body.status === "approved" && body.token) return body.token;
+      if (body.status === "expired" || body.status === "unknown") {
+        void vscode.window.showErrorMessage("Remote link code expired — run the link command again.");
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+
+  /** "Grok: Unlink Remote Device" — drop the token + connection. */
+  async unlinkRemoteDevice(): Promise<void> {
+    await this.context.secrets.delete(GrokSidebar.DEVICE_TOKEN_SECRET);
+    this.uplink?.dispose();
+    this.uplink = undefined;
+    void vscode.window.showInformationMessage("Remote device unlinked.");
+  }
+
+  /** Ordered catch-up for a newly-`ready` client: initialState first (so chat.js
+   *  initializes), then clearMessages + the focused chat buffer, then the rest of
+   *  the sticky chrome (labels/donut/lists — order among them is moot). All of it
+   *  through the outbound policy (media inlined, host-local suppressed). */
+  private buildRemoteSnapshot(): HostMsg[] {
+    const snap: HostMsg[] = [];
+    snap.push(this.stickyChrome.get("initialState") ?? this.buildInitialStateMsg());
+    snap.push({ type: "clearMessages" });
+    for (const m of this.focused.buffer) snap.push(m);
+    for (const [type, m] of this.stickyChrome) {
+      if (type === "initialState") continue;
+      snap.push(m);
+    }
+    const out: HostMsg[] = [];
+    for (const m of snap) {
+      const t = transformHostMsgForRemote(m, GrokSidebar.REMOTE_MEDIA_DEPS);
+      if (t) out.push(t);
+    }
+    return out;
   }
 
   private getHtml(webview: vscode.Webview): string {
