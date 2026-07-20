@@ -60,6 +60,7 @@ import {
   makeImplicitChip,
   mimeFromPath,
   removeChip,
+  selectionLineRange,
   toggleChip,
 } from "./chips";
 import { buildPromptWithImages, type PromptImageInput } from "./prompt-builder";
@@ -75,7 +76,7 @@ import {
   readGlobalConfigurationValue,
   resolveNewSessionSandboxProfile,
 } from "./grok-config";
-import { parseFileRef, shouldReadFileInline } from "./file-ref";
+import { fileUriToPath, parseFileRef, shouldReadFileInline } from "./file-ref";
 import { pickRejectOption, shouldRejectPermission } from "./plan-gate";
 import { appendPlanEntry, countsAsUserBubble, decideRestoreState } from "./plan-restore";
 import { planReviewFileBaseName, sanitizePlanReviewFilePart } from "./plan-review";
@@ -95,6 +96,7 @@ import {
   forkDisplayName,
   indexSessions,
   isEmptyPrimerSession,
+  isPathInside,
   readContextUsage,
   readSessionEntries,
   resolveGrokHome,
@@ -396,8 +398,9 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
     let selStart: number | undefined;
     let selEnd: number | undefined;
     if (opts?.selection && editor && !editor.selection.isEmpty) {
-      selStart = editor.selection.start.line + 1;
-      selEnd = editor.selection.end.line + 1;
+      const range = selectionLineRange(editor.selection.start, editor.selection.end);
+      selStart = range.startLine;
+      selEnd = range.endLine;
     }
     this.chips.push(makeExplicitChip(uri.fsPath, relPath, selStart, selEnd));
     this.postChips();
@@ -1343,9 +1346,7 @@ See design doc for the full state machine diagram.`;
    * generated media lives under, so `asWebviewUri` can serve it from disk. */
   private isServableFromDisk(p: string): boolean {
     try {
-      const root = path.resolve(resolveGrokHome());
-      const rel = path.relative(root, path.resolve(p));
-      return !!rel && !rel.startsWith("..") && !path.isAbsolute(rel);
+      return isPathInside(resolveGrokHome(), p);
     } catch {
       return false;
     }
@@ -1467,7 +1468,12 @@ See design doc for the full state machine diagram.`;
 
   private async ensureClient(): Promise<AcpClient | undefined> {
     if (this.focused.client) return this.focused.client;
-    return this.startSession();
+    // After a CLI crash the focused session keeps its grok id but loses its
+    // client — respawn by RESUMING that id, so the next send continues the same
+    // conversation (a bare startSession would open a blank-context session
+    // under the old transcript). Fresh/unstarted sessions have no id and start
+    // clean as before.
+    return this.startSession(this.focused.activeSessionId);
   }
 
   /** Read `grok --version` for the policy checks. Returns "" on failure (logged). */
@@ -2331,6 +2337,13 @@ See design doc for the full state machine diagram.`;
       }
       this.setStatus(session, "error");
       this.pool.delete(session); // the process is gone; it's no longer a live pool member
+      // Drop the dead client too (and bump gen so its other in-flight handlers
+      // bail): `handleSend`/`ensureClient` prefer `session.client`, so leaving
+      // it set routed every post-crash send into a dead pipe instead of
+      // respawning.
+      session.gen++;
+      session.client = undefined;
+      void client.dispose();
     });
     client.on("stderr", (text: string) => this.output.append(text));
 
@@ -3782,7 +3795,17 @@ See design doc for the full state machine diagram.`;
     return true;
   }
 
-  private async addDroppedFile(absPath: string, shiftHeld: boolean): Promise<void> {
+  private async addDroppedFile(dropped: string, shiftHeld: boolean): Promise<void> {
+    // The webview posts the raw file:// URI (it has no path library); accept a
+    // plain path too so older webview builds degrade instead of breaking.
+    let absPath = dropped;
+    if (/^file:\/\//i.test(dropped)) {
+      try {
+        absPath = fileUriToPath(dropped);
+      } catch {
+        return;
+      }
+    }
     if (!fs.existsSync(absPath)) return;
     if (!shiftHeld && isVisionImagePath(absPath)) {
       try {
@@ -4570,6 +4593,11 @@ See design doc for the full state machine diagram.`;
   private async newFocusedSession(): Promise<void> {
     this.parkFocused();
     this.focused = new Session();
+    // The webview toolbar button clears its own DOM before posting newSession,
+    // but the Command Palette command lands here directly — without this clear
+    // the old transcript stayed onscreen under the fresh session. (The toolbar
+    // path just clears twice, a no-op.)
+    this.emit(this.focused, { type: "clearMessages" });
     await this.startSession();
   }
 
@@ -4642,8 +4670,9 @@ See design doc for the full state machine diagram.`;
     let selStart: number | undefined;
     let selEnd: number | undefined;
     if (!editor.selection.isEmpty) {
-      selStart = editor.selection.start.line + 1;
-      selEnd = editor.selection.end.line + 1;
+      const range = selectionLineRange(editor.selection.start, editor.selection.end);
+      selStart = range.startLine;
+      selEnd = range.endLine;
     }
 
     if (

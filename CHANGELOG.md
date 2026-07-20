@@ -1,15 +1,25 @@
 # Changelog
 
-## 1.7.3-sandbox.1 - 2026-07-18
+## 1.7.5-sandbox.1 - 2026-07-20
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v1.7.2.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v1.7.4.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive directly from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Session behavior:** the chosen profile is fixed for the life of a conversation and restored when that conversation resumes. Built-in application failures warn and continue like Grok; invalid or unapplied custom profiles refuse to start; and loss of the live delegated-operation sandbox ends the affected session instead of silently weakening it.
   - **Sandbox controls:** supported macOS hosts get a compact lock/unlock indicator stacked between the voice and Send controls; profile names, distinct source icons, and source labels for built-in, user-defined, and workspace-defined profiles live in its picker. The control stays disabled from session startup through the full active turn, in lockstep with Agent Mode, and changing the profile of an existing conversation opens the Summarize or Just Restart flow required to start a new session under the new boundary.
   - See the [macOS sandbox architecture guide](docs/macos-sandbox-architecture.md) for the full access matrix, profile resolution rules, process topology, and enforcement boundary.
+
+## 1.7.4 — 2026-07-19
+
+Eleven long-standing bugs found by running this extension through a multi-model bug-finding benchmark, then re-verified and fixed against the live tree — most of them Windows path handling. 42 new regression tests.
+
+### Fixed
+
+- **Windows path family:** drag-and-drop into the chat works on Windows (the dropped `file:///C:/…` URI was mis-stripped to `/C:/…` and silently failed); absolute Windows paths like `C:\work\file.ts` (with or without `:42`) now linkify in chat — and clicking any `path:line` ref now actually opens at that line; agent-sent `file://` media refs convert via a proper URI→path helper (drive letters + UNC hosts); session history now reads the same `~/.grok` the CLI writes (`GROK_HOME` override honored, USERPROFILE-first on Windows — a set `HOME`, e.g. git-bash, used to split them). ([media/chat.js](media/chat.js), [media/webview-helpers.js](media/webview-helpers.js), [src/file-ref.ts](src/file-ref.ts), [src/acp-dispatch.ts](src/acp-dispatch.ts), [src/sessions.ts](src/sessions.ts), [src/sidebar.ts](src/sidebar.ts))
+- **Crash recovery:** after the CLI process dies, the next send respawns and resumes the same session instead of writing into the dead client (which errored, or hung at "Grokking…", until you manually started a new session); a `taskkill` that runs-but-fails (Access Denied) no longer leaves the agent's `wait_for_exit` pending forever — a direct signal fallback fires; an error or exit during the startup lock can no longer strand the composer's locked state. ([src/sidebar.ts](src/sidebar.ts), [src/terminal-manager.ts](src/terminal-manager.ts), [media/chat.js](media/chat.js))
+- **Smaller correctness fixes:** full-line selections no longer attach one phantom line past the selection (VS Code selection ends are exclusive at column 0); Command Palette *New Session* clears the previous transcript like the toolbar button; the per-session webview reset clears the question/restored-card maps (a new session's tool updates could mutate the previous session's cards); generated media in a `..`-prefixed dir under grok home serves from disk instead of falling back to base64; the STT keyterm list enforces its documented 100-term cap. ([src/chips.ts](src/chips.ts), [src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js), [src/sessions.ts](src/sessions.ts), [src/voice.ts](src/voice.ts))
 
 ## 1.7.3 — 2026-07-18
 
