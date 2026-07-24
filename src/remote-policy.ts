@@ -38,6 +38,8 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   listSessions: "view",
   resumeSession: "view",
   renameSession: "view",
+  // read-only workspace file-name lookup (the composer's @ popover)
+  mentionQuery: "view",
   // input/turn control (propose+)
   send: "propose",
   newSession: "propose",
@@ -55,6 +57,9 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   pasteImage: "propose",
   removeChip: "propose",
   toggleChip: "propose",
+  // attaches a chip (host-validated against its own file index) — same class
+  // of composer-state mutation as removeChip/toggleChip
+  addMentionFile: "propose",
   // recheckConnection restarts the CLI session on the host — turn control, not handshake
   recheckConnection: "propose",
   // approvals + destructive + host-CLI mutations (full only)
@@ -87,6 +92,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   setShowThinking: "host-local",
   setExpandCommandOutputs: "host-local",
   setSteerByDefault: "host-local",
+  setSoundNotifications: "host-local",
   // Sandbox profiles are resolved from host/workspace files and changing one
   // mutates the host's persisted session boundary. A remote may observe the
   // resulting state, but it must not select a host sandbox profile.
@@ -144,6 +150,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   openModePopover: "mirror",
   chips: "mirror",
   commandsUpdate: "mirror",
+  mentionResults: "mirror",
   userMessage: "mirror",
   agentStart: "mirror",
   thoughtChunk: "mirror",
@@ -180,6 +187,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   commandOutput: "mirror",
   expandCommandOutputs: "mirror",
   steerByDefault: "mirror",
+  soundNotifications: "mirror",
   setAllToolDetails: "mirror",
   focusInput: "mirror",
   sessions: "mirror",

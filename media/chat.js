@@ -20,6 +20,7 @@
   const donutLabel = $("donut-label");
   const contextPopover = $("context-popover");
   const slashPopover = $("slash-popover");
+  const mentionPopover = $("mention-popover");
   const modePopover = $("mode-popover");
   const sandboxPopover = $("sandbox-popover");
   const gearPopover = $("gear-popover");
@@ -104,6 +105,13 @@
     activeToolGroupEl: null,
     slashFiltered: [],
     slashActive: 0,
+    // "@" file popover: the rows the host sent for the current token
+    // (mentionResults), the highlighted row, and the token the rows answer —
+    // null while no token is under the caret (stale replies are dropped
+    // against it, so fast typing can't render an older query's rows).
+    mentionFiles: [],
+    mentionActive: 0,
+    mentionQuery: null,
     pendingDiffByToolCallId: new Map(),
     toolItemsByToolCallId: new Map(),
     toolFailuresById: new Map(), // toolCallId → error text, so a single-call group carries it onto the flat
@@ -229,6 +237,10 @@
     // grok is working SKIPS the queue and is interjected into the running turn.
     // False = today's behavior (queue, with an on-demand Steer button).
     steerByDefault: false,
+    // grok.soundNotifications (persisted, global): when true a short synth tone
+    // plays on turn completion / error, but only when the Grok panel isn't
+    // focused (#59). Off by default. Host posts the value on init + config change.
+    soundNotifications: false,
     // toolExpandOverride (per-session, in-memory): the Command Palette
     // Expand/Collapse All latch. null = follow the setting above; true/false =
     // force ALL groups + details open/closed for this session, and keep applying
@@ -346,6 +358,67 @@
     return s.charAt(0).toUpperCase() + s.slice(1);
   }
 
+  // ---------- sound notifications (#59) ----------
+  // Synth tones via Web Audio — no bundled assets, CSP-safe, offline. Two cues:
+  // a rising two-note chime for completion, a lower falling tone for errors. The
+  // AudioContext is created lazily and unlocked on the first user gesture (the
+  // autoplay policy starts it "suspended"); the send/keypress that starts a turn
+  // is that gesture, so a later completion beep is allowed.
+  let audioCtx = null;
+  function ensureAudioCtx() {
+    if (audioCtx) return audioCtx;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      audioCtx = AC ? new AC() : null;
+    } catch (_e) { audioCtx = null; }
+    return audioCtx;
+  }
+  function unlockAudio() {
+    const ctx = ensureAudioCtx();
+    if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {});
+  }
+  function playNotificationTone(kind) {
+    const ctx = ensureAudioCtx();
+    if (!ctx) return;
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    const t0 = ctx.currentTime;
+    // { frequency Hz, start-offset s, duration s }
+    const notes = kind === "error"
+      ? [{ f: 311, s: 0, d: 0.18 }, { f: 233, s: 0.15, d: 0.26 }]  // falling, darker
+      : [{ f: 587, s: 0, d: 0.14 }, { f: 880, s: 0.13, d: 0.20 }]; // rising, bright
+    const master = ctx.createGain();
+    master.gain.value = 0.08; // gentle — a cue, not an alarm
+    master.connect(ctx.destination);
+    for (const n of notes) {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = n.f;
+      // Tiny attack + exponential decay so each note doesn't click.
+      g.gain.setValueAtTime(0.0001, t0 + n.s);
+      g.gain.exponentialRampToValueAtTime(1, t0 + n.s + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + n.s + n.d);
+      osc.connect(g);
+      g.connect(master);
+      osc.start(t0 + n.s);
+      osc.stop(t0 + n.s + n.d + 0.03);
+    }
+  }
+  // Play only when the user isn't looking at the Grok panel — the "notify me when
+  // I've stepped away" case (#59). A focused, visible panel means they'll see the
+  // result without a beep. hasFocus() is false when the editor/another app has
+  // focus; visibilityState covers a fully collapsed panel.
+  function maybeNotifySound(kind) {
+    if (!state.soundNotifications) return;
+    const away = document.visibilityState === "hidden" || !document.hasFocus();
+    if (!away) return;
+    playNotificationTone(kind);
+  }
+  // Unlock on the first user gesture anywhere in the webview (typing/clicking to
+  // send qualifies), so the first completion beep isn't blocked by autoplay.
+  document.addEventListener("pointerdown", unlockAudio, { passive: true });
+  document.addEventListener("keydown", unlockAudio, { passive: true });
+
   function toK(n) {
     return Math.round(n / 1000) + "K";
   }
@@ -419,7 +492,7 @@
 
   // ---------- markdown ----------
 
-  const { looksLikeFileRef, formatRelativeTime, modelDisplayName, nextMicState, trailingSendPhrase, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage } = globalThis.GrokWebviewHelpers;
+  const { looksLikeFileRef, formatRelativeTime, modelDisplayName, nextMicState, trailingSendPhrase, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, getMentionQuery, applyMentionPick } = globalThis.GrokWebviewHelpers;
 
   function escapeAttr(s) {
     return String(s == null ? "" : s)
@@ -1429,6 +1502,19 @@
         },
       );
     }
+    // Sound notifications (#59) — a short tone on turn completion / error, played
+    // only when the Grok panel isn't focused (notify me when I've stepped away).
+    addGearItem(
+      `<span title="Play a short sound when Grok finishes or errors — only when the Grok panel isn't focused. A rising chime for done, a lower tone for errors.">Sound notifications</span><span class="popover-switch${state.soundNotifications ? " on" : ""}" role="switch" aria-checked="${state.soundNotifications}"><span class="popover-switch-knob"></span></span>`,
+      () => {
+        state.soundNotifications = !state.soundNotifications;
+        vscode.postMessage({ type: "setSoundNotifications", value: state.soundNotifications });
+        // Unlock the audio context on this user gesture so the first later beep
+        // is allowed (autoplay policy). A no-op when already running.
+        if (state.soundNotifications) unlockAudio();
+        renderConfigDebugPanel();
+      },
+    );
     addGearSep();
     addGearItem('<span>Open global config</span><span class="popover-external">↗</span>', () => {
       vscode.postMessage({ type: "openGlobalConfig" });
@@ -3664,6 +3750,7 @@
     // (Thinking / tools use the dots for discrete progress instead).
     el.innerHTML = `<span class="grokking-icon">${ICON.orbit}</span><span class="grokking-label">Grokking</span>`;
     el.setAttribute("aria-label", "Grok is working");
+    el.title = "Waiting for response";
     messagesEl.appendChild(el);
     state.grokkingEl = el;
     scrollToBottom();
@@ -4461,6 +4548,66 @@
     input.focus();
   }
 
+  // ---------- "@" file autocomplete ----------
+  // Typing `@` (at the start of a word) opens a workspace-file picker fed by the
+  // host: every keystroke posts the token (mentionQuery), the host answers from
+  // a TTL-cached findFiles index (mentionResults, ranked in src/mention.ts), and
+  // a pick rewrites the token to `@rel/path ` AND attaches the file as an
+  // explicit chip (addMentionFile) — the same pipeline as drop / the + picker,
+  // so the prompt carries both the prose reference and the attachment.
+
+  function hideMention() {
+    if (mentionPopover) mentionPopover.hidden = true;
+    state.mentionFiles = [];
+    state.mentionQuery = null;
+  }
+
+  function updateMention() {
+    if (!mentionPopover) return;
+    const q = getMentionQuery(input.value, input.selectionStart || 0);
+    if (q === null) { hideMention(); return; }
+    state.mentionQuery = q;
+    // No debounce: the host answers from an in-memory index (concurrent
+    // keystrokes during a cold build share one findFiles pass), so a reply per
+    // keystroke is cheap and keeps the popover snappy.
+    vscode.postMessage({ type: "mentionQuery", query: q });
+  }
+
+  function renderMention() {
+    mentionPopover.innerHTML = "";
+    let activeEl = null;
+    state.mentionFiles.forEach((rel, i) => {
+      const el = document.createElement("div");
+      el.className = `mention-item${i === state.mentionActive ? " active" : ""}`;
+      if (i === state.mentionActive) activeEl = el;
+      const cut = rel.lastIndexOf("/");
+      const name = document.createElement("span");
+      name.className = "mention-name";
+      name.textContent = cut >= 0 ? rel.slice(cut + 1) : rel;
+      el.appendChild(name);
+      if (cut >= 0) {
+        const dir = document.createElement("span");
+        dir.className = "mention-dir";
+        dir.textContent = rel.slice(0, cut);
+        el.appendChild(dir);
+      }
+      el.title = rel;
+      el.onclick = () => pickMention(rel);
+      mentionPopover.appendChild(el);
+    });
+    if (activeEl) activeEl.scrollIntoView({ block: "nearest" });
+  }
+
+  function pickMention(rel) {
+    const r = applyMentionPick(input.value, input.selectionStart || 0, rel);
+    input.value = r.text;
+    if (input.setSelectionRange) input.setSelectionRange(r.caret, r.caret);
+    hideMention();
+    vscode.postMessage({ type: "addMentionFile", relPath: rel });
+    input.focus();
+    renderInputHighlight();
+  }
+
   // ---------- send ----------
 
   function updateSendButton() {
@@ -4479,14 +4626,14 @@
     // keystroke, and rebuilding the block would churn its DOM (and fight the
     // Edit/Remove buttons) for what is a pure visibility flip.
     document.body.classList.toggle("turn-busy", !!state.busy);
-    // The mode switch (Agent/Plan/Auto-accept) restarts the gate and calls the CLI,
-    // so it's locked whenever busy — like the model/effort controls. Crucially this
-    // covers the session-start window (busy is true through spawn → session/new),
-    // where a setMode would otherwise throw "no session". Unlike a separate
-    // readiness flag, `busy` always clears, so the control can never get stuck.
-    modeBtn.disabled = state.busy;
-    modeBtn.classList.toggle("disabled", state.busy);
-    modeBtn.title = state.busy ? "Mode — available once the session is ready" : "Pick mode";
+    // The mode switch (Agent/Plan/Auto-accept) stays available DURING a running
+    // turn (#64): flipping to Auto-accept mid-run is the whole point, and the host
+    // setMode gate is client-side (autoApprove) so it takes effect immediately.
+    // Only the session-start window (busyLocked: spawn → session/new → priming) is
+    // locked, where a setMode would throw "no session"; that flag always clears.
+    modeBtn.disabled = state.busyLocked;
+    modeBtn.classList.toggle("disabled", state.busyLocked);
+    modeBtn.title = state.busyLocked ? "Mode — available once the session is ready" : "Pick mode";
     updateSandboxBtn();
     if (!state.busy) {
       sendBtn.innerHTML = ICON.arrowUp;
@@ -4519,6 +4666,7 @@
     input.value = "";
     renderInputHighlight(); // also flips the busy button back to Stop (empty composer)
     updateSlash();
+    updateMention();
     return true;
   }
 
@@ -4567,6 +4715,7 @@
     input.value = "";
     renderInputHighlight();
     slashPopover.hidden = true;
+    hideMention();
   }
 
   // ---------- voice control ----------
@@ -4636,6 +4785,7 @@
     input.value = cur + sep + t;
     input.focus();
     updateSlash();
+    updateMention();
     renderInputHighlight();
   }
 
@@ -4843,6 +4993,7 @@
         if (typeof msg.showThinking === "boolean") state.showThinking = msg.showThinking;
         if (typeof msg.expandCommandOutputs === "boolean") state.expandCommandOutputs = msg.expandCommandOutputs;
         if (typeof msg.steerByDefault === "boolean") state.steerByDefault = msg.steerByDefault;
+        if (typeof msg.soundNotifications === "boolean") state.soundNotifications = msg.soundNotifications;
         applyThinkingVisibility();
         updateSandboxBtn();
         break;
@@ -4850,6 +5001,12 @@
         // Live toggle (grok.steerByDefault). Pure policy for the next send —
         // nothing to re-render, the queued block's Steer button is unaffected.
         state.steerByDefault = !!msg.value;
+        break;
+      case "soundNotifications":
+        // Live toggle (grok.soundNotifications). Only affects future turn-end/
+        // error beeps; keep the gear switch in sync if it's open.
+        state.soundNotifications = !!msg.value;
+        if (state.gearView === "config") renderConfigDebugPanel();
         break;
       case "showThinking":
         // Live toggle (grok.showThinking). Initial value also arrives via
@@ -5000,6 +5157,7 @@
           input.value = composeVoiceTail(state.voiceBase, (msg.text || "").trim());
           input.focus();
           updateSlash();
+          updateMention();
           renderInputHighlight();
         } else {
           insertTranscript(msg.text);
@@ -5022,6 +5180,23 @@
       case "commandsUpdate":
         state.commands = msg.commands || [];
         break;
+      case "mentionResults": {
+        // Only render rows that answer the token still under the caret — the
+        // popover may have closed (query null) or the user typed further (query
+        // moved on) while this reply was in flight.
+        if (!mentionPopover || state.mentionQuery === null || msg.query !== state.mentionQuery) break;
+        state.mentionFiles = msg.files || [];
+        if (!state.mentionFiles.length) {
+          // Keep the query: the token is still active, so more typing (or a
+          // backspace) re-queries — only the empty row-list hides.
+          mentionPopover.hidden = true;
+          break;
+        }
+        state.mentionActive = 0;
+        renderMention();
+        mentionPopover.hidden = false;
+        break;
+      }
       case "userMessage":
         // Live send (or immediate verdict-feedback bubble): render and bump the
         // counter so any plan history queued for this position drains first.
@@ -5403,6 +5578,7 @@
         state.busy = false;
         state.busyLocked = false; // an error ends any startup lock too
         updateSendButton();
+        maybeNotifySound("error"); // #59 — only when the panel isn't focused
         break;
       case "agentEnd":
         hideGrokking(); // turn ended (defensive — content normally clears it first)
@@ -5414,6 +5590,7 @@
         revealTurnFooter();
         state.busy = false;
         updateSendButton();
+        maybeNotifySound("done"); // #59 — only when the panel isn't focused
         break;
       case "exit":
         hideGrokking();
@@ -5578,7 +5755,7 @@
     resetForNewSession();
     vscode.postMessage({ type: "newSession" });
   };
-  modeBtn.onclick = (e) => { e.stopPropagation(); if (state.busy) return; openModePopover(); };
+  modeBtn.onclick = (e) => { e.stopPropagation(); if (state.busyLocked) return; openModePopover(); };
   if (sandboxBtn) {
     sandboxBtn.onclick = (e) => {
       e.stopPropagation();
@@ -5715,6 +5892,7 @@
       const end = input.selectionEnd ?? start;
       input.setRangeText(pastedText, start, end, "end");
       updateSlash();
+      updateMention();
       renderInputHighlight();
     }
     for (const blob of blobs) {
@@ -5732,7 +5910,7 @@
     }
   });
 
-  input.addEventListener("input", () => { updateSlash(); renderInputHighlight(); });
+  input.addEventListener("input", () => { updateSlash(); updateMention(); renderInputHighlight(); });
   input.addEventListener("scroll", () => {
     if (!inputHighlight) return;
     inputHighlight.scrollTop = input.scrollTop;
@@ -5763,6 +5941,25 @@
         pickSlash(state.slashFiltered[state.slashActive]); return;
       }
       if (e.key === "Escape") { slashPopover.hidden = true; return; }
+    }
+    // "@" popover nav — mutually exclusive with the slash popover (a slash token
+    // can't contain whitespace, so `/cmd @file` never matches both).
+    if (mentionPopover && !mentionPopover.hidden && state.mentionFiles.length) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        state.mentionActive = (state.mentionActive + 1) % state.mentionFiles.length;
+        renderMention(); return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        state.mentionActive = (state.mentionActive - 1 + state.mentionFiles.length) % state.mentionFiles.length;
+        renderMention(); return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        e.preventDefault();
+        pickMention(state.mentionFiles[state.mentionActive]); return;
+      }
+      if (e.key === "Escape") { hideMention(); return; }
     }
     const sendKey = state.useCtrlEnter
       ? e.key === "Enter" && (e.metaKey || e.ctrlKey)

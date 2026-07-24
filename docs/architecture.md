@@ -205,6 +205,7 @@ The full pedagogical write-up lives in
 | [src/chips.ts](../src/chips.ts) | File-chip CRUD (pure) |
 | [src/prompt-builder.ts](../src/prompt-builder.ts) | Chip → prompt-string with `@path` refs and fenced blocks (pure) |
 | [src/slash-filter.ts](../src/slash-filter.ts) | Slash-command autocomplete filter + `matchSlashCommand` dispatch gate + hidden-command filter (`filterAdvertisedCommands` drops the config-mutating `/always-approve`) (pure) |
+| [src/mention.ts](../src/mention.ts) | The composer's `@` file popover, host half (pure) — `filterMentionFiles` ranking, `buildExcludeGlob` (files.exclude + search.exclude → one findFiles exclude), `orderMentionIndex`; the webview half (`getMentionQuery`/`applyMentionPick`) lives in webview-helpers.js |
 | [src/grok-config.ts](../src/grok-config.ts) | Reads permission/sandbox selection config, filters repository `.env` control-plane overrides, and discovers custom profiles (pure) |
 | [src/mode-prefs.ts](../src/mode-prefs.ts) | Remembered-mode policy (pure) — persist Agent/Auto-accept (never Plan), apply on new sessions only |
 | [src/view-move.ts](../src/view-move.ts) | View placement (pure) — maps the gear-menu "Move view" destinations to the extension-owned per-location view containers targeted via `vscode.moveViews` (view default-homes in the Secondary Side Bar) |

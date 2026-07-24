@@ -1,15 +1,31 @@
 # Changelog
 
-## 1.7.5-sandbox.1 - 2026-07-20
+## 1.7.6-sandbox.1 - 2026-07-24
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v1.7.4.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v1.7.5.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive directly from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Session behavior:** the chosen profile is fixed for the life of a conversation and restored when that conversation resumes. Built-in application failures warn and continue like Grok; invalid or unapplied custom profiles refuse to start; and loss of the live delegated-operation sandbox ends the affected session instead of silently weakening it.
-  - **Sandbox controls:** supported macOS hosts get a compact lock/unlock indicator stacked between the voice and Send controls; profile names, distinct source icons, and source labels for built-in, user-defined, and workspace-defined profiles live in its picker. The control stays disabled from session startup through the full active turn, in lockstep with Agent Mode, and changing the profile of an existing conversation opens the Summarize or Just Restart flow required to start a new session under the new boundary.
+  - **Sandbox controls:** supported macOS hosts get a compact lock/unlock indicator stacked between the voice and Send controls; profile names, distinct source icons, and source labels for built-in, user-defined, and workspace-defined profiles live in its picker. The sandbox control stays disabled from session startup through the full active turn because its boundary is fixed for the conversation, while Agent Mode remains available mid-turn; changing the profile of an existing conversation opens the Summarize or Just Restart flow required to start a new session under the new boundary.
   - See the [macOS sandbox architecture guide](docs/macos-sandbox-architecture.md) for the full access matrix, profile resolution rules, process topology, and enforcement boundary.
+
+## 1.7.5 — 2026-07-24
+
+### Added
+
+- **`@` file autocomplete in the composer** — type `@` to fuzzy-search workspace files and attach one as a chip (keyboard-navigable; the pick keeps both the `@path` text and a real chip). Thanks to [@funkpopo](https://github.com/funkpopo) ([#63](https://github.com/phuryn/grok-build-vscode/pull/63); closes [#60](https://github.com/phuryn/grok-build-vscode/issues/60)).
+- **Sound notifications** — an optional short tone when Grok finishes a turn or hits an error, played *only when the Grok panel isn't focused* (a rising chime for done, a lower tone for errors). Off by default; toggle in gear → *Config & debug → Sound notifications* (`grok.soundNotifications`). ([#59](https://github.com/phuryn/grok-build-vscode/issues/59))
+
+### Changed
+
+- **Switch to Auto accept mid-turn** — the mode picker stays live during a running turn, so you can stop approving permission cards without stopping Grok; flipping to Auto accept also clears any card already on screen. Approving a plan now returns you to your pre-plan mode (Auto accept stays Auto accept). ([#64](https://github.com/phuryn/grok-build-vscode/issues/64))
+- The waiting indicator (*Grokking* / *Thinking…*) now shimmers while idle. Thanks to [@funkpopo](https://github.com/funkpopo) ([#63](https://github.com/phuryn/grok-build-vscode/pull/63)).
+
+### Fixed
+
+- **Plan mode no longer blocks Grok from writing its own `plan.md`.** On Windows, Grok sometimes persists its plan via a PowerShell `Set-Content` command instead of the file-write tool; the plan-gate was refusing it ("Plan mode blocked a command…") and Grok had to retry. That write lands outside your workspace, so it's now allowed — while any command that also reaches into the workspace stays blocked. ([src/plan-gate.ts](src/plan-gate.ts))
 
 ## 1.7.4 — 2026-07-19
 

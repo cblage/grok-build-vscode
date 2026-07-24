@@ -65,6 +65,7 @@ import {
 } from "./chips";
 import { buildPromptWithImages, type PromptImageInput } from "./prompt-builder";
 import { matchSlashCommand } from "./slash-filter";
+import { MENTION_INDEX_LIMIT, MENTION_INDEX_TTL_MS, buildExcludeGlob, filterMentionFiles, normalizeRelPath, orderMentionIndex } from "./mention";
 import {
   collectAvailableSandboxProfileOptions,
   configDisablesBypassPermissions,
@@ -216,6 +217,11 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   private chips: FileChip[] = [];
   /** Attachment-staging ops still in flight — see trackAttach. */
   private readonly pendingAttach = new Set<Promise<void>>();
+  /** The composer's `@` file popover index: workspace-relative paths (ranked by
+   *  src/mention.ts) + rel→abs map for the pick. One findFiles snapshot serves
+   *  {@link MENTION_INDEX_TTL_MS}; concurrent queries share one in-flight build. */
+  private mentionIndex: { at: number; rels: string[]; absByRel: Map<string, string> } | null = null;
+  private mentionIndexPromise: Promise<{ rels: string[]; absByRel: Map<string, string> }> | null = null;
   private editorWatcher?: vscode.Disposable;
   private voiceRecorder = new VoiceRecorder();
   private voiceTempPath?: string;
@@ -239,6 +245,7 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
     "initialState", "session", "modelChanged", "modeChanged", "chips",
     "contextUsage", "sessions", "queuedSends", "onboarding", "commandsUpdate",
     "grokUpdateStatus", "voiceConfigured", "fontScale", "showThinking", "expandCommandOutputs",
+    "soundNotifications",
   ]);
   private cliPath?: string;
   // Guards the silent grok-CLI auto-update so it runs at most once per activation.
@@ -337,6 +344,12 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
         this.post({
           type: "steerByDefault",
           value: vscode.workspace.getConfiguration("grok").get<boolean>("steerByDefault", false),
+        });
+      }
+      if (e.affectsConfiguration("grok.soundNotifications")) {
+        this.post({
+          type: "soundNotifications",
+          value: vscode.workspace.getConfiguration("grok").get<boolean>("soundNotifications", false),
         });
       }
       if (e.affectsConfiguration("grok.includeActiveFileByDefault")) {
@@ -848,6 +861,9 @@ See design doc for the full state machine diagram.`;
       }
       session.autoApprove = true;
       this.setPlanActive(session, false); // posts displayMode → "yolo"
+      // Flipping to Auto-accept mid-turn (#64) should unblock the CURRENT prompt,
+      // not just future requests: clear any permission card already on screen.
+      this.autoApprovePendingPermissions(session);
       if (session.client) {
         try { await session.client.setMode(ACT_MODE_ID); } catch { /* CLI stays put; gate is what matters */ }
       }
@@ -937,6 +953,13 @@ See design doc for the full state machine diagram.`;
       const promptToGrok = feedback ? `[Plan approved] ${feedback}` : "[Plan approved]";
       session.afterTurn = async () => {
         session.suppressPlanReject = false;
+        // Return to the mode the user was in BEFORE planning (#64): if that was
+        // Auto-accept, implementation runs without re-prompting; otherwise Agent.
+        // `defaultMode` is the last non-plan mode (Plan is never remembered), so
+        // it holds exactly the pre-plan choice. The gate was already dropped above.
+        const prePlanYolo = vscode.workspace.getConfiguration("grok").get<string>("defaultMode", "") === "yolo";
+        session.autoApprove = prePlanYolo;
+        this.emit(session, { type: "modeChanged", modeId: prePlanYolo ? "yolo" : "agent" });
         try { await client.setMode(ACT_MODE_ID); } catch { /* CLI usually auto-exits already */ }
         this.emit(session, { type: "agentStart" });
         this.setStatus(session, "working");
@@ -1136,6 +1159,29 @@ See design doc for the full state machine diagram.`;
       ...overrides,
       [sid]: { ...cur, permissions },
     });
+  }
+
+  /** Auto-approve every permission card currently awaiting the user (#64). Fired
+   *  when the user switches to Auto-accept mid-turn so on-screen cards resolve
+   *  immediately instead of only future requests. Mirrors the `permissionAnswer`
+   *  handler for each pending request; a card with no allow option is left for
+   *  the user to decide. */
+  private autoApprovePendingPermissions(session: Session): void {
+    const client = session.client;
+    if (!client || session.pendingPermissions.size === 0) return;
+    let resolved = 0;
+    // Snapshot first — persistPermissionAnswer mutates pendingPermissions.
+    for (const [requestId, pending] of [...session.pendingPermissions]) {
+      const opt = pending.options.find((o) => o.kind === "allow_always")
+                ?? pending.options.find((o) => o.kind === "allow_once");
+      if (!opt) continue;
+      client.respondPermission(requestId, opt.optionId);
+      this.emit(session, { type: "permissionResolved", requestId, optionId: opt.optionId });
+      this.persistPermissionAnswer(session, requestId, opt.optionId);
+      this.closeDiffForRequest(requestId);
+      resolved += 1;
+    }
+    if (resolved > 0) this.setStatus(session, "working"); // the turn resumes
   }
 
   /** Run and clear any deferred post-turn action set by `handleExitPlan`. */
@@ -2799,6 +2845,11 @@ See design doc for the full state machine diagram.`;
           .getConfiguration("grok")
           .update("steerByDefault", !!msg.value, vscode.ConfigurationTarget.Global);
         break;
+      case "setSoundNotifications":
+        await vscode.workspace
+          .getConfiguration("grok")
+          .update("soundNotifications", !!msg.value, vscode.ConfigurationTarget.Global);
+        break;
       case "runInstallCmd": {
         const term = vscode.window.createTerminal("Install Grok");
         term.show();
@@ -2856,6 +2907,29 @@ See design doc for the full state machine diagram.`;
       case "pickFile":
         await this.trackAttach(this.pickFileFromComputer());
         break;
+      case "mentionQuery": {
+        // Answer from the TTL-cached index; a failed build degrades to an empty
+        // list (the popover just hides) rather than an error surface.
+        let files: string[] = [];
+        try {
+          files = filterMentionFiles((await this.mentionFileIndex()).rels, msg.query);
+        } catch (e) {
+          this.output.appendLine(`[mention] index failed: ${(e as Error).message}`);
+        }
+        this.post({ type: "mentionResults", query: msg.query, files });
+        break;
+      }
+      case "addMentionFile": {
+        // The pick came from a posted result, so the index (and its rel→abs map)
+        // exists; fall back to a workspace-root join if it somehow expired.
+        const abs = this.mentionIndex?.absByRel.get(msg.relPath)
+          ?? (vscode.workspace.workspaceFolders?.[0]
+            ? path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, msg.relPath)
+            : undefined);
+        // addDroppedFile re-checks existence, so a stale/garbage path is a no-op.
+        if (abs) await this.trackAttach(this.addDroppedFile(abs, false));
+        break;
+      }
       case "voiceStart":
         await this.handleVoiceStart();
         break;
@@ -3201,6 +3275,42 @@ See design doc for the full state machine diagram.`;
       }
     }
     this.revealAndFocusComposer();
+  }
+
+  /** The `@` popover's file index, rebuilt at most once per
+   *  {@link MENTION_INDEX_TTL_MS}. Keystrokes during a cold build all await the
+   *  same findFiles pass instead of stacking one per key. */
+  private async mentionFileIndex(): Promise<{ rels: string[]; absByRel: Map<string, string> }> {
+    const cached = this.mentionIndex;
+    if (cached && Date.now() - cached.at < MENTION_INDEX_TTL_MS) return cached;
+    if (!this.mentionIndexPromise) {
+      this.mentionIndexPromise = this.buildMentionIndex()
+        .then((idx) => {
+          this.mentionIndex = { at: Date.now(), ...idx };
+          return idx;
+        })
+        .finally(() => { this.mentionIndexPromise = null; });
+    }
+    return this.mentionIndexPromise;
+  }
+
+  private async buildMentionIndex(): Promise<{ rels: string[]; absByRel: Map<string, string> }> {
+    const cfg = vscode.workspace.getConfiguration();
+    // findFiles' default excludes are files.exclude ONLY — node_modules lives in
+    // search.exclude, so both must be merged in or the index is dependency soup.
+    const exclude = buildExcludeGlob([
+      cfg.get<Record<string, unknown>>("files.exclude"),
+      cfg.get<Record<string, unknown>>("search.exclude"),
+    ]);
+    const uris = await vscode.workspace.findFiles("**/*", exclude, MENTION_INDEX_LIMIT);
+    const absByRel = new Map<string, string>();
+    for (const uri of uris) {
+      // Default asRelativePath prefixes the folder name only in a multi-root
+      // workspace — exactly when the prefix is needed to disambiguate.
+      const rel = normalizeRelPath(vscode.workspace.asRelativePath(uri));
+      if (!absByRel.has(rel)) absByRel.set(rel, uri.fsPath);
+    }
+    return { rels: orderMentionIndex([...absByRel.keys()]), absByRel };
   }
 
   /** Resolve the xAI key for Speech-to-Text: the `grok.voiceApiKey` setting,
@@ -4172,6 +4282,7 @@ See design doc for the full state machine diagram.`;
       expandCommandOutputs: cfg.get("expandCommandOutputs", false),
       platform: process.platform,
       steerByDefault: cfg.get("steerByDefault", false),
+      soundNotifications: cfg.get("soundNotifications", false),
     };
   }
 
@@ -4959,6 +5070,7 @@ See design doc for the full state machine diagram.`;
     <div id="add-popover" class="toolbar-popover" hidden></div>
     <div id="context-popover" class="toolbar-popover" hidden></div>
     <div id="slash-popover" class="slash-popover" hidden></div>
+    <div id="mention-popover" class="slash-popover mention-popover" hidden></div>
   </footer>
 
   <script nonce="${nonce}">

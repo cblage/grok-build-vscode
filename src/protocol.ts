@@ -50,8 +50,10 @@ export interface PlanHistoryItem {
 
 /** host -> webview */
 export type HostMsg =
-  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform; steerByDefault: boolean }
+  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform; steerByDefault: boolean; soundNotifications: boolean }
   | { type: "showThinking"; value: boolean }
+  // grok.soundNotifications — live toggle for the turn-complete/error sound (#59).
+  | { type: "soundNotifications"; value: boolean }
   | { type: "fontScale"; value: number }
   | { type: "grokUpdateStatus"; current?: string | null; latest?: string | null; updateAvailable?: boolean; policy?: unknown; error?: string }
   | { type: "initialized"; info: { cliPath: string; cwd: string; version: string | null; init: { protocolVersion?: unknown } } }
@@ -72,6 +74,10 @@ export type HostMsg =
   | { type: "voiceError" }
   | { type: "chips"; chips: FileChip[] }
   | { type: "commandsUpdate"; commands: unknown[] }
+  // Reply to the webview's `mentionQuery` (the composer's `@` file popover):
+  // workspace-relative paths (forward slashes), ranked by src/mention.ts. The
+  // echoed `query` lets the webview drop stale replies after further typing.
+  | { type: "mentionResults"; query: string; files: string[] }
   | { type: "userMessage"; text: string; chips?: FileChip[] }
   | { type: "agentStart" }
   | { type: "thoughtChunk"; text: string }
@@ -171,6 +177,8 @@ export type WebviewMsg =
   | { type: "showLogs" }
   | { type: "moveView"; location: "panel" | "sidebar" | "auxiliarybar" }
   | { type: "setShowThinking"; value: boolean }
+  // grok.soundNotifications gear switch (#59) — persisted globally by the host.
+  | { type: "setSoundNotifications"; value: boolean }
   | { type: "setExpandCommandOutputs"; value: boolean }
   | { type: "setSteerByDefault"; value: boolean }
   | { type: "dropFile"; path: string; shift: boolean }
@@ -191,6 +199,13 @@ export type WebviewMsg =
   | { type: "deleteSession"; id: string; name?: string }
   | { type: "clearAllSessions" }
   | { type: "pickFile" }
+  // The composer's `@` file popover: the current token after `@`, posted on
+  // every keystroke; answered by `mentionResults`.
+  | { type: "mentionQuery"; query: string }
+  // A popover pick: attach this workspace-relative file as an explicit chip
+  // (same pipeline as drop / the + picker). The `@rel/path` text stays in the
+  // composer, so the prompt carries both the prose reference and the chip.
+  | { type: "addMentionFile"; relPath: string }
   | { type: "pasteImage"; mimeType: string; data: string }
   | { type: "voiceStart" }
   | { type: "voiceStop" }
@@ -216,7 +231,7 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   modeChanged: true, modePolicy: true, sandboxState: true, openModePopover: true,
   voiceState: true, voiceConfigured: true,
   voicePartial: true, voiceSubmit: true, voiceTranscript: true, voiceError: true,
-  chips: true, commandsUpdate: true, userMessage: true, agentStart: true,
+  chips: true, commandsUpdate: true, mentionResults: true, userMessage: true, agentStart: true,
   thoughtChunk: true, messageChunk: true, media: true, userMessageChunk: true,
   historyReplay: true, permissionHistoryQueue: true, planHistoryQueue: true,
   planProcessing: true, toolCall: true, toolCallUpdate: true, permissionRequest: true,
@@ -225,6 +240,7 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   agentError: true, agentEnd: true, exit: true, setBusy: true, summarizing: true,
   sessionContext: true, clearMessages: true, onboarding: true, error: true,
   xaiNotification: true, subagentUpdate: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true,
+  soundNotifications: true,
   setAllToolDetails: true, focusInput: true, sessions: true, sessionDot: true, queuedSends: true,
   steerUnavailable: true, usage: true,
 };
@@ -235,11 +251,13 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   openDiff: true, exportExpr: true, setEffort: true, openGlobalConfig: true,
   openProjectConfig: true, runMcpList: true, showLogs: true, moveView: true,
   setShowThinking: true, setExpandCommandOutputs: true, setSteerByDefault: true,
+  setSoundNotifications: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
   questionCancel: true, setModel: true, runInstallCmd: true, runGrokLogin: true,
   logout: true, checkGrokUpdate: true, updateGrok: true, recheckConnection: true,
   listSessions: true, resumeSession: true, renameSession: true, deleteSession: true,
-  clearAllSessions: true, pickFile: true, pasteImage: true, voiceStart: true,
+  clearAllSessions: true, pickFile: true, mentionQuery: true, addMentionFile: true,
+  pasteImage: true, voiceStart: true,
   voiceStop: true, queueSend: true, dequeueSend: true, clearQueuedSends: true,
   steerSend: true, forkSession: true,
 };
