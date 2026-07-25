@@ -28,8 +28,8 @@
   const historyPopover = $("history-popover");
   const scrollBottomBtn = $("scroll-bottom-btn");
 
-  // grok's accepted reasoning-effort values, lowest → highest (matches the CLI;
-  // `max` is not a real grok level and is intentionally excluded — see #3/#4).
+  // Canonical low→high ORDER for known effort ids, and the FALLBACK ladder when a
+  // model advertises no menu (`max` is not a real grok level — see #3/#4).
   const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh"];
   const EFFORT_TOOLTIPS = {
     none: "None — no extra reasoning",
@@ -39,6 +39,25 @@
     high: "High — deeper reasoning",
     xhigh: "XHigh — deepest reasoning, slowest",
   };
+
+  // The effort levels the gear picker OFFERS: the ACTIVE model's advertised menu
+  // (`models[]._meta.reasoningEfforts`, already delivered to the webview on the
+  // `session` message), ordered low→high with any unknown advertised value
+  // appended. Falls back to the full ladder only when a model advertises none
+  // (older CLI / non-reasoning model). So the dots always match what the current
+  // model actually accepts — not a hardcoded set (grok-4.5 advertises just
+  // low/medium/high). The advertised list rides in state.availableModels, which
+  // is our per-session cache; the picker is locked until that's loaded anyway.
+  function effortLevelsForModel() {
+    const m = (state.availableModels || []).find((x) => x && x.modelId === state.currentModelId);
+    const adv = m && Array.isArray(m.reasoningEfforts)
+      ? m.reasoningEfforts.filter((v) => typeof v === "string" && v)
+      : [];
+    if (!adv.length) return EFFORT_LEVELS.slice();
+    const known = EFFORT_LEVELS.filter((id) => adv.includes(id));
+    const extra = adv.filter((id) => !EFFORT_LEVELS.includes(id)); // unknown advertised → keep as given
+    return [...known, ...extra];
+  }
 
   const state = {
     welcomeVisible: true,
@@ -151,6 +170,8 @@
     // tool_call_update finds its row (title refinement, duration, result)
     // instead of leaking into the generic tool group.
     subagentCards: new Map(),
+    // Deep Research / Workflow / Goal progress cards (P2-10) — keyed by run/goal id.
+    runProgressCards: new Map(),
     // The current turn's agent-message footer (copy + timestamp). Only the
     // turn's LAST narration segment keeps one — see addMessage.
     turnAgentActionsEl: null,
@@ -241,6 +262,9 @@
     // plays on turn completion / error, but only when the Grok panel isn't
     // focused (#59). Off by default. Host posts the value on init + config change.
     soundNotifications: false,
+    // grok.worktree — true when the focused session runs in an isolated git
+    // worktree (from the `session` message). Gates the gear Apply/Remove items.
+    isWorktree: false,
     // toolExpandOverride (per-session, in-memory): the Command Palette
     // Expand/Collapse All latch. null = follow the setting above; true/false =
     // force ALL groups + details open/closed for this session, and keep applying
@@ -308,6 +332,9 @@
     mic: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>`,
     cornerDownRight: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 10 20 15 15 20"/><path d="M4 4v7a4 4 0 0 0 4 4h12"/></svg>`,
     gitBranch: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>`,
+    gitFork: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>`,
+    // Undo / rewind — used on user-bubble action row (P2-9).
+    undo: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6.7 3L3 13"/></svg>`,
     // Animated equalizer bars shown while listening (CSS drives the bounce).
     micWaves: `<span class="mic-waves" aria-hidden="true"><i></i><i></i><i></i><i></i></span>`,
     // Codicon-style lock / unlock (VS Code $(lock) / $(unlock))
@@ -1316,37 +1343,53 @@
     // the same `busy` signal that disables send/submit.
     const settingsLocked = state.busy;
 
+    // Until the session's model info arrives (its name + advertised effort menu),
+    // don't show a guessed model or a stale effort ladder — show a Loading state.
+    const modelLoaded = state.availableModels.length > 0 && !!state.currentModelId;
+
     const nameBtn = document.createElement("button");
-    nameBtn.className = "toolbar-btn model-name-btn" + (settingsLocked ? " disabled" : "");
-    const modelName = modelDisplayName(state.currentModelId, state.availableModels) || "Grok Build";
+    nameBtn.className = "toolbar-btn model-name-btn" + (settingsLocked || !modelLoaded ? " disabled" : "");
+    const modelName = modelLoaded ? (modelDisplayName(state.currentModelId, state.availableModels) || "Grok Build") : "Loading…";
     nameBtn.innerHTML = `<span class="btn-label">${escapeHtml(truncate(modelName, 16))}</span>`;
-    nameBtn.disabled = settingsLocked;
-    nameBtn.title = settingsLocked
-      ? `${modelName} — available once the session is ready`
-      : `${modelName} — click to change`;
-    if (!settingsLocked) nameBtn.onclick = (e) => { e.stopPropagation(); renderModelPicker(); };
+    nameBtn.disabled = settingsLocked || !modelLoaded;
+    nameBtn.title = !modelLoaded
+      ? "Loading the session…"
+      : (settingsLocked ? `${modelName} — available once the session is ready` : `${modelName} — click to change`);
+    if (!settingsLocked && modelLoaded) nameBtn.onclick = (e) => { e.stopPropagation(); renderModelPicker(); };
     row.appendChild(nameBtn);
 
     const dotsEl = document.createElement("span");
-    dotsEl.className = "effort-dots" + (settingsLocked ? " disabled" : "");
-    const currentIdx = EFFORT_LEVELS.indexOf(state.effort);
-    EFFORT_LEVELS.forEach((id, i) => {
-      const dot = document.createElement("span");
-      dot.className = "effort-dot" + (i <= currentIdx ? " active" : "") + (settingsLocked ? " disabled" : "");
-      // Render the dot as a CSS-shaped span (see chat.css). Avoids the classic
-      // ● vs ○ Unicode size mismatch where the empty glyph is visibly larger.
-      dot.title = settingsLocked
-        ? "Available once the session is ready"
-        : (EFFORT_TOOLTIPS[id] || capitalize(id));
-      if (!settingsLocked) dot.onclick = (e) => {
-        e.stopPropagation();
-        state.effort = state.effort === id ? "" : id;
-        vscode.postMessage({ type: "setEffort", level: state.effort });
-        renderGearMain();
-        gearPopover.hidden = false;
-      };
-      dotsEl.appendChild(dot);
-    });
+    dotsEl.className = "effort-dots" + (settingsLocked || !modelLoaded ? " disabled" : "");
+    if (!modelLoaded) {
+      // Loading: neutral placeholder dots — we don't know the model's menu yet,
+      // so show a fixed skeleton rather than the (stale) fallback ladder.
+      for (let i = 0; i < 5; i++) {
+        const dot = document.createElement("span");
+        dot.className = "effort-dot loading disabled";
+        dot.title = "Loading the session…";
+        dotsEl.appendChild(dot);
+      }
+    } else {
+      const effortLevels = effortLevelsForModel();
+      const currentIdx = effortLevels.indexOf(state.effort);
+      effortLevels.forEach((id, i) => {
+        const dot = document.createElement("span");
+        dot.className = "effort-dot" + (i <= currentIdx ? " active" : "") + (settingsLocked ? " disabled" : "");
+        // Render the dot as a CSS-shaped span (see chat.css). Avoids the classic
+        // ● vs ○ Unicode size mismatch where the empty glyph is visibly larger.
+        dot.title = settingsLocked
+          ? "Available once the session is ready"
+          : (EFFORT_TOOLTIPS[id] || capitalize(id));
+        if (!settingsLocked) dot.onclick = (e) => {
+          e.stopPropagation();
+          state.effort = state.effort === id ? "" : id;
+          vscode.postMessage({ type: "setEffort", level: state.effort });
+          renderGearMain();
+          gearPopover.hidden = false;
+        };
+        dotsEl.appendChild(dot);
+      });
+    }
     row.appendChild(dotsEl);
     gearPopover.appendChild(row);
 
@@ -1354,10 +1397,39 @@
     // Session-LIFECYCLE actions live here; context actions (Compact) live on the
     // context donut, next to the number that motivates them.
     addSection("Session");
-    addGearItem(`<span>Fork conversation</span>`, () => {
+    // Fork copies the CONVERSATION (not files). It's fine on a worktree too — the
+    // fork shares that checkout, the same as the Agent Dashboard already running
+    // parallel sessions on one repo; Remove worktree disposes both.
+    addGearItem(`<span class="gear-lead">${ICON.gitFork}<span>Fork conversation</span></span>`, () => {
       vscode.postMessage({ type: "forkSession" });
       closePopovers();
     });
+    // Rewind needs a conversation to roll back — hide it on an empty session.
+    if (messagesEl.querySelector(".msg.user")) {
+      addGearItem(`<span class="gear-lead">${ICON.undo}<span>Rewind conversation</span></span>`, () => {
+        vscode.postMessage({ type: "rewindSession" });
+        closePopovers();
+      });
+    }
+    // Worktree = an isolated git checkout, in the one Session menu. New is hidden
+    // INSIDE a worktree (no worktree-from-worktree — checkouts stay singular);
+    // Apply merges edits back and Remove deletes the checkout, so both apply only
+    // to a worktree session.
+    if (!state.isWorktree) {
+      addGearItem(`<span class="gear-lead">${ICON.gitBranch}<span>New worktree session</span></span>`, () => {
+        vscode.postMessage({ type: "newWorktreeSession" });
+        closePopovers();
+      });
+    } else {
+      addGearItem(`<span class="gear-lead">${ICON.gitBranch}<span>Apply worktree</span></span>`, () => {
+        vscode.postMessage({ type: "applyWorktree" });
+        closePopovers();
+      });
+      addGearItem(`<span class="gear-lead">${ICON.gitBranch}<span>Remove worktree</span></span>`, () => {
+        vscode.postMessage({ type: "removeWorktree" });
+        closePopovers();
+      });
+    }
 
     // ── Other ─────────────────────────────────────────────────────────────
     // Collapses the former Config / Account / Debug sections into sub-views
@@ -1855,8 +1927,25 @@
       } else {
         const name = document.createElement("div");
         name.className = "history-row-name";
-        name.textContent = s.displayName || "Untitled";
-        name.title = s.rawSummary || s.displayName || "";
+        // Tooltip is the name the USER sees/gave — never the primer-derived
+        // summary (rawSummary), which is an internal title on primed sessions.
+        name.title = s.displayName || "";
+        // A worktree session gets a branch icon (a TYPE marker in muted gray,
+        // off the status-dot palette), not a "(WT)" text prefix like a fork's
+        // "(Fork)" — it's an isolated checkout, not a renamed conversation.
+        let displayName = s.displayName || "Untitled";
+        if (s.worktreeLabel) {
+          if (displayName.startsWith("(WT)")) displayName = displayName.slice(4).trim() || "Worktree";
+          const branch = document.createElement("span");
+          branch.className = "history-row-branch";
+          branch.innerHTML = ICON.gitBranch;
+          branch.title = "Worktree: " + s.worktreeLabel;
+          name.appendChild(branch);
+        }
+        const txt = document.createElement("span");
+        txt.className = "history-row-txt";
+        txt.textContent = displayName;
+        name.appendChild(txt);
         main.appendChild(name);
 
         const meta = document.createElement("div");
@@ -1871,7 +1960,7 @@
         // stopPropagation so they don't also trigger a resume.
         row.onclick = () => {
           if (active) { closePopovers(); return; }
-          vscode.postMessage({ type: "resumeSession", id: s.id });
+          vscode.postMessage({ type: "resumeSession", id: s.id, cwd: s.cwd });
           closePopovers();
         };
       }
@@ -1883,12 +1972,21 @@
       const renameBtn = document.createElement("button");
       renameBtn.className = "history-action-btn";
       renameBtn.innerHTML = ICON.pencil;
-      renameBtn.title = "Rename";
-      renameBtn.onclick = (e) => {
-        e.stopPropagation();
-        state.renamingSessionId = s.id;
-        renderSessionRows();
-      };
+      // A worktree session's name IS the worktree name (baked into the checkout
+      // path), so renaming it would decouple the display from the real checkout.
+      // Disable rename there; delete still works.
+      if (s.worktreeLabel) {
+        renameBtn.disabled = true;
+        renameBtn.classList.add("disabled");
+        renameBtn.title = "Worktree name is fixed to the checkout";
+      } else {
+        renameBtn.title = "Rename";
+        renameBtn.onclick = (e) => {
+          e.stopPropagation();
+          state.renamingSessionId = s.id;
+          renderSessionRows();
+        };
+      }
       actions.appendChild(renameBtn);
       // No delete for the active session: it's the live conversation and the CLI
       // re-persists it, so a delete wouldn't stick. Rename is still fine.
@@ -1931,6 +2029,7 @@
   }
 
   function resetForNewSession() {
+    state.isWorktree = false; // re-set by the incoming session's `session` message
     // The caret belongs in the box after any session swap — new session, a
     // history-row re-focus, a disk restore (all funnel through here via the
     // host's clearMessages). Guarded on document.hasFocus(): user-initiated
@@ -1954,6 +2053,7 @@
     state.toolItemsByToolCallId.clear();
     state.toolFailuresById.clear();
     state.subagentCards.clear();
+    state.runProgressCards.clear();
     // Question/restored-card maps too, or a new session's tool updates could
     // attach to the previous session's (now-detached) cards by toolCallId.
     state.questionToolCalls.clear();
@@ -2101,6 +2201,11 @@
       bubble.className = "msg-bubble";
       el.appendChild(bubble);
       contentParent = bubble;
+      // 0-based index among visible user bubbles — host maps this to a rewind
+      // prompt_index (skipping the hidden primer). Set after userMsgCount bump.
+      if (state.userMsgCount > 0) {
+        el.dataset.userBubbleIndex = String(state.userMsgCount - 1);
+      }
     }
 
     const body = document.createElement("div");
@@ -2123,10 +2228,21 @@
       copyBtn.type = "button";
       copyBtn.title = "Copy message";
       copyBtn.innerHTML = `<span class="msg-action-glyph">${ICON.copy}</span>`;
+      actions.appendChild(copyBtn);
+      // Rewind sits next to Copy on user bubbles only (P2-9). Latest message
+      // has nothing after it to discard — hidden via refreshUserRewindButtons.
+      if (role === "user") {
+        const rewindBtn = document.createElement("button");
+        rewindBtn.className = "msg-action-btn msg-rewind-btn";
+        rewindBtn.type = "button";
+        rewindBtn.title = "Rewind to this message";
+        rewindBtn.setAttribute("aria-label", "Rewind to this message");
+        rewindBtn.innerHTML = `<span class="msg-action-glyph">${ICON.undo}</span>`;
+        actions.appendChild(rewindBtn);
+      }
       const ts = document.createElement("span");
       ts.className = "msg-timestamp";
       ts.textContent = formatTime(Date.now());
-      actions.appendChild(copyBtn);
       actions.appendChild(ts);
       el.appendChild(actions);
       if (role === "agent") {
@@ -2150,6 +2266,7 @@
     }
 
     messagesEl.appendChild(el);
+    if (role === "user") refreshUserRewindButtons();
     scrollToBottom();
     if (role === "user" && text) {
       requestAnimationFrame(() => {
@@ -2157,6 +2274,22 @@
       });
     }
     return body;
+  }
+
+  /**
+   * Keep each user bubble's Rewind button + data-user-bubble-index in sync.
+   * The latest user message can't be a rewind target (CLI tip); earlier ones can.
+   * Queued (not-yet-sent) blocks are excluded.
+   */
+  function refreshUserRewindButtons() {
+    const users = [...messagesEl.querySelectorAll(".msg.user:not(.queued)")];
+    users.forEach((el, i) => {
+      el.dataset.userBubbleIndex = String(i);
+      const btn = el.querySelector(".msg-rewind-btn");
+      if (!btn) return;
+      // Hide on the tip — rewinding there is a no-op / errors on the wire.
+      btn.hidden = users.length <= 1 || i === users.length - 1;
+    });
   }
 
   // Show the current turn's (single) agent footer — called at every turn-end
@@ -3417,6 +3550,119 @@
       cancelled: parsed.status === "cancelled",
     });
     return true;
+  }
+
+  // ---------- Workflow / Goal / Deep-research progress cards (P2-10) ----------
+  // Host normalizes `_x.ai/session_notification` workflow_updated / goal_updated
+  // into a stable shape; we upsert one card per id and stop the dots on done.
+
+  function applyRunProgress(update) {
+    if (!update || !update.id) return;
+    clearWelcome();
+    hideGrokking();
+    const id = String(update.id);
+    let el = state.runProgressCards.get(id);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "run-progress-card";
+      el.dataset.runId = id;
+      el.innerHTML =
+        `<div class="run-progress-row">` +
+          `<span class="run-progress-badge">${ICON.orbit || ""}</span>` +
+          `<span class="run-progress-kind"></span>` +
+          `<span class="run-progress-sep">·</span>` +
+          `<span class="run-progress-title"></span>` +
+          BLINK_DOTS +
+          `<span class="run-progress-phase"></span>` +
+        `</div>` +
+        `<div class="run-progress-sub" hidden></div>` +
+        `<div class="run-progress-detail" hidden></div>` +
+        `<div class="run-progress-actions" hidden></div>`;
+      state.runProgressCards.set(id, el);
+      messagesEl.appendChild(el);
+    }
+
+    const kindLabel = update.kind === "goal" ? "Goal" : "Workflow";
+    el.querySelector(".run-progress-kind").textContent = kindLabel;
+    const title = update.title || id;
+    el.querySelector(".run-progress-title").textContent = title;
+    el.querySelector(".run-progress-title").title = title;
+
+    const phase = String(update.phase || "running");
+    const pct =
+      typeof update.progress === "number" && Number.isFinite(update.progress)
+        ? ` ${Math.round(update.progress * 100)}%`
+        : "";
+    const phaseEl = el.querySelector(".run-progress-phase");
+    const statusWord = update.failed
+      ? "failed"
+      : update.cancelled
+        ? "cancelled"
+        : update.done
+          ? (phase === "completed" || phase === "success" ? "done" : phase)
+          : phase;
+    phaseEl.textContent = `· ${statusWord}${pct}`;
+
+    const sub = el.querySelector(".run-progress-sub");
+    if (update.subtitle) {
+      sub.hidden = false;
+      sub.textContent = update.subtitle;
+    } else {
+      sub.hidden = true;
+      sub.textContent = "";
+    }
+    const detail = el.querySelector(".run-progress-detail");
+    if (update.detail) {
+      detail.hidden = false;
+      detail.textContent = update.detail;
+    } else {
+      detail.hidden = true;
+      detail.textContent = "";
+    }
+
+    el.classList.toggle("run-progress-failed", !!update.failed);
+    el.classList.toggle("run-progress-cancelled", !!update.cancelled && !update.failed);
+    el.classList.toggle("run-progress-done", !!update.done);
+
+    const dots = el.querySelector(".blink-dots");
+    if (update.done) {
+      if (dots) dots.remove();
+    } else if (!dots) {
+      // Restarted (e.g. resume) — put dots back after the title.
+      const titleEl = el.querySelector(".run-progress-title");
+      if (titleEl) titleEl.insertAdjacentHTML("afterend", BLINK_DOTS);
+    }
+
+    // Workflow control buttons (pause/resume/stop) while running or paused.
+    const actions = el.querySelector(".run-progress-actions");
+    if (update.kind === "workflow" && update.displayName && !update.done) {
+      actions.hidden = false;
+      const paused = /paus/.test(phase);
+      actions.innerHTML = "";
+      const mk = (label, action) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "run-progress-btn";
+        b.textContent = label;
+        b.onclick = (e) => {
+          e.stopPropagation();
+          vscode.postMessage({
+            type: "workflowControl",
+            action,
+            displayName: update.displayName,
+          });
+        };
+        return b;
+      };
+      if (paused) actions.appendChild(mk("Resume", "resume"));
+      else actions.appendChild(mk("Pause", "pause"));
+      actions.appendChild(mk("Stop", "stop"));
+    } else {
+      actions.hidden = true;
+      actions.innerHTML = "";
+    }
+
+    scrollToBottom();
   }
 
   function addPlanNotice(text) {
@@ -5064,6 +5310,7 @@
       }
       case "session": {
         state.currentModelId = msg.currentModelId;
+        state.isWorktree = !!msg.worktree; // gates the gear Apply/Remove worktree items
         state.availableModels = msg.models || [];
         const m = state.availableModels.find((x) => x.modelId === msg.currentModelId);
         if (m?.totalContextTokens) state.contextWindow = m.totalContextTokens;
@@ -5434,6 +5681,9 @@
         }
         break;
       }
+      case "runProgress":
+        applyRunProgress(msg.update);
+        break;
       case "permissionRequest":
         addPermissionCard(msg.req);
         break;
@@ -5856,6 +6106,17 @@
           msgCopyBtn.classList.remove("copied");
         }, 1500);
       });
+      return;
+    }
+    const msgRewindBtn = e.target.closest(".msg-rewind-btn");
+    if (msgRewindBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (msgRewindBtn.hidden) return;
+      const msgEl = msgRewindBtn.closest(".msg.user");
+      const idx = msgEl ? Number(msgEl.dataset.userBubbleIndex) : NaN;
+      if (!Number.isInteger(idx) || idx < 0) return;
+      vscode.postMessage({ type: "rewindSession", userBubbleIndex: idx });
       return;
     }
     closePopovers();

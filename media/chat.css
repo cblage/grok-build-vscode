@@ -504,6 +504,9 @@ body.turn-busy .queued-steer:hover {
 }
 .msg-action-btn.copied { color: var(--vscode-charts-green, #4ec9b0); }
 .msg-action-glyph { display: inline-flex; align-items: center; }
+/* Rewind on the latest tip is a no-op — hide rather than disable so the row
+   stays copy+timestamp only on the current message. */
+.msg-rewind-btn[hidden] { display: none; }
 .msg-timestamp { font-size: 11px; }
 .msg.thinking {
   background: transparent;
@@ -788,6 +791,71 @@ body.thinking-hidden .msg.thinking { display: none; }
 }
 .subagent-card .subagent-result > *:first-child { margin-top: 0; }
 .subagent-card .subagent-result > *:last-child { margin-bottom: 0; }
+
+/* Workflow / Goal / Deep-research progress (P2-10) — teal accent to distinguish
+   from purple subagent cards. Same density as subagent rows. */
+.run-progress-card {
+  font-size: var(--vscode-font-size);
+  color: var(--vscode-descriptionForeground);
+  padding: 5px 10px;
+  margin: 4px var(--pad);
+  border-left: 2px solid var(--vscode-charts-blue, #3794ff);
+  background: var(--vscode-textBlockQuote-background, rgba(55, 148, 255, 0.08));
+  border-radius: 0 6px 6px 0;
+}
+.run-progress-card.run-progress-failed {
+  border-left-color: var(--vscode-errorForeground);
+}
+.run-progress-card.run-progress-failed .run-progress-kind,
+.run-progress-card.run-progress-failed .run-progress-phase {
+  color: var(--vscode-errorForeground);
+}
+.run-progress-card.run-progress-cancelled .run-progress-phase {
+  opacity: 0.7;
+}
+.run-progress-card .run-progress-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.run-progress-card .run-progress-badge { display: inline-flex; flex: none; }
+.run-progress-card .run-progress-kind { font-weight: 600; flex: none; }
+.run-progress-card .run-progress-sep { flex: none; opacity: 0.7; }
+.run-progress-card .run-progress-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-progress-card .run-progress-phase { flex: none; opacity: 0.85; }
+.run-progress-card .run-progress-sub,
+.run-progress-card .run-progress-detail {
+  margin-top: 3px;
+  font-size: 0.92em;
+  opacity: 0.9;
+  overflow-wrap: anywhere;
+  color: var(--vscode-foreground);
+}
+.run-progress-card .run-progress-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.run-progress-card .run-progress-btn {
+  font: inherit;
+  font-size: 0.88em;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  background: var(--vscode-button-secondaryBackground, rgba(127, 127, 127, 0.2));
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  cursor: pointer;
+}
+.run-progress-card .run-progress-btn:hover {
+  background: var(--vscode-button-secondaryHoverBackground, rgba(127, 127, 127, 0.35));
+}
 
 .tool-group {
   font-size: var(--vscode-font-size);
@@ -1659,6 +1727,11 @@ textarea#input {
   pointer-events: none;
 }
 .effort-dot.disabled:hover { background: transparent; }
+/* Loading placeholder dots — a gentle pulse while the session's model/effort
+   menu is still loading (so it reads as "not final yet", not a real ladder). */
+.effort-dot.loading { opacity: 0.3; animation: effort-dot-pulse 1.2s ease-in-out infinite; }
+@keyframes effort-dot-pulse { 0%, 100% { opacity: 0.2; } 50% { opacity: 0.5; } }
+@media (prefers-reduced-motion: reduce) { .effort-dot.loading { animation: none; } }
 
 /* ---- mode / section popover extras ---- */
 
@@ -2416,6 +2489,12 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
 .history-row-name {
   font-size: 13px;
   color: var(--vscode-foreground);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.history-row-txt {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2423,6 +2502,22 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
 .history-row.active .history-row-name {
   color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
 }
+/* Worktree marker — a git-branch icon in muted gray (the same color as the
+   gear-menu worktree icons), vertically centered with the title. A TYPE marker,
+   kept off the status-dot palette so it can't be mistaken for a session state. */
+.history-row-branch {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  color: var(--vscode-descriptionForeground);
+}
+.history-row-branch svg { width: 13px; height: 13px; display: block; }
+.history-row.active .history-row-branch { color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground)); opacity: 0.85; }
+.history-action-btn.disabled, .history-action-btn:disabled { opacity: 0.3; cursor: default; }
+/* Gear-menu Session items: a muted leading icon (fork / rewind / branch) so the
+   whole section reads as one consistent group. Icon is a marker, not an accent. */
+.toolbar-popover-item .gear-lead { display: inline-flex; align-items: center; gap: 9px; }
+.toolbar-popover-item .gear-lead svg { width: 14px; height: 14px; flex: none; color: var(--vscode-descriptionForeground); }
 .history-row-meta {
   font-size: 11px;
   color: var(--vscode-descriptionForeground);

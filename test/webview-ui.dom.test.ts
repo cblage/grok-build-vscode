@@ -218,6 +218,33 @@ describe("session rows (regression: only the label was clickable)", () => {
   });
 });
 
+describe("worktree session rows (#65 — branch icon, rename disabled)", () => {
+  function open(entries: any[]) {
+    const h = bootWebview();
+    click(h.window, $(h.doc, "history-btn"));
+    h.posted.length = 0;
+    dispatch(h.window, { type: "sessions", entries, activeId: null });
+    return h;
+  }
+
+  it("marks a worktree row with a branch icon (not a WT text badge), strips the (WT) prefix, and disables Rename", () => {
+    const { doc } = open([
+      { id: "w1", displayName: "(WT) feat-payments", worktreeLabel: "feat-payments", numMessages: 3, updatedAt: Date.now() },
+      { id: "s1", displayName: "Normal session", numMessages: 5, updatedAt: Date.now() - 1000 },
+    ]);
+    const rows = doc.querySelectorAll(".history-row");
+    const wtRow = rows[0];
+    expect(wtRow.querySelector(".history-row-branch")).not.toBeNull(); // branch icon
+    expect(wtRow.querySelector(".history-row-wt")).toBeNull();          // legacy text badge gone
+    expect(wtRow.querySelector(".history-row-txt")!.textContent).toBe("feat-payments"); // (WT) stripped
+    expect((wtRow.querySelector(".history-action-btn") as HTMLButtonElement).disabled).toBe(true); // rename off
+
+    const normalRow = rows[1];
+    expect(normalRow.querySelector(".history-row-branch")).toBeNull();
+    expect((normalRow.querySelector(".history-action-btn") as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
 describe("session history pagination", () => {
   const page1 = [
     { id: "p0", displayName: "Session 0", numMessages: 1, updatedAt: Date.now() - 1000 },
@@ -762,6 +789,47 @@ describe("gear settings lock (model + effort disabled while busy / priming)", ()
   });
 });
 
+describe("effort picker uses the model's advertised levels (not a hardcoded set)", () => {
+  const openEffortDots = (h: any) => {
+    click(h.window, $(h.doc, "gear-btn"));
+    return [...h.doc.querySelectorAll(".effort-dot")] as HTMLElement[];
+  };
+
+  it("shows exactly the current model's advertised efforts, ordered low→high", () => {
+    const h = bootWebview();
+    dispatch(h.window, {
+      type: "session", sessionId: "s1", currentModelId: "grok-build",
+      models: [{ modelId: "grok-build", name: "Grok Build", reasoningEfforts: ["high", "medium", "low"] }],
+    });
+    const dots = openEffortDots(h);
+    expect(dots).toHaveLength(3); // low/medium/high — not the 6-level ladder
+    expect(dots.map((d) => d.title)).toEqual([
+      "Low — fast, lightweight reasoning",
+      "Medium — balanced",
+      "High — deeper reasoning",
+    ]);
+  });
+
+  it("falls back to the full ladder when the model advertises no efforts", () => {
+    const h = bootWebview();
+    dispatch(h.window, {
+      type: "session", sessionId: "s1", currentModelId: "grok-build",
+      models: [{ modelId: "grok-build", name: "Grok Build" }], // no reasoningEfforts
+    });
+    expect(openEffortDots(h)).toHaveLength(6);
+  });
+
+  it("shows a Loading… model + 5 neutral placeholder dots before the session's model info arrives", () => {
+    const h = bootWebview();
+    // no `session` message yet → no model / effort menu known
+    const dots = openEffortDots(h);
+    const nameBtn = h.doc.querySelector("#gear-popover .model-name-btn") as HTMLElement;
+    expect(nameBtn.textContent).toContain("Loading");
+    expect(dots).toHaveLength(5);
+    expect(dots.every((d) => d.classList.contains("loading"))).toBe(true);
+  });
+});
+
 describe("reasoning trace (regression: thinking traces no longer expandable)", () => {
   it("renders a collapsed thinking block whose header toggles the body open/closed", () => {
     const { window, doc } = bootWebview();
@@ -1296,6 +1364,44 @@ describe("thinking traces toggle (#26)", () => {
     // The re-rendered switch (still-open panel) now reflects the off state.
     toggle = soundToggle();
     expect(toggle.querySelector(".popover-switch.on")).toBeNull();
+  });
+});
+
+describe("gear menu — worktree/rewind gating (#65)", () => {
+  const gearItems = (doc: Document) =>
+    [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")].map((el) => el.textContent || "");
+  const has = (doc: Document, label: string) => gearItems(doc).some((t) => t.includes(label));
+
+  it("non-worktree shows Fork + New worktree; worktree shows Fork + Apply/Remove and hides only New worktree", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "session", sessionId: "s1", models: [], currentModelId: "grok-build" });
+    click(window, $(doc, "gear-btn"));
+    expect(has(doc, "Fork conversation")).toBe(true);
+    expect(has(doc, "New worktree session")).toBe(true);
+    expect(has(doc, "Apply worktree")).toBe(false);
+    expect(has(doc, "Remove worktree")).toBe(false);
+    click(window, $(doc, "gear-btn")); // close
+
+    dispatch(window, { type: "session", sessionId: "s2", models: [], currentModelId: "grok-build", worktree: true });
+    click(window, $(doc, "gear-btn")); // re-open
+    expect(has(doc, "Apply worktree")).toBe(true);
+    expect(has(doc, "Remove worktree")).toBe(true);
+    // Fork stays (a shared-checkout branch, like the Dashboard's parallel sessions);
+    // only New worktree is blocked (no nesting).
+    expect(has(doc, "Fork conversation")).toBe(true);
+    expect(has(doc, "New worktree session")).toBe(false);
+  });
+
+  it("hides Rewind conversation on an empty session, shows it once a user message exists", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "session", sessionId: "s1", models: [], currentModelId: "grok-build" });
+    click(window, $(doc, "gear-btn"));
+    expect(has(doc, "Rewind conversation")).toBe(false);
+    click(window, $(doc, "gear-btn")); // close
+
+    dispatch(window, { type: "userMessage", text: "hello", chips: [] });
+    click(window, $(doc, "gear-btn")); // re-open
+    expect(has(doc, "Rewind conversation")).toBe(true);
   });
 });
 

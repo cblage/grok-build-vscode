@@ -26,6 +26,7 @@ import type { FileChip } from "./chips";
 import type { SandboxProfileOption } from "./grok-config";
 import type { SessionListEntry } from "./sessions";
 import type { Dot } from "./session-pool";
+import type { RunProgressUpdate } from "./run-progress";
 
 /** grok's tool-call payload as it comes off the wire (acp emits it untyped). The
  *  webview reads a handful of fields; the index signature keeps assignment from
@@ -58,7 +59,8 @@ export type HostMsg =
   | { type: "grokUpdateStatus"; current?: string | null; latest?: string | null; updateAvailable?: boolean; policy?: unknown; error?: string }
   | { type: "initialized"; info: { cliPath: string; cwd: string; version: string | null; init: { protocolVersion?: unknown } } }
   | { type: "cliUpdating" }
-  | { type: "session"; sessionId: string; models: ModelInfo[]; currentModelId: string | undefined }
+  // `worktree` gates the gear's Apply/Remove worktree items to worktree sessions.
+  | { type: "session"; sessionId: string; models: ModelInfo[]; currentModelId: string | undefined; worktree?: boolean }
   | { type: "modelChanged"; modelId: string }
   | { type: "modeChanged"; modeId: string }
   /** YOLO/Auto-accept blocked when config has disable_bypass_permissions_mode. */
@@ -122,6 +124,10 @@ export type HostMsg =
   // subagent_finished — duration/output stats the Composer agent's completed
   // tool_call_update lacks, and a completion backstop for the card.
   | { type: "subagentUpdate"; update?: unknown }
+  // Deep Research / Workflow / Goal progress (P2-10) — normalized from the
+  // live `_x.ai/session_notification` rail (`workflow_updated` / `goal_updated`).
+  // Cards update in place by `id`; terminal phases stop the live dots.
+  | { type: "runProgress"; update: RunProgressUpdate }
   // A finished shell command's full text + captured output (#41) — snapshotted
   // host-side at terminal/release (the extension runs the commands, so the
   // buffer is exactly what grok received). exitCode null = killed/cancelled.
@@ -194,7 +200,9 @@ export type WebviewMsg =
   | { type: "updateGrok" }
   | { type: "recheckConnection" }
   | { type: "listSessions"; offset?: number; limit?: number; query?: string }
-  | { type: "resumeSession"; id: string }
+  // cwd is required to reopen a worktree-isolated session (sessions are keyed
+  // by cwd on disk). Omitted → host resolves from meta / workspace root.
+  | { type: "resumeSession"; id: string; cwd?: string }
   | { type: "renameSession"; id: string; name: string }
   | { type: "deleteSession"; id: string; name?: string }
   | { type: "clearAllSessions" }
@@ -219,7 +227,17 @@ export type WebviewMsg =
   // prompt itself, so a -32601 fallback can re-queue the text without losing it.
   | { type: "steerSend"; text: string }
   // Fork (#48): branch this session's conversation into a new one and focus it.
-  | { type: "forkSession" };
+  | { type: "forkSession" }
+  // Worktree UI (P2-8): new isolated session / merge back / remove worktree.
+  | { type: "newWorktreeSession" }
+  | { type: "applyWorktree" }
+  | { type: "removeWorktree" }
+  // Rewind UI (P2-9): truncate chat + restore files.
+  // `userBubbleIndex` (0-based among visible user bubbles) comes from the
+  // per-message Rewind button; omit it for the gear QuickPick path.
+  | { type: "rewindSession"; userBubbleIndex?: number }
+  // Workflow card controls (P2-10): pause / resume / stop by display name.
+  | { type: "workflowControl"; action: "pause" | "resume" | "stop"; displayName: string };
 
 // Exhaustive maps: `Record<Union["type"], true>` forces every discriminant to be
 // a key (missing -> tsc error) and forbids any extra (excess-property -> tsc
@@ -239,7 +257,7 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   planNotice: true, autoCompactNotice: true, planBlocked: true, promptComplete: true, contextUsage: true, agentReset: true,
   agentError: true, agentEnd: true, exit: true, setBusy: true, summarizing: true,
   sessionContext: true, clearMessages: true, onboarding: true, error: true,
-  xaiNotification: true, subagentUpdate: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true,
+  xaiNotification: true, subagentUpdate: true, runProgress: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true,
   soundNotifications: true,
   setAllToolDetails: true, focusInput: true, sessions: true, sessionDot: true, queuedSends: true,
   steerUnavailable: true, usage: true,
@@ -260,6 +278,8 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   pasteImage: true, voiceStart: true,
   voiceStop: true, queueSend: true, dequeueSend: true, clearQueuedSends: true,
   steerSend: true, forkSession: true,
+  newWorktreeSession: true, applyWorktree: true, removeWorktree: true,
+  rewindSession: true, workflowControl: true,
 };
 
 export const HOST_MESSAGE_TYPES: readonly HostMsg["type"][] = Object.keys(HOST_MESSAGE_TYPE_MAP) as HostMsg["type"][];

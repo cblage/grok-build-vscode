@@ -29,6 +29,24 @@ import {
 } from "./plan-gate";
 import { resolveGrokHome } from "./sessions";
 import { filterAdvertisedCommands } from "./slash-filter";
+import {
+  parseWorktreeApply,
+  parseWorktreeCreate,
+  parseWorktreeList,
+  parseWorktreeRemove,
+  parseWorktreeStatus,
+  type WorktreeApplyResult,
+  type WorktreeCreateResult,
+  type WorktreeRecord,
+  type WorktreeRemoveResult,
+} from "./worktree";
+import {
+  parseRewindExecute,
+  parseRewindPoints,
+  type RewindExecuteResult,
+  type RewindMode,
+  type RewindPoint,
+} from "./rewind";
 
 export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
@@ -205,8 +223,6 @@ export class AcpClient extends EventEmitter {
    * `plan-gate.ts`. The host toggles this; the CLI's own plan mode is advisory.
    */
   planActive = false;
-
-  // TEST COMMENT: added to demonstrate file editing in src/acp.ts
 
   /** Set by the host to satisfy server→client fs requests. */
   fsRead?: FsReadHandler;
@@ -507,6 +523,141 @@ export class AcpClient extends EventEmitter {
     } catch (e: any) {
       if (isMethodNotFoundError(e)) {
         this.opts.log("[fork] CLI does not support _x.ai/session/fork");
+        return "unsupported";
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * Create an isolated git worktree for this session (P2-8).
+   * Required params: `sessionId` (this session) + `sourcePath` (the main
+   * checkout). Optional `label` names the worktree dir under
+   * `~/.grok/worktrees/<repo>/`. Returns immediately with `status:"creating"`;
+   * progress/completion rides `_x.ai/git/worktree/status` (emitted as
+   * `worktreeStatus`). `"unsupported"` on older CLIs (-32601).
+   */
+  async createWorktree(opts: {
+    sourcePath: string;
+    label?: string;
+  }): Promise<WorktreeCreateResult | "unsupported"> {
+    if (!this.sessionId) throw new Error("no session");
+    try {
+      const params: Record<string, string> = {
+        sessionId: this.sessionId,
+        sourcePath: opts.sourcePath,
+      };
+      if (opts.label) params.label = opts.label;
+      const r = await this.request("_x.ai/git/worktree/create", params);
+      const parsed = parseWorktreeCreate(r);
+      if (!parsed) throw new Error("worktree/create returned no worktreePath");
+      return parsed;
+    } catch (e: any) {
+      if (isMethodNotFoundError(e)) {
+        this.opts.log("[worktree] CLI does not support _x.ai/git/worktree/create");
+        return "unsupported";
+      }
+      throw e;
+    }
+  }
+
+  /** List tracked worktrees. Empty params = all; optional filters pass through. */
+  async listWorktrees(params: Record<string, unknown> = {}): Promise<WorktreeRecord[] | "unsupported"> {
+    try {
+      const r = await this.request("_x.ai/git/worktree/list", params);
+      return parseWorktreeList(r);
+    } catch (e: any) {
+      if (isMethodNotFoundError(e)) {
+        this.opts.log("[worktree] CLI does not support _x.ai/git/worktree/list");
+        return "unsupported";
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * Merge a worktree's file changes back into the main checkout.
+   * Required: `sessionId` (any live session works) + `worktreePath`.
+   */
+  async applyWorktree(worktreePath: string): Promise<WorktreeApplyResult | "unsupported"> {
+    if (!this.sessionId) throw new Error("no session");
+    try {
+      const r = await this.request("_x.ai/git/worktree/apply", {
+        sessionId: this.sessionId,
+        worktreePath,
+      });
+      const parsed = parseWorktreeApply(r);
+      if (!parsed) throw new Error("worktree/apply returned an empty result");
+      return parsed;
+    } catch (e: any) {
+      if (isMethodNotFoundError(e)) {
+        this.opts.log("[worktree] CLI does not support _x.ai/git/worktree/apply");
+        return "unsupported";
+      }
+      throw e;
+    }
+  }
+
+  /** Remove a worktree by path. Fails if a live process still has it as cwd. */
+  async removeWorktree(worktreePath: string): Promise<WorktreeRemoveResult | "unsupported"> {
+    try {
+      const r = await this.request("_x.ai/git/worktree/remove", { worktreePath });
+      const parsed = parseWorktreeRemove(r);
+      if (!parsed) throw new Error("worktree/remove returned an empty result");
+      return parsed;
+    } catch (e: any) {
+      if (isMethodNotFoundError(e)) {
+        this.opts.log("[worktree] CLI does not support _x.ai/git/worktree/remove");
+        return "unsupported";
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * List rewind points for this session (P2-9). One point per user prompt;
+   * each carries a prompt preview + whether file snapshots exist.
+   * `"unsupported"` on older CLIs (-32601).
+   */
+  async listRewindPoints(): Promise<RewindPoint[] | "unsupported"> {
+    if (!this.sessionId) throw new Error("no session");
+    try {
+      const r = await this.request("_x.ai/rewind/points", { sessionId: this.sessionId });
+      return parseRewindPoints(r);
+    } catch (e: any) {
+      if (isMethodNotFoundError(e)) {
+        this.opts.log("[rewind] CLI does not support _x.ai/rewind/points");
+        return "unsupported";
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * Rewind conversation (+ optional file snapshots) to `targetPromptIndex`.
+   * Always passes `force: true` — the extension's confirm dialog is the UX
+   * gate (without force the CLI returns success:false with no truncation).
+   * Default mode `"all"` matches the TUI `/rewind` (conversation + files).
+   * `"unsupported"` on older CLIs.
+   */
+  async executeRewind(opts: {
+    targetPromptIndex: number;
+    mode?: RewindMode;
+  }): Promise<RewindExecuteResult | "unsupported"> {
+    if (!this.sessionId) throw new Error("no session");
+    try {
+      const r = await this.request("_x.ai/rewind/execute", {
+        sessionId: this.sessionId,
+        targetPromptIndex: opts.targetPromptIndex,
+        mode: opts.mode ?? "all",
+        force: true,
+      });
+      const parsed = parseRewindExecute(r);
+      if (!parsed) throw new Error("rewind/execute returned an empty result");
+      return parsed;
+    } catch (e: any) {
+      if (isMethodNotFoundError(e)) {
+        this.opts.log("[rewind] CLI does not support _x.ai/rewind/execute");
         return "unsupported";
       }
       throw e;
@@ -887,6 +1038,17 @@ export class AcpClient extends EventEmitter {
         // test/fixtures/composer-subagent-session.jsonl), and doubles as a
         // completion backstop for the card.
         this.emit("subagentLifecycle", params?.update);
+        if (id != null) this.respondOk(id, {});
+        return;
+      }
+      if (
+        method === "_x.ai/git/worktree/status" ||
+        method === "x.ai/git/worktree/status"
+      ) {
+        // Create progress/completion. Parse into a stable shape; emit even when
+        // unparseable so the host can log the raw params.
+        const status = parseWorktreeStatus(params) ?? { status: "unknown" };
+        this.emit("worktreeStatus", status, params);
         if (id != null) this.respondOk(id, {});
         return;
       }

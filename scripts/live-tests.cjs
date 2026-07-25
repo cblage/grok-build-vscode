@@ -527,6 +527,177 @@ async function testSessionFork() {
   } finally { acp.kill(); }
 }
 
+// Worktree lifecycle (P2-8): the sidebar's New/Apply/Remove flow, end-to-end
+// against real grok — create an isolated git worktree via the unadvertised
+// `_x.ai/git/worktree/create`, confirm it via `list`, merge it back via `apply`,
+// and clean it up via `remove` (then confirm it's gone). Reuses the SHIPPED pure
+// parsers (out/worktree.js), so it tests the wire→parser path the extension runs,
+// not a re-implementation. SKIPs on -32601 — a pre-worktree CLI, where the
+// extension degrades to "unsupported" rather than erroring.
+async function testWorktree() {
+  const wt = require(path.join(REPO, "out", "worktree.js"));
+  const execFileSync = require("node:child_process").execFileSync;
+  const cwd = mkTmp("wt");
+  const acp = new Acp(cwd);
+  try {
+    // A worktree source must be a git repo with at least one commit.
+    const git = (args) => execFileSync("git", args, { cwd, stdio: "pipe" });
+    git(["init", "-q"]);
+    git(["config", "user.email", "t@t.t"]);
+    git(["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(cwd, "seed.txt"), "seed\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "seed"]);
+
+    let r = await withTimeout(acp.send("initialize", INIT), 30000, "init");
+    assert(!r.error, "init errored");
+    r = await withTimeout(acp.send("session/new", { cwd, mcpServers: [] }), 30000, "session/new");
+    assert(!r.error && r.result && r.result.sessionId, "session/new failed: " + JSON.stringify(r.error));
+    const sessionId = r.result.sessionId;
+
+    const cr = await withTimeout(
+      acp.send("_x.ai/git/worktree/create", { sessionId, sourcePath: cwd, label: "livetest" }),
+      60000, "worktree create");
+    if (cr.error && cr.error.code === -32601) throw new Skip("CLI has no _x.ai/git/worktree/* (pre-worktree build) — extension degrades to unsupported");
+    assert(!cr.error, "worktree create errored: " + JSON.stringify(cr.error));
+    const created = wt.parseWorktreeCreate(cr.result);
+    assert(created && created.worktreePath, "create returned no worktreePath: " + JSON.stringify(cr.result));
+    const worktreePath = created.worktreePath;
+    // create is async: it returns status "creating" with the path, and the actual
+    // checkout appears once the `_x.ai/git/worktree/status` "created" work finishes.
+    await waitFor(() => fs.existsSync(worktreePath), 30000, `worktree checkout on disk (${worktreePath})`);
+
+    // Registration in the CLI's worktree db can lag the checkout dir, so poll.
+    let records = [];
+    const listDeadline = Date.now() + 20000;
+    while (Date.now() < listDeadline) {
+      const ls = await withTimeout(acp.send("_x.ai/git/worktree/list", {}), 30000, "worktree list");
+      assert(!ls.error, "worktree list errored: " + JSON.stringify(ls.error));
+      records = wt.parseWorktreeList(ls.result);
+      if (records.some((w) => wt.pathsEqual(w.path, worktreePath))) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    assert(records.some((w) => wt.pathsEqual(w.path, worktreePath)),
+      `created worktree not in list (${records.length} records: ${JSON.stringify(records.map((w) => w.path)).slice(0, 200)})`);
+
+    // Apply merges edits back; with no edits it still succeeds (empty file set).
+    const ap = await withTimeout(acp.send("_x.ai/git/worktree/apply", { sessionId, worktreePath }), 60000, "worktree apply");
+    assert(!ap.error, "worktree apply errored: " + JSON.stringify(ap.error));
+    assert(wt.parseWorktreeApply(ap.result), "apply returned no result: " + JSON.stringify(ap.result));
+
+    // No process holds the worktree as cwd here, so remove should clean up.
+    const rm = await withTimeout(acp.send("_x.ai/git/worktree/remove", { worktreePath }), 60000, "worktree remove");
+    assert(!rm.error, "worktree remove errored: " + JSON.stringify(rm.error));
+    const removed = wt.parseWorktreeRemove(rm.result);
+    assert(removed && removed.removed, "remove did not report removed: " + JSON.stringify(rm.result));
+
+    const ls2 = await withTimeout(acp.send("_x.ai/git/worktree/list", {}), 30000, "worktree list 2");
+    const after = wt.parseWorktreeList(ls2.result);
+    assert(!after.some((w) => wt.pathsEqual(w.path, worktreePath)), "worktree still listed after remove");
+
+    return `create→list→apply→remove OK (${path.basename(worktreePath)}; ${records.length}→${after.length} worktrees)`;
+  } finally { acp.kill(); }
+}
+
+// Rewind (P2-9): the gear/Rewind flow end-to-end against real grok — list the
+// rewind points, dry-run an execute (the CLI's confirmation gate: success:false,
+// no mutation), then a real `conversation_only` + force rewind (truncates chat,
+// touches NO files on disk). Reuses the SHIPPED parsers (out/rewind.js). SKIPs on
+// -32601 — a pre-rewind CLI, where the extension degrades to "unsupported".
+async function testRewind() {
+  const rw = require(path.join(REPO, "out", "rewind.js"));
+  const cwd = mkTmp("rewind");
+  const acp = new Acp(cwd);
+  try {
+    let r = await withTimeout(acp.send("initialize", INIT), 30000, "init");
+    assert(!r.error, "init errored");
+    r = await withTimeout(acp.send("session/new", { cwd, mcpServers: [] }), 30000, "session/new");
+    assert(!r.error && r.result && r.result.sessionId, "session/new failed: " + JSON.stringify(r.error));
+    const sessionId = r.result.sessionId;
+
+    // Seed two turns so there are rewind points (one per user prompt).
+    for (const t of ["Say only: one. No tools.", "Say only: two. No tools."]) {
+      const p = await withTimeout(acp.send("session/prompt", { sessionId, prompt: [{ type: "text", text: t }] }), 120000, "seed");
+      assert(!p.error, "seed prompt errored: " + JSON.stringify(p.error));
+    }
+
+    const pts = await withTimeout(acp.send("_x.ai/rewind/points", { sessionId }), 30000, "rewind points");
+    if (pts.error && pts.error.code === -32601) throw new Skip("CLI has no _x.ai/rewind/* (pre-rewind build) — extension degrades to unsupported");
+    assert(!pts.error, "rewind points errored: " + JSON.stringify(pts.error));
+    const points = rw.parseRewindPoints(pts.result);
+    assert(points.length >= 1, `no rewind points parsed (${JSON.stringify(pts.result).slice(0, 160)})`);
+    const target = points[0].promptIndex;
+
+    // Dry-run (no force): the CLI's confirmation gate — parses, mutates nothing.
+    const dry = await withTimeout(acp.send("_x.ai/rewind/execute", { sessionId, targetPromptIndex: target, mode: "conversation_only" }), 30000, "rewind dry-run");
+    assert(!dry.error, "rewind dry-run errored: " + JSON.stringify(dry.error));
+    assert(rw.parseRewindExecute(dry.result), "dry-run execute did not parse: " + JSON.stringify(dry.result));
+
+    // Real conversation-only rewind (force) — truncates chat, touches NO files.
+    const ex = await withTimeout(acp.send("_x.ai/rewind/execute", { sessionId, targetPromptIndex: target, mode: "conversation_only", force: true }), 30000, "rewind execute");
+    assert(!ex.error, "rewind execute errored: " + JSON.stringify(ex.error));
+    const res = rw.parseRewindExecute(ex.result);
+    assert(res && res.success, "rewind execute did not report success: " + JSON.stringify(ex.result));
+
+    return `points(${points.length}) → dry-run + conversation_only rewind to #${target} OK`;
+  } finally { acp.kill(); }
+}
+
+// Rewind FILE RESTORE (P2-9) — the risky half: rewinding reverts code on disk.
+// Have grok actually edit a file (the harness performs fs/write_text_file for
+// real), then rewind with mode "all" + force and assert the file is restored to
+// its pre-edit contents. Disposable temp git repo. SKIPs if grok doesn't take the
+// file-edit path (non-deterministic) or the CLI lacks rewind (-32601).
+async function testRewindFiles() {
+  const rw = require(path.join(REPO, "out", "rewind.js"));
+  const execFileSync = require("node:child_process").execFileSync;
+  const cwd = mkTmp("rewindfiles");
+  const acp = new Acp(cwd);
+  try {
+    const git = (args) => execFileSync("git", args, { cwd, stdio: "pipe" });
+    git(["init", "-q"]); git(["config", "user.email", "t@t.t"]); git(["config", "user.name", "t"]);
+    const file = path.join(cwd, "foo.txt");
+    const ORIGINAL = "ORIGINAL LINE\n";
+    fs.writeFileSync(file, ORIGINAL);
+    git(["add", "-A"]); git(["commit", "-qm", "seed"]);
+
+    let r = await withTimeout(acp.send("initialize", INIT), 30000, "init");
+    assert(!r.error, "init errored");
+    r = await withTimeout(acp.send("session/new", { cwd, mcpServers: [] }), 30000, "session/new");
+    assert(!r.error && r.result && r.result.sessionId, "session/new failed: " + JSON.stringify(r.error));
+    const sessionId = r.result.sessionId;
+
+    // Ask grok to overwrite foo.txt. The harness writes it to disk for real, so
+    // the file actually changes and grok snapshots a rewind point for the turn.
+    const edit = await withTimeout(acp.send("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "Use your file-editing tool to replace the ENTIRE contents of foo.txt with exactly this one line:\nMODIFIED LINE\nThen stop. Do not run any shell commands." }],
+    }), 180000, "edit prompt");
+    assert(!edit.error, "edit prompt errored: " + JSON.stringify(edit.error));
+
+    const afterEdit = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    if (!/MODIFIED/.test(afterEdit)) throw new Skip("grok did not edit foo.txt via the file tool (chose another path) — nothing to restore");
+
+    const pts = await withTimeout(acp.send("_x.ai/rewind/points", { sessionId }), 30000, "rewind points");
+    if (pts.error && pts.error.code === -32601) throw new Skip("CLI has no _x.ai/rewind/* (pre-rewind build)");
+    assert(!pts.error, "rewind points errored: " + JSON.stringify(pts.error));
+    const points = rw.parseRewindPoints(pts.result);
+    assert(points.length >= 1, `no rewind points (${JSON.stringify(pts.result).slice(0, 120)})`);
+    const target = points[points.length - 1].promptIndex; // the edit turn's point (snapshot is pre-edit)
+
+    // Rewind with file restore (mode "all" + force) → foo.txt must revert.
+    const ex = await withTimeout(acp.send("_x.ai/rewind/execute", { sessionId, targetPromptIndex: target, mode: "all", force: true }), 60000, "rewind execute");
+    assert(!ex.error, "rewind execute errored: " + JSON.stringify(ex.error));
+    const res = rw.parseRewindExecute(ex.result);
+    assert(res && res.success, "rewind execute not success: " + JSON.stringify(ex.result));
+
+    const restored = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    assert(restored === ORIGINAL, `file NOT restored to original — got ${JSON.stringify(restored.slice(0, 40))} (revertedFiles=${JSON.stringify(res.revertedFiles)})`);
+
+    return `grok edited foo.txt → rewind(mode=all,#${target}) restored it (revertedFiles=${res.revertedFiles.length})`;
+  } finally { acp.kill(); }
+}
+
 // The Agent Dashboard runs a pool of live sessions — one `grok agent stdio`
 // process each, same workspace (#37's reporter ran several concurrently). Two
 // processes serving overlapping prompts must complete independently: no
@@ -1074,6 +1245,9 @@ const TESTS = [
   { name: "cancel-mid-turn", fn: testCancelMidTurn, slow: false },
   { name: "interject", fn: testInterject, slow: false },
   { name: "session-fork", fn: testSessionFork, slow: false },
+  { name: "worktree", fn: testWorktree, slow: false },
+  { name: "rewind", fn: testRewind, slow: false },
+  { name: "rewind-files", fn: testRewindFiles, slow: true },
   { name: "parallel-sessions", fn: testParallelSessions, slow: false },
   { name: "vision-prompt", fn: testVisionPrompt, slow: false },
   { name: "session-restore", fn: testRestore, slow: false },

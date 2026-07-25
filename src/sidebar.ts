@@ -103,6 +103,29 @@ import {
   resolveGrokHome,
   sessionsDirFor,
 } from "./sessions";
+import {
+  isGitRepo,
+  matchWorktreeForCwd,
+  mergeSessionIndexes,
+  normalizeFsPath,
+  pathsEqual,
+  sanitizeWorktreeLabel,
+  worktreeDisplayName,
+  worktreesForRepo,
+  type WorktreeRecord,
+} from "./worktree";
+import {
+  formatRewindPointDetail,
+  formatRewindPointLabel,
+  resolveUserBubbleRewind,
+  rewindConfirmMessage,
+  selectableRewindPoints,
+  userFacingRewindPoints,
+} from "./rewind";
+import {
+  parseRunProgressUpdate,
+  workflowControlCommand,
+} from "./run-progress";
 
 // HostMsg (host -> webview) and WebviewMsg (webview -> host) both live in
 // src/protocol.ts now — the single source of truth for the message contract,
@@ -1281,7 +1304,8 @@ See design doc for the full state machine diagram.`;
     const parentName = this.sessionDisplayName(session);
     const forkName = forkDisplayName(parentName);
     try {
-      const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+      // Fork keeps the same cwd as the source, worktree-isolated ones included.
+      const cwd = this.sessionCwd(session);
       const r = await session.client.forkSession(cwd);
       if (r === "unsupported") {
         return void vscode.window.showWarningMessage(
@@ -1292,15 +1316,28 @@ See design doc for the full state machine diagram.`;
       // Stamp the name before focusing, so neither the history list nor the
       // toolbar ever flashes grok's own generated title for the fork.
       const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+      const prev = overrides[r.newSessionId] ?? {};
+      const carried: SessionMetaOverrides[string] = {
+        ...prev,
+        customName: forkName,
+      };
+      // A fork of a worktree session stays in that worktree — carry the binding.
+      // It's a second conversation branch sharing the checkout (like the Agent
+      // Dashboard's parallel sessions); Remove worktree disposes both.
+      if (session.worktree) {
+        carried.worktreePath = session.worktree.path;
+        carried.worktreeLabel = session.worktree.label;
+        carried.sourceGitRoot = session.worktree.sourceGitRoot;
+      }
       await this.context.globalState.update(SESSION_META_KEY, {
         ...overrides,
-        [r.newSessionId]: { ...(overrides[r.newSessionId] ?? {}), customName: forkName },
+        [r.newSessionId]: carried,
       });
       this.sessionCache.delete(r.newSessionId); // customName changes displayName without touching mtime
 
       // The fork is on disk but has no live process; openSession loads it into a
       // fresh pool member and focuses it, exactly like clicking a history row.
-      await this.openSession(r.newSessionId);
+      await this.openSession(r.newSessionId, cwd);
       void vscode.window.showInformationMessage(
         `Forked into "${forkName}". The original conversation is unchanged and is in your session history` +
           (parentName ? ` as "${parentName}"` : "") +
@@ -1308,6 +1345,482 @@ See design doc for the full state machine diagram.`;
       );
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Fork failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /**
+   * Rewind (P2-9) — roll the conversation (and file snapshots) back to an
+   * earlier user prompt. Primary UX: the Rewind button on a user bubble
+   * (`userBubbleIndex`). Fallback: gear / command palette opens a QuickPick.
+   * Execute always uses `force:true` + mode `all`; then reloads the same
+   * session so the chat matches the truncated history.
+   */
+  async rewindFocusedSession(userBubbleIndex?: number): Promise<void> {
+    const session = this.focused;
+    if (!session.client || !session.activeSessionId) {
+      return void vscode.window.showWarningMessage("Start a session before rewinding it.");
+    }
+    if (session.status === "working" || session.status === "needs-you") {
+      return void vscode.window.showWarningMessage(
+        "Wait for the current turn to finish (or Stop it) before rewinding.",
+      );
+    }
+    if (!session.hasHistory) {
+      return void vscode.window.showInformationMessage("Nothing to rewind yet — this session has no conversation.");
+    }
+    try {
+      const points = await session.client.listRewindPoints();
+      if (points === "unsupported") {
+        return void vscode.window.showWarningMessage(
+          "Rewind needs a newer Grok Build CLI. Update via the gear menu → Version & about.",
+        );
+      }
+
+      let target: ReturnType<typeof resolveUserBubbleRewind> = null;
+      if (typeof userBubbleIndex === "number") {
+        // Bubble button: map visible user bubble → wire prompt_index (skips primer).
+        target = resolveUserBubbleRewind(points, userBubbleIndex);
+        if (!target) {
+          return void vscode.window.showInformationMessage(
+            "Can't rewind to this message — it's the latest turn, or the checkpoint is unavailable.",
+          );
+        }
+      } else {
+        // Gear / command palette: pick among user-facing points that aren't the tip.
+        const facing = userFacingRewindPoints(points);
+        const selectable = selectableRewindPoints(facing.length ? facing : points);
+        if (selectable.length === 0) {
+          return void vscode.window.showInformationMessage(
+            facing.length <= 1
+              ? "Only one message so far — hover an earlier user message and click Rewind."
+              : "No rewind points available.",
+          );
+        }
+        const items = [...selectable]
+          .sort((a, b) => b.promptIndex - a.promptIndex)
+          .map((p) => ({
+            label: formatRewindPointLabel(p),
+            description: p.hasFileChanges ? "files" : undefined,
+            detail: formatRewindPointDetail(p),
+            point: p,
+          }));
+        const pick = await vscode.window.showQuickPick(items, {
+          placeHolder: "Rewind to which message? (discards everything after it)",
+          ignoreFocusOut: true,
+          matchOnDescription: true,
+          matchOnDetail: true,
+        });
+        if (!pick) return;
+        target = pick.point;
+      }
+
+      const ok = await vscode.window.showWarningMessage(
+        rewindConfirmMessage(target, "all"),
+        { modal: true },
+        "Rewind",
+      );
+      if (ok !== "Rewind") return;
+
+      const result = await session.client.executeRewind({
+        targetPromptIndex: target.promptIndex,
+        mode: "all",
+      });
+      if (result === "unsupported") {
+        return void vscode.window.showWarningMessage(
+          "Rewind needs a newer Grok Build CLI. Update via the gear menu → Version & about.",
+        );
+      }
+      if (!result.success) {
+        const err = result.error || "Rewind did not apply (no changes).";
+        return void vscode.window.showErrorMessage(err);
+      }
+
+      const nFiles = result.revertedFiles.length;
+      this.output.appendLine(
+        `[rewind] → prompt #${result.targetPromptIndex} (mode=${result.mode}, files=${nFiles}` +
+          (typeof userBubbleIndex === "number" ? `, bubble=${userBubbleIndex}` : "") +
+          `)`,
+      );
+      const resumeId = session.activeSessionId;
+      this.emit(session, { type: "clearMessages" });
+      await this.startSession(resumeId);
+      const fileNote =
+        nFiles > 0
+          ? ` Restored ${nFiles} file${nFiles === 1 ? "" : "s"}.`
+          : result.mode === "conversation_only"
+            ? ""
+            : " (no file changes at that point)";
+      void vscode.window.showInformationMessage(
+        `Rewound to this message.${fileNote}`,
+      );
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`Rewind failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /**
+   * Pause / resume / stop a background workflow by its display name (P2-10).
+   * Sends the matching `/workflow …` slash command as a real turn so the CLI
+   * dispatches it (same path as typing the command in the composer).
+   */
+  private async controlWorkflow(
+    action: "pause" | "resume" | "stop",
+    displayName: string,
+  ): Promise<void> {
+    const cmd = workflowControlCommand(action, displayName);
+    if (!cmd) {
+      return void vscode.window.showWarningMessage("Missing workflow display name.");
+    }
+    await this.handleSend(cmd, true);
+  }
+
+  /** Workspace folder root (the main checkout for worktree ops). */
+  private workspaceRoot(): string {
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  }
+
+  /** Effective cwd for a session (worktree path or workspace root). */
+  private sessionCwd(session: Session = this.focused): string {
+    return session.cwd || this.workspaceRoot();
+  }
+
+  /**
+   * New Worktree Session (P2-8) — create an isolated git worktree and open a
+   * fresh session whose cwd is that worktree. Edits stay out of the main
+   * checkout until the user runs Apply Worktree.
+   */
+  async newWorktreeSession(): Promise<void> {
+    // No worktree-from-worktree — checkouts stay singular. The gear hides this
+    // inside a worktree; guard the Command-Palette path too.
+    if (this.focused.worktree) {
+      return void vscode.window.showInformationMessage(
+        "You're already in a worktree. Start a new worktree from a normal session — worktrees don't nest.",
+      );
+    }
+    const sourcePath = this.workspaceRoot();
+    if (!isGitRepo(sourcePath, fs)) {
+      return void vscode.window.showWarningMessage(
+        "Worktree sessions need a git repository. Open a folder that is a git checkout (or run git init).",
+      );
+    }
+    const rawLabel = await vscode.window.showInputBox({
+      prompt: "Worktree label (optional)",
+      placeHolder: "e.g. feat-auth — leave blank for an auto name",
+      ignoreFocusOut: true,
+    });
+    if (rawLabel === undefined) return; // cancelled
+    const label = sanitizeWorktreeLabel(rawLabel);
+
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: "Creating git worktree…", cancellable: false },
+      async () => {
+        try {
+          // Create needs a live sessionId. Prefer a workspace-cwd client so we
+          // don't pin a worktree to a session that already lives in another wt;
+          // otherwise spin a short-lived ACP client just for the create RPC.
+          const creator = await this.clientForWorktreeCreate(sourcePath);
+          if (!creator) {
+            return void vscode.window.showErrorMessage("Could not start Grok to create a worktree.");
+          }
+          const { client, disposeAfter } = creator;
+          let created;
+          try {
+            created = await client.createWorktree({
+              sourcePath,
+              label: label || undefined,
+            });
+          } finally {
+            if (disposeAfter) await client.dispose();
+          }
+          if (created === "unsupported") {
+            return void vscode.window.showWarningMessage(
+              "Worktrees need a newer Grok Build CLI. Update via the gear menu → Version & about.",
+            );
+          }
+          const wtPath = created.worktreePath;
+          const wtLabel = label || path.basename(wtPath);
+          this.output.appendLine(`[worktree] created ${wtPath} (label=${wtLabel})`);
+          // Refresh cache so history can see sessions under this path.
+          this.worktreeCache = this.worktreeCache.filter((w) => !pathsEqual(w.path, wtPath));
+          this.worktreeCache.push({
+            id: wtLabel,
+            path: wtPath,
+            sourceRepo: sourcePath,
+            repoName: path.basename(sourcePath),
+            kind: "session",
+            creationMode: "linked",
+            gitRef: "HEAD",
+            headCommit: "",
+            status: "alive",
+            label: wtLabel,
+            userProvidedLabel: !!label,
+          });
+
+          // create is ASYNC — the RPC returns "creating" before git writes the
+          // checkout (its dir + `.git` pointer appear a beat later). Spawning a
+          // session in a not-yet-existing cwd hangs the whole flow, so wait for
+          // the checkout to land before starting the session.
+          const ready = await this.waitForWorktreeReady(wtPath, 30000);
+          if (!ready) {
+            return void vscode.window.showErrorMessage(
+              `Worktree "${wtLabel}" was created but its checkout never appeared on disk — the session wasn't started. Try again, or check \`git worktree list\`.`,
+            );
+          }
+
+          // Open a brand-new session whose process cwd is the worktree.
+          this.parkFocused();
+          this.focused = new Session();
+          this.pool.add(this.focused);
+          this.focused.cwd = wtPath;
+          this.focused.worktree = {
+            path: wtPath,
+            label: wtLabel,
+            sourceGitRoot: created.sourceGitRoot || sourcePath,
+          };
+          await this.startSession();
+          const id = this.focused.activeSessionId;
+          if (id) {
+            const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+            await this.context.globalState.update(SESSION_META_KEY, {
+              ...overrides,
+              [id]: {
+                ...(overrides[id] ?? {}),
+                customName: worktreeDisplayName(wtLabel),
+                worktreePath: wtPath,
+                worktreeLabel: wtLabel,
+                sourceGitRoot: created.sourceGitRoot || sourcePath,
+              },
+            });
+            this.sessionCache.delete(id);
+          }
+          this.postSessionsList();
+          void vscode.window.showInformationMessage(
+            `Worktree session ready: ${wtLabel}. Edits stay isolated until you Apply worktree.`,
+          );
+        } catch (e: any) {
+          void vscode.window.showErrorMessage(`Create worktree failed: ${e?.message ?? e}`);
+        }
+      },
+    );
+  }
+
+  /** Poll until a freshly-created worktree's checkout exists on disk (its `.git`
+   *  pointer file, which `git worktree add` writes). create is async — the RPC
+   *  returns "creating" before git finishes — so a session spawned in the cwd
+   *  before this would hang. Accepts a bare dir over hanging if `.git` never
+   *  shows. */
+  private async waitForWorktreeReady(worktreePath: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        if (fs.existsSync(path.join(worktreePath, ".git"))) return true;
+      } catch { /* keep polling */ }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    try { return fs.existsSync(worktreePath); } catch { return false; }
+  }
+
+  /**
+   * Get an AcpClient that can call worktree/create against `sourcePath`.
+   * Returns `{ disposeAfter:true }` when we spun up a temporary process.
+   */
+  private async clientForWorktreeCreate(
+    sourcePath: string,
+  ): Promise<{ client: AcpClient; disposeAfter: boolean } | undefined> {
+    // Reuse a live workspace-root session when we have one (cheap + no orphan).
+    for (const s of this.pool) {
+      if (s.client?.sessionId && pathsEqual(this.sessionCwd(s), sourcePath)) {
+        return { client: s.client, disposeAfter: false };
+      }
+    }
+    if (this.focused.client?.sessionId && pathsEqual(this.sessionCwd(this.focused), sourcePath)) {
+      return { client: this.focused.client, disposeAfter: false };
+    }
+    // Temporary client: initialize + session/new, caller disposes after create.
+    const cfg = vscode.workspace.getConfiguration("grok");
+    const cliPath = locateGrokCli(cfg.get<string>("cliPath", ""));
+    if (!cliPath) return undefined;
+    const client = new AcpClient({
+      cliPath,
+      cwd: sourcePath,
+      env: this.buildEnv(sourcePath),
+      log: (msg) => this.output.appendLine(msg),
+    });
+    // Minimal handlers so the handshake doesn't hang on server requests.
+    client.fsRead = async (p) => fs.readFileSync(p, "utf8");
+    client.fsWrite = async () => { /* create-only client */ };
+    const terminalManager = new TerminalManager();
+    client.terminal = terminalManager;
+    client.executionBackend = { dispose: () => terminalManager.disposeAll() };
+    await client.start();
+    await client.newSession();
+    return { client, disposeAfter: true };
+  }
+
+  /** Merge the focused worktree's changes back into the main checkout. */
+  async applyFocusedWorktree(): Promise<void> {
+    const session = this.focused;
+    const wt = session.worktree;
+    if (!wt) {
+      return void vscode.window.showInformationMessage(
+        "This session is not in a worktree. Start one with Grok: New Worktree Session.",
+      );
+    }
+    if (!session.client?.sessionId) {
+      return void vscode.window.showWarningMessage("Start the session before applying its worktree.");
+    }
+    const ok = await vscode.window.showWarningMessage(
+      `Apply worktree "${wt.label}" into the main checkout?\n\n${wt.path}\n→ ${wt.sourceGitRoot || this.workspaceRoot()}`,
+      { modal: true },
+      "Apply",
+    );
+    if (ok !== "Apply") return;
+    try {
+      const r = await session.client.applyWorktree(wt.path);
+      if (r === "unsupported") {
+        return void vscode.window.showWarningMessage(
+          "Apply worktree needs a newer Grok Build CLI. Update via the gear menu → Version & about.",
+        );
+      }
+      const n = r.files?.length ?? 0;
+      this.output.appendLine(`[worktree] apply ${wt.path}: ${n} file(s), status=${r.status}`);
+      void vscode.window.showInformationMessage(
+        n ? `Applied ${n} file${n === 1 ? "" : "s"} from worktree "${wt.label}".` : `Worktree "${wt.label}" applied (no file changes).`,
+      );
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`Apply worktree failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /** Remove the focused session's worktree (after disposing processes that use it). */
+  async removeFocusedWorktree(): Promise<void> {
+    const session = this.focused;
+    const wt = session.worktree;
+    if (!wt) {
+      return void vscode.window.showInformationMessage("This session is not in a worktree.");
+    }
+    const ok = await vscode.window.showWarningMessage(
+      `Remove worktree "${wt.label}"?\n\n${wt.path}\n\nThis deletes the isolated checkout. Unapplied edits are lost.`,
+      { modal: true },
+      "Remove",
+    );
+    if (ok !== "Remove") return;
+    try {
+      // Any live process still using the worktree as cwd locks remove on Windows.
+      for (const s of [...this.pool]) {
+        if (s.worktree && pathsEqual(s.worktree.path, wt.path)) {
+          s.client?.dispose();
+          s.client = undefined;
+          if (s !== this.focused) this.pool.delete(s);
+        }
+      }
+      // Need a live client for the remove RPC — use focused if still up, else temp.
+      let client = this.focused.client;
+      let disposeAfter = false;
+      if (!client) {
+        const tmp = await this.clientForWorktreeCreate(this.workspaceRoot());
+        if (!tmp) {
+          return void vscode.window.showErrorMessage("Could not start Grok to remove the worktree.");
+        }
+        client = tmp.client;
+        disposeAfter = tmp.disposeAfter;
+      }
+      let r;
+      try {
+        r = await client.removeWorktree(wt.path);
+      } finally {
+        if (disposeAfter) await client.dispose();
+      }
+      if (r === "unsupported") {
+        return void vscode.window.showWarningMessage(
+          "Remove worktree needs a newer Grok Build CLI. Update via the gear menu → Version & about.",
+        );
+      }
+      this.worktreeCache = this.worktreeCache.filter((w) => !pathsEqual(w.path, wt.path));
+      this.output.appendLine(`[worktree] removed ${wt.path} (removed=${r.removed})`);
+      // Clear worktree binding on meta for sessions that pointed here.
+      const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+      let changed = false;
+      const next: SessionMetaOverrides = { ...overrides };
+      for (const [id, o] of Object.entries(overrides)) {
+        if (o.worktreePath && pathsEqual(o.worktreePath, wt.path)) {
+          const { worktreePath: _p, worktreeLabel: _l, sourceGitRoot: _s, ...rest } = o;
+          next[id] = rest;
+          changed = true;
+        }
+      }
+      if (changed) await this.context.globalState.update(SESSION_META_KEY, next);
+      this.focused.worktree = undefined;
+      // Leave the chat; start a normal workspace session so the user isn't stuck.
+      this.parkFocused();
+      this.focused = new Session();
+      this.pool.add(this.focused);
+      this.focused.cwd = this.workspaceRoot();
+      await this.startSession();
+      this.postSessionsList();
+      void vscode.window.showInformationMessage(`Removed worktree "${wt.label}".`);
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`Remove worktree failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /** Cached worktree list for the current repo (refreshed on create/list). */
+  private worktreeCache: WorktreeRecord[] = [];
+
+  private async refreshWorktreeCache(): Promise<void> {
+    const client =
+      this.focused.client ||
+      [...this.pool].map((s) => s.client).find((c) => !!c);
+    if (!client) return;
+    try {
+      const list = await client.listWorktrees({});
+      if (list === "unsupported") return;
+      this.worktreeCache = list;
+    } catch (e: any) {
+      this.output.appendLine(`[worktree] list failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /** Cwd catalogs to scan for history: workspace + known worktrees for this repo. */
+  private collectSessionCwds(workspaceCwd: string, overrides: SessionMetaOverrides): string[] {
+    const cwds: string[] = [];
+    const seen = new Set<string>();
+    const add = (p?: string) => {
+      if (!p) return;
+      const key = normalizeFsPath(p);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      cwds.push(p);
+    };
+    add(workspaceCwd);
+    for (const o of Object.values(overrides)) add(o.worktreePath);
+    for (const wt of worktreesForRepo(this.worktreeCache, workspaceCwd)) add(wt.path);
+    for (const s of this.pool) {
+      add(s.cwd);
+      add(s.worktree?.path);
+    }
+    return cwds;
+  }
+
+  private annotateWorktreeLabels(
+    entries: SessionListEntry[],
+    overrides: SessionMetaOverrides,
+    workspaceCwd: string,
+  ): void {
+    const repoWts = worktreesForRepo(this.worktreeCache, workspaceCwd, { includeDead: true });
+    for (const e of entries) {
+      const fromMeta = overrides[e.id]?.worktreeLabel;
+      if (fromMeta) {
+        e.worktreeLabel = fromMeta;
+        continue;
+      }
+      const hit = matchWorktreeForCwd(e.cwd, repoWts);
+      if (hit) e.worktreeLabel = hit.label;
+      else if (e.cwd && !pathsEqual(e.cwd, workspaceCwd)) {
+        // Session lives outside the workspace (likely a worktree we no longer
+        // track) — still surface the basename so the row is distinguishable.
+        e.worktreeLabel = path.basename(e.cwd);
+      }
     }
   }
 
@@ -1722,6 +2235,8 @@ See design doc for the full state machine diagram.`;
       if (choice !== "Update Anyway") return;
     }
     const resumeId = this.focused.activeSessionId;
+    const resumeCwd = this.focused.cwd;
+    const resumeWorktree = this.focused.worktree;
     // Free the binary: every pooled session's process holds it open (a hard lock
     // on Windows), so tear the whole pool down before the update replaces the
     // executable, then resume the focused session on the fresh binary. Other
@@ -1730,6 +2245,8 @@ See design doc for the full state machine diagram.`;
     // the grok.exe lock a beat after the process actually exits — running the
     // update before that loses the rename with "cannot rename locked executable".
     this.focused = new Session();
+    this.focused.cwd = resumeCwd;
+    this.focused.worktree = resumeWorktree;
     this.post({ type: "clearMessages" });
     this.post({ type: "cliUpdating" });
     await this.disposePool();
@@ -1829,7 +2346,8 @@ See design doc for the full state machine diagram.`;
   private discardRestartedEmptySession(oldId: string | undefined): void {
     const newId = this.focused.activeSessionId;
     if (!oldId || oldId === newId) return;
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    // Restart keeps the same session.cwd (workspace or worktree).
+    const cwd = this.sessionCwd(this.focused);
     const grokHome = resolveGrokHome(process.env);
     try {
       deleteSessionDir({ fs: defaultFs, grokHome, cwd, id: oldId });
@@ -1837,7 +2355,22 @@ See design doc for the full state machine diagram.`;
       this.output.appendLine(`[sessions] could not discard empty session ${oldId}: ${(e as Error).message}`);
     }
     const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
-    void this.context.globalState.update(SESSION_META_KEY, carrySessionName(overrides, oldId, newId));
+    // carrySessionName only moves customName — also carry worktree binding so a
+    // model switch mid-worktree session doesn't lose Apply/Remove.
+    let next = carrySessionName(overrides, oldId, newId);
+    const oldMeta = overrides[oldId];
+    if (newId && oldMeta?.worktreePath) {
+      next = {
+        ...next,
+        [newId]: {
+          ...(next[newId] ?? {}),
+          worktreePath: oldMeta.worktreePath,
+          worktreeLabel: oldMeta.worktreeLabel,
+          sourceGitRoot: oldMeta.sourceGitRoot,
+        },
+      };
+    }
+    void this.context.globalState.update(SESSION_META_KEY, next);
     this.sessionCache.delete(oldId);
     this.postSessionsList();
   }
@@ -1933,7 +2466,20 @@ See design doc for the full state machine diagram.`;
     await this.maybePinBrokenCli(cliPath);
     if (gen !== session.gen) return undefined;
 
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    // Worktree sessions pin cwd at creation/open; everyone else uses the workspace root.
+    const cwd = session.cwd || this.workspaceRoot();
+    session.cwd = cwd;
+    // Re-bind worktree meta from override when resuming (cold open may only have cwd).
+    if (!session.worktree && resumeId) {
+      const o = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {})[resumeId];
+      if (o?.worktreePath) {
+        session.worktree = {
+          path: o.worktreePath,
+          label: o.worktreeLabel || path.basename(o.worktreePath),
+          sourceGitRoot: o.sourceGitRoot || this.workspaceRoot(),
+        };
+      }
+    }
     const env = this.buildEnv(cwd);
     // Sandbox selection, definitions, and persistence are user-controlled. A
     // repository `.env` is allowed to feed the Grok process credentials, but
@@ -2117,6 +2663,7 @@ See design doc for the full state machine diagram.`;
         sessionId: res.sessionId,
         models: client.availableModels,
         currentModelId: client.currentModelId,
+        worktree: !!session.worktree,
       });
     });
     client.on("modelChanged", (id) => {
@@ -2289,6 +2836,10 @@ See design doc for the full state machine diagram.`;
       // subagentLifecycle channel). Re-route to the same `subagentUpdate` the
       // webview cards already consume — subagent_finished fills duration/output.
       if (isSubagentLifecycleUpdate(u)) this.emit(session, { type: "subagentUpdate", update: u });
+      // Deep Research / Workflow / Goal progress (P2-10) — same live rail.
+      // Normalized once so the webview only sees a stable card shape.
+      const runProg = parseRunProgressUpdate(u);
+      if (runProg) this.emit(session, { type: "runProgress", update: runProg });
       // Automatic (context-full) compaction was previously silent — surface a
       // dedicated notice (auto-path only; manual /compact paints "Compacted."
       // from the slash path). Dedicated (not a messageChunk) so it finalizes any
@@ -2630,6 +3181,23 @@ See design doc for the full state machine diagram.`;
       case "forkSession":
         await this.forkFocusedSession();
         break;
+      case "newWorktreeSession":
+        await this.newWorktreeSession();
+        break;
+      case "applyWorktree":
+        await this.applyFocusedWorktree();
+        break;
+      case "removeWorktree":
+        await this.removeFocusedWorktree();
+        break;
+      case "rewindSession":
+        await this.rewindFocusedSession(
+          typeof msg.userBubbleIndex === "number" ? msg.userBubbleIndex : undefined,
+        );
+        break;
+      case "workflowControl":
+        await this.controlWorkflow(msg.action, msg.displayName);
+        break;
       case "clearQueuedSends": {
         // Posted by the webview's Stop flow BEFORE the cancel — a halt must not
         // auto-fire queued sends into the cancelled turn's wake.
@@ -2893,7 +3461,7 @@ See design doc for the full state machine diagram.`;
         this.postSessionsList({ offset: msg.offset, limit: msg.limit, query: msg.query });
         break;
       case "resumeSession":
-        await this.openSession(msg.id);
+        await this.openSession(msg.id, msg.cwd);
         break;
       case "renameSession":
         this.renameSession(msg.id, msg.name);
@@ -2955,13 +3523,26 @@ See design doc for the full state machine diagram.`;
     const offset = Math.max(0, opts?.offset ?? 0);
     const limit = opts?.limit ?? SESSION_PAGE_SIZE;
     const query = (opts?.query ?? "").trim().toLowerCase();
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const cwd = this.workspaceRoot();
     const grokHome = resolveGrokHome(process.env);
     const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const log = (m: string) => this.output.appendLine(m);
 
-    const index = indexSessions({ fs: defaultFs, grokHome, cwd, log });
+    // Best-effort refresh so worktree sessions appear without a create this window.
+    // Fire-and-forget: a late refresh just needs another list open to show up.
+    void this.refreshWorktreeCache();
+
+    // History spans the workspace cwd PLUS any worktree checkouts for this repo
+    // (P2-8). Sessions are stored under encodeURIComponent(cwd), so a worktree
+    // session is invisible unless we scan its path too.
+    const cwds = this.collectSessionCwds(cwd, overrides);
+    const perCwd = cwds.map((c) => ({
+      cwd: c,
+      entries: indexSessions({ fs: defaultFs, grokHome, cwd: c, log }),
+    }));
+    const index = mergeSessionIndexes(perCwd);
     const mtimeById = new Map(index.map((e) => [e.id, e.mtimeMs]));
+    const cwdById = new Map(index.map((e) => [e.id, e.cwd]));
 
     // Subagent child sessions (`session_kind: "subagent"` — grok persists every
     // spawn_subagent delegation as a top-level sibling session) are grok's own
@@ -2974,22 +3555,27 @@ See design doc for the full state machine diagram.`;
     let nextOffset: number;
     if (query) {
       // Search needs names for everything, so read (cache-backed) the whole list once, then filter.
-      const all = this.readEntriesCached(index.map((e) => e.id), mtimeById, overrides, cwd, grokHome, log)
+      const all = this.readEntriesCachedMulti(index.map((e) => e.id), mtimeById, cwdById, overrides, grokHome, log)
         .filter((e) => e.kind !== "subagent");
       all.sort((a, b) => b.updatedAt - a.updatedAt);
-      const matched = all.filter((e) => e.displayName.toLowerCase().includes(query));
+      const matched = all.filter(
+        (e) =>
+          e.displayName.toLowerCase().includes(query) ||
+          (e.worktreeLabel && e.worktreeLabel.toLowerCase().includes(query)),
+      );
       total = matched.length;
       pageEntries = matched.slice(offset, offset + limit);
       nextOffset = offset + pageEntries.length;
     } else {
       total = index.length;
       const pageIds = index.slice(offset, offset + limit).map((e) => e.id);
-      pageEntries = this.readEntriesCached(pageIds, mtimeById, overrides, cwd, grokHome, log)
+      pageEntries = this.readEntriesCachedMulti(pageIds, mtimeById, cwdById, overrides, grokHome, log)
         .filter((e) => e.kind !== "subagent");
       // mtime is an approximate sort key; re-order the loaded page by exact updated_at.
       pageEntries.sort((a, b) => b.updatedAt - a.updatedAt);
       nextOffset = offset + pageIds.length;
     }
+    this.annotateWorktreeLabels(pageEntries, overrides, cwd);
 
     // hasMore is governed purely by what's on disk (load-more pages disk-only); compute it before
     // injecting any live-only rows below so an injected entry can't be mistaken for another page.
@@ -3009,7 +3595,9 @@ See design doc for the full state machine diagram.`;
       for (const s of this.pool) {
         const id = s.activeSessionId;
         if (!id || onDisk.has(id) || seen.has(id)) continue;
-        synthetic.push(this.liveSessionEntry(s, id, cwd, overrides));
+        const entry = this.liveSessionEntry(s, id, this.sessionCwd(s), overrides);
+        if (s.worktree) entry.worktreeLabel = s.worktree.label;
+        synthetic.push(entry);
         seen.add(id);
       }
       if (synthetic.length) {
@@ -3078,7 +3666,7 @@ See design doc for the full state machine diagram.`;
     const custom = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]?.customName?.trim();
     if (custom) return custom;
     try {
-      const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+      const cwd = this.sessionCwd(session);
       const raw = fs.readFileSync(
         path.join(sessionsDirFor(resolveGrokHome(process.env), cwd), id, "summary.json"),
         "utf8",
@@ -3143,6 +3731,37 @@ See design doc for the full state machine diagram.`;
     return ids.map((id) => this.sessionCache.get(id)?.entry).filter((e): e is SessionListEntry => !!e);
   }
 
+  /**
+   * Like {@link readEntriesCached} but each id may live under a different cwd
+   * (workspace vs worktree). Groups stale ids by cwd so we still batch the
+   * disk reads per catalog.
+   */
+  private readEntriesCachedMulti(
+    ids: string[],
+    mtimeById: Map<string, number>,
+    cwdById: Map<string, string>,
+    overrides: SessionMetaOverrides,
+    grokHome: string,
+    log: (m: string) => void,
+  ): SessionListEntry[] {
+    const staleByCwd = new Map<string, string[]>();
+    for (const id of ids) {
+      const cached = this.sessionCache.get(id);
+      if (cached && cached.mtimeMs === (mtimeById.get(id) ?? -1)) continue;
+      const c = cwdById.get(id) || this.workspaceRoot();
+      const list = staleByCwd.get(c) ?? [];
+      list.push(id);
+      staleByCwd.set(c, list);
+    }
+    for (const [c, stale] of staleByCwd) {
+      const fresh = readSessionEntries({ fs: defaultFs, grokHome, cwd: c, ids: stale, overrides, log });
+      for (const e of fresh) {
+        this.sessionCache.set(e.id, { mtimeMs: mtimeById.get(e.id) ?? 0, entry: e });
+      }
+    }
+    return ids.map((id) => this.sessionCache.get(id)?.entry).filter((e): e is SessionListEntry => !!e);
+  }
+
   private renameSession(id: string, name: string): void {
     const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const trimmed = (name || "").trim();
@@ -3172,7 +3791,13 @@ See design doc for the full state machine diagram.`;
       "Delete",
     );
     if (choice !== "Delete") return;
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const overridesNow = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const liveForCwd = [...this.pool].find((s) => s.activeSessionId === id);
+    const cwd =
+      liveForCwd?.cwd ||
+      overridesNow[id]?.worktreePath ||
+      this.sessionCache.get(id)?.entry.cwd ||
+      this.workspaceRoot();
     try {
       deleteSessionDir({
         fs: defaultFs,
@@ -4313,12 +4938,12 @@ See design doc for the full state machine diagram.`;
   // them out costs those flows nothing.
   private static readonly SUPPRESS_TYPES = new Set([
     "messageChunk", "userMessageChunk", "thoughtChunk", "toolCall", "toolCallUpdate",
-    "promptComplete", "xaiNotification", "subagentUpdate", "commandOutput", "agentEnd",
+    "promptComplete", "xaiNotification", "subagentUpdate", "runProgress", "commandOutput", "agentEnd",
   ]);
   // Subset: content only, not lifecycle. Lets promptComplete/agentEnd through so
   // the webview's `busy` state clears when the false-approval turn ends.
   private static readonly PLAN_REJECT_SUPPRESS = new Set([
-    "messageChunk", "userMessageChunk", "thoughtChunk", "toolCall", "toolCallUpdate", "xaiNotification", "subagentUpdate", "commandOutput",
+    "messageChunk", "userMessageChunk", "thoughtChunk", "toolCall", "toolCallUpdate", "xaiNotification", "subagentUpdate", "runProgress", "commandOutput",
   ]);
 
   private post(message: HostMsg): void {
@@ -4396,29 +5021,37 @@ See design doc for the full state machine diagram.`;
   private parkFocused(): void {
     const cur = this.focused;
     const busy = cur.status === "working" || cur.status === "needs-you";
-    if (cur.hasHistory || cur.afterTurn || busy) return; // real/active work — keep it parked & alive
+    // A worktree session backs a real git checkout the user explicitly created —
+    // never auto-delete it as an "empty primer session", even before the first
+    // message (that's what made creating/leaving a worktree replace the current
+    // one). It's removed only via Remove worktree.
+    if (cur.hasHistory || cur.afterTurn || busy || cur.worktree) return; // real/active work — keep it parked & alive
     // Empty (primer-only) session being left behind (New Session, or switching to
     // another): tear down its process AND delete its on-disk dir so it doesn't pile
     // up in history (#24). The next focused session becomes the single live "New
     // session"; abandoning this one removes it entirely.
     this.disposeSession(cur);
-    this.removeSessionFromDisk(cur.activeSessionId);
+    this.removeSessionFromDisk(cur.activeSessionId, cur.cwd);
     this.postSessionsList();
   }
 
   /** Delete a session's on-disk dir + drop its meta override and read-cache entry.
    *  Used when an empty (primer-only) session is abandoned or swept. Best-effort —
    *  a locked/already-gone dir is logged, not thrown. */
-  private removeSessionFromDisk(id: string | undefined): void {
+  private removeSessionFromDisk(id: string | undefined, sessionCwd?: string): void {
     if (!id) return;
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const cwd =
+      sessionCwd ||
+      overrides[id]?.worktreePath ||
+      this.sessionCache.get(id)?.entry.cwd ||
+      this.workspaceRoot();
     const grokHome = resolveGrokHome(process.env);
     try {
       deleteSessionDir({ fs: defaultFs, grokHome, cwd, id });
     } catch (e) {
       this.output.appendLine(`[sessions] could not remove empty session ${id}: ${(e as Error).message}`);
     }
-    const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     if (overrides[id]) {
       const next = { ...overrides };
       delete next[id];
@@ -4704,6 +5337,10 @@ See design doc for the full state machine diagram.`;
   private async newFocusedSession(): Promise<void> {
     this.parkFocused();
     this.focused = new Session();
+    // Always open "New session" in the workspace root — leave worktree sessions
+    // parked in the pool (or reaped) rather than trapping the user in a wt cwd.
+    this.focused.cwd = this.workspaceRoot();
+    this.focused.worktree = undefined;
     // The webview toolbar button clears its own DOM before posting newSession,
     // but the Command Palette command lands here directly — without this clear
     // the old transcript stayed onscreen under the fresh session. (The toolbar
@@ -4717,7 +5354,7 @@ See design doc for the full state machine diagram.`;
    * it instantly (lossless buffer replay — no reload). Otherwise park the current
    * session and load this one cold from grok's on-disk history into a fresh member.
    */
-  private async openSession(id: string): Promise<void> {
+  private async openSession(id: string, sessionCwd?: string): Promise<void> {
     for (const s of this.pool) {
       if (s.activeSessionId === id && s.client) {
         this.focusSession(s);
@@ -4726,6 +5363,33 @@ See design doc for the full state machine diagram.`;
     }
     this.parkFocused();
     this.focused = new Session();
+    this.pool.add(this.focused);
+    // Resolve cwd: explicit (history row) → meta worktree → cache → workspace.
+    const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const o = overrides[id];
+    const cwd =
+      sessionCwd ||
+      o?.worktreePath ||
+      this.sessionCache.get(id)?.entry.cwd ||
+      this.workspaceRoot();
+    this.focused.cwd = cwd;
+    if (o?.worktreePath) {
+      this.focused.worktree = {
+        path: o.worktreePath,
+        label: o.worktreeLabel || path.basename(o.worktreePath),
+        sourceGitRoot: o.sourceGitRoot || this.workspaceRoot(),
+      };
+    } else {
+      const hit = matchWorktreeForCwd(cwd, worktreesForRepo(this.worktreeCache, this.workspaceRoot(), { includeDead: true }));
+      if (hit) {
+        this.focused.worktree = {
+          path: hit.path,
+          label: hit.label,
+          sourceGitRoot: hit.sourceRepo || this.workspaceRoot(),
+          id: hit.id,
+        };
+      }
+    }
     await this.startSession(id);
     this.markRead(this.focused); // opening a cold session clears its unread badge
   }
