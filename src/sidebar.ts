@@ -65,7 +65,7 @@ import {
 } from "./chips";
 import { buildPromptWithImages, type PromptImageInput } from "./prompt-builder";
 import { matchSlashCommand } from "./slash-filter";
-import { MENTION_INDEX_LIMIT, MENTION_INDEX_TTL_MS, buildExcludeGlob, filterMentionFiles, normalizeRelPath, orderMentionIndex } from "./mention";
+import { MENTION_INDEX_LIMIT, MENTION_INDEX_TTL_MS, buildExcludeGlob, clampMentionIndexLimit, filterMentionFiles, mergeMentionEntries, normalizeRelPath, orderMentionIndex } from "./mention";
 import {
   collectAvailableSandboxProfileOptions,
   configDisablesBypassPermissions,
@@ -85,7 +85,8 @@ import { GROK_PRIMER, isPrimerText, isPrimerSummary } from "./grok-primer";
 import { HostMsg, WebviewMsg } from "./protocol";
 import { RemoteUplink } from "./remote-uplink";
 import { allowFromRemote, transformHostMsgForRemote, type MediaInlineDeps, type RemoteTier } from "./remote-policy";
-import { httpBaseFromRelayUrl } from "./remote-frames";
+import { deviceDisplayName, httpBaseFromRelayUrl, REMOTE_RELAY_URL } from "./remote-frames";
+import { KeepAwake, shouldKeepAwake } from "./keep-awake";
 import {
   SessionListEntry,
   SessionMetaOverrides,
@@ -240,9 +241,9 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   private chips: FileChip[] = [];
   /** Attachment-staging ops still in flight — see trackAttach. */
   private readonly pendingAttach = new Set<Promise<void>>();
-  /** The composer's `@` file popover index: workspace-relative paths (ranked by
-   *  src/mention.ts) + rel→abs map for the pick. One findFiles snapshot serves
-   *  {@link MENTION_INDEX_TTL_MS}; concurrent queries share one in-flight build. */
+  /** Cached findFiles snapshot for the `@` popover (no open-editor merge).
+   *  One snapshot serves {@link MENTION_INDEX_TTL_MS}; concurrent queries share
+   *  one in-flight build. Open tabs are layered on at read time. */
   private mentionIndex: { at: number; rels: string[]; absByRel: Map<string, string> } | null = null;
   private mentionIndexPromise: Promise<{ rels: string[]; absByRel: Map<string, string> }> | null = null;
   private editorWatcher?: vscode.Disposable;
@@ -255,11 +256,15 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   private voiceStreamCtx?: { key: string; ffmpegPath: string; device?: string; phrase: string; keyterms: string[] };
   private configWatcher?: vscode.Disposable;
   private lastUserSandboxSetting = "";
-  // Remote uplink — outbound wss to a relay, active only when
-  // grok.remoteControl.relayUrl is set AND a device token is stored (the
-  // "Grok: Link Remote Device" flow). The taps in post()/emit() are no-ops when
-  // it's off, so the shipping path is unaffected.
+  // Remote uplink — outbound wss to the relay (REMOTE_RELAY_URL), active only
+  // when a device token is stored (the "Grok: Link Remote Device" / gear
+  // sign-in flow). The taps in post()/emit() are no-ops when it's off, so the
+  // shipping path is unaffected.
   private uplink?: RemoteUplink;
+  // OS wake lock, held for exactly as long as the uplink is (linked device token
+  // + live extension host) so an AFK machine can't idle-suspend out from under a
+  // remote turn. `grok.remote.keepAwake` is the opt-out. See src/keep-awake.ts.
+  private readonly keepAwake = new KeepAwake((l) => this.output.appendLine(l), process.platform, process.pid, os.release());
   // Last-seen "chrome" messages (labels, donut, lists, config echoes) that live
   // OUTSIDE Session.buffer — the buffer replays the chat, this replays the shell.
   // A new remote client's snapshot = these + clearMessages + the focused buffer.
@@ -380,6 +385,11 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
         // chip right away (not on the next editor event), enabling shows it.
         this.refreshImplicitChip(true);
       }
+      if (e.affectsConfiguration("grok.mentionIndexLimit")) {
+        // Drop the TTL-cached findFiles snapshot so the next `@` rebuilds with
+        // the new cap (otherwise a raise would wait up to MENTION_INDEX_TTL_MS).
+        this.mentionIndex = null;
+      }
       if (e.affectsConfiguration("grok.terminalShell")) {
         this.applyTerminalShellPref();
       }
@@ -394,11 +404,8 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
             .then(() => this.postSandboxState(process.env));
         }
       }
-      if (e.affectsConfiguration("grok.remoteControl")) {
-        // relayUrl can change, so tear down and re-create rather than no-op.
-        this.uplink?.dispose();
-        this.uplink = undefined;
-        void this.maybeStartUplink();
+      if (e.affectsConfiguration("grok.remote.keepAwake")) {
+        this.refreshKeepAwake();
       }
     });
     this.applyTerminalShellPref();
@@ -1657,8 +1664,9 @@ See design doc for the full state machine diagram.`;
     return { client, disposeAfter: true };
   }
 
-  /** Merge the focused worktree's changes back into the main checkout. */
-  async applyFocusedWorktree(): Promise<void> {
+  /** Merge the focused worktree's changes back into the main checkout.
+   *  `skipConfirm` = the webview's custom confirm dialog already ran. */
+  async applyFocusedWorktree(skipConfirm = false): Promise<void> {
     const session = this.focused;
     const wt = session.worktree;
     if (!wt) {
@@ -1669,12 +1677,14 @@ See design doc for the full state machine diagram.`;
     if (!session.client?.sessionId) {
       return void vscode.window.showWarningMessage("Start the session before applying its worktree.");
     }
-    const ok = await vscode.window.showWarningMessage(
-      `Apply worktree "${wt.label}" into the main checkout?\n\n${wt.path}\n→ ${wt.sourceGitRoot || this.workspaceRoot()}`,
-      { modal: true },
-      "Apply",
-    );
-    if (ok !== "Apply") return;
+    if (!skipConfirm) {
+      const ok = await vscode.window.showWarningMessage(
+        `Apply worktree "${wt.label}" into the main checkout?\n\n${wt.path}\n→ ${wt.sourceGitRoot || this.workspaceRoot()}`,
+        { modal: true },
+        "Apply",
+      );
+      if (ok !== "Apply") return;
+    }
     try {
       const r = await session.client.applyWorktree(wt.path);
       if (r === "unsupported") {
@@ -1692,19 +1702,22 @@ See design doc for the full state machine diagram.`;
     }
   }
 
-  /** Remove the focused session's worktree (after disposing processes that use it). */
-  async removeFocusedWorktree(): Promise<void> {
+  /** Remove the focused session's worktree (after disposing processes that use it).
+   *  `skipConfirm` = the webview's custom confirm dialog already ran. */
+  async removeFocusedWorktree(skipConfirm = false): Promise<void> {
     const session = this.focused;
     const wt = session.worktree;
     if (!wt) {
       return void vscode.window.showInformationMessage("This session is not in a worktree.");
     }
-    const ok = await vscode.window.showWarningMessage(
-      `Remove worktree "${wt.label}"?\n\n${wt.path}\n\nThis deletes the isolated checkout. Unapplied edits are lost.`,
-      { modal: true },
-      "Remove",
-    );
-    if (ok !== "Remove") return;
+    if (!skipConfirm) {
+      const ok = await vscode.window.showWarningMessage(
+        `Remove worktree "${wt.label}"?\n\n${wt.path}\n\nThis deletes the isolated checkout. Unapplied edits are lost.`,
+        { modal: true },
+        "Remove",
+      );
+      if (ok !== "Remove") return;
+    }
     try {
       // Any live process still using the worktree as cwd locks remove on Windows.
       for (const s of [...this.pool]) {
@@ -2015,6 +2028,7 @@ See design doc for the full state machine diagram.`;
     if (this.reaper) { clearInterval(this.reaper); this.reaper = undefined; }
     this.uplink?.dispose();
     this.uplink = undefined;
+    try { this.keepAwake.stop(); } catch { /* the pid watcher reaps it anyway */ }
     void this.disposePool();
     this.editorWatcher?.dispose();
     this.configWatcher?.dispose();
@@ -3185,10 +3199,21 @@ See design doc for the full state machine diagram.`;
         await this.newWorktreeSession();
         break;
       case "applyWorktree":
-        await this.applyFocusedWorktree();
+        // The webview's custom confirm already ran (native modals stay only on
+        // the Command-Palette path).
+        await this.applyFocusedWorktree(true);
         break;
       case "removeWorktree":
-        await this.removeFocusedWorktree();
+        await this.removeFocusedWorktree(true);
+        break;
+      case "remoteSignIn":
+        await this.linkRemoteDevice();
+        break;
+      case "remoteSignOut":
+        await this.unlinkRemoteDevice();
+        break;
+      case "openRemotePortal":
+        void vscode.env.openExternal(vscode.Uri.parse(httpBaseFromRelayUrl(REMOTE_RELAY_URL)));
         break;
       case "rewindSession":
         await this.rewindFocusedSession(
@@ -3488,9 +3513,11 @@ See design doc for the full state machine diagram.`;
         break;
       }
       case "addMentionFile": {
-        // The pick came from a posted result, so the index (and its rel→abs map)
-        // exists; fall back to a workspace-root join if it somehow expired.
+        // Pick came from a posted result: prefer the findFiles map, then an open
+        // tab (open-only merge isn't written into the cached index, #69), then a
+        // workspace-root join if both somehow miss.
         const abs = this.mentionIndex?.absByRel.get(msg.relPath)
+          ?? this.openWorkspaceFileEntries().find((e) => e.rel === msg.relPath)?.abs
           ?? (vscode.workspace.workspaceFolders?.[0]
             ? path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, msg.relPath)
             : undefined);
@@ -3783,14 +3810,10 @@ See design doc for the full state machine diagram.`;
     this.postSessionsList();
   }
 
-  private async deleteSession(id: string, name?: string): Promise<void> {
-    const label = name ? `session "${name}"` : "this session";
-    const choice = await vscode.window.showWarningMessage(
-      `Delete ${label}? This cannot be undone.`,
-      { modal: true },
-      "Delete",
-    );
-    if (choice !== "Delete") return;
+  // No native confirm here: the webview shows its own confirm dialog before
+  // posting deleteSession (works in the browser client too, where a host-side
+  // modal would stall invisibly).
+  private async deleteSession(id: string, _name?: string): Promise<void> {
     const overridesNow = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const liveForCwd = [...this.pool].find((s) => s.activeSessionId === id);
     const cwd =
@@ -3830,8 +3853,8 @@ See design doc for the full state machine diagram.`;
   }
 
   /** Delete every session in this workspace's history except the live/focused one (grok
-   *  re-persists that, so deleting it wouldn't stick). Behind a modal confirm showing the
-   *  count. Tears down any backgrounded live members it deletes and purges their overrides. */
+   *  re-persists that, so deleting it wouldn't stick). The webview confirms first (custom
+   *  dialog). Tears down any backgrounded live members it deletes and purges their overrides. */
   private async clearAllSessions(): Promise<void> {
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     const grokHome = resolveGrokHome(process.env);
@@ -3844,12 +3867,7 @@ See design doc for the full state machine diagram.`;
       void vscode.window.showInformationMessage("No history to clear.");
       return;
     }
-    const choice = await vscode.window.showWarningMessage(
-      `Delete ${clearableCount} session${clearableCount === 1 ? "" : "s"} from this workspace's history? This cannot be undone.`,
-      { modal: true },
-      "Delete All",
-    );
-    if (choice !== "Delete All") return;
+    // Confirm lives in the webview (custom dialog) — see deleteSession.
 
     let removed: string[] = [];
     try {
@@ -3904,8 +3922,18 @@ See design doc for the full state machine diagram.`;
 
   /** The `@` popover's file index, rebuilt at most once per
    *  {@link MENTION_INDEX_TTL_MS}. Keystrokes during a cold build all await the
-   *  same findFiles pass instead of stacking one per key. */
+   *  same findFiles pass instead of stacking one per key. Open editors that the
+   *  findFiles cap missed are merged in on every read (not cached) so a newly
+   *  opened tab is mentionable immediately, and closing it drops it again (#69). */
   private async mentionFileIndex(): Promise<{ rels: string[]; absByRel: Map<string, string> }> {
+    const base = await this.mentionFindFilesIndex();
+    const merged = mergeMentionEntries(base.absByRel, this.openWorkspaceFileEntries());
+    if (merged === base.absByRel) return base;
+    return { rels: orderMentionIndex([...merged.keys()]), absByRel: merged };
+  }
+
+  /** TTL-cached `findFiles` snapshot only — no open-editor injection. */
+  private async mentionFindFilesIndex(): Promise<{ rels: string[]; absByRel: Map<string, string> }> {
     const cached = this.mentionIndex;
     if (cached && Date.now() - cached.at < MENTION_INDEX_TTL_MS) return cached;
     if (!this.mentionIndexPromise) {
@@ -3927,7 +3955,12 @@ See design doc for the full state machine diagram.`;
       cfg.get<Record<string, unknown>>("files.exclude"),
       cfg.get<Record<string, unknown>>("search.exclude"),
     ]);
-    const uris = await vscode.workspace.findFiles("**/*", exclude, MENTION_INDEX_LIMIT);
+    // Cap is user-tunable (`grok.mentionIndexLimit`) — large monorepos that hit
+    // the default 5000 can miss files from `@` autocomplete (#69).
+    const limit = clampMentionIndexLimit(
+      vscode.workspace.getConfiguration("grok").get<number>("mentionIndexLimit", MENTION_INDEX_LIMIT),
+    );
+    const uris = await vscode.workspace.findFiles("**/*", exclude, limit);
     const absByRel = new Map<string, string>();
     for (const uri of uris) {
       // Default asRelativePath prefixes the folder name only in a multi-root
@@ -3936,6 +3969,30 @@ See design doc for the full state machine diagram.`;
       if (!absByRel.has(rel)) absByRel.set(rel, uri.fsPath);
     }
     return { rels: orderMentionIndex([...absByRel.keys()]), absByRel };
+  }
+
+  /** Currently open workspace text tabs as `{rel, abs}` for mention merge.
+   *  Non-file schemes and paths outside the workspace are skipped. */
+  private openWorkspaceFileEntries(): Array<{ rel: string; abs: string }> {
+    const out: Array<{ rel: string; abs: string }> = [];
+    const seen = new Set<string>();
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        const input = tab.input;
+        if (!(input instanceof vscode.TabInputText)) continue;
+        const uri = input.uri;
+        if (uri.scheme !== "file") continue;
+        if (!vscode.workspace.getWorkspaceFolder(uri)) continue;
+        const abs = uri.fsPath;
+        if (seen.has(abs)) continue;
+        seen.add(abs);
+        out.push({
+          rel: normalizeRelPath(vscode.workspace.asRelativePath(uri)),
+          abs,
+        });
+      }
+    }
+    return out;
   }
 
   /** Resolve the xAI key for Speech-to-Text: the `grok.voiceApiKey` setting,
@@ -4919,6 +4976,7 @@ See design doc for the full state machine diagram.`;
     this.postVoiceConfigured();
     this.postModePolicy();
     this.postSandboxState();
+    void this.postRemoteStatus();
     // Sweep stale empty primer sessions once the first session is live (so the
     // newly-focused session is excluded from the sweep).
     void this.startSession().then(() => this.sweepEmptyPrimerSessions());
@@ -5008,6 +5066,22 @@ See design doc for the full state machine diagram.`;
     if (wv) {
       wv.postMessage({ type: "clearMessages" });
       for (const m of session.buffer) wv.postMessage(m);
+    }
+    // Remote clients don't share the webview, so replay the same clear + buffer
+    // to them over the uplink — otherwise re-focusing a session that's still
+    // live in the pool (this path) reloads only the local webview while the
+    // remote keeps showing the previous session (switching a session in history
+    // didn't always reload on the browser client). Cold loads go through
+    // emit()/post(), which already mirror; this path deliberately bypasses them.
+    // Transform by hand (image inlining, host-local/video drop) but skip
+    // mirrorToRemote's sticky-chrome recording — this is chat content, and
+    // postMode()/postSessionsList() below refresh the remote's chrome.
+    if (this.uplink) {
+      const replay: HostMsg[] = [{ type: "clearMessages" }, ...session.buffer];
+      for (const m of replay) {
+        const out = transformHostMsgForRemote(m, GrokSidebar.REMOTE_MEDIA_DEPS);
+        if (out) this.uplink.broadcast(out);
+      }
     }
     this.postMode();
     this.postSessionsList();
@@ -5552,23 +5626,37 @@ See design doc for the full state machine diagram.`;
 
   private static readonly DEVICE_TOKEN_SECRET = "grok.remoteControl.deviceToken";
 
-  /** Start the relay uplink when grok.remoteControl.relayUrl is set and a device
-   *  token is stored (from the link flow). Idempotent; disposed by the config
-   *  watcher on any remoteControl.* change. */
+  /** Start the relay uplink when a device token is stored (from the link flow).
+   *  Idempotent. */
   private async maybeStartUplink(): Promise<void> {
-    const relayUrl = vscode.workspace.getConfiguration("grok").get<string>("remoteControl.relayUrl", "").trim();
-    if (!relayUrl || this.uplink) return;
+    if (this.uplink) return;
     const token = await this.context.secrets.get(GrokSidebar.DEVICE_TOKEN_SECRET);
     if (!token) return; // not linked yet — the link command starts the uplink itself
     this.uplink = new RemoteUplink({
-      relayUrl,
+      relayUrl: REMOTE_RELAY_URL,
       token,
-      deviceName: `${os.hostname()} — ${path.basename(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "no workspace")}`,
+      deviceName: deviceDisplayName(os.hostname(), process.platform, os.release()),
       snapshot: () => this.buildRemoteSnapshot(),
       onClientMessage: (m) => this.handleRemoteMessage(m),
       log: (l) => this.output.appendLine(l),
     });
     this.uplink.start();
+    this.refreshKeepAwake();
+  }
+
+  /** Re-assert the wake lock against the current (setting, linked) state. Called
+   *  after every event that can change either; both start and stop are
+   *  idempotent, so callers never have to know the previous state. Wrapped
+   *  because keeping the machine awake is never worth failing a link/unlink or a
+   *  config change over. */
+  private refreshKeepAwake(): void {
+    try {
+      const enabled = vscode.workspace.getConfiguration("grok").get<boolean>("remote.keepAwake", true);
+      if (shouldKeepAwake({ enabled, linked: !!this.uplink })) this.keepAwake.start();
+      else this.keepAwake.stop();
+    } catch (e) {
+      this.output.appendLine(`[keep-awake] skipped: ${(e as Error)?.message ?? e}`);
+    }
   }
 
   /** "Grok: Link Remote Device" — the device-code flow against the relay's REST
@@ -5576,14 +5664,9 @@ See design doc for the full state machine diagram.`;
    *  until the relay hands back a long-lived device token, store it in secrets,
    *  connect. Mirrors how a CLI links to a web account. */
   async linkRemoteDevice(): Promise<void> {
-    const relayUrl = vscode.workspace.getConfiguration("grok").get<string>("remoteControl.relayUrl", "").trim();
-    if (!relayUrl) {
-      void vscode.window.showErrorMessage("Set grok.remoteControl.relayUrl first (e.g. ws://localhost:8787).");
-      return;
-    }
-    const base = httpBaseFromRelayUrl(relayUrl);
+    const base = httpBaseFromRelayUrl(REMOTE_RELAY_URL);
     try {
-      const name = `${os.hostname()} — ${path.basename(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "no workspace")}`;
+      const name = deviceDisplayName(os.hostname(), process.platform, os.release());
       const startRes = await fetch(`${base}/api/link/start`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -5601,6 +5684,7 @@ See design doc for the full state machine diagram.`;
       this.uplink?.dispose();
       this.uplink = undefined;
       await this.maybeStartUplink();
+      this.post({ type: "remoteStatus", linked: true });
       void vscode.window.showInformationMessage("Remote device linked — this workspace is now reachable from the web client.");
     } catch (e) {
       void vscode.window.showErrorMessage(`Remote link failed: ${(e as Error)?.message ?? String(e)}`);
@@ -5629,10 +5713,36 @@ See design doc for the full state machine diagram.`;
 
   /** "Grok: Unlink Remote Device" — drop the token + connection. */
   async unlinkRemoteDevice(): Promise<void> {
+    // Best-effort server-side revoke first: without it the device row lingers
+    // on the account and keeps counting against the relay's device cap (a
+    // locally-unlinked machine used to block relinking at the free tier's
+    // 1-device limit). Local unlink proceeds regardless — offline stays a
+    // working kill-switch.
+    const token = await this.context.secrets.get(GrokSidebar.DEVICE_TOKEN_SECRET);
+    if (token) {
+      try {
+        await fetch(`${httpBaseFromRelayUrl(REMOTE_RELAY_URL)}/api/device/unlink`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(5000),
+        });
+      } catch (e) {
+        this.output.appendLine(`[remote] server-side unlink failed (local unlink continues): ${(e as Error)?.message ?? e}`);
+      }
+    }
     await this.context.secrets.delete(GrokSidebar.DEVICE_TOKEN_SECRET);
     this.uplink?.dispose();
     this.uplink = undefined;
+    this.refreshKeepAwake();
+    this.post({ type: "remoteStatus", linked: false });
     void vscode.window.showInformationMessage("Remote device unlinked.");
+  }
+
+  /** Tell the webview whether this machine holds a relay device token (drives
+   *  the gear "AFK Pilot" section's sign-in vs account/sign-out items). */
+  private async postRemoteStatus(): Promise<void> {
+    const token = await this.context.secrets.get(GrokSidebar.DEVICE_TOKEN_SECRET);
+    this.post({ type: "remoteStatus", linked: !!token });
   }
 
   /** Ordered catch-up for a newly-`ready` client: initialState first (so chat.js

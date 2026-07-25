@@ -206,7 +206,7 @@ The full pedagogical write-up lives in
 | [src/chips.ts](../src/chips.ts) | File-chip CRUD (pure) |
 | [src/prompt-builder.ts](../src/prompt-builder.ts) | Chip → prompt-string with `@path` refs and fenced blocks (pure) |
 | [src/slash-filter.ts](../src/slash-filter.ts) | Slash-command autocomplete filter + `matchSlashCommand` dispatch gate + hidden-command filter (`filterAdvertisedCommands` drops the config-mutating `/always-approve`) (pure) |
-| [src/mention.ts](../src/mention.ts) | The composer's `@` file popover, host half (pure) — `filterMentionFiles` ranking, `buildExcludeGlob` (files.exclude + search.exclude → one findFiles exclude), `orderMentionIndex`; the webview half (`getMentionQuery`/`applyMentionPick`) lives in webview-helpers.js |
+| [src/mention.ts](../src/mention.ts) | The composer's `@` file popover, host half (pure) — `filterMentionFiles` ranking, `buildExcludeGlob` (files.exclude + search.exclude → one findFiles exclude), `orderMentionIndex`, `clampMentionIndexLimit` (`grok.mentionIndexLimit`) and `mergeMentionEntries` (open tabs layered over the capped findFiles snapshot, #69); the webview half (`getMentionQuery`/`applyMentionPick`) lives in webview-helpers.js |
 | [src/grok-config.ts](../src/grok-config.ts) | Reads permission/sandbox selection config, filters repository `.env` control-plane overrides, and discovers custom profiles (pure) |
 | [src/mode-prefs.ts](../src/mode-prefs.ts) | Remembered-mode policy (pure) — persist Agent/Auto-accept (never Plan), apply on new sessions only |
 | [src/view-move.ts](../src/view-move.ts) | View placement (pure) — maps the gear-menu "Move view" destinations to the extension-owned per-location view containers targeted via `vscode.moveViews` (view default-homes in the Secondary Side Bar) |
@@ -217,6 +217,8 @@ The full pedagogical write-up lives in
 | [src/voice-recorder.ts](../src/voice-recorder.ts) | Batch capture (`ffmpeg` → WAV) + STT REST upload |
 | [src/voice-streamer.ts](../src/voice-streamer.ts) | Live capture (ffmpeg PCM → WebSocket STT) |
 | [src/telemetry.ts](../src/telemetry.ts) | Anonymous Aptabase telemetry — pure payload builders + a fire-and-forget `session_start` (opt-out via `grok.telemetry.enabled`; see [privacy.md](privacy.md)) |
+| [src/remote-policy.ts](../src/remote-policy.ts) / [src/remote-frames.ts](../src/remote-frames.ts) / [src/remote-uplink.ts](../src/remote-uplink.ts) | Remote Control client for [AFK Pilot](https://afkpilot.com) — `remote-policy` (pure) classifies every protocol message and gates what a linked remote may send; `remote-frames` (pure) is the wire contract; `remote-uplink` dials out over ws. Inert until a device is linked (gear → Remote Control). The companion service lives in its own repo; deeper detail is deliberately not documented here |
+| [src/keep-awake.ts](../src/keep-awake.ts) | OS wake lock held for exactly the uplink's lifetime, so an AFK machine can't idle-suspend mid-turn. Pure plan builders per platform (`buildKeepAwakePlan`) + the `KeepAwake` runner; `grok.remote.keepAwake` is the opt-out. See [research/keep-awake.md](../research/keep-awake.md) |
 | [media/chat.{js,css}](../media/) | Webview UI |
 | [media/webview-helpers.js](../media/webview-helpers.js) | Pure webview helpers (file-ref detection, relative-time, mic-button state machine, trailing send-phrase highlight, math extraction `splitMath`/`stripUnsupportedTex`, and the subagent classifier `isSubagentToolCall`/`subagentLabel`) — shared between webview and tests |
 
