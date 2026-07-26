@@ -22,18 +22,18 @@
     "planHistoryQueue", "planProcessing", "toolCall", "toolCallUpdate", "permissionRequest",
     "permissionResolved", "exitPlanRequest", "planResolved", "questionRequest", "planNotice", "autoCompactNotice", "planBlocked",
     "promptComplete", "contextUsage", "commandOutput", "expandCommandOutputs", "setAllToolDetails", "focusInput", "restoreComposer", "truncateMessages", "uiConfirmRequest", "agentReset", "agentError", "agentEnd", "exit", "setBusy", "summarizing",
-    "sessionContext", "clearMessages", "onboarding", "error", "xaiNotification", "subagentUpdate", "runProgress", "sessions",
+    "sessionContext", "clearMessages", "onboarding", "error", "xaiNotification", "subagentUpdate", "runProgress", "sessions", "repos",
     "sessionDot", "queuedSends", "steerUnavailable", "usage", "steerByDefault", "soundNotifications",
     "remoteStatus",
   ];
   const WEBVIEW_MESSAGE_TYPES = [
     "ready", "send", "newSession", "cancel", "pickModel", "setMode", "setSandbox", "removeChip",
-    "toggleChip", "openFile", "openUrl", "openDiff", "exportExpr", "setEffort",
+    "toggleChip", "openFile", "openUrl", "openText", "openDiff", "exportExpr", "setEffort",
     "openGlobalConfig", "openProjectConfig", "runMcpList", "showLogs", "moveView",
     "setShowThinking", "setExpandCommandOutputs",
     "dropFile", "permissionAnswer", "exitPlanAnswer", "questionAnswer", "questionCancel",
     "setModel", "runInstallCmd", "runGrokLogin", "logout", "checkGrokUpdate", "updateGrok",
-    "recheckConnection", "listSessions", "resumeSession", "renameSession", "deleteSession",
+    "recheckConnection", "listSessions", "selectRepo", "toggleRepoPin", "resumeSession", "renameSession", "deleteSession",
     "clearAllSessions", "pickFile", "mentionQuery", "addMentionFile", "pasteImage", "voiceStart", "voiceStop",
     "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "forkSession", "setSteerByDefault",
     "setSoundNotifications",
@@ -439,6 +439,18 @@
     return label.length > 30 ? label.slice(0, 29) + "…" : label;
   }
 
+  function commandTextPreview(text, maxLines) {
+    const fullText = text == null ? "" : String(text);
+    const lines = fullText.split("\n");
+    const lineCount = lines.length;
+    const shown = Math.max(0, Math.floor(maxLines));
+    return {
+      text: lines.slice(0, shown).join("\n"),
+      lineCount,
+      truncated: lineCount > shown,
+    };
+  }
+
   // Pull a self-executed shell command's result off a completed `tool_call_update`.
   // The cursor/Composer agent runs commands in its OWN CLI-side persistent shell
   // and reports the result on the completed update (keyed by `toolCallId`) instead
@@ -729,7 +741,7 @@
     return { lines, added, removed, truncated: false };
   }
 
-  const api = { FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText };
+  const api = { FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;

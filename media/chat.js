@@ -14,6 +14,7 @@
   const inputHighlight = $("input-highlight");
   const newBtn = $("new-btn");
   const historyBtn = $("history-btn");
+  const repoBtn = $("repo-btn");
   const modeBtn = $("mode-btn");
   const sandboxBtn = $("sandbox-btn");
   const gearBtn = $("gear-btn");
@@ -31,6 +32,7 @@
   const gearPopover = $("gear-popover");
   const addPopover = $("add-popover");
   const historyPopover = $("history-popover");
+  const repoPopover = $("repo-popover");
   const scrollBottomBtn = $("scroll-bottom-btn");
 
   // Canonical low→high ORDER for known effort ids, and the FALLBACK ladder when a
@@ -144,6 +146,12 @@
     thoughtBuffer: "",
     thoughtRenderScheduled: false,
     sessions: [],
+    repos: [],
+    // Set by the first `repos` frame — the host's proof that it supports the
+    // switcher at all. Older extensions never send one (see repoSwitcherAvailable).
+    reposKnown: false,
+    selectedRepoCwd: "",
+    activeRepoCwd: "",
     activeSessionId: null,
     // Dashboard dot per grok-session id (id → "working"|"needs-you"|"unread"|
     // "error"|"none"). The host computes the value (live status + persisted unread
@@ -330,6 +338,7 @@
     copy: `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`,
     check: `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`,
     chevronRight: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`,
+    chevronDown: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>`,
     clock: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`,
     plus: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>`,
     x: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
@@ -337,6 +346,8 @@
     download: `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m7 10 5 5 5-5"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/></svg>`,
     trash: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>`,
     pencil: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></svg>`,
+    folder: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h5l2 3h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/></svg>`,
+    pin: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="m5 17 2-7V5l-2-2h14l-2 2v5l2 7Z"/></svg>`,
     mic: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>`,
     cornerDownRight: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 10 20 15 15 20"/><path d="M4 4v7a4 4 0 0 0 4 4h12"/></svg>`,
     gitBranch: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>`,
@@ -531,7 +542,7 @@
 
   // ---------- markdown ----------
 
-  const { looksLikeFileRef, formatRelativeTime, modelDisplayName, nextMicState, trailingSendPhrase, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText } = globalThis.GrokWebviewHelpers;
+  const { looksLikeFileRef, formatRelativeTime, modelDisplayName, nextMicState, trailingSendPhrase, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText } = globalThis.GrokWebviewHelpers;
 
   function escapeAttr(s) {
     return String(s == null ? "" : s)
@@ -1215,6 +1226,7 @@
     gearPopover.hidden = true;
     addPopover.hidden = true;
     historyPopover.hidden = true;
+    repoPopover.hidden = true;
     contextPopover.hidden = true;
   }
 
@@ -1377,6 +1389,25 @@
     const available = Math.max(0, parentRect.width - EDGE * 2);
     popover.style.maxWidth = Math.min(360, available) + "px";
     popover.style.minWidth = Math.min(280, available) + "px";
+  }
+
+  function positionRepoPopover() {
+    const parentRect = repoPopover.parentElement.getBoundingClientRect();
+    const btnRect = repoBtn.getBoundingClientRect();
+    const EDGE = 6;
+    const available = Math.max(0, parentRect.width - EDGE * 2);
+    const maxWidth = Math.min(360, available);
+    const chipLeft = btnRect.left - parentRect.left;
+    const left = Math.min(
+      Math.max(EDGE, chipLeft),
+      Math.max(EDGE, parentRect.width - EDGE - maxWidth),
+    );
+    repoPopover.style.bottom = "auto";
+    repoPopover.style.top = (btnRect.bottom - parentRect.top + 4) + "px";
+    repoPopover.style.left = left + "px";
+    repoPopover.style.right = "auto";
+    repoPopover.style.maxWidth = maxWidth + "px";
+    repoPopover.style.minWidth = Math.min(280, available) + "px";
   }
 
   // ---------- gear popover ----------
@@ -1988,6 +2019,109 @@
     if (dot) applySessionDot(dot, state.dots[id]);
   }
 
+  const cwdKey = (cwd) => String(cwd || "").replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
+  const sameCwd = (a, b) => cwdKey(a) === cwdKey(b);
+  const cwdLeaf = (cwd) => {
+    const parts = String(cwd || "").replace(/[\\/]+$/, "").split(/[\\/]+/).filter(Boolean);
+    return parts[parts.length - 1] || "Repository";
+  };
+
+  // The repo switcher is a REMOTE-only affordance, and even there only once the
+  // host has proved it speaks `repos`. Two independent reasons:
+  //  - In VS Code the window already IS the repo — you switch by opening a
+  //    folder, and a second, weaker switcher beside it is just confusing.
+  //  - A remote client is served by the relay and can outrun the extension a
+  //    user has installed. An older host never sends `repos`, so an
+  //    unconditional chip would render empty with a menu saying "no
+  //    repositories" — a dead control that looks broken. Waiting for the frame
+  //    makes the chip appear only where it works.
+  function repoSwitcherAvailable() {
+    return IS_REMOTE && state.reposKnown;
+  }
+
+  function applyRepoSwitcherVisibility() {
+    const on = repoSwitcherAvailable();
+    repoBtn.hidden = !on;
+    if (!on) repoPopover.hidden = true;
+  }
+
+  function renderRepoChip() {
+    applyRepoSwitcherVisibility();
+    if (!repoSwitcherAvailable()) return;
+    const selected = state.repos.find((r) => sameCwd(r.cwd, state.selectedRepoCwd));
+    const label = selected?.label || cwdLeaf(state.selectedRepoCwd || state.activeRepoCwd);
+    const browsing = !!state.selectedRepoCwd && !!state.activeRepoCwd &&
+      !sameCwd(state.selectedRepoCwd, state.activeRepoCwd);
+    repoBtn.classList.toggle("browsing", browsing);
+    repoBtn.innerHTML =
+      `<span class="repo-chip-icon">${selected?.worktreeLabel ? ICON.gitBranch : ICON.folder}</span>` +
+      `<span class="repo-chip-label"></span>${ICON.chevronDown}`;
+    repoBtn.querySelector(".repo-chip-label").textContent = label;
+    repoBtn.title = browsing
+      ? `Browsing ${state.selectedRepoCwd}; live session is in ${state.activeRepoCwd}`
+      : (state.selectedRepoCwd || "Choose repository");
+  }
+
+  function renderRepoPopover() {
+    repoPopover.innerHTML = "";
+    if (!state.repos.length) {
+      const empty = document.createElement("div");
+      empty.className = "history-empty";
+      empty.textContent = "No repositories with Grok sessions.";
+      repoPopover.appendChild(empty);
+      return;
+    }
+    for (const repo of state.repos) {
+      const row = document.createElement("div");
+      const selected = sameCwd(repo.cwd, state.selectedRepoCwd);
+      const live = sameCwd(repo.cwd, state.activeRepoCwd);
+      row.className = "repo-row" + (selected ? " selected" : "") + (repo.available ? "" : " unavailable");
+      row.title = repo.cwd;
+
+      const main = document.createElement("button");
+      main.type = "button";
+      main.className = "repo-row-main";
+      main.disabled = !repo.available;
+      main.innerHTML = `<span class="repo-row-icon">${repo.worktreeLabel ? ICON.gitBranch : ICON.folder}</span><span class="repo-row-copy"><span class="repo-row-name"></span><span class="repo-row-meta"></span></span>`;
+      main.querySelector(".repo-row-name").textContent = repo.label || cwdLeaf(repo.cwd);
+      const meta = main.querySelector(".repo-row-meta");
+      meta.textContent = repo.available
+        ? [repo.worktreeLabel, live ? "Live" : ""].filter(Boolean).join(" · ")
+        : "Unavailable";
+      main.onclick = (e) => {
+        e.stopPropagation();
+        if (!repo.available) return;
+        vscode.postMessage({ type: "selectRepo", cwd: repo.cwd });
+        closePopovers();
+      };
+      row.appendChild(main);
+
+      const actions = document.createElement("div");
+      actions.className = "history-row-actions repo-row-actions";
+      const pin = document.createElement("button");
+      pin.type = "button";
+      pin.className = "history-action-btn" + (repo.pinned ? " active" : "");
+      pin.innerHTML = ICON.pin;
+      pin.title = repo.pinned ? "Unpin repository" : "Pin repository";
+      pin.onclick = (e) => {
+        e.stopPropagation();
+        vscode.postMessage({ type: "toggleRepoPin", cwd: repo.cwd, pinned: !repo.pinned });
+      };
+      actions.appendChild(pin);
+      row.appendChild(actions);
+      repoPopover.appendChild(row);
+    }
+  }
+
+  function openRepoPopover() {
+    if (!repoSwitcherAvailable()) return;
+    if (!repoPopover.hidden) { closePopovers(); return; }
+    closePopovers();
+    renderRepoPopover();
+    positionRepoPopover();
+    repoPopover.hidden = false;
+  }
+
   // Live references to the popover's list + footer, so a `sessions` message can repaint
   // just the rows (without rebuilding the search input, which would drop focus mid-type).
   let historyListEl = null;
@@ -2046,16 +2180,21 @@
     const clearBtn = document.createElement("button");
     clearBtn.className = "history-clear-all";
     clearBtn.innerHTML = ICON.trash + "<span>Clear all history</span>";
-    clearBtn.title = "Delete all sessions in this workspace's history";
+    clearBtn.title = "Delete all sessions in this repository's history";
     clearBtn.onclick = (e) => {
       e.stopPropagation();
       closePopovers();
+      const repo = state.repos.find((r) => sameCwd(r.cwd, state.selectedRepoCwd));
+      const repoLabel = repo?.label || cwdLeaf(state.selectedRepoCwd);
+      const repoPath = repo?.cwd || state.selectedRepoCwd;
       uiConfirm({
-        title: "Clear all history?",
-        body: "Deletes every session in this workspace's history except the current one. This cannot be undone.",
+        title: `Clear history for “${repoLabel}”?`,
+        body: `Deletes every session for:\n${repoPath}\n\nThe current session is kept. This cannot be undone.`,
         confirmLabel: "Delete All",
         danger: true,
-      }).then((ok) => { if (ok) vscode.postMessage({ type: "clearAllSessions" }); });
+      }).then((ok) => {
+        if (ok) vscode.postMessage({ type: "clearAllSessions", cwd: repoPath });
+      });
     };
     footer.appendChild(clearBtn);
     historyPopover.appendChild(footer);
@@ -3000,6 +3139,50 @@
     });
   }
 
+  const MAX_COMMAND_PREVIEW_LINES = 6;
+
+  function makeInlineExpandToggle(collapsedText, className, onToggle) {
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = className;
+    toggle.textContent = collapsedText;
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.onclick = (e) => {
+      e.stopPropagation();
+      const expanding = toggle.getAttribute("aria-expanded") !== "true";
+      onToggle(expanding);
+      toggle.textContent = expanding ? "Show less" : collapsedText;
+      toggle.setAttribute("aria-expanded", String(expanding));
+    };
+    return toggle;
+  }
+
+  function appendCommandPreview(container, text, className, language) {
+    const fullText = text == null ? "" : String(text);
+    const preview = commandTextPreview(fullText, MAX_COMMAND_PREVIEW_LINES);
+    const pre = document.createElement("pre");
+    pre.className = className;
+    pre.textContent = preview.text;
+    container.appendChild(pre);
+    if (!preview.truncated) return;
+    const label = `View all (${preview.lineCount} lines) →`;
+    const viewAll = IS_REMOTE
+      ? makeInlineExpandToggle(label, "msg-collapse-btn command-view-all", (expanding) => {
+          pre.textContent = expanding ? fullText : preview.text;
+        })
+      : document.createElement("button");
+    if (!IS_REMOTE) {
+      viewAll.type = "button";
+      viewAll.className = "preview-link command-view-all";
+      viewAll.textContent = label;
+      viewAll.onclick = (e) => {
+        e.stopPropagation();
+        vscode.postMessage({ type: "openText", content: fullText, language });
+      };
+    }
+    container.appendChild(viewAll);
+  }
+
   function attachCommandDetails(item, command, toolCallId) {
     // Chevron at the END of the (possibly ellipsized) command line: › when
     // collapsed, rotated to v while expanded.
@@ -3020,10 +3203,10 @@
     inTag.className = "cmd-io-tag";
     inTag.textContent = "IN";
     inRow.appendChild(inTag);
-    const cmd = document.createElement("pre");
-    cmd.className = "tool-cmd";
-    cmd.textContent = command;
-    inRow.appendChild(cmd);
+    const body = document.createElement("div");
+    body.className = "cmd-in-body";
+    appendCommandPreview(body, command, "tool-cmd", "shellscript");
+    inRow.appendChild(body);
     block.appendChild(inRow);
     details.appendChild(block);
     item.appendChild(details);
@@ -3083,10 +3266,7 @@
     // Only render the output <pre> when there's actually output — a marker alone
     // carries the empty cases (success/error/cancel).
     if (hasOutput) {
-      const out = document.createElement("pre");
-      out.className = "tool-cmd-output";
-      out.textContent = output;
-      body.appendChild(out);
+      appendCommandPreview(body, output, "tool-cmd-output", "plaintext");
     }
     if (msg.truncated) {
       const note = document.createElement("div");
@@ -3126,8 +3306,9 @@
   // message fences use). grok only sends the replaced region (old/new strings),
   // so computeLineDiff produces the +/-/context lines; a "+"/"-"/" " gutter goes
   // in front of each so the diff reads (and copies) as a real unified diff even
-  // for colorblind users. Long regions cap the rendered rows (the full change is
-  // one "open diff →" click away in the native editor).
+  // for colorblind users. Long regions start as a short preview and can grow
+  // inline; the native editor remains one "open diff →" click away.
+  const DIFF_PREVIEW_LINES = 12;
   const MAX_INLINE_DIFF_LINES = 400;
   // A wire line number is only usable if it's a real 1-based file line; anything
   // else (absent, 0, negative, non-integer) falls back to the old region-relative 1.
@@ -3145,10 +3326,9 @@
     return sep;
   }
 
-  // Render ONE diff block as a single scrollable region containing one hunk per
-  // replaced SITE (`hunks` = [{site, result}] — see extractDiffSites). One region
-  // per BLOCK, never per site: `.tool-diff-region` scrolls at 320px, so a
-  // 148-occurrence replace would otherwise stack 148 nested scroll boxes.
+  // Render ONE diff block as a single region containing one hunk per replaced
+  // SITE (`hunks` = [{site, result}] — see extractDiffSites). One region per
+  // BLOCK, never per site.
   //
   // Codex-style rows: a line-number gutter + a colored left-border stripe + a subtle
   // per-line background (green add / red del). A small +/- glyph sits right by the
@@ -3165,10 +3345,9 @@
     let widest = 0;
     let rendered = 0;
     let total = 0;
-    let truncated = false;
+    const previewOverflow = [];
     for (const h of hunks) {
       total += h.result.lines.length;
-      if (h.result.truncated) truncated = true;
     }
     // MAX_INLINE_DIFF_LINES is a budget ACROSS the block's hunks, not per hunk —
     // 1000 sites must not paint 2000 rows. The +N −M stat is summed over EVERY
@@ -3181,7 +3360,14 @@
       let oldNo = fileLineOr1(site && site.oldLine);
       let newNo = fileLineOr1(site && site.newLine);
       // Only between hunks, and only when the new side actually skipped lines.
-      if (prevNewEnd !== null && newNo !== prevNewEnd) wrap.appendChild(makeHunkSeparator());
+      if (prevNewEnd !== null && newNo !== prevNewEnd) {
+        const sep = makeHunkSeparator();
+        if (rendered >= DIFF_PREVIEW_LINES) {
+          sep.hidden = true;
+          previewOverflow.push(sep);
+        }
+        wrap.appendChild(sep);
+      }
       const shown = Math.min(rows.length, MAX_INLINE_DIFF_LINES - rendered);
       for (let i = 0; i < shown; i++) {
         const ln = rows[i];
@@ -3206,6 +3392,10 @@
         row.appendChild(sign);
         row.appendChild(num);
         row.appendChild(code);
+        if (rendered + i >= DIFF_PREVIEW_LINES) {
+          row.hidden = true;
+          previewOverflow.push(row);
+        }
         wrap.appendChild(row);
       }
       rendered += shown;
@@ -3217,11 +3407,23 @@
     // fixed track would instead overflow — 5 digits would collide with the +/- glyph.
     wrap.style.setProperty("--tdl-num-w", Math.max(4, String(widest).length + 1) + "ch");
     const remaining = total - rendered;
-    if (remaining > 0 || truncated) {
+    if (remaining > 0) {
       const more = document.createElement("div");
       more.className = "tool-diff-more";
       more.textContent = "... " + remaining + " more line(s) - open diff for the full change";
+      more.hidden = true;
+      previewOverflow.push(more);
       wrap.appendChild(more);
+    }
+    if (rendered > DIFF_PREVIEW_LINES) {
+      const toggle = makeInlineExpandToggle(
+        "Show more",
+        "msg-collapse-btn tool-diff-toggle",
+        (expanding) => {
+          for (const el of previewOverflow) el.hidden = !expanding;
+        },
+      );
+      wrap.appendChild(toggle);
     }
     return wrap;
   }
@@ -4542,6 +4744,11 @@
         // resumes the turn after the answer.
         collapsePermissionCard(el, opt.kind, cardTitle);
         showGrokking();
+        // Return the caret to the composer so the next message can be typed
+        // immediately — answering must not orphan focus on the collapsed card
+        // (#68). Composer, not the editor: the webview iframe can only move
+        // focus within itself, and the composer is where you continue anyway.
+        input.focus();
       };
       buttons.push(btn);
       actions.appendChild(btn);
@@ -4564,7 +4771,7 @@
         defaultIndex,
       })
     ) {
-      buttons[defaultIndex].focus();
+      focusPermissionButton(buttons, defaultIndex);
     }
   }
 
@@ -4614,7 +4821,16 @@
   }
 
   function focusPermissionButton(buttons, index) {
-    buttons.forEach((b, i) => { b.tabIndex = i === index ? 0 : -1; });
+    // `.chosen` is the VISIBLE armed marker (outline via .card-actions button.chosen).
+    // It rides the roving button rather than :focus-visible, which browsers do NOT
+    // paint on programmatic .focus() — that gap is why the default sometimes showed
+    // no selected border (#68). Tie it to the roving focus so the border is
+    // deterministic however focus arrived (default steal, arrow nav, or click).
+    buttons.forEach((b, i) => {
+      const on = i === index;
+      b.tabIndex = on ? 0 : -1;
+      b.classList.toggle("chosen", on);
+    });
     buttons[index].focus();
   }
 
@@ -6445,6 +6661,14 @@
         if (open) renderSessionRows();
         break;
       }
+      case "repos":
+        state.reposKnown = true;
+        state.repos = Array.isArray(msg.entries) ? msg.entries : [];
+        state.selectedRepoCwd = msg.selectedCwd || "";
+        state.activeRepoCwd = msg.activeCwd || "";
+        renderRepoChip();
+        if (!repoPopover.hidden) renderRepoPopover();
+        break;
       case "sessionDot":
         if (msg.dot && msg.dot !== "none") state.dots[msg.id] = msg.dot;
         else delete state.dots[msg.id];
@@ -6501,6 +6725,10 @@
   if (welcomeAboutLink) welcomeAboutLink.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openAboutPanel(); };
   addBtn.onclick = (e) => { e.stopPropagation(); openAddPopover(); };
   historyBtn.onclick = (e) => { e.stopPropagation(); openHistoryPopover(); };
+  repoBtn.onclick = (e) => { e.stopPropagation(); openRepoPopover(); };
+  // Hidden from the first paint: the chip has nothing to say until a `repos`
+  // frame arrives, and in VS Code it never appears at all.
+  applyRepoSwitcherVisibility();
   donutEl.onclick = (e) => {
     e.stopPropagation();
     if (contextPopover.hidden) openContextPopover(); else closePopovers();
@@ -6509,6 +6737,7 @@
   if (sandboxPopover) sandboxPopover.addEventListener("click", (e) => e.stopPropagation());
   gearPopover.addEventListener("click", (e) => e.stopPropagation());
   contextPopover.addEventListener("click", (e) => e.stopPropagation());
+  repoPopover.addEventListener("click", (e) => e.stopPropagation());
   addPopover.addEventListener("click", (e) => e.stopPropagation());
   historyPopover.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", (e) => {
@@ -6783,6 +7012,7 @@
   // dependent (the composer popovers are bottom-anchored), so just re-run its positioning.
   window.addEventListener("resize", () => {
     if (!historyPopover.hidden) positionDropdownPopover(historyPopover, historyBtn);
+    if (!repoPopover.hidden) positionRepoPopover();
   });
 
   // A resize can also happen while Grok is hidden (another panel tab / extension focused),

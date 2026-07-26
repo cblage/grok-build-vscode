@@ -36,6 +36,8 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   ready: "control",
   // view (read-only+)
   listSessions: "view",
+  selectRepo: "view",
+  toggleRepoPin: "full",
   resumeSession: "view",
   renameSession: "view",
   // read-only workspace file-name lookup (the composer's @ popover)
@@ -93,6 +95,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   pickModel: "host-local",
   openFile: "host-local",
   openUrl: "host-local",
+  openText: "host-local",
   openDiff: "host-local",
   exportExpr: "host-local",
   openGlobalConfig: "host-local",
@@ -138,6 +141,49 @@ export function allowFromRemote(type: WebviewMsg["type"], tier: RemoteTier): boo
     default:
       return false; // control | host-local
   }
+}
+
+/** Cwd-bearing remote messages may only name a catalog the host discovered.
+ *  `isKnownCwd` is a predicate rather than a prebuilt set so the host can answer
+ *  it lazily: resolving the catalog walks the session store on disk, and this
+ *  gate sees every inbound message — including per-keystroke `mentionQuery`. */
+export function allowRemoteRepoTarget(msg: WebviewMsg, isKnownCwd: (cwd: string) => boolean): boolean {
+  switch (msg.type) {
+    case "selectRepo":
+    case "toggleRepoPin":
+    case "clearAllSessions":
+      return isKnownCwd(msg.cwd);
+    case "resumeSession":
+      return !msg.cwd || isKnownCwd(msg.cwd);
+    default:
+      return true;
+  }
+}
+
+/** Which side a webview message came from. */
+export type MsgOrigin = "local" | "remote";
+
+/**
+ * Which repository a client's history list and *New session* target.
+ *
+ * The repo selection is **global**, and deliberately so — that IS the remote
+ * feature: one phone drives whichever project you pick, and every remote client
+ * agrees on it. But the VS Code webview hides the switcher, because that window
+ * already IS a repository. It can therefore neither show the selection nor
+ * change it, which makes following it strictly harmful: a phone that switched
+ * repos would silently re-scope the local history list, and point the local
+ * *New session* button at a different checkout — where Grok would then write
+ * files. So a local client reads its own workspace and ignores the selection.
+ *
+ * Restore this to a single global value only if/when VS Code grows the switcher
+ * too; the split exists to match the affordance, not the transport.
+ */
+export function repoScopeFor(
+  origin: MsgOrigin,
+  scopes: { selectedCwd: string; workspaceRoot: string },
+): string {
+  if (origin === "local") return scopes.workspaceRoot;
+  return scopes.selectedCwd || scopes.workspaceRoot;
 }
 
 // ---------- outbound: HostMsg to a remote client ----------
@@ -218,6 +264,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   truncateMessages: "mirror",
   uiConfirmRequest: "mirror",
   sessions: "mirror",
+  repos: "mirror",
   sessionDot: "mirror",
   queuedSends: "mirror",
   steerUnavailable: "mirror",

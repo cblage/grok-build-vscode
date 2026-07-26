@@ -211,7 +211,7 @@ The full pedagogical write-up lives in
 | [src/grok-config.ts](../src/grok-config.ts) | Reads permission/sandbox selection config, filters repository `.env` control-plane overrides, and discovers custom profiles (pure) |
 | [src/mode-prefs.ts](../src/mode-prefs.ts) | Remembered-mode policy (pure) — persist Agent/Auto-accept (never Plan), apply on new sessions only |
 | [src/view-move.ts](../src/view-move.ts) | View placement (pure) — maps the gear-menu "Move view" destinations to the extension-owned per-location view containers targeted via `vscode.moveViews` (view default-homes in the Secondary Side Bar) |
-| [src/sessions.ts](../src/sessions.ts) | Disk-driven session listing/delete + name overrides (pure) — `indexSessions` (stat-only ordering), `readSessionEntries` (windowed read), `listSessions` (whole-list), `clearSessions` |
+| [src/sessions.ts](../src/sessions.ts) | Disk-driven session listing/delete + name overrides (pure) — `indexSessions` (stat-only ordering), `readSessionEntries` (windowed read), `listSessions` (whole-list), `clearSessions`, `discoverRepos` (the repo catalog behind the remote switcher) |
 | [src/file-ref.ts](../src/file-ref.ts) | Open-file ref parsing + large-file inline-read guard (pure) |
 | [src/plan-review.ts](../src/plan-review.ts) | Plan-snapshot Markdown filename generation (pure) |
 | [src/voice.ts](../src/voice.ts) | Voice-input pure helpers — STT request/response, ffmpeg args, device parsing, key resolution |
@@ -239,6 +239,30 @@ newest-first), built from two pure primitives in
   id-sort would order by when the session was first opened, which is wrong.
 - `readSessionEntries` reads + parses `summary.json` for **exactly the visible page's
   ids** and applies name overrides.
+
+History is scoped to the **selected repo**. `discoverRepos` enumerates cwd catalogs from
+`<grokHome>/sessions` (rejecting temp roots and `<grokHome>/worktrees` — a worktree is
+not a checkout you choose between; the one carve-out is `trustedCwds`, the folder VS Code
+actually has open, because the selection must always name a catalog row or `clearAllSessions`
+silently no-ops). `postSessionsList` indexes that repo *plus* the worktrees belonging to it
+(`worktreeCwdsForRepo`, pure), so a worktree session stays reachable after you leave it —
+and the **primary workspace lists every worktree unconditionally**, since `sourceGitRoot`
+holds the CLI's *git root* rather than the workspace folder and a failed match must never
+be why a session disappears. The
+picker itself is a remote-only affordance: in VS Code the window already *is* the
+repository. And because the relay serves a client that can be newer than the installed
+extension, the chip renders only once a `repos` frame has actually arrived — an older
+host that never sends one gets no chip rather than a dead control.
+
+The selection is **global across remote clients** (that is the feature) but the VS Code
+webview **ignores it**, because it is the one client that can neither see nor change it —
+following it would re-scope a history list the user cannot re-aim and point *New session*
+at a checkout they are not looking at. `repoScopeFor` ([src/remote-policy.ts](../src/remote-policy.ts),
+pure) is that rule; `onMessage` carries a `MsgOrigin` and `postSessionsList` /
+`postRepoCatalog` build one payload per audience (`postLocal` / `postRemote`), skipping the
+second disk scan whenever both scopes resolve to the same cwd. Sticky chrome records the
+*remote* variant so a late-joining client replays the right one. The split matches the
+affordance, not the transport: undo it if VS Code ever grows the switcher.
 
 The host (`postSessionsList` in [src/sidebar.ts](../src/sidebar.ts)) orders everything
 cheaply with `indexSessions`, then drives an **mtime-keyed read cache** so a re-open /

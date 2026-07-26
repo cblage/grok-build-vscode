@@ -3,6 +3,8 @@ import {
   INBOUND_DISPOSITION,
   OUTBOUND_DISPOSITION,
   allowFromRemote,
+  allowRemoteRepoTarget,
+  repoScopeFor,
   inlineMediaForRemote,
   mediaMimeFromPath,
   transformHostMsgForRemote,
@@ -33,8 +35,11 @@ describe("remote-policy classification tables", () => {
     expect(INBOUND_DISPOSITION.logout).toBe("full");
     expect(INBOUND_DISPOSITION.clearAllSessions).toBe("full");
     expect(INBOUND_DISPOSITION.listSessions).toBe("view");
+    expect(INBOUND_DISPOSITION.selectRepo).toBe("view");
+    expect(INBOUND_DISPOSITION.toggleRepoPin).toBe("full");
     // native pickers/editors/mic act on the LOCAL VS Code — never remote-drivable
     expect(INBOUND_DISPOSITION.openFile).toBe("host-local");
+    expect(INBOUND_DISPOSITION.openText).toBe("host-local");
     expect(INBOUND_DISPOSITION.pickFile).toBe("host-local");
     expect(INBOUND_DISPOSITION.voiceStart).toBe("host-local");
     expect(INBOUND_DISPOSITION.moveView).toBe("host-local");
@@ -61,6 +66,38 @@ describe("remote-policy classification tables", () => {
     expect(OUTBOUND_DISPOSITION.permissionRequest).toBe("mirror");
     expect(OUTBOUND_DISPOSITION.modePolicy).toBe("mirror");
     expect(OUTBOUND_DISPOSITION.sandboxState).toBe("mirror");
+  });
+});
+
+describe("remote repo target gate", () => {
+  // A predicate, not a set: the host resolves the catalog from disk, and this
+  // gate runs on every inbound message including per-keystroke mentionQuery.
+  const known = new Set(["/work/a", "/work/b"]);
+  const discovered = (cwd: string) => known.has(cwd);
+
+  it("is consulted lazily — a message with no cwd never resolves the catalog", () => {
+    let calls = 0;
+    const counting = (cwd: string) => { calls++; return known.has(cwd); };
+    expect(allowRemoteRepoTarget({ type: "send", text: "hi" }, counting)).toBe(true);
+    expect(allowRemoteRepoTarget({ type: "mentionQuery", query: "a" }, counting)).toBe(true);
+    expect(allowRemoteRepoTarget({ type: "resumeSession", id: "s" }, counting)).toBe(true);
+    expect(calls).toBe(0);
+  });
+
+  it("accepts only discovered cwd values for switching, pinning, and explicit resume", () => {
+    expect(allowRemoteRepoTarget({ type: "selectRepo", cwd: "/work/a" }, discovered)).toBe(true);
+    expect(allowRemoteRepoTarget({ type: "toggleRepoPin", cwd: "/work/b", pinned: true }, discovered)).toBe(true);
+    expect(allowRemoteRepoTarget({ type: "resumeSession", id: "s", cwd: "/work/a" }, discovered)).toBe(true);
+    expect(allowRemoteRepoTarget({ type: "clearAllSessions", cwd: "/work/a" }, discovered)).toBe(true);
+    expect(allowRemoteRepoTarget({ type: "selectRepo", cwd: "/etc" }, discovered)).toBe(false);
+    expect(allowRemoteRepoTarget({ type: "toggleRepoPin", cwd: "/etc", pinned: true }, discovered)).toBe(false);
+    expect(allowRemoteRepoTarget({ type: "resumeSession", id: "s", cwd: "/etc" }, discovered)).toBe(false);
+    expect(allowRemoteRepoTarget({ type: "clearAllSessions", cwd: "/etc" }, discovered)).toBe(false);
+  });
+
+  it("allows cwd-less resume to use the host's already-bounded resolution", () => {
+    expect(allowRemoteRepoTarget({ type: "resumeSession", id: "s" }, discovered)).toBe(true);
+    expect(allowRemoteRepoTarget({ type: "send", text: "hi" }, discovered)).toBe(true);
   });
 });
 
@@ -178,5 +215,30 @@ describe("mediaMimeFromPath", () => {
     expect(mediaMimeFromPath("/a/b.PNG")).toBe("image/png");
     expect(mediaMimeFromPath("clip.mp4")).toBe("video/mp4");
     expect(mediaMimeFromPath("noext")).toBe("application/octet-stream");
+  });
+});
+
+describe("repo scope — global for remote, workspace-local in VS Code", () => {
+  const WS = "/work/current";
+  const PICKED = "/work/other";
+
+  // The selection is global ON PURPOSE: that is the remote feature, one phone
+  // driving whichever project you pick, with every remote client agreeing.
+  it("gives every remote client the global selection", () => {
+    expect(repoScopeFor("remote", { selectedCwd: PICKED, workspaceRoot: WS })).toBe(PICKED);
+  });
+
+  // ...but VS Code hides the switcher, so following the selection there is
+  // strictly harmful: it would re-scope a history list the user cannot re-aim,
+  // and point New session at a checkout they are not looking at — where Grok
+  // would then write files.
+  it("keeps VS Code on its own workspace no matter what a phone picked", () => {
+    expect(repoScopeFor("local", { selectedCwd: PICKED, workspaceRoot: WS })).toBe(WS);
+  });
+
+  it("agrees on the workspace when nothing has been picked", () => {
+    for (const origin of ["local", "remote"] as const) {
+      expect(repoScopeFor(origin, { selectedCwd: "", workspaceRoot: WS })).toBe(WS);
+    }
   });
 });
