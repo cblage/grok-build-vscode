@@ -83,7 +83,10 @@ export type HostMsg =
   // workspace-relative paths (forward slashes), ranked by src/mention.ts. The
   // echoed `query` lets the webview drop stale replies after further typing.
   | { type: "mentionResults"; query: string; files: string[] }
-  | { type: "userMessage"; text: string; chips?: FileChip[] }
+  /** `steer` marks a mid-turn interjection (#52). It paints a user bubble but is
+   *  NOT a prompt and gets no rewind point, so the bubble must not consume a
+   *  rewind index — see refreshUserRewindButtons. */
+  | { type: "userMessage"; text: string; chips?: FileChip[]; steer?: boolean }
   | { type: "agentStart" }
   | { type: "thoughtChunk"; text: string }
   | { type: "messageChunk"; text: string }
@@ -147,6 +150,18 @@ export type HostMsg =
   // Selection / Send File / @-mention so the user can type a prompt right away.
   // Ephemeral UI action, not session-scoped (goes via `post`, never buffered).
   | { type: "focusInput" }
+  /** Put text back in the composer (Edit-and-resend, #56). Posted after the
+   *  rewind + reload so it survives the clearMessages/replay that follows. */
+  | { type: "restoreComposer"; text: string }
+  /** Drop everything after the Nth visible user message (rewind/edit, P2-9).
+   *  Replaces the old clearMessages + full reload, which blanked the panel to
+   *  the welcome logo and re-rendered the whole conversation. */
+  | { type: "truncateMessages"; surviving: number }
+  /** Ask the webview to run its own in-chat confirm dialog and report back.
+   *  Used where only the HOST knows whether a confirm is warranted (rewind/edit
+   *  reverting files), so the webview can't decide to show `uiConfirm` itself.
+   *  `id` correlates the answer; the host awaits a promise keyed on it. */
+  | { type: "uiConfirmRequest"; id: string; title: string; body?: string; confirmLabel: string; danger?: boolean }
   // nextOffset = the index offset the next load-more should request — ids CONSUMED
   // from the on-disk index, not entries shown (hidden subagent sessions occupy
   // slots without producing rows).
@@ -177,7 +192,15 @@ export type WebviewMsg =
   | { type: "toggleChip"; id: string }
   | { type: "openFile"; path: string }
   | { type: "openUrl"; url: string }
-  | { type: "openDiff"; path: string; oldText: string; newText: string; requestId?: number | string }
+  | {
+      type: "openDiff";
+      path: string;
+      oldText: string;
+      newText: string;
+      requestId?: number | string;
+      replaceAll?: boolean;
+      sites?: { oldText: string; newText: string; oldLine?: number; newLine?: number }[];
+    }
   | { type: "exportExpr"; action: string; kind: string; current?: string; svg?: string; png?: string; svgDark?: string; svgLight?: string }
   | { type: "setEffort"; level: string }
   | { type: "openGlobalConfig" }
@@ -238,7 +261,17 @@ export type WebviewMsg =
   // Rewind UI (P2-9): truncate chat + restore files.
   // `userBubbleIndex` (0-based among visible user bubbles) comes from the
   // per-message Rewind button; omit it for the gear QuickPick path.
-  | { type: "rewindSession"; userBubbleIndex?: number }
+  /** `text` is the bubble's own cleaned text, sent so the host can hand it back
+   *  to the composer — rewind DISCARDS the message it targets, so without this
+   *  the user silently loses what they wrote. Absent for the QuickPick path,
+   *  which has no bubble to read. */
+  | { type: "rewindSession"; userBubbleIndex?: number; text?: string; totalUserBubbles?: number }
+  /** Edit-and-resend (#56): rewind past this (latest) user message and hand its
+   *  text back to the composer. `text` is the bubble's own cleaned copy text. */
+  | { type: "editLastMessage"; userBubbleIndex: number; text: string; totalUserBubbles?: number }
+  /** Reply to `uiConfirmRequest`. Host-local only: this is the last gate before
+   *  a rewind reverts files, so a remote must never be able to answer one. */
+  | { type: "uiConfirmAnswer"; id: string; ok: boolean }
   // Workflow card controls (P2-10): pause / resume / stop by display name.
   | { type: "workflowControl"; action: "pause" | "resume" | "stop"; displayName: string }
   // Relay account (gear "AFK Pilot" section, local webview only): start the
@@ -267,7 +300,8 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   sessionContext: true, clearMessages: true, onboarding: true, error: true,
   xaiNotification: true, subagentUpdate: true, runProgress: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true,
   soundNotifications: true, remoteStatus: true,
-  setAllToolDetails: true, focusInput: true, sessions: true, sessionDot: true, queuedSends: true,
+  setAllToolDetails: true, focusInput: true, restoreComposer: true, truncateMessages: true, uiConfirmRequest: true,
+  sessions: true, sessionDot: true, queuedSends: true,
   steerUnavailable: true, usage: true,
 };
 
@@ -287,7 +321,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   voiceStop: true, queueSend: true, dequeueSend: true, clearQueuedSends: true,
   steerSend: true, forkSession: true,
   newWorktreeSession: true, applyWorktree: true, removeWorktree: true,
-  rewindSession: true, workflowControl: true,
+  rewindSession: true, editLastMessage: true, uiConfirmAnswer: true, workflowControl: true,
   remoteSignIn: true, remoteSignOut: true, openRemotePortal: true,
 };
 
