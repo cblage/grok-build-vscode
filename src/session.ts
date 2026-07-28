@@ -154,6 +154,11 @@ export class Session {
   /** Process-lifetime sandbox profile for this live/saved conversation.
    * `off` means no sandbox; cold resumes restore summary.json's saved value. */
   sandboxProfile?: string;
+  /** Last browser-reported AFK Pilot preferences, in displayed percent + boolean.
+   * Undefined until a remote client reports them for this focused session. */
+  remoteFontScale?: number;
+  remoteReadRepliesAloud?: boolean;
+  remoteUsesTouch?: boolean;
 
   /**
    * Effective working directory for this session's `grok agent stdio` process.

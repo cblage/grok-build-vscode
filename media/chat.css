@@ -1947,6 +1947,16 @@ textarea#input {
   white-space: nowrap;
   min-width: 0;
 }
+/* The label ellipsizes and .attachment-remove is flex:0 0 auto, but the leading
+   icon had neither — so in a chip too narrow for its filename (a long name in
+   the phone client, or a narrow sidebar) the SVG was the only child left able
+   to absorb the squeeze, and it rendered ~6px wide instead of 11. Sizing it
+   explicitly keeps the icon a constant while the text does the shrinking. */
+.attachment > svg {
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+}
 .attachment-remove {
   display: inline-flex;
   align-items: center;
@@ -2138,7 +2148,11 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
 .card-actions button:last-child { border-bottom: none; }
 .card-actions button:hover { background: var(--vscode-list-hoverBackground); }
 .card-actions button.primary { font-weight: 600; }
-.card-actions button.danger { color: var(--vscode-errorForeground); }
+.card-actions button.danger {
+  color: var(--vscode-errorForeground);
+  margin-top: 10px;
+  border-top: 1px solid var(--vscode-editorWidget-border);
+}
 .card-actions button:disabled { opacity: 0.4; cursor: default; }
 .card.resolved { opacity: 0.5; border-left-color: var(--vscode-editorWidget-border); }
 
@@ -2445,7 +2459,8 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
   align-items: center;
   border-radius: 4px;
 }
-.repo-row:hover, .repo-row.selected { background: var(--vscode-list-hoverBackground); }
+.repo-row:hover { background: var(--vscode-list-hoverBackground); }
+.repo-row.selected { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground)); }
 .repo-row.unavailable { opacity: 0.62; }
 .repo-row-main {
   flex: 1;
@@ -2483,7 +2498,14 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
 .repo-row-actions .history-action-btn.active,
 .repo-row:hover .repo-row-actions .history-action-btn,
 .repo-row-actions .history-action-btn:focus-visible { opacity: 1; }
-.repo-row-actions .history-action-btn.active { color: var(--vscode-button-background); }
+/* Pinned reads as emphasis, not as an accent link. --vscode-button-background
+   made a pin look like a control you press rather than a state it is already
+   in, and it is the one colour here that does NOT invert with the theme the way
+   a foreground does. Full foreground for pinned, muted for unpinned: near-white
+   on dark, near-black on light, and the pair stays legible on touch where both
+   pins are always present. */
+.repo-row-actions .history-action-btn { color: var(--vscode-descriptionForeground); }
+.repo-row-actions .history-action-btn.active { color: var(--vscode-foreground); }
 /* Touch: every pin stays visible. Tap-to-reveal is wrong HERE specifically —
    the row's primary action is selecting the repo, and iOS treats a tap on an
    element whose :hover reveals content as "apply hover" and swallows the
@@ -2863,6 +2885,20 @@ mjx-container[display="true"] {
   .card button.question-option { padding: 12px 14px; }
   .card .question-option-desc { font-size: 13px; }
   .card-actions button { padding: 13px 14px; font-size: 14px; }
+  .card-actions button.danger { margin-top: 16px; }
+}
+
+.remote-font-row {
+  cursor: default;
+  gap: 8px;
+}
+.remote-font-row label { flex: none; }
+.remote-font-row input { min-width: 80px; flex: 1; }
+.remote-font-row output {
+  min-width: 38px;
+  color: var(--vscode-descriptionForeground);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Phones: "Last turn" is billing diagnostics — hide it in the donut's context

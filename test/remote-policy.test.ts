@@ -4,6 +4,7 @@ import {
   OUTBOUND_DISPOSITION,
   allowFromRemote,
   allowRemoteRepoTarget,
+  bracketRemoteSnapshot,
   repoScopeFor,
   inlineMediaForRemote,
   mediaMimeFromPath,
@@ -30,10 +31,12 @@ describe("remote-policy classification tables", () => {
     expect(INBOUND_DISPOSITION.ready).toBe("control");
     expect(INBOUND_DISPOSITION.send).toBe("propose");
     expect(INBOUND_DISPOSITION.steerSend).toBe("propose");
+    expect(INBOUND_DISPOSITION.uploadFile).toBe("propose");
     expect(INBOUND_DISPOSITION.permissionAnswer).toBe("full");
     expect(INBOUND_DISPOSITION.exitPlanAnswer).toBe("full");
     expect(INBOUND_DISPOSITION.logout).toBe("full");
     expect(INBOUND_DISPOSITION.clearAllSessions).toBe("full");
+    expect(INBOUND_DISPOSITION.remotePreferences).toBe("view");
     expect(INBOUND_DISPOSITION.listSessions).toBe("view");
     expect(INBOUND_DISPOSITION.selectRepo).toBe("view");
     expect(INBOUND_DISPOSITION.toggleRepoPin).toBe("full");
@@ -47,6 +50,7 @@ describe("remote-policy classification tables", () => {
     // per-connection view pref exists
     expect(INBOUND_DISPOSITION.setShowThinking).toBe("host-local");
     expect(INBOUND_DISPOSITION.setSandbox).toBe("host-local");
+    expect(INBOUND_DISPOSITION.setReadRepliesAloud).toBe("host-local");
     // worktree/rewind flows run native host dialogs (input box / QuickPick) —
     // desktop-only until they get remote-capable UI (2026-07-24)
     expect(INBOUND_DISPOSITION.newWorktreeSession).toBe("host-local");
@@ -58,6 +62,7 @@ describe("remote-policy classification tables", () => {
     expect(INBOUND_DISPOSITION.remoteSignOut).toBe("host-local");
     expect(INBOUND_DISPOSITION.openRemotePortal).toBe("host-local");
     expect(OUTBOUND_DISPOSITION.remoteStatus).toBe("host-local");
+    expect(OUTBOUND_DISPOSITION.readRepliesAloud).toBe("host-local");
     // voice is host-mic/ffmpeg-driven; media needs the base64 transform
     expect(OUTBOUND_DISPOSITION.voiceState).toBe("host-local");
     expect(OUTBOUND_DISPOSITION.voiceConfigured).toBe("host-local");
@@ -106,6 +111,7 @@ describe("allowFromRemote tier gating", () => {
     for (const tier of ["read-only", "propose", "full"] as const) {
       expect(allowFromRemote("listSessions", tier)).toBe(true);
       expect(allowFromRemote("resumeSession", tier)).toBe(true);
+      expect(allowFromRemote("remotePreferences", tier)).toBe(true);
     }
   });
 
@@ -240,5 +246,20 @@ describe("repo scope — global for remote, workspace-local in VS Code", () => {
     for (const origin of ["local", "remote"] as const) {
       expect(repoScopeFor(origin, { selectedCwd: "", workspaceRoot: WS })).toBe(WS);
     }
+  });
+});
+
+describe("remote reconnect snapshot replay", () => {
+  it("brackets the full buffered transcript so completed turns are replay-only", () => {
+    const buffer: HostMsg[] = [
+      { type: "agentStart" },
+      { type: "messageChunk", text: "already finished" },
+      { type: "agentEnd" },
+    ];
+    expect(bracketRemoteSnapshot(buffer)).toEqual([
+      { type: "historyReplay", active: true },
+      ...buffer,
+      { type: "historyReplay", active: false },
+    ]);
   });
 });

@@ -12,6 +12,16 @@
 
 import type { HostMsg, WebviewMsg } from "./protocol";
 
+/** Mark a reconnect snapshot as replayed UI state. Buffers may already contain
+ * their own load-session replay brackets, so the webview treats these as nested. */
+export function bracketRemoteSnapshot(buffer: readonly HostMsg[]): HostMsg[] {
+  return [
+    { type: "historyReplay", active: true },
+    ...buffer,
+    { type: "historyReplay", active: false },
+  ];
+}
+
 // ---------- inbound: WebviewMsg from a remote client ----------
 
 /** Capability tier of a remote connection (design doc § Trust model). v1 ships
@@ -35,6 +45,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // transport
   ready: "control",
   // view (read-only+)
+  remotePreferences: "view",
   listSessions: "view",
   selectRepo: "view",
   toggleRepoPin: "full",
@@ -74,10 +85,13 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // Workflow pause/resume/stop is a slash turn (same class as queueSend/steer).
   workflowControl: "propose",
   pasteImage: "propose",
+  // Host validates the extension/name/bytes before staging under globalStorage.
+  uploadFile: "propose",
   removeChip: "propose",
   toggleChip: "propose",
-  // attaches a chip (host-validated against its own file index) — same class
-  // of composer-state mutation as removeChip/toggleChip
+  // attaches a chip only after an exact host mention-catalog lookup plus
+  // lexical + canonical workspace containment — same composer-state class
+  // as removeChip/toggleChip
   addMentionFile: "propose",
   // recheckConnection restarts the CLI session on the host — turn control, not handshake
   recheckConnection: "propose",
@@ -117,6 +131,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // mutates the host's persisted session boundary. A remote may observe the
   // resulting state, but it must not select a host sandbox profile.
   setSandbox: "host-local",
+  setReadRepliesAloud: "host-local",
   // relay account actions (link/unlink/portal) manage THIS machine's device
   // token — only the local webview may drive them
   remoteSignIn: "host-local",
@@ -257,6 +272,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   expandCommandOutputs: "mirror",
   steerByDefault: "mirror",
   soundNotifications: "mirror",
+  readRepliesAloud: "host-local",
   remoteStatus: "host-local",
   setAllToolDetails: "mirror",
   focusInput: "mirror",
