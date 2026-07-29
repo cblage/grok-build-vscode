@@ -41,7 +41,7 @@ import {
   setTerminalShellPreference,
   type ShellPreference,
 } from "./terminal-manager";
-import { SeatbeltBroker } from "./seatbelt-broker";
+import { resolveSeatbeltBrokerRuntime, SeatbeltBroker } from "./seatbelt-broker";
 import {
   resolveAndCompileSeatbeltPolicy,
   sandboxStartupFailureDisposition,
@@ -2920,11 +2920,7 @@ See design doc for the full state machine diagram.`;
           );
         }
         const tomls = this.readSandboxTomls(cwd, sandboxEnv);
-        const execPath = path.resolve(process.execPath);
-        const appMarker = execPath.indexOf(".app/");
-        const appRoot = appMarker >= 0
-          ? execPath.slice(0, appMarker + ".app".length)
-          : path.dirname(execPath);
+        const brokerRuntime = resolveSeatbeltBrokerRuntime(sandboxEnv);
         const trustedTempDir = os.tmpdir();
         const compiled = resolveAndCompileSeatbeltPolicy(
           sandbox,
@@ -2937,13 +2933,17 @@ See design doc for the full state machine diagram.`;
             home: sandboxEnv.HOME || sandboxEnv.USERPROFILE || os.homedir(),
             grokHome: resolveGrokHome(sandboxEnv),
             tempDir: trustedTempDir,
-            runtimeReadPaths: [appRoot, this.context.extensionPath],
+            runtimeReadPaths: [...brokerRuntime.readRoots, this.context.extensionPath],
           },
+        );
+        this.output.appendLine(
+          `[sandbox] broker runtime: ${brokerRuntime.executable} (${brokerRuntime.kind})`,
         );
         broker = new SeatbeltBroker({
           policy: compiled.policy,
           workspaceRoot: cwd,
           childScriptPath: path.join(this.context.extensionPath, "out", "seatbelt-broker-child.js"),
+          runtimePath: brokerRuntime.executable,
           env,
           trustedTempDir,
           onLog: (message) => this.output.appendLine(message),

@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.0.11-sandbox.5 - 2026-07-29
+
+### Fixed
+
+- **Strict-derived profiles now permit path traversal without widening readable content.** The generated Seatbelt policy grants metadata access to the exact ancestor directories of each configured read root (such as `/`, `/Users`, and `/opt`) while keeping their siblings and descendants blocked. This lets the standalone broker runtime resolve its executable and working directory instead of aborting before its protocol starts.
+
+---
+
+## 2.0.11-sandbox.4 - 2026-07-29
+
+### Fixed
+
+- **Strict-derived profiles now start the delegated-operation broker with a standalone Node runtime when available.** This keeps the sandboxed child free of Electron's Chromium and Crashpad bootstrap reads, which could abort the broker under `strict` before its protocol became ready. The extension logs the selected runtime and admits only that runtime's installation roots to the strict read boundary.
+
+---
+
+## 2.0.11-sandbox.3 - 2026-07-29
+
+### Fixed
+
+- **Custom `read_only` paths now match Grok's additive profile semantics.** They grant reads without revoking writes inherited from `strict`, `workspace`, `devbox`, or `read-only`; the base profile and `read_write` entries continue to govern writable roots. This removes the extra broker policy rule that could abort a strict-derived custom profile during startup.
+
+---
+
+## 2.0.11-sandbox.2 - 2026-07-29
+
+### Fixed
+
+- **Strict-derived custom profiles now preserve writable descendants of a broader `read_only` path.** A profile can make `$HOME` read-only while retaining inherited project and `$GROK_HOME` writes plus explicit writable paths such as caches. This prevents the Seatbelt broker from exiting before startup when those paths overlap.
+
+---
+
 ## 2.0.11-sandbox.1 - 2026-07-28
 
 ### Added

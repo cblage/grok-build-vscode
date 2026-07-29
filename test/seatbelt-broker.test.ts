@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildSeatbeltBrokerArgs, sanitizeBootstrapEnv } from "../src/seatbelt-broker";
+import {
+  buildSeatbeltBrokerArgs,
+  resolveSeatbeltBrokerRuntime,
+  sanitizeBootstrapEnv,
+} from "../src/seatbelt-broker";
 import {
   executeBrokerMethod,
   resolveBrokerPath,
@@ -46,6 +50,25 @@ describe("Seatbelt broker protocol helpers", () => {
     expect(env.TMPDIR).toBe("/private/var/folders/trusted/T");
     expect(env.TMP).toBe("/private/var/folders/trusted/T");
     expect(env.TEMP).toBe("/private/var/folders/trusted/T");
+  });
+
+  it("prefers a standalone Node runtime over the Electron extension host", async () => {
+    const runtime = resolveSeatbeltBrokerRuntime(
+      {
+        PATH: path.dirname(process.execPath),
+        GROK_SANDBOX_NODE: process.execPath,
+      },
+      "/Applications/Editor.app/Contents/MacOS/Editor Helper",
+    );
+    const executable = await fs.realpath(process.execPath);
+    expect(runtime).toEqual({
+      executable,
+      readRoots: expect.arrayContaining([
+        path.dirname(executable),
+        path.dirname(path.dirname(executable)),
+      ]),
+      kind: "standalone-node",
+    });
   });
 
   it("prevents ACP terminal requests from replacing pinned temp variables", () => {

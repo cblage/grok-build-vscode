@@ -198,10 +198,10 @@ deny = ["**/*.pem", ".secrets"]
     expect(compiled.writePaths).toContain("/Users/test/work");
     expect(compiled.writePaths).toContain("/Users/test/.local");
     expect(compiled.writePaths).toContain("/private/tmp/scratch");
+    expect(compiled.readPaths).toContain("/Users/test/.ssh");
     expect(compiled.policy).toContain("(deny file-write*");
     expect(compiled.policy).toContain('(subpath "/Users/test/work")');
-    expect(compiled.policy).toContain('(literal "/Users/test/.ssh")');
-    expect(compiled.policy).toContain('(subpath "/Users/test/.ssh")');
+    expect(compiled.policy).not.toContain('(literal "/Users/test/.ssh")');
     expect(compiled.policy).toContain('(literal "/Users/test/work/.secrets")');
     expect(compiled.policy).toContain('(subpath "/Users/test/work/.secrets")');
     expect(compiled.deniedGlobs).toEqual([
@@ -210,6 +210,29 @@ deny = ["**/*.pem", ".secrets"]
     expect(compiled.policy).toContain(
       '(deny file-read* file-write* (regex #"^/Users/test/work/(.*/)?[^/]*\\.pem$"))',
     );
+  });
+
+  it("treats read_only as an additive read grant rather than a write revoke", () => {
+    const compiled = resolveAndCompileSeatbeltPolicy(
+      "lumina",
+      {
+        projectSandbox: `[profiles.lumina]
+extends = "strict"
+read_only = ["~"]
+read_write = ["~/.local"]
+`,
+      },
+      context,
+    );
+
+    expect(compiled.writePaths).toEqual(expect.arrayContaining([
+      "/Users/test/work",
+      "/Users/test/.grok",
+      "/Users/test/.local",
+    ]));
+    expect(compiled.readPaths).toContain("/Users/test");
+    expect(compiled.policy).toContain('(subpath "/Users/test")');
+    expect(compiled.policy).toContain('(literal "/Users/test")');
   });
 
   it("matches Grok's documented built-in filesystem and network matrix on macOS", () => {
@@ -302,6 +325,20 @@ deny = ["**/*.pem", ".secrets"]
       expect(strict.readPaths, `strict reads ${readable}`).toContain(readable);
     }
     expect(strict.readPaths).not.toContain("/opt");
+    for (const traversable of [
+      "/",
+      "/Users",
+      "/Users/test",
+      "/Applications",
+      "/Applications/Editor.app",
+    ]) {
+      expect(strict.policy, `strict traverses ${traversable}`).toContain(
+        `(literal "${traversable}")`,
+      );
+    }
+    expect(strict.policy).not.toContain('(subpath "/")');
+    expect(strict.policy).not.toContain('(subpath "/Users")');
+    expect(strict.policy).not.toContain('(subpath "/Applications")');
   });
 
   it("enumerates root only for devbox and fails instead of silently narrowing it", () => {

@@ -558,6 +558,29 @@ function containmentRule(
   return `(deny ${operation}\n  (require-not\n    (require-any\n${filters}\n    )\n  )\n)`;
 }
 
+/**
+ * Seatbelt's `subpath` filter grants a directory and its descendants, but it
+ * does not grant the parent metadata needed to traverse an absolute path.
+ * Runtime loaders can abort before user code starts when `/`, `/Users`, or
+ * `/opt` cannot be inspected even though the final executable and workspace
+ * are readable. Admit only the exact ancestor directory entries: never their
+ * siblings or descendants.
+ */
+function readTraversalLiterals(roots: string[]): string[] {
+  const ancestors: string[] = [];
+  for (const root of roots) {
+    let parent = path.dirname(root);
+    while (true) {
+      ancestors.push(parent);
+      if (parent === "/") break;
+      const next = path.dirname(parent);
+      if (next === parent) break;
+      parent = next;
+    }
+  }
+  return unique(ancestors);
+}
+
 function exactDenyRule(value: string): string {
   return `(deny file-read* file-write*
   (require-any
@@ -687,7 +710,12 @@ export function compileSeatbeltPolicyDetails(
   // a no-op so the built-ins and custom profiles behave exactly like Grok.
 
   if (!base.readEverywhere) {
-    const rule = containmentRule("file-read*", readPaths);
+    const rule = containmentRule(
+      "file-read*",
+      readPaths,
+      [],
+      readTraversalLiterals(readPaths),
+    );
     if (rule) rules.push(rule);
   }
   if (!base.writeEverywhere) {
@@ -705,11 +733,9 @@ export function compileSeatbeltPolicyDetails(
     const resolved = resolveSandboxPath(value, cwd, home);
     rules.push(exactWriteDenyRule(resolved));
   }
-  // `read_only` is additive and must still remove write access when the base is
-  // broad (especially `devbox`), not merely add a readable path.
-  for (const value of customReadOnly) {
-    rules.push(exactWriteDenyRule(value));
-  }
+  // Grok's `read_only` field is an additive read grant. Write access remains
+  // governed by the selected built-in and any `read_write` additions; only
+  // explicit `deny` entries revoke an inherited write permission.
   for (const entry of profile.deny) {
     if (hasGlob(entry)) {
       const regex = denyGlobToSeatbeltRegex(entry, cwd, home);

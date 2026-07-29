@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import fs from "node:fs";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import * as path from "node:path";
 import type { TerminalCreateParams, TerminalOutputResult } from "./terminal-manager";
@@ -50,6 +51,78 @@ type BrokerState = "new" | "starting" | "ready" | "dead" | "disposed";
 const DEFAULT_STARTUP_TIMEOUT_MS = 5_000;
 const DEFAULT_SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 const STDERR_TAIL_LIMIT = 8_192;
+const COMMON_NODE_PATHS = ["/opt/homebrew/bin/node", "/usr/local/bin/node"];
+
+export interface SeatbeltBrokerRuntime {
+  executable: string;
+  readRoots: string[];
+  kind: "standalone-node" | "extension-host";
+}
+
+function existingExecutable(candidate: string | undefined): string | undefined {
+  if (!candidate || !path.isAbsolute(candidate)) return undefined;
+  try {
+    const resolved = fs.realpathSync(candidate);
+    fs.accessSync(resolved, fs.constants.X_OK);
+    return fs.statSync(resolved).isFile() ? resolved : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function standaloneNodeReadRoots(executable: string): string[] {
+  const roots = new Set<string>([path.dirname(executable), path.dirname(path.dirname(executable))]);
+  for (const prefix of ["/opt/homebrew", "/usr/local"]) {
+    if (executable === prefix || executable.startsWith(`${prefix}/`)) roots.add(prefix);
+  }
+  return [...roots];
+}
+
+function extensionHostReadRoots(executable: string): string[] {
+  const appMarker = executable.indexOf(".app/");
+  return [
+    appMarker >= 0
+      ? executable.slice(0, appMarker + ".app".length)
+      : path.dirname(executable),
+  ];
+}
+
+/**
+ * Prefer a real Node executable for the sandboxed broker. VS Code's
+ * `process.execPath` is an Electron Helper binary; it can start in Node mode,
+ * but Chromium/Crashpad still performs host reads during bootstrap and aborts
+ * under Grok's `strict` read boundary before the broker protocol comes up.
+ */
+export function resolveSeatbeltBrokerRuntime(
+  env: NodeJS.ProcessEnv = process.env,
+  fallbackExecutable = process.execPath,
+): SeatbeltBrokerRuntime {
+  const pathCandidates = (env.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .map((entry) => path.join(entry, "node"));
+  for (const candidate of [
+    env.GROK_SANDBOX_NODE,
+    ...pathCandidates,
+    ...COMMON_NODE_PATHS,
+  ]) {
+    const executable = existingExecutable(candidate);
+    if (!executable) continue;
+    return {
+      executable,
+      readRoots: standaloneNodeReadRoots(executable),
+      kind: "standalone-node",
+    };
+  }
+
+  const executable = existingExecutable(path.resolve(fallbackExecutable))
+    ?? path.resolve(fallbackExecutable);
+  return {
+    executable,
+    readRoots: extensionHostReadRoots(executable),
+    kind: "extension-host",
+  };
+}
 
 export function sanitizeBootstrapEnv(
   source: NodeJS.ProcessEnv,
