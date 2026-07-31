@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
-import { HOST_MESSAGE_TYPES as TS_HOST, WEBVIEW_MESSAGE_TYPES as TS_WEBVIEW } from "../src/protocol";
+import {
+  HOST_CAPABILITIES,
+  HOST_MESSAGE_TYPES as TS_HOST,
+  WEBVIEW_MESSAGE_TYPES as TS_WEBVIEW,
+} from "../src/protocol";
 // The webview's own copy of the contract (plain JS — it can't import the TS types).
 import { HOST_MESSAGE_TYPES as JS_HOST, WEBVIEW_MESSAGE_TYPES as JS_WEBVIEW } from "../media/webview-helpers.js";
 
@@ -12,10 +16,45 @@ const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.me
 const sorted = (a: readonly string[]) => [...a].sort();
 
 describe("host <-> webview message contract (src/protocol.ts is the source of truth)", () => {
+  it("advertises remote voice as a host protocol capability", () => {
+    expect(HOST_CAPABILITIES).toEqual({ uploadFile: true, remoteVoice: true });
+  });
+
   it("keeps the fresh local read-aloud configuration default off", () => {
     expect(
       packageJson.contributes.configuration.properties["grok.readRepliesAloud"].default,
     ).toBe(false);
+    expect(
+      packageJson.contributes.configuration.properties["grok.processingSound"].default,
+    ).toBe(false);
+    expect(
+      packageJson.contributes.configuration.properties["grok.summarizeRepliesAloud"].default,
+    ).toBe(false);
+  });
+
+  it("scopes the macOS Emacs composer bindings to composer focus", () => {
+    const bindings = packageJson.contributes.keybindings;
+    expect(bindings).toContainEqual({
+      command: "grok.composerForward",
+      key: "ctrl+f",
+      when: "isMac && grok.composerFocus",
+    });
+    expect(bindings).toContainEqual({
+      command: "grok.composerPreviousLine",
+      key: "ctrl+p",
+      when: "isMac && grok.composerFocus",
+    });
+  });
+
+  it("uses findable AFK Pilot titles without changing the remote command ids", () => {
+    expect(packageJson.contributes.commands).toContainEqual({
+      command: "grok.linkRemote",
+      title: "AFK Pilot: Link this device",
+    });
+    expect(packageJson.contributes.commands).toContainEqual({
+      command: "grok.unlinkRemote",
+      title: "AFK Pilot: Unlink this device",
+    });
   });
 
   it("the webview's host-message list matches the TS union exactly", () => {

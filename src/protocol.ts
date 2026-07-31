@@ -50,13 +50,22 @@ export interface PlanHistoryItem {
 }
 
 /** host -> webview */
+export const HOST_CAPABILITIES = {
+  uploadFile: true,
+  remoteVoice: true,
+} as const;
+
 export type HostMsg =
-  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform; steerByDefault: boolean; soundNotifications: boolean; readRepliesAloud: boolean; capabilities: { uploadFile: boolean } }
+  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform; steerByDefault: boolean; soundNotifications: boolean; processingSound: boolean; readRepliesAloud: boolean; capabilities: { uploadFile: boolean; remoteVoice: boolean } }
   | { type: "showThinking"; value: boolean }
   // grok.soundNotifications — live toggle for the turn-complete/error sound (#59).
   | { type: "soundNotifications"; value: boolean }
+  | { type: "processingSound"; value: boolean }
   // grok.readRepliesAloud — local VS Code speech-synthesis preference.
   | { type: "readRepliesAloud"; value: boolean }
+  | { type: "summarizeRepliesAloud"; value: boolean }
+  | { type: "speechSummary"; requestId: number; text: string }
+  | { type: "moveComposerCaret"; direction: "forward" | "previousLine" }
   // Whether this machine holds a relay device token (gear "AFK Pilot" section).
   // Local-webview chrome — never mirrored to remotes.
   | { type: "remoteStatus"; linked: boolean }
@@ -88,12 +97,12 @@ export type HostMsg =
   /** `steer` marks a mid-turn interjection (#52). It paints a user bubble but is
    *  NOT a prompt and gets no rewind point, so the bubble must not consume a
    *  rewind index — see refreshUserRewindButtons. */
-  | { type: "userMessage"; text: string; chips?: FileChip[]; steer?: boolean }
+  | { type: "userMessage"; text: string; chips?: FileChip[]; steer?: boolean; submissionId?: string }
   | { type: "agentStart" }
   | { type: "thoughtChunk"; text: string }
   | { type: "messageChunk"; text: string }
   | { type: "media"; media: string; src?: string; url?: string; mimeType?: string; path?: string }
-  | { type: "userMessageChunk"; text: string }
+  | { type: "userMessageChunk"; text: string; timestampMs?: number }
   | { type: "historyReplay"; active: boolean }
   | { type: "permissionHistoryQueue"; permissions: unknown[] }
   | { type: "planHistoryQueue"; plans: PlanHistoryItem[] }
@@ -101,6 +110,7 @@ export type HostMsg =
   | { type: "toolCall"; call: ToolCallPayload }
   | { type: "toolCallUpdate"; call: ToolCallPayload }
   | { type: "permissionRequest"; req: PermissionRequest }
+  | { type: "permissionOptions"; requestId: number | string; options: PermissionRequest["options"] }
   | { type: "permissionResolved"; requestId: number | string; optionId: string }
   // The host spreads the plan-review snapshot (planPath/planName) into the bare
   // ExitPlanRequest before posting, so the wire shape is wider than acp's type.
@@ -127,11 +137,11 @@ export type HostMsg =
   | { type: "clearMessages" }
   | { type: "onboarding"; state: "missing-cli" | "auth-required"; platform?: string }
   | { type: "error"; text: string }
+  | { type: "hostNotice"; level: "info" | "warning"; text: string }
   | { type: "xaiNotification"; update?: unknown }
-  // Subagent lifecycle (method _x.ai/session/update): subagent_spawned /
-  // subagent_finished — duration/output stats the Composer agent's completed
-  // tool_call_update lacks, and a completion backstop for the card.
-  | { type: "subagentUpdate"; update?: unknown }
+  // Persisted xAI lifecycle (method _x.ai/session/update): subagent spawn/finish
+  // plus replayed turn_completed, whose timestamp finalizes the agent footer.
+  | { type: "subagentUpdate"; update?: unknown; timestampMs?: number }
   // Deep Research / Workflow / Goal progress (P2-10) — normalized from the
   // live `_x.ai/session_notification` rail (`workflow_updated` / `goal_updated`).
   // Cards update in place by `id`; terminal phases stop the live dots.
@@ -167,12 +177,16 @@ export type HostMsg =
   // nextOffset = the index offset the next load-more should request — ids CONSUMED
   // from the on-disk index, not entries shown (hidden subagent sessions occupy
   // slots without producing rows).
-  | { type: "sessions"; entries: SessionListEntry[]; activeId?: string; dots: Record<string, Dot>; offset: number; total: number; hasMore: boolean; nextOffset: number; query: string }
+  | { type: "sessions"; entries: SessionListEntry[]; activeId?: string | null; dots: Record<string, Dot>; offset: number; total: number; hasMore: boolean; nextOffset: number; query: string }
   | { type: "repos"; entries: RepoListEntry[]; selectedCwd: string; activeCwd: string }
   | { type: "sessionDot"; id: string; dot: Dot }
   // Full snapshot of the focused session's host-owned send queue (#37) — the
   // webview renders pending user blocks from this; replay rebuilds them.
   | { type: "queuedSends"; items: string[] }
+  // A remote queued prompt is ready to run. The browser echoes this as an
+  // ordinary send carrying the same host-issued id, so relay quota/rate metering
+  // applies at dequeue time and replayed/outbox copies are recognisably one send.
+  | { type: "submitQueuedSend"; id: string; text: string }
   // Steer (#52) is unavailable on this CLI (`_x.ai/interject` → -32601). Latches
   // the button off for the session; the queue stays as the fallback.
   | { type: "steerUnavailable" }
@@ -183,10 +197,10 @@ export type HostMsg =
 
 /** webview -> host */
 export type WebviewMsg =
-  | { type: "ready" }
+  | { type: "ready"; tabToken?: string }
   // Browser-owned remote preferences reported for session_start telemetry.
   | { type: "remotePreferences"; fontScale: number; readRepliesAloud: boolean; usesTouch: boolean }
-  | { type: "send"; text: string; chips?: FileChip[]; bare?: boolean }
+  | { type: "send"; text: string; chips?: FileChip[]; bare?: boolean; queuedSendId?: string; submissionId?: string }
   | { type: "newSession" }
   | { type: "cancel" }
   | { type: "pickModel" }
@@ -217,7 +231,11 @@ export type WebviewMsg =
   | { type: "setShowThinking"; value: boolean }
   // grok.soundNotifications gear switch (#59) — persisted globally by the host.
   | { type: "setSoundNotifications"; value: boolean }
+  | { type: "setProcessingSound"; value: boolean }
   | { type: "setReadRepliesAloud"; value: boolean }
+  | { type: "setSummarizeRepliesAloud"; value: boolean }
+  | { type: "summarizeSpeech"; requestId: number; text: string }
+  | { type: "composerFocus"; focused: boolean }
   | { type: "setExpandCommandOutputs"; value: boolean }
   | { type: "setSteerByDefault"; value: boolean }
   | { type: "dropFile"; path: string; shift: boolean }
@@ -255,6 +273,11 @@ export type WebviewMsg =
   | { type: "uploadFile"; name: string; data: string }
   | { type: "voiceStart" }
   | { type: "voiceStop" }
+  // AFK Pilot microphone input. Audio remains raw PCM16 LE / 16 kHz / mono;
+  // the relay treats these opaque messages like every other WebviewMsg.
+  | { type: "remoteVoiceStart" }
+  | { type: "remoteVoiceChunk"; data: string }
+  | { type: "remoteVoiceStop"; cancel?: boolean }
   // Host-owned send queue mutations (#37): the webview never mutates its local
   // mirror — it posts these and re-renders from the queuedSends snapshot.
   | { type: "queueSend"; text: string }
@@ -290,7 +313,7 @@ export type WebviewMsg =
   // device-link flow / drop the device token / open the relay web portal.
   | { type: "remoteSignIn" }
   | { type: "remoteSignOut" }
-  | { type: "openRemotePortal" };
+  | { type: "openRemotePortal"; withHint?: boolean };
 
 // Exhaustive maps: `Record<Union["type"], true>` forces every discriminant to be
 // a key (missing -> tsc error) and forbids any extra (excess-property -> tsc
@@ -305,15 +328,15 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   chips: true, commandsUpdate: true, mentionResults: true, userMessage: true, agentStart: true,
   thoughtChunk: true, messageChunk: true, media: true, userMessageChunk: true,
   historyReplay: true, permissionHistoryQueue: true, planHistoryQueue: true,
-  planProcessing: true, toolCall: true, toolCallUpdate: true, permissionRequest: true,
+  planProcessing: true, toolCall: true, toolCallUpdate: true, permissionRequest: true, permissionOptions: true,
   permissionResolved: true, exitPlanRequest: true, planResolved: true, questionRequest: true,
   planNotice: true, autoCompactNotice: true, planBlocked: true, promptComplete: true, contextUsage: true, agentReset: true,
   agentError: true, agentEnd: true, exit: true, setBusy: true, summarizing: true,
-  sessionContext: true, clearMessages: true, onboarding: true, error: true,
+  sessionContext: true, clearMessages: true, onboarding: true, error: true, hostNotice: true,
   xaiNotification: true, subagentUpdate: true, runProgress: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true,
-  soundNotifications: true, readRepliesAloud: true, remoteStatus: true,
+  soundNotifications: true, processingSound: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, moveComposerCaret: true, remoteStatus: true,
   setAllToolDetails: true, focusInput: true, restoreComposer: true, truncateMessages: true, uiConfirmRequest: true,
-  sessions: true, repos: true, sessionDot: true, queuedSends: true,
+  sessions: true, repos: true, sessionDot: true, queuedSends: true, submitQueuedSend: true,
   steerUnavailable: true, usage: true,
 };
 
@@ -323,7 +346,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   openText: true, openDiff: true, exportExpr: true, setEffort: true, openGlobalConfig: true,
   openProjectConfig: true, runMcpList: true, showLogs: true, moveView: true,
   setShowThinking: true, setExpandCommandOutputs: true, setSteerByDefault: true,
-  setSoundNotifications: true, setReadRepliesAloud: true,
+  setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, summarizeSpeech: true, composerFocus: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
   questionCancel: true, setModel: true, runInstallCmd: true, runGrokLogin: true,
   logout: true, checkGrokUpdate: true, updateGrok: true, recheckConnection: true,
@@ -331,7 +354,8 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   resumeSession: true, renameSession: true, deleteSession: true,
   clearAllSessions: true, pickFile: true, mentionQuery: true, addMentionFile: true,
   pasteImage: true, uploadFile: true, voiceStart: true,
-  voiceStop: true, queueSend: true, dequeueSend: true, clearQueuedSends: true,
+  voiceStop: true, remoteVoiceStart: true, remoteVoiceChunk: true,
+  remoteVoiceStop: true, queueSend: true, dequeueSend: true, clearQueuedSends: true,
   steerSend: true, forkSession: true,
   newWorktreeSession: true, applyWorktree: true, removeWorktree: true,
   rewindSession: true, editLastMessage: true, uiConfirmAnswer: true, workflowControl: true,

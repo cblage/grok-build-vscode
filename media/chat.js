@@ -1,5 +1,6 @@
 (function () {
   const vscode = acquireVsCodeApi();
+  const CHAT_SCRIPT_URL = document.currentScript?.src || window.location.href;
   // True in the relay's browser client (its chat.html shim sets the flag before
   // loading this file); always false inside the VS Code webview. Gates the
   // host-only affordances: worktree/rewind actions (their host flows run native
@@ -7,6 +8,170 @@
   const IS_REMOTE = !!window.grokRemoteClient;
   const REMOTE_FONT_SCALE_KEY = "grok.remote.fontScale";
   const REMOTE_TTS_KEY = "grok.remote.tts";
+  const REMOTE_STORAGE_SUFFIX = (
+    typeof location !== "undefined"
+      ? new URLSearchParams(location.search || "").get("device") || "default"
+      : "default"
+  );
+  const REMOTE_SESSION_KEY = "grok.remote.tabSession:" + REMOTE_STORAGE_SUFFIX;
+  const REMOTE_TAB_TOKEN_KEY = "grok.remote.tabToken:" + REMOTE_STORAGE_SUFFIX;
+  const REMOTE_TAB_OWNER_KEY = "grok.remote.tabOwner:" + REMOTE_STORAGE_SUFFIX;
+  const REMOTE_TAB_CHANNEL = "grok.remote.tabClaim:" + REMOTE_STORAGE_SUFFIX;
+  const REMOTE_TAB_CLAIM_TIMEOUT_MS = 250;
+  let remoteTabToken = null;
+  let priorRemoteTabOwner = null;
+  let remoteTabInstanceId = null;
+  let rememberedRemoteSession = null;
+
+  function newRemoteTabToken() {
+    try {
+      const bytes = new Uint8Array(24);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    } catch (_) {
+      try {
+        return crypto.randomUUID().replace(/-/g, "");
+      } catch (_) {
+        return null;
+      }
+    }
+  }
+
+  if (IS_REMOTE) {
+    try {
+      remoteTabToken = sessionStorage.getItem(REMOTE_TAB_TOKEN_KEY);
+      priorRemoteTabOwner = sessionStorage.getItem(REMOTE_TAB_OWNER_KEY);
+      if (!remoteTabToken) {
+        remoteTabToken = newRemoteTabToken();
+        if (remoteTabToken) sessionStorage.setItem(REMOTE_TAB_TOKEN_KEY, remoteTabToken);
+      }
+    } catch (_) {
+      remoteTabToken = newRemoteTabToken();
+    }
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(REMOTE_SESSION_KEY) || "null");
+      if (
+        saved &&
+        typeof saved.id === "string" &&
+        typeof saved.repoCwd === "string" &&
+        (!saved.cwd || typeof saved.cwd === "string")
+      ) rememberedRemoteSession = saved;
+    } catch (_) { /* storage unavailable/private mode */ }
+  }
+  function saveRememberedRemoteSession(value) {
+    if (!IS_REMOTE) return;
+    rememberedRemoteSession = value;
+    try {
+      if (value) sessionStorage.setItem(REMOTE_SESSION_KEY, JSON.stringify(value));
+      else sessionStorage.removeItem(REMOTE_SESSION_KEY);
+    } catch (_) { /* storage unavailable/private mode */ }
+  }
+
+  function replaceRemoteTabIdentity() {
+    const replacement = newRemoteTabToken();
+    if (!replacement) return;
+    remoteTabToken = replacement;
+    saveRememberedRemoteSession(null);
+    try {
+      sessionStorage.setItem(REMOTE_TAB_TOKEN_KEY, replacement);
+    } catch (_) { /* storage unavailable/private mode */ }
+  }
+
+  function markRemoteTabClaimed() {
+    if (!remoteTabInstanceId) return;
+    try {
+      sessionStorage.setItem(REMOTE_TAB_OWNER_KEY, remoteTabInstanceId);
+    } catch (_) { /* storage unavailable/private mode */ }
+  }
+
+  function clearRemoteTabOwner() {
+    if (!remoteTabInstanceId) return;
+    try {
+      if (sessionStorage.getItem(REMOTE_TAB_OWNER_KEY) === remoteTabInstanceId) {
+        sessionStorage.removeItem(REMOTE_TAB_OWNER_KEY);
+      }
+    } catch (_) { /* storage unavailable/private mode */ }
+  }
+
+  function claimRemoteTabIdentity(done) {
+    if (!IS_REMOTE || !remoteTabToken) {
+      done(remoteTabToken || undefined);
+      return;
+    }
+    remoteTabInstanceId = newRemoteTabToken();
+    if (!remoteTabInstanceId) {
+      if (priorRemoteTabOwner) replaceRemoteTabIdentity();
+      done(remoteTabToken || undefined);
+      return;
+    }
+    window.addEventListener("pagehide", clearRemoteTabOwner, { once: true });
+
+    const finish = (replace) => {
+      if (replace) replaceRemoteTabIdentity();
+      markRemoteTabClaimed();
+      done(remoteTabToken || undefined);
+    };
+    if (typeof BroadcastChannel !== "function") {
+      finish(!!priorRemoteTabOwner);
+      return;
+    }
+    let channel;
+    try {
+      channel = new BroadcastChannel(REMOTE_TAB_CHANNEL);
+    } catch (_) {
+      finish(!!priorRemoteTabOwner);
+      return;
+    }
+    let claimed = false;
+    let settled = false;
+    let timer;
+    const settle = (replace) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      claimed = true;
+      finish(replace);
+    };
+    channel.onmessage = (event) => {
+      const message = event && event.data;
+      if (!message || message.token !== remoteTabToken || message.instanceId === remoteTabInstanceId) return;
+      if (message.type === "probe") {
+        if (claimed || remoteTabInstanceId < message.instanceId) {
+          channel.postMessage({
+            type: "occupied",
+            token: remoteTabToken,
+            instanceId: remoteTabInstanceId,
+            target: message.instanceId,
+          });
+        } else {
+          settle(true);
+        }
+      } else if (message.type === "occupied" && message.target === remoteTabInstanceId) {
+        settle(true);
+      }
+    };
+    if (priorRemoteTabOwner) {
+      channel.postMessage({ type: "probe", token: remoteTabToken, instanceId: remoteTabInstanceId });
+      timer = setTimeout(() => settle(false), REMOTE_TAB_CLAIM_TIMEOUT_MS);
+    } else {
+      settle(false);
+    }
+    window.addEventListener("pagehide", () => channel.close(), { once: true });
+  }
+
+  let resolveRemoteTabTokenReady;
+  window.__grokTabTokenReady = new Promise((resolve) => {
+    resolveRemoteTabTokenReady = resolve;
+  });
+
+  function restoreRememberedRemoteSession() {
+    const saved = rememberedRemoteSession;
+    if (!IS_REMOTE || !saved) return;
+    if (saved.repoCwd && saved.repoCwd !== state.cwd) {
+      vscode.postMessage({ type: "selectRepo", cwd: saved.repoCwd });
+    }
+    vscode.postMessage({ type: "resumeSession", id: saved.id, cwd: saved.cwd || undefined });
+  }
   const ttsAvailable = !!window.speechSynthesis && typeof window.SpeechSynthesisUtterance === "function";
 
   function storedNumber(key, fallback) {
@@ -44,6 +209,7 @@
   const inputHighlight = $("input-highlight");
   const newBtn = $("new-btn");
   const historyBtn = $("history-btn");
+  const remoteBtn = $("remote-btn");
   const repoBtn = $("repo-btn");
   const modeBtn = $("mode-btn");
   const sandboxBtn = $("sandbox-btn");
@@ -126,7 +292,7 @@
     // Voice-input button: "idle" | "listening" | "transcribing" (see nextMicState).
     mic: "idle",
     // Whether the host found a voice API key. Optimistic until the host says
-    // otherwise; drives the mic button's "needs setup" hint.
+    // otherwise; remote clients cannot configure the host themselves.
     voiceConfigured: true,
     // Streaming dictation: text typed before the mic started ("base"), and
     // whether live partials have begun replacing the tail.
@@ -138,6 +304,7 @@
     hostFontScale: Number(document.body.style.getPropertyValue("--chat-zoom")) || 1,
     remoteTts: IS_REMOTE && storedBool(REMOTE_TTS_KEY, false),
     readRepliesAloud: false,
+    summarizeRepliesAloud: false,
     remotePreferencesSupported: false,
     ttsTurnText: "",
     // Render MIRROR of the focused session's host-owned send queue (#37) —
@@ -147,6 +314,16 @@
     // flushes it (one combined prompt) when the session's turn ends.
     sendQueue: [],
     queuedWrapEl: null, // the .queued-msgs container pinned to the end of the chat
+    queuedSubmissionPending: false,
+    queuedSubmissionRejected: false,
+    submittedQueuedSendIds: new Set(),
+    queuedSubmissionId: null,
+    pendingSubmissionText: "",
+    pendingSubmissionId: null,
+    pendingSubmissionChipIds: [],
+    rejectedSubmissionText: "",
+    // Remote-only placeholder bubble shown between a send and the host's echo.
+    optimisticSendEl: null,
     // Steer (#52). Optimistic: `_x.ai/interject` is unadvertised, so we can't ask
     // whether it works — we offer it and let the host latch this off the first
     // time the CLI answers -32601 (the text falls back to the queue, never lost).
@@ -312,12 +489,20 @@
     // plays on turn completion / error, but only when the Grok panel isn't
     // focused (#59). Off by default. Host posts the value on init + config change.
     soundNotifications: false,
+    // grok.processingSound: a quiet repeating cue while a live turn is still
+    // running. Separate from the completion/error notification and off by default.
+    processingSound: false,
     // grok.worktree — true when the focused session runs in an isolated git
     // worktree (from the `session` message). Gates the gear Apply/Remove items.
     isWorktree: false,
     // Whether the host machine holds a relay device token (`remoteStatus`).
     // Drives the gear AFK Pilot items; never sent to remote clients.
-    remoteLinked: false,
+    // THREE states, not two: null = not answered yet. The host reads the token
+    // from secret storage asynchronously, so defaulting to false told an
+    // already-linked machine to "Sign in (link this device)" for that window —
+    // inviting the user to re-link a device that was working. Unknown shows
+    // nothing at all.
+    remoteLinked: null,
     // toolExpandOverride (per-session, in-memory): the Command Palette
     // Expand/Collapse All latch. null = follow the setting above; true/false =
     // force ALL groups + details open/closed for this session, and keep applying
@@ -391,8 +576,9 @@
     gitFork: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>`,
     // Undo / rewind — used on user-bubble action row (P2-9).
     undo: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6.7 3L3 13"/></svg>`,
-    // Remote Control gear section (sign in / account / sign out / how it works).
+    // Remote Control gear section (sign in / continue remotely / sign out / how it works).
     user: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`,
+    smartphone: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg>`,
     logOut: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/></svg>`,
     info: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>`,
     // Animated equalizer bars shown while listening (CSS drives the bounce).
@@ -436,6 +622,8 @@
   // progress indicator (Grokking / Thinking) so they all pulse the same way
   // instead of the old morphing "…" ellipsis (#26 follow-up).
   const BLINK_DOTS = `<span class="blink-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>`;
+  let composerPreferredColumn = null;
+  let speechRequestId = 0;
 
   // ---------- helpers ----------
 
@@ -446,8 +634,8 @@
   }
 
   // ---------- sound notifications (#59) ----------
-  // Synth tones via Web Audio — no bundled assets, CSP-safe, offline. Two cues:
-  // a rising two-note chime for completion, a lower falling tone for errors. The
+  // Synth tones via Web Audio — no bundled assets, CSP-safe, offline. Completion
+  // rises, errors fall, and the in-flight reminder is a single soft pulse. The
   // AudioContext is created lazily and unlocked on the first user gesture (the
   // autoplay policy starts it "suspended"); the send/keypress that starts a turn
   // is that gesture, so a later completion beep is allowed.
@@ -471,10 +659,12 @@
     const t0 = ctx.currentTime;
     // { frequency Hz, start-offset s, duration s }
     const notes = kind === "error"
-      ? [{ f: 311, s: 0, d: 0.18 }, { f: 233, s: 0.15, d: 0.26 }]  // falling, darker
-      : [{ f: 587, s: 0, d: 0.14 }, { f: 880, s: 0.13, d: 0.20 }]; // rising, bright
+      ? [{ f: 311, s: 0, d: 0.18 }, { f: 233, s: 0.15, d: 0.26 }]
+      : kind === "processing"
+        ? [{ f: 440, s: 0, d: 0.16 }]
+        : [{ f: 587, s: 0, d: 0.14 }, { f: 880, s: 0.13, d: 0.20 }];
     const master = ctx.createGain();
-    master.gain.value = 0.08; // gentle — a cue, not an alarm
+    master.gain.value = kind === "processing" ? 0.035 : 0.08;
     master.connect(ctx.destination);
     for (const n of notes) {
       const osc = ctx.createOscillator();
@@ -500,6 +690,50 @@
     const away = document.visibilityState === "hidden" || !document.hasFocus();
     if (!away) return;
     playNotificationTone(kind);
+  }
+
+  function moveComposerCaret(direction) {
+    if (document.activeElement !== input) return;
+    const start = input.selectionStart ?? 0;
+    const end = input.selectionEnd ?? start;
+    const caret = input.selectionDirection === "backward" ? start : end;
+    if (direction === "forward") {
+      composerPreferredColumn = null;
+      const next = Math.min(input.value.length, caret + 1);
+      input.setSelectionRange(next, next);
+      return;
+    }
+    const lineStart = input.value.lastIndexOf("\n", Math.max(0, caret - 1)) + 1;
+    if (composerPreferredColumn == null) composerPreferredColumn = caret - lineStart;
+    if (lineStart === 0) {
+      input.setSelectionRange(0, 0);
+      return;
+    }
+    const previousEnd = lineStart - 1;
+    const previousStart = input.value.lastIndexOf("\n", Math.max(0, previousEnd - 1)) + 1;
+    const previousLength = previousEnd - previousStart;
+    const next = previousStart + Math.min(composerPreferredColumn, previousLength);
+    input.setSelectionRange(next, next);
+  }
+  let processingCueTimer = null;
+  let liveTurnInFlight = false;
+  function stopProcessingCue() {
+    liveTurnInFlight = false;
+    if (processingCueTimer != null) {
+      clearTimeout(processingCueTimer);
+      processingCueTimer = null;
+    }
+  }
+  function scheduleProcessingCue(delay = 7000) {
+    if (processingCueTimer != null) clearTimeout(processingCueTimer);
+    processingCueTimer = null;
+    if (!state.processingSound || !liveTurnInFlight) return;
+    processingCueTimer = setTimeout(() => {
+      processingCueTimer = null;
+      if (!state.processingSound || !liveTurnInFlight) return;
+      playNotificationTone("processing");
+      scheduleProcessingCue(8000);
+    }, delay);
   }
   // Unlock on the first user gesture anywhere in the webview (typing/clicking to
   // send qualifies), so the first completion beep isn't blocked by autoplay.
@@ -570,6 +804,14 @@
 
   newBtn.innerHTML = ICON.squarePen;
   historyBtn.innerHTML = ICON.clock;
+  // "Continue remotely", one tap from the chat instead of buried in the gear
+  // menu — the desk is where someone decides to get up and keep going on
+  // their phone. Local client only (a remote is already remote), and only
+  // once this machine is linked; syncRemoteButton flips it live.
+  if (remoteBtn) {
+    remoteBtn.innerHTML = ICON.smartphone;
+    remoteBtn.onclick = () => vscode.postMessage({ type: "openRemotePortal", withHint: true });
+  }
   updateSendButton(); // spinner by default — session is starting up (busy+locked)
   gearBtn.innerHTML = ICON.gear;
   addBtn.innerHTML = ICON.plus;
@@ -579,7 +821,7 @@
 
   // ---------- markdown ----------
 
-  const { looksLikeFileRef, formatRelativeTime, modelDisplayName, nextMicState, trailingSendPhrase, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, spokenTextFromMarkdown } = globalThis.GrokWebviewHelpers;
+  const { looksLikeFileRef, formatRelativeTime, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, spokenTextFromMarkdown, isRelaySendRejection } = globalThis.GrokWebviewHelpers;
 
   function escapeAttr(s) {
     return String(s == null ? "" : s)
@@ -1531,6 +1773,92 @@
     });
   }
 
+  function showRemoteExplainer() {
+    const overlay = document.createElement("div");
+    overlay.className = "confirm-overlay remote-explainer-overlay";
+    const panel = document.createElement("div");
+    panel.className = "confirm-panel remote-explainer-panel";
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "remote-explainer-close";
+    closeBtn.innerHTML = ICON.x;
+    closeBtn.title = "Close";
+    closeBtn.setAttribute("aria-label", "Close");
+
+    const title = document.createElement("div");
+    title.className = "confirm-title";
+    title.textContent = "How AFK Pilot works";
+
+    const body = document.createElement("div");
+    body.className = "confirm-body remote-explainer-body";
+    const steps = document.createElement("ol");
+    const step1 = document.createElement("li");
+    step1.textContent = "Link this device. Sign in with your account.";
+    const step2 = document.createElement("li");
+    step2.textContent = "Keep VS Code, Cursor, or Antigravity open.";
+    const step3 = document.createElement("li");
+    step3.append("Open ");
+    const urlBtn = document.createElement("button");
+    urlBtn.type = "button";
+    urlBtn.className = "remote-url-copy";
+    urlBtn.textContent = "afkpilot.com";
+    urlBtn.title = "Copy afkpilot.com";
+    const copied = document.createElement("span");
+    copied.className = "remote-url-copied";
+    copied.setAttribute("aria-live", "polite");
+    step3.append(urlBtn, copied, " on your phone and sign in.");
+    steps.append(step1, step2, step3);
+
+    const note = document.createElement("p");
+    note.textContent = "You can then work 100% remotely — it keeps this device awake, and never stores your prompts or code.";
+    body.append(steps, note);
+
+    const actions = document.createElement("div");
+    actions.className = "confirm-actions";
+    const moreBtn = document.createElement("button");
+    moreBtn.type = "button";
+    moreBtn.className = "confirm-btn confirm-primary";
+    moreBtn.textContent = "More & FAQ";
+    actions.appendChild(moreBtn);
+
+    const done = () => {
+      document.removeEventListener("keydown", onKey, true);
+      overlay.remove();
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        done();
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    closeBtn.onclick = (e) => { e.stopPropagation(); done(); };
+    overlay.onclick = (e) => {
+      if (e.target === overlay) {
+        e.stopPropagation();
+        done();
+      }
+    };
+    urlBtn.onclick = (e) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText("https://afkpilot.com").then(() => {
+        copied.textContent = "Copied";
+        urlBtn.classList.add("copied");
+      }).catch(() => {});
+    };
+    moreBtn.onclick = (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: "openRemotePortal" });
+      done();
+    };
+
+    panel.append(closeBtn, title, body, actions);
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+    moreBtn.focus();
+  }
+
   function renderGearMain() {
     state.gearView = "main";
     gearPopover.innerHTML = "";
@@ -1604,21 +1932,25 @@
     // The hosted relay account, on the machine that links itself — above
     // Session on purpose (it's about reaching this machine at all). Hidden in
     // the browser client: a remote can't (un)link the desktop it's driving.
-    if (!IS_REMOTE) {
+    // `remoteLinked === null` = the host hasn't answered yet: show NOTHING
+    // rather than guessing. Guessing "not linked" is the harmful direction —
+    // it offers to link a machine that may already be linked and working.
+    if (!IS_REMOTE && state.remoteLinked !== null) {
       addSection("Remote Control");
       if (state.remoteLinked) {
+        addGearItem(`<span class="gear-lead">${ICON.smartphone}<span>Continue remotely</span></span>`, () => {
+          vscode.postMessage({ type: "openRemotePortal", withHint: true });
+          closePopovers();
+        });
+        // Deliberately NOT a one-tap unlink any more: signing out from a menu
+        // item next to "Continue remotely" made an irreversible action (every
+        // other device loses this machine) a slip away. The portal owns
+        // account + device management — it can show what's linked before
+        // anything is removed. `AFK Pilot: Unlink this device` still exists in
+        // the Command Palette for the deliberate case.
         addGearItem(`<span class="gear-lead">${ICON.user}<span>Your account</span></span>`, () => {
           vscode.postMessage({ type: "openRemotePortal" });
           closePopovers();
-        });
-        addGearItem(`<span class="gear-lead">${ICON.logOut}<span>Sign out (unlink this device)</span></span>`, () => {
-          closePopovers();
-          uiConfirm({
-            title: "Sign out and unlink this device?",
-            body: "This machine will no longer be reachable from your other devices. To use it again, link it from VS Code again.",
-            confirmLabel: "Sign out",
-            danger: true,
-          }).then((ok) => { if (ok) vscode.postMessage({ type: "remoteSignOut" }); });
         });
       } else {
         addGearItem(`<span class="gear-lead">${ICON.user}<span>Sign in (link this device)</span></span>`, () => {
@@ -1626,8 +1958,8 @@
           closePopovers();
         });
         addGearItem(`<span class="gear-lead">${ICON.info}<span>How it works</span></span>`, () => {
-          vscode.postMessage({ type: "openRemotePortal" });
           closePopovers();
+          showRemoteExplainer();
         });
       }
     }
@@ -1868,6 +2200,21 @@
         renderConfigDebugPanel();
       },
     );
+    addGearItem(
+      `<span title="Play a quiet reminder while Grok is still working. Starts after seven seconds and repeats every eight seconds until the turn ends.">Still-processing sound</span><span class="popover-switch${state.processingSound ? " on" : ""}" role="switch" aria-checked="${state.processingSound}"><span class="popover-switch-knob"></span></span>`,
+      () => {
+        state.processingSound = !state.processingSound;
+        vscode.postMessage({ type: "setProcessingSound", value: state.processingSound });
+        if (state.processingSound) {
+          unlockAudio();
+          if (liveTurnInFlight) scheduleProcessingCue();
+        } else {
+          if (processingCueTimer != null) clearTimeout(processingCueTimer);
+          processingCueTimer = null;
+        }
+        renderConfigDebugPanel();
+      },
+    );
     if (ttsAvailable) {
       const enabled = IS_REMOTE ? state.remoteTts : state.readRepliesAloud;
       addGearItem(
@@ -1878,11 +2225,41 @@
           } else {
             state.readRepliesAloud = !state.readRepliesAloud;
             vscode.postMessage({ type: "setReadRepliesAloud", value: state.readRepliesAloud });
-            if (!state.readRepliesAloud && window.speechSynthesis) window.speechSynthesis.cancel();
+            if (!state.readRepliesAloud) {
+              cancelPendingSpeech();
+              if (state.summarizeRepliesAloud) {
+                state.summarizeRepliesAloud = false;
+                vscode.postMessage({ type: "setSummarizeRepliesAloud", value: false });
+              }
+            }
           }
           renderConfigDebugPanel();
         },
       );
+      if (!IS_REMOTE) {
+        const summarizeEnabled = state.readRepliesAloud;
+        const summarizeRow = document.createElement("div");
+        summarizeRow.className = "toolbar-popover-item" +
+          (summarizeEnabled ? "" : " popover-action disabled");
+        summarizeRow.innerHTML =
+          `<span title="Use xAI to make each spoken message brief and speech-friendly before reading it. Adds a billed API call and network delay; falls back to the full text on any failure.">Summarize before speaking</span><span class="popover-switch${state.summarizeRepliesAloud ? " on" : ""}" role="switch" aria-checked="${state.summarizeRepliesAloud}"><span class="popover-switch-knob"></span></span>`;
+        if (summarizeEnabled) {
+          summarizeRow.onclick = (e) => {
+            e.stopPropagation();
+            state.summarizeRepliesAloud = !state.summarizeRepliesAloud;
+            speechRequestId += 1;
+            vscode.postMessage({
+              type: "setSummarizeRepliesAloud",
+              value: state.summarizeRepliesAloud,
+            });
+            renderConfigDebugPanel();
+          };
+        } else {
+          summarizeRow.setAttribute("aria-disabled", "true");
+          summarizeRow.title = "Turn on Read replies aloud to summarize spoken replies";
+        }
+        gearPopover.appendChild(summarizeRow);
+      }
     } else {
       addGearInfo("<span>Read replies aloud</span><span class=\"popover-ver\">Not supported</span>");
     }
@@ -2076,8 +2453,8 @@
   const DOT_LABEL = {
     working: "Working",
     "needs-you": "Needs you",
-    unread: "Finished — unopened",
-    error: "Finished with an error — unopened",
+    unread: "Finished while no view was watching",
+    error: "Errored while no view was watching",
   };
 
   function applySessionDot(dot, value) {
@@ -2166,6 +2543,7 @@
       main.onclick = (e) => {
         e.stopPropagation();
         if (!repo.available) return;
+        saveRememberedRemoteSession(null);
         vscode.postMessage({ type: "selectRepo", cwd: repo.cwd });
         closePopovers();
       };
@@ -2458,6 +2836,11 @@
   }
 
   function resetForNewSession() {
+    stopProcessingCue();
+    cancelPendingSpeech();
+    // The transcript is about to be emptied wholesale; drop the reference so a
+    // later echo can't try to remove a node from the previous session.
+    state.optimisticSendEl = null;
     state.isWorktree = false; // re-set by the incoming session's `session` message
     // The caret belongs in the box after any session swap — new session, a
     // history-row re-focus, a disk restore (all funnel through here via the
@@ -2524,6 +2907,12 @@
     // snapshot, so its queued messages reappear when you swap back.
     state.sendQueue = [];
     state.queuedWrapEl = null;
+    state.queuedSubmissionPending = false;
+    state.queuedSubmissionRejected = false;
+    state.pendingSubmissionText = "";
+    state.pendingSubmissionId = null;
+    state.pendingSubmissionChipIds = [];
+    state.rejectedSubmissionText = "";
     updateSendButton();
   }
 
@@ -2687,7 +3076,12 @@
       }
       const ts = document.createElement("span");
       ts.className = "msg-timestamp";
-      ts.textContent = formatTime(Date.now());
+      const replayTimestamp = opts && opts.timestampMs;
+      ts.textContent = state.replaying
+        ? (typeof replayTimestamp === "number" && Number.isFinite(replayTimestamp)
+          ? formatTime(replayTimestamp)
+          : "")
+        : formatTime(Date.now());
       actions.appendChild(ts);
       el.appendChild(actions);
       if (role === "agent") {
@@ -2769,12 +3163,17 @@
   // signal: promptComplete/agentEnd/agentError live, the next user message or
   // replay end on restore. Stamps the time at reveal so it reads as the
   // turn's END time, not the moment the last segment happened to start.
-  function revealTurnFooter() {
+  function revealTurnFooter(timestampMs) {
     const a = state.turnAgentActionsEl;
     if (!a || !a.hidden) return;
     a.hidden = false;
     const ts = a.querySelector(".msg-timestamp");
-    if (ts && !state.replaying) ts.textContent = formatTime(Date.now());
+    if (!ts) return;
+    if (!state.replaying) {
+      ts.textContent = formatTime(Date.now());
+    } else if (typeof timestampMs === "number" && Number.isFinite(timestampMs)) {
+      ts.textContent = formatTime(timestampMs);
+    }
   }
 
   const TOOL_VERB = {
@@ -4389,17 +4788,42 @@
     });
   }
 
-  function speakCompletedTurn() {
+  function cancelPendingSpeech() {
+    speechRequestId += 1;
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+  }
+
+  function requestSpeech(markdownText) {
     const enabled = IS_REMOTE ? state.remoteTts : state.readRepliesAloud;
-    if (!enabled || !ttsAvailable || !state.ttsTurnText) {
-      state.ttsTurnText = "";
+    if (!enabled || !ttsAvailable || state.replaying) return;
+    const text = spokenTextFromMarkdown(markdownText);
+    if (!text) return;
+    const requestId = ++speechRequestId;
+    window.speechSynthesis.cancel();
+    if (!IS_REMOTE && state.summarizeRepliesAloud) {
+      vscode.postMessage({ type: "summarizeSpeech", requestId, text });
       return;
     }
-    const text = spokenTextFromMarkdown(state.ttsTurnText);
-    state.ttsTurnText = "";
-    if (!text) return;
-    window.speechSynthesis.cancel();
     window.speechSynthesis.speak(new window.SpeechSynthesisUtterance(text));
+  }
+
+  function speakCompletedTurn() {
+    const text = state.ttsTurnText;
+    state.ttsTurnText = "";
+    // The agent copy affordance identifies the newest narration segment for the
+    // current turn. Use that same pointer so neither plain nor summarized speech
+    // can target an older rendered message.
+    const agentActions = messagesEl.querySelectorAll(".msg.agent .msg-actions");
+    if (
+      !state.turnAgentActionsEl ||
+      agentActions[agentActions.length - 1] !== state.turnAgentActionsEl
+    ) return;
+    requestSpeech(text);
+  }
+
+  function speakWaitingPrompt(markdownText) {
+    state.ttsTurnText = "";
+    requestSpeech(markdownText);
   }
 
   // Finalize the current agent turn (flush buffers, stamp the "Thought for Ns"
@@ -4432,7 +4856,7 @@
 
   // Replayed user prompts (session/load) arrive as user_message_chunk updates.
   // Commit any in-flight agent turn first, then accumulate into one user bubble.
-  function appendUserChunk(text) {
+  function appendUserChunk(text, timestampMs) {
     // Replay-only: live user bubbles come from the optimistic `userMessage`
     // post. grok ≥0.2.33 echoes the live prompt back as a user_message_chunk;
     // the host already drops those, but guard here too so a stray live echo
@@ -4484,7 +4908,7 @@
         }
       }
       state.userMsgCount += 1;
-      state.activeUserEl = addMessage("user", "");
+      state.activeUserEl = addMessage("user", "", undefined, { timestampMs });
       state.activeUserRaw = "";
     }
     if (state.skipUserBubble) return; // marker-only verdict: no user bubble
@@ -4805,6 +5229,69 @@
     el.appendChild(line);
   }
 
+  function renderPermissionActions(el, requestId, cardTitle, rawOptions) {
+    const oldActions = el.querySelector(".card-actions");
+    if (oldActions) oldActions.remove();
+    el._permOptions = rawOptions || [];
+    const actions = document.createElement("div");
+    actions.className = "card-actions";
+    // Approve first, reject last — the CLI's own order isn't guaranteed, and the
+    // keyboard default below must never land on a reject (#68).
+    const options = orderPermissionOptions(rawOptions);
+    const defaultIndex = defaultPermissionIndex(options);
+    const buttons = [];
+    options.forEach((opt, i) => {
+      const btn = document.createElement("button");
+      btn.textContent = opt.name;
+      btn.type = "button";
+      if (opt.kind === "allow_once") btn.classList.add("primary");
+      if (opt.kind === "reject_once") {
+        btn.classList.add("danger");
+        // A permission arrival force-scrolls the transcript. Ignore pointer
+        // targeting during that layout transition so a click intended for the
+        // adjacent Thinking disclosure cannot land on Reject (#76).
+        if (state.showThinking) {
+          btn.classList.add("arming");
+          setTimeout(() => btn.classList.remove("arming"), 1000);
+        }
+      }
+      // Only the default button is in the tab order; the arrow keys move within
+      // the group. Standard toolbar/radiogroup roving-tabindex, so Tab escapes
+      // the card in one press instead of walking every option.
+      btn.tabIndex = i === (defaultIndex >= 0 ? defaultIndex : 0) ? 0 : -1;
+      btn.onclick = () => {
+        vscode.postMessage({
+          type: "permissionAnswer",
+          requestId,
+          optionId: opt.optionId,
+        });
+        // Collapse to one muted line and show the working indicator — grok
+        // resumes the turn after the answer.
+        collapsePermissionCard(el, opt.kind, cardTitle);
+        showGrokking();
+        // Return the caret to the composer so the next message can be typed
+        // immediately — answering must not orphan focus on the collapsed card
+        // (#68). Composer, not the editor: the webview iframe can only move
+        // focus within itself, and the composer is where you continue anyway.
+        input.focus();
+      };
+      buttons.push(btn);
+      actions.appendChild(btn);
+    });
+    wirePermissionKeys(actions, buttons);
+    el.appendChild(actions);
+    return { buttons, defaultIndex };
+  }
+
+  function updatePermissionOptions(requestId, options) {
+    const cards = [...messagesEl.querySelectorAll(".card.permission")];
+    const el = cards.find((card) =>
+      card.dataset.permReqId === String(requestId) &&
+      !card.classList.contains("perm-resolved")
+    );
+    if (el) renderPermissionActions(el, requestId, el._permTitle, options);
+  }
+
   function addPermissionCard(req) {
     clearWelcome();
     hideGrokking();
@@ -4820,7 +5307,6 @@
     // mutation that isn't in the session buffer, so without this an already-answered
     // card replays as active on every re-focus.
     el.dataset.permReqId = String(req.id);
-    el._permOptions = req.options || [];
     el._permTitle = cardTitle;
     const title = document.createElement("div");
     title.className = "card-title";
@@ -4852,44 +5338,8 @@
       if (!IS_REMOTE) openDiff();
     }
 
-    const actions = document.createElement("div");
-    actions.className = "card-actions";
-    // Approve first, reject last — the CLI's own order isn't guaranteed, and the
-    // keyboard default below must never land on a reject (#68).
-    const options = orderPermissionOptions(req.options);
-    const defaultIndex = defaultPermissionIndex(options);
-    const buttons = [];
-    options.forEach((opt, i) => {
-      const btn = document.createElement("button");
-      btn.textContent = opt.name;
-      btn.type = "button";
-      if (opt.kind === "allow_once") btn.classList.add("primary");
-      if (opt.kind === "reject_once") btn.classList.add("danger");
-      // Only the default button is in the tab order; the arrow keys move within
-      // the group. Standard toolbar/radiogroup roving-tabindex, so Tab escapes
-      // the card in one press instead of walking every option.
-      btn.tabIndex = i === (defaultIndex >= 0 ? defaultIndex : 0) ? 0 : -1;
-      btn.onclick = () => {
-        vscode.postMessage({
-          type: "permissionAnswer",
-          requestId: req.id,
-          optionId: opt.optionId,
-        });
-        // Collapse to one muted line and show the working indicator — grok
-        // resumes the turn after the answer.
-        collapsePermissionCard(el, opt.kind, cardTitle);
-        showGrokking();
-        // Return the caret to the composer so the next message can be typed
-        // immediately — answering must not orphan focus on the collapsed card
-        // (#68). Composer, not the editor: the webview iframe can only move
-        // focus within itself, and the composer is where you continue anyway.
-        input.focus();
-      };
-      buttons.push(btn);
-      actions.appendChild(btn);
-    });
-    wirePermissionKeys(actions, buttons);
-    el.appendChild(actions);
+    const { buttons, defaultIndex } =
+      renderPermissionActions(el, req.id, cardTitle, req.options);
     messagesEl.appendChild(el);
     forceScrollToBottom(); // a pending permission must be visible (#16)
 
@@ -5008,9 +5458,23 @@
     // selections[i] = array of chosen labels for question i.
     const selections = questions.map(() => []);
     const oneClick = questions.length === 1 && !questions[0].multiSelect;
+    const otherSelected = questions.map(() => false);
+    const otherText = questions.map(() => "");
+    const hasOther = questions.some((q) =>
+      (q.options || []).some((opt) => String(opt.label || "").trim().toLowerCase() === "other"));
+    const effectiveSelections = () => selections.map((picked, qi) => {
+      const custom = otherSelected[qi] ? otherText[qi].trim() : "";
+      return custom ? [...picked, custom] : [...picked];
+    });
 
     let submitBtn;
     let skip;
+    const updateSubmit = () => {
+      if (!submitBtn) return;
+      const built = buildQuestionAnswers(questions, effectiveSelections());
+      const otherComplete = otherSelected.every((selected, qi) => !selected || !!otherText[qi].trim());
+      submitBtn.disabled = !built.allAnswered || !otherComplete;
+    };
     // Collapse the card to its answered/skipped representation: drop the option
     // buttons + Submit + Skip, retitle, and append the chosen answer per block.
     const collapse = (skipped) => {
@@ -5022,11 +5486,12 @@
       [...el.querySelectorAll(".question-block")].forEach((block, qi) => {
         const opts = block.querySelector(".question-options");
         if (opts) opts.remove();
-        block.appendChild(answerLineEl(skipped ? "" : (selections[qi] || []).join(", ")));
+        block.appendChild(answerLineEl(skipped ? "" : (effectiveSelections()[qi] || []).join(", ")));
       });
     };
     const submit = () => {
-      const { answers } = buildQuestionAnswers(questions, selections);
+      const { answers, allAnswered } = buildQuestionAnswers(questions, effectiveSelections());
+      if (!allAnswered || otherSelected.some((selected, qi) => selected && !otherText[qi].trim())) return;
       vscode.postMessage({ type: "questionAnswer", requestId: req.id, answers, annotations: {} });
       collapse(false);
     };
@@ -5042,6 +5507,7 @@
       const opts = document.createElement("div");
       opts.className = "question-options";
       for (const opt of q.options || []) {
+        const isOther = String(opt.label || "").trim().toLowerCase() === "other";
         const btn = document.createElement("button");
         btn.className = "question-option";
         const lbl = document.createElement("span");
@@ -5055,8 +5521,27 @@
           btn.appendChild(desc);
         }
         btn.onclick = () => {
+          if (isOther) {
+            if (q.multiSelect) {
+              otherSelected[qi] = !otherSelected[qi];
+              btn.classList.toggle("selected", otherSelected[qi]);
+            } else {
+              selections[qi] = [];
+              otherSelected[qi] = true;
+              for (const sib of opts.querySelectorAll(".question-option")) sib.classList.remove("selected");
+              btn.classList.add("selected");
+            }
+            const custom = opts.querySelector(".question-other-input");
+            if (custom) {
+              custom.hidden = !otherSelected[qi];
+              if (otherSelected[qi]) custom.focus();
+            }
+            updateSubmit();
+            return;
+          }
           if (oneClick) {
             selections[qi] = [opt.label];
+            otherSelected[qi] = false;
             submit();
             return;
           }
@@ -5066,20 +5551,40 @@
             else { selections[qi].push(opt.label); btn.classList.add("selected"); }
           } else {
             selections[qi] = [opt.label];
+            otherSelected[qi] = false;
             for (const sib of opts.querySelectorAll(".question-option")) sib.classList.remove("selected");
             btn.classList.add("selected");
+            const custom = opts.querySelector(".question-other-input");
+            if (custom) custom.hidden = true;
           }
-          if (submitBtn) {
-            submitBtn.disabled = !buildQuestionAnswers(questions, selections).allAnswered;
-          }
+          updateSubmit();
         };
         opts.appendChild(btn);
+        if (isOther) {
+          const custom = document.createElement("input");
+          custom.type = "text";
+          custom.className = "question-other-input";
+          custom.placeholder = "Type your answer";
+          custom.setAttribute("aria-label", `${questionText(q)} — Other answer`);
+          custom.hidden = true;
+          custom.oninput = () => {
+            otherText[qi] = custom.value;
+            updateSubmit();
+          };
+          custom.onkeydown = (e) => {
+            if (e.key === "Enter" && submitBtn && !submitBtn.disabled) {
+              e.preventDefault();
+              submit();
+            }
+          };
+          opts.appendChild(custom);
+        }
       }
       block.appendChild(opts);
       el.appendChild(block);
     });
 
-    if (!oneClick) {
+    if (!oneClick || hasOther) {
       const actions = document.createElement("div");
       actions.className = "card-actions";
       submitBtn = document.createElement("button");
@@ -5661,6 +6166,49 @@
     return true;
   }
 
+  function syncRemoteButton() {
+    if (remoteBtn) remoteBtn.hidden = IS_REMOTE || !state.remoteLinked;
+  }
+
+  // REMOTE ONLY — paint the user's message the instant they send it.
+  //
+  // A local webview echoes back in microseconds, so waiting for the host's
+  // `userMessage` is invisible. Over a relay on a weak phone connection that
+  // round trip is 1-2s, during which the composer had already cleared and the
+  // message existed nowhere on screen — the send read as lost. This is a
+  // PLACEHOLDER, not a second source of truth: the host's echo is still
+  // authoritative and replaces it (clearOptimisticSend runs first, so the
+  // real bubble carries the true chips, rewind index and counter). If the
+  // relay rejects the send instead, the placeholder is removed and the
+  // existing "Not sent" recovery block takes over.
+  function showOptimisticSend(text, chips) {
+    clearOptimisticSend();
+    if (!text && !(chips && chips.length)) return;
+    // addMessage returns the message BODY; the placeholder we later remove is
+    // its whole bubble.
+    const body = addMessage("user", text, chips || []);
+    state.optimisticSendEl = body && body.closest ? body.closest(".msg") : null;
+    if (state.optimisticSendEl) state.optimisticSendEl.dataset.optimistic = "1";
+    forceScrollToBottom();
+    showGrokking();
+  }
+
+  function clearOptimisticSend() {
+    const el = state.optimisticSendEl;
+    state.optimisticSendEl = null;
+    if (el && el.parentNode) el.remove();
+  }
+
+  function visibleChipIds(chips) {
+    return (chips || []).filter((chip) => !chip.hidden).map((chip) => String(chip.id || ""));
+  }
+
+  function sameChipIds(chips, expectedIds) {
+    const actualIds = visibleChipIds(chips);
+    return actualIds.length === expectedIds.length &&
+      actualIds.every((id, index) => id === expectedIds[index]);
+  }
+
   function sendOrStop() {
     if (state.busy) {
       // Typed text signals send-intent — queue it; text present never cancels.
@@ -5677,6 +6225,8 @@
       if (state.sendQueue.length) {
         input.value = state.sendQueue.join("\n\n");
         state.sendQueue = [];
+        state.queuedSubmissionPending = false;
+        state.queuedSubmissionRejected = false;
         renderQueuedBlocks();
         vscode.postMessage({ type: "clearQueuedSends" });
         renderInputHighlight();
@@ -5700,9 +6250,18 @@
     state.activeThoughtHdrEl = null;
     state.thoughtStartTime = null;
     state.activeToolGroupEl = null;
+    let submissionId;
+    if (IS_REMOTE) {
+      const visibleChips = state.chips.filter((c) => !c.hidden);
+      submissionId = newRemoteTabToken();
+      state.pendingSubmissionText = text;
+      state.pendingSubmissionId = submissionId;
+      state.pendingSubmissionChipIds = visibleChipIds(visibleChips);
+      showOptimisticSend(text, visibleChips);
+    }
     // Chips are host-owned state (every mutation routes through the host and
     // comes back via postChips) — the host snapshots its own copy on send.
-    vscode.postMessage({ type: "send", text });
+    vscode.postMessage({ type: "send", text, ...(submissionId ? { submissionId } : {}) });
     input.value = "";
     renderInputHighlight();
     slashPopover.hidden = true;
@@ -5720,9 +6279,13 @@
     micBtn.classList.toggle("listening", state.mic === "listening");
     micBtn.classList.toggle("transcribing", state.mic === "transcribing");
     micBtn.classList.toggle("connecting", state.mic === "connecting");
-    if (IS_REMOTE && !browserRecognitionCtor()) {
+    if (IS_REMOTE && (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode)) {
       micBtn.innerHTML = ICON.mic;
       micBtn.title = "Dictation is not supported by this browser";
+      micBtn.disabled = true;
+    } else if (IS_REMOTE && state.mic === "listening" && !remoteMic) {
+      micBtn.innerHTML = ICON.micWaves;
+      micBtn.title = "Dictation is active in another tab on this repository";
       micBtn.disabled = true;
     } else if (state.mic === "listening") {
       micBtn.innerHTML = ICON.micWaves;
@@ -5735,6 +6298,10 @@
     } else if (state.mic === "transcribing") {
       micBtn.innerHTML = ICON.spinner;
       micBtn.title = "Transcribing…";
+      micBtn.disabled = true;
+    } else if (IS_REMOTE && !state.voiceConfigured) {
+      micBtn.innerHTML = ICON.mic;
+      micBtn.title = "Voice dictation is unavailable because the host has no Speech-to-Text credential";
       micBtn.disabled = true;
     } else {
       micBtn.innerHTML = ICON.mic;
@@ -5775,61 +6342,188 @@
     // "transcribing": ignore clicks until the transcript or an error arrives.
   }
 
-  let browserRecognition = null;
-  let browserTranscript = "";
+  let remoteMic = null;
+  let remoteMicStart = null;
+  const REMOTE_MIC_PREROLL_MAX_BYTES = 16 * 16000 * 2;
 
-  function browserRecognitionCtor() {
-    return window.SpeechRecognition || window.webkitSpeechRecognition;
+  function browserMicErrorText(error) {
+    const name = error && typeof error.name === "string" ? error.name : "";
+    if (name === "NotAllowedError" || name === "SecurityError") {
+      return "Microphone access was denied. Allow microphone access for this site in your browser settings, then try again.";
+    }
+    if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+      return "No microphone was found on this device.";
+    }
+    if (name === "NotReadableError" || name === "TrackStartError") {
+      return "The microphone is unavailable. Close other apps using it, check your device settings, then try again.";
+    }
+    return "The browser could not start the microphone. Check its microphone permissions and try again.";
+  }
+
+  function pcmBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 8192) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+    }
+    return btoa(binary);
+  }
+
+  function postRemotePcm(buffer) {
+    if (!remoteMic) return;
+    if (!remoteMic.ready) {
+      if (
+        !buffer ||
+        typeof buffer.byteLength !== "number" ||
+        remoteMic.pendingBytes + buffer.byteLength > REMOTE_MIC_PREROLL_MAX_BYTES
+      ) {
+        remoteMic.stopping = true;
+        cleanupRemoteMic();
+        setMic("error");
+        addError("Speech recognition took too long to start. No audio was sent; please try dictating again.");
+        vscode.postMessage({ type: "remoteVoiceStop", cancel: true });
+        return;
+      }
+      remoteMic.pending.push(buffer);
+      remoteMic.pendingBytes += buffer.byteLength;
+      return;
+    }
+    vscode.postMessage({ type: "remoteVoiceChunk", data: pcmBase64(buffer) });
+  }
+
+  function cleanupRemoteMic() {
+    const mic = remoteMic;
+    remoteMic = null;
+    if (!mic) return;
+    clearTimeout(mic.timer);
+    if (mic.flushTimer) clearTimeout(mic.flushTimer);
+    try { mic.source.disconnect(); } catch {}
+    try { mic.node.disconnect(); } catch {}
+    try { mic.silent.disconnect(); } catch {}
+    for (const track of mic.stream.getTracks()) {
+      try { track.stop(); } catch {}
+    }
+    void mic.context.close().catch(() => {});
+  }
+
+  function discardBrowserMicSetup(stream, context) {
+    if (stream) {
+      for (const track of stream.getTracks()) {
+        try { track.stop(); } catch {}
+      }
+    }
+    if (context) {
+      try {
+        const closing = context.close();
+        if (closing && typeof closing.catch === "function") void closing.catch(() => {});
+      } catch {}
+    }
+  }
+
+  async function startBrowserMic() {
+    if (!state.voiceConfigured || remoteMic || remoteMicStart || state.mic !== "idle") return;
+    const attempt = { cancelled: false };
+    remoteMicStart = attempt;
+    state.voiceBase = input.value;
+    setMic("start");
+    let stream;
+    let context;
+    let installed = false;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      if (attempt.cancelled) return;
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+      context = new AudioContextCtor();
+      if (context.state === "suspended") await context.resume();
+      await context.audioWorklet.addModule(versionedSiblingUrl("pcm-worklet.js", CHAT_SCRIPT_URL));
+      if (attempt.cancelled) return;
+      const source = context.createMediaStreamSource(stream);
+      const node = new AudioWorkletNode(context, "grok-pcm-capture", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      const silent = context.createGain();
+      silent.gain.value = 0;
+      node.port.onmessage = (event) => {
+        if (event.data && event.data.type === "flushed") {
+          if (remoteMic?.stopping) finishBrowserMicStop(remoteMic);
+          return;
+        }
+        postRemotePcm(event.data);
+      };
+      source.connect(node);
+      node.connect(silent);
+      silent.connect(context.destination);
+      remoteMic = {
+        stream, context, source, node, silent, ready: false, pending: [], pendingBytes: 0,
+        timer: setTimeout(() => stopBrowserMic(false), 120000),
+      };
+      for (const track of stream.getTracks()) {
+        track.addEventListener?.("ended", () => stopBrowserMic(true), { once: true });
+      }
+      installed = true;
+      vscode.postMessage({ type: "remoteVoiceStart" });
+    } catch (error) {
+      if (installed) cleanupRemoteMic();
+      if (!attempt.cancelled) {
+        addError(browserMicErrorText(error));
+        setMic("error");
+      }
+    } finally {
+      if (remoteMicStart === attempt) remoteMicStart = null;
+      if (!installed) discardBrowserMicSetup(stream, context);
+    }
+  }
+
+  function stopBrowserMic(cancel) {
+    const mic = remoteMic;
+    if (!mic || mic.stopping) return;
+    mic.stopping = true;
+    if (cancel) {
+      cleanupRemoteMic();
+      setMic("error");
+      vscode.postMessage({ type: "remoteVoiceStop", cancel: true });
+      return;
+    }
+    setMic("stop");
+    mic.flushTimer = setTimeout(() => finishBrowserMicStop(mic), 500);
+    try {
+      mic.node.port.postMessage("flush");
+    } catch {
+      finishBrowserMicStop(mic);
+    }
+  }
+
+  function finishBrowserMicStop(mic) {
+    if (remoteMic !== mic) return;
+    if (mic.flushTimer) clearTimeout(mic.flushTimer);
+    cleanupRemoteMic();
+    vscode.postMessage({ type: "remoteVoiceStop" });
   }
 
   function toggleBrowserMic() {
-    const Recognition = browserRecognitionCtor();
-    if (!Recognition) return;
-    if (state.mic === "listening") {
-      if (browserRecognition) browserRecognition.stop();
-      return;
-    }
-    if (state.mic !== "idle") return;
-
-    state.voiceBase = input.value;
-    browserTranscript = "";
-    const recognition = new Recognition();
-    browserRecognition = recognition;
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.onresult = (event) => {
-      let finalText = "";
-      let interimText = "";
-      for (let i = 0; i < event.results.length; i++) {
-        const result = event.results[i];
-        const text = result && result[0] && result[0].transcript ? result[0].transcript : "";
-        if (result.isFinal) finalText += text;
-        else interimText += text;
-      }
-      browserTranscript = finalText;
-      input.value = composeVoiceTail(state.voiceBase, finalText + interimText);
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    };
-    recognition.onerror = () => {
-      browserRecognition = null;
+    if (remoteMic && (state.mic === "listening" || state.mic === "connecting")) {
+      stopBrowserMic(false);
+    } else if (remoteMicStart && state.mic === "connecting") {
+      remoteMicStart.cancelled = true;
       setMic("error");
-    };
-    recognition.onend = () => {
-      browserRecognition = null;
-      if (browserTranscript) input.value = composeVoiceTail(state.voiceBase, browserTranscript);
-      setMic("error");
-      input.focus();
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    };
-    state.mic = "listening";
-    renderMic();
-    try {
-      recognition.start();
-    } catch {
-      browserRecognition = null;
-      setMic("error");
+    } else if (state.mic === "idle") {
+      void startBrowserMic();
     }
   }
+
+  function teardownBrowserMic() {
+    if (!IS_REMOTE || !remoteMic) return;
+    remoteMic.stopping = true;
+    cleanupRemoteMic();
+    vscode.postMessage({ type: "remoteVoiceStop", cancel: true });
+  }
+
+  window.addEventListener("pagehide", teardownBrowserMic);
+  window.addEventListener("beforeunload", teardownBrowserMic);
 
   // Append a transcript to whatever's typed (batch mode — one-shot result).
   function insertTranscript(text) {
@@ -5907,7 +6601,15 @@
     state.activeThoughtHdrEl = null;
     state.thoughtStartTime = null;
     state.activeToolGroupEl = null;
-    vscode.postMessage({ type: "send", text: t });
+    let submissionId;
+    if (IS_REMOTE) {
+      submissionId = newRemoteTabToken();
+      state.pendingSubmissionText = t;
+      state.pendingSubmissionId = submissionId;
+      state.pendingSubmissionChipIds = [];
+      showOptimisticSend(t, []);
+    }
+    vscode.postMessage({ type: "send", text: t, ...(submissionId ? { submissionId } : {}) });
   }
 
   // ---------- queued sends (#37) ----------
@@ -5939,7 +6641,8 @@
     let wrap = state.queuedWrapEl;
     // Defensive join: the host's invariant is a single entry, but render
     // whatever arrives the way the flush would send it.
-    const text = state.sendQueue.join("\n\n");
+    const rejected = !!state.rejectedSubmissionText;
+    const text = rejected ? state.rejectedSubmissionText : state.sendQueue.join("\n\n");
     if (!text) {
       if (wrap) wrap.remove();
       state.queuedWrapEl = null;
@@ -5959,8 +6662,10 @@
     hdr.className = "queued-hdr";
     const tag = document.createElement("span");
     tag.className = "queued-tag";
-    tag.innerHTML = `${ICON.clock}<span>Queued</span>`;
-    tag.title = "Sends when Grok finishes";
+    tag.innerHTML = `${ICON.clock}<span>${state.queuedSubmissionRejected || rejected ? "Not sent" : "Queued"}</span>`;
+    tag.title = state.queuedSubmissionRejected || rejected
+      ? "The relay rejected this prompt. Edit it to retry, or remove it."
+      : "Sends when Grok finishes";
     const actions = document.createElement("span");
     actions.className = "queued-actions";
     const editBtn = document.createElement("button");
@@ -5972,7 +6677,12 @@
     editBtn.onpointerdown = (e) => {
       e.preventDefault();
       e.stopPropagation();
-      vscode.postMessage({ type: "dequeueSend", index: 0 });
+      if (rejected) {
+        state.rejectedSubmissionText = "";
+        renderQueuedBlocks();
+      } else {
+        vscode.postMessage({ type: "dequeueSend", index: 0 });
+      }
       input.value = input.value.trim() ? text + "\n\n" + input.value : text;
       renderInputHighlight();
       input.focus();
@@ -5984,7 +6694,12 @@
     rmBtn.onpointerdown = (e) => {
       e.preventDefault();
       e.stopPropagation();
-      vscode.postMessage({ type: "dequeueSend", index: 0 });
+      if (rejected) {
+        state.rejectedSubmissionText = "";
+        renderQueuedBlocks();
+      } else {
+        vscode.postMessage({ type: "dequeueSend", index: 0 });
+      }
     };
     // Steer (#52): send this into the RUNNING turn instead of waiting for it.
     // Rendered whenever the CLI supports it; `body.turn-busy` (updateSendButton)
@@ -6054,10 +6769,12 @@
         state.extVersion = msg.extVersion || "";
         state.platform = msg.platform || "";
         state.sandboxSupported = state.platform === "darwin";
+        restoreRememberedRemoteSession();
         if (typeof msg.showThinking === "boolean") state.showThinking = msg.showThinking;
         if (typeof msg.expandCommandOutputs === "boolean") state.expandCommandOutputs = msg.expandCommandOutputs;
         if (typeof msg.steerByDefault === "boolean") state.steerByDefault = msg.steerByDefault;
         if (typeof msg.soundNotifications === "boolean") state.soundNotifications = msg.soundNotifications;
+        if (typeof msg.processingSound === "boolean") state.processingSound = msg.processingSound;
         if (typeof msg.readRepliesAloud === "boolean") {
           state.readRepliesAloud = msg.readRepliesAloud;
           if (IS_REMOTE && !state.remotePreferencesSupported) {
@@ -6070,6 +6787,12 @@
         break;
       case "remoteStatus":
         state.remoteLinked = !!msg.linked;
+        syncRemoteButton();
+        // The answer can land while the gear is already open (it usually
+        // arrives within a frame of boot, but a slow secret read is exactly
+        // the case this guards): repaint so the section appears rather than
+        // waiting for the next open.
+        if (!gearPopover.hidden && state.gearView === "main") renderGearMain();
         break;
       case "steerByDefault":
         // Live toggle (grok.steerByDefault). Pure policy for the next send —
@@ -6082,15 +6805,48 @@
         state.soundNotifications = !!msg.value;
         if (state.gearView === "config") renderConfigDebugPanel();
         break;
+      case "processingSound":
+        state.processingSound = !!msg.value;
+        if (state.processingSound && liveTurnInFlight) {
+          scheduleProcessingCue();
+        } else if (!state.processingSound && processingCueTimer != null) {
+          clearTimeout(processingCueTimer);
+          processingCueTimer = null;
+        }
+        if (state.gearView === "config") renderConfigDebugPanel();
+        break;
       case "readRepliesAloud": {
         const wasEnabled = state.readRepliesAloud;
         state.readRepliesAloud = !!msg.value;
-        if (wasEnabled && !state.readRepliesAloud && !IS_REMOTE && window.speechSynthesis) {
-          window.speechSynthesis.cancel();
+        if (!state.readRepliesAloud && !IS_REMOTE) {
+          if (wasEnabled) cancelPendingSpeech();
+          if (state.summarizeRepliesAloud) {
+            state.summarizeRepliesAloud = false;
+            vscode.postMessage({ type: "setSummarizeRepliesAloud", value: false });
+          }
         }
         if (state.gearView === "config") renderConfigDebugPanel();
         break;
       }
+      case "summarizeRepliesAloud":
+        state.summarizeRepliesAloud = !IS_REMOTE && state.readRepliesAloud && !!msg.value;
+        if (!IS_REMOTE && !state.readRepliesAloud && msg.value) {
+          vscode.postMessage({ type: "setSummarizeRepliesAloud", value: false });
+        }
+        speechRequestId += 1;
+        if (state.gearView === "config") renderConfigDebugPanel();
+        break;
+      case "speechSummary":
+        if (
+          !IS_REMOTE &&
+          msg.requestId === speechRequestId &&
+          state.readRepliesAloud &&
+          ttsAvailable &&
+          msg.text
+        ) {
+          window.speechSynthesis.speak(new window.SpeechSynthesisUtterance(msg.text));
+        }
+        break;
       case "showThinking":
         // Live toggle (grok.showThinking). Initial value also arrives via
         // initialState + is baked into the <body class> by the host to avoid a flash.
@@ -6111,6 +6867,9 @@
         // panel taking focus; land the caret in the composer so the user can
         // type a prompt immediately.
         input.focus();
+        break;
+      case "moveComposerCaret":
+        moveComposerCaret(msg.direction);
         break;
       case "uiConfirmRequest":
         // The host asks; the webview owns the dialog. Always answer, including
@@ -6270,12 +7029,19 @@
         // accept the known states; ignore anything unexpected.
         if (msg.status === "listening" || msg.status === "transcribing") {
           state.mic = msg.status;
+          if (IS_REMOTE && msg.status === "listening" && remoteMic && !remoteMic.ready) {
+            remoteMic.ready = true;
+            const pending = remoteMic.pending.splice(0);
+            remoteMic.pendingBytes = 0;
+            for (const buffer of pending) postRemotePcm(buffer);
+          }
           renderMic();
         } else if (msg.status === "idle") {
           // Hard reset — the host stopped voice (e.g. session switch). Clear the
           // live flag and any queued messages too, not just the button.
           state.mic = "idle";
           state.voiceLive = false;
+          if (IS_REMOTE) cleanupRemoteMic();
           renderMic();
         }
         break;
@@ -6287,14 +7053,20 @@
         break;
       case "voicePartial":
         // Live streaming update: replace the tail after the pre-dictation base.
-        state.voiceLive = true;
-        input.value = composeVoiceTail(state.voiceBase, msg.text || "");
-        renderInputHighlight();
+        // Same-repo passive tabs receive the shared partial too, but their
+        // independently typed composer must remain untouched.
+        if (!IS_REMOTE || remoteMic) {
+          state.voiceLive = true;
+          input.value = composeVoiceTail(state.voiceBase, msg.text || "");
+          renderInputHighlight();
+        }
         break;
       case "voiceSubmit": {
-        // Continuous "grok send": submit now (or queue if Grok is mid-response),
-        // clear the composer, and keep the mic listening for the next utterance.
-        const t = (msg.text || "").trim();
+        // The webview is the submission boundary for local and remote voice.
+        // In AFK Pilot this makes the spoken prompt cross the relay as the same
+        // send/queueSend frame as typed input, so relay metering and busy-turn
+        // queueing apply before the host can prompt the agent.
+        const t = composeVoiceTail(state.voiceBase, msg.text || "").trim();
         state.voiceBase = "";
         state.voiceLive = false;
         input.value = "";
@@ -6317,6 +7089,7 @@
           insertTranscript(msg.text);
         }
         state.voiceLive = false;
+        if (IS_REMOTE) cleanupRemoteMic();
         setMic("transcript");
         // "grok send" detected: submit hands-free — but only when idle, so it
         // never doubles as a "stop" on an in-flight turn.
@@ -6325,6 +7098,7 @@
       case "voiceError":
         // Setup/record/transcribe failed (the host already showed the reason).
         state.voiceLive = false;
+        if (IS_REMOTE) cleanupRemoteMic();
         setMic("error");
         break;
       case "chips":
@@ -6352,6 +7126,24 @@
         break;
       }
       case "userMessage":
+        // A co-attached view also receives sends from the other view. Prefer our
+        // submission id; old hosts omit it, so fall back to exact text + chip
+        // identity. agentStart has no ownership signal and must not clear the
+        // recovery copy.
+        if (!IS_REMOTE || (
+          state.pendingSubmissionId &&
+          (msg.submissionId !== undefined
+            ? msg.submissionId === state.pendingSubmissionId
+            : msg.text === state.pendingSubmissionText &&
+              sameChipIds(msg.chips, state.pendingSubmissionChipIds))
+        )) {
+          clearOptimisticSend();
+          state.pendingSubmissionText = "";
+          state.pendingSubmissionId = null;
+          state.pendingSubmissionChipIds = [];
+          state.rejectedSubmissionText = "";
+          renderQueuedBlocks();
+        }
         // Live send (or immediate verdict-feedback bubble): render and bump the
         // counter so any plan history queued for this position drains first.
         drainPlanHistory(state.userMsgCount);
@@ -6378,6 +7170,10 @@
         // session relies on this), agentEnd/agentError clear it.
         state.busy = true;
         state.busyLocked = false;
+        if (!state.replaying) {
+          liveTurnInFlight = true;
+          scheduleProcessingCue();
+        }
         updateSendButton();
         break;
       case "thoughtChunk":
@@ -6390,7 +7186,7 @@
         addGeneratedMedia(msg);
         break;
       case "userMessageChunk":
-        appendUserChunk(msg.text);
+        appendUserChunk(msg.text, msg.timestampMs);
         break;
       case "historyReplay":
         if (msg.active) {
@@ -6425,8 +7221,8 @@
             const dots = el.querySelector(".blink-dots");
             if (dots) dots.remove();
           }
-          // The final replayed turn has no explicit turn-end signal — its
-          // footer becomes final here.
+          // Older CLIs may not replay turn_completed; finalize that last footer
+          // here too. Without agentTimestampMs it deliberately stays blank.
           revealTurnFooter();
         }
         break;
@@ -6547,6 +7343,13 @@
         // tool_call_update lacks, and a completion backstop if the tool
         // channel's update never lands.
         const u = msg.update || {};
+        if (u.sessionUpdate === "turn_completed") {
+          if (state.replaying) {
+            commitAgentTurn();
+            revealTurnFooter(msg.timestampMs);
+          }
+          break;
+        }
         // A restore-built card CAN receive its own lifecycle when grok re-forwards
         // the `_x.ai/session/update` rail on session/load (fills Composer's missing
         // duration + the completion backstop). But a LATER LIVE spawn/finish must
@@ -6606,6 +7409,14 @@
         break;
       case "permissionRequest":
         addPermissionCard(msg.req);
+        if (!state.replaying) {
+          // Tool titles can expose commands or file operations. The accessibility
+          // cue says what the user must do without reading tool details aloud.
+          speakWaitingPrompt("Grok is waiting for your permission. Review the request and choose an option.");
+        }
+        break;
+      case "permissionOptions":
+        updatePermissionOptions(msg.requestId, msg.options);
         break;
       case "permissionResolved": {
         // Replayed (on re-focus) right after the buffered permissionRequest, or
@@ -6633,6 +7444,13 @@
       }
       case "questionRequest":
         addQuestionCard(msg.req);
+        if (!state.replaying) {
+          const questions = (msg.req?.questions || [])
+            .map((question) => questionText(question))
+            .filter(Boolean)
+            .join(" ");
+          speakWaitingPrompt(questions || "Grok is waiting for your answer.");
+        }
         break;
       case "planHistory":
         addPlanHistoryCard(msg.text, msg.verdict, msg.planPath, msg.planName);
@@ -6725,6 +7543,7 @@
         break;
       }
       case "agentReset": {
+        stopProcessingCue();
         hidePlanProcessing(); // turn is being reset, indicator no longer applies
         hideGrokking();
         hideThinkingIndicator();
@@ -6747,6 +7566,7 @@
         break;
       }
       case "agentError":
+        stopProcessingCue();
         hideGrokking(); // turn ended (possibly before any content)
         hideThinkingIndicator();
         hidePlanProcessing();
@@ -6759,6 +7579,7 @@
         state.ttsTurnText = "";
         break;
       case "agentEnd":
+        stopProcessingCue();
         hideGrokking(); // turn ended (defensive — content normally clears it first)
         hideThinkingIndicator();
         // A turn that ends with NO content (grok's [Plan cancelled] ack can be
@@ -6772,6 +7593,7 @@
         speakCompletedTurn();
         break;
       case "exit":
+        stopProcessingCue();
         hideGrokking();
         hidePlanProcessing();
         addError(`Grok exited (code ${msg.code}). Send a message to restart this session, or start a new one.`);
@@ -6783,7 +7605,35 @@
         // Snapshot of the focused session's host-owned send queue — replayed on
         // re-focus like everything else, so queued blocks survive session swaps.
         state.sendQueue = Array.isArray(msg.items) ? msg.items : [];
+        if (!state.sendQueue.length) {
+          state.queuedSubmissionPending = false;
+          state.queuedSubmissionRejected = false;
+        }
         renderQueuedBlocks();
+        break;
+      case "submitQueuedSend":
+        // Remote dequeue boundary: echo the host-owned text through the browser
+        // as the exact ordinary send frame the relay meters. Do not optimistically
+        // enter busy state — an over-quota relay bounces `error` and never
+        // forwards the frame, so the queued block stays pending and usable.
+        if (
+          IS_REMOTE &&
+          typeof msg.id === "string" &&
+          msg.id &&
+          typeof msg.text === "string" &&
+          msg.text.trim() &&
+          !state.submittedQueuedSendIds.has(msg.id)
+        ) {
+          state.submittedQueuedSendIds.add(msg.id);
+          if (state.submittedQueuedSendIds.size > 32) {
+            state.submittedQueuedSendIds.delete(state.submittedQueuedSendIds.values().next().value);
+          }
+          state.queuedSubmissionPending = true;
+          state.queuedSubmissionRejected = false;
+          state.queuedSubmissionId = msg.id;
+          renderQueuedBlocks();
+          vscode.postMessage({ type: "send", text: msg.text.trim(), queuedSendId: msg.id });
+        }
         break;
       case "steerUnavailable":
         // This CLI can't interject (#52). Latch the button off — the queue,
@@ -6849,7 +7699,34 @@
         showOnboarding(msg.state, { platform: msg.platform });
         break;
       case "error":
+        if (state.queuedSubmissionPending && isRelaySendRejection(msg.text)) {
+          state.queuedSubmissionPending = false;
+          state.queuedSubmissionRejected = true;
+          if (state.queuedSubmissionId) state.submittedQueuedSendIds.delete(state.queuedSubmissionId);
+          state.queuedSubmissionId = null;
+          renderQueuedBlocks();
+        } else if (
+          state.pendingSubmissionId &&
+          isRelaySendRejection(msg.text)
+        ) {
+          // Rejected by the relay (quota/rate cap): the message was never
+          // sent, so the optimistic bubble must go — the "Not sent" recovery
+          // block below is the honest representation.
+          clearOptimisticSend();
+          hideGrokking();
+          state.rejectedSubmissionText = state.pendingSubmissionText;
+          state.pendingSubmissionText = "";
+          state.pendingSubmissionId = null;
+          state.pendingSubmissionChipIds = [];
+          state.busy = false;
+          state.busyLocked = false;
+          renderQueuedBlocks();
+          updateSendButton();
+        }
         addError(msg.text);
+        break;
+      case "hostNotice":
+        addPlanNotice(msg.text);
         break;
       case "xaiNotification":
         break;
@@ -6879,7 +7756,18 @@
           state.sessions = entries;
           state.sessionQuery = msg.query || "";
         }
-        if (msg.activeId !== undefined) state.activeSessionId = msg.activeId || null;
+        if (msg.activeId !== undefined) {
+          state.activeSessionId = msg.activeId || null;
+          if (state.activeSessionId) {
+            const activeEntry = entries.find((entry) => entry.id === state.activeSessionId)
+              || state.sessions.find((entry) => entry.id === state.activeSessionId);
+            saveRememberedRemoteSession({
+              id: state.activeSessionId,
+              repoCwd: state.selectedRepoCwd || state.cwd || "",
+              cwd: activeEntry?.cwd || state.activeRepoCwd || state.cwd || "",
+            });
+          } else saveRememberedRemoteSession(null);
+        }
         // Merge (not replace) so dots from earlier pages survive a load-more, which
         // only carries dots for the new page.
         state.dots = Object.assign({}, state.dots, msg.dots || {});
@@ -6939,6 +7827,7 @@
     renderMic();
   }
   newBtn.onclick = () => {
+    saveRememberedRemoteSession(null);
     resetForNewSession();
     vscode.postMessage({ type: "newSession" });
   };
@@ -7145,7 +8034,20 @@
     }
   });
 
-  input.addEventListener("input", () => { updateSlash(); updateMention(); renderInputHighlight(); });
+  input.addEventListener("focus", () => {
+    if (!IS_REMOTE) vscode.postMessage({ type: "composerFocus", focused: true });
+  });
+  input.addEventListener("blur", () => {
+    composerPreferredColumn = null;
+    if (!IS_REMOTE) vscode.postMessage({ type: "composerFocus", focused: false });
+  });
+  input.addEventListener("pointerdown", () => { composerPreferredColumn = null; });
+  input.addEventListener("input", () => {
+    composerPreferredColumn = null;
+    updateSlash();
+    updateMention();
+    renderInputHighlight();
+  });
   input.addEventListener("scroll", () => {
     if (!inputHighlight) return;
     inputHighlight.scrollTop = input.scrollTop;
@@ -7165,6 +8067,7 @@
     // signal; keyCode 229 is the legacy "IME processing" code some engines
     // still report on the confirming keydown itself.
     if (e.isComposing || e.keyCode === 229) return;
+    if (!(e.ctrlKey && String(e.key).toLowerCase() === "p")) composerPreferredColumn = null;
     if (!slashPopover.hidden && state.slashFiltered.length) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -7280,6 +8183,12 @@
   applyChatZoom();
   initMermaid();
   initMathJax();
-  vscode.postMessage({ type: "ready" });
-  reportRemotePreferences();
+  claimRemoteTabIdentity((finalToken) => {
+    resolveRemoteTabTokenReady(finalToken);
+    vscode.postMessage({
+      type: "ready",
+      ...(IS_REMOTE && finalToken ? { tabToken: finalToken } : {}),
+    });
+    reportRemotePreferences();
+  });
 })();

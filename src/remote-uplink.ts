@@ -10,6 +10,7 @@ import {
   buildUplinkUrl,
   helloFrame,
   hostFrame,
+  hostToFrame,
   snapshotFrame,
   parseRelayFrame,
   nextBackoffMs,
@@ -23,9 +24,17 @@ export interface RemoteUplinkOptions {
   token: string;
   deviceName?: string;
   /** Ordered catch-up (already remote-transformed) for a newly-ready browser client. */
-  snapshot: () => HostMsg[];
+  snapshot: (clientId: string) => HostMsg[];
+  /** A browser connection is ready to receive its client-specific snapshot. */
+  onClientReady?: (clientId: string, tabToken?: string) => void;
+  /** A specific browser connection has left the relay. */
+  onClientLeft?: (clientId: string) => void;
+  /** Authoritative surviving-client roster replayed after each uplink connect. */
+  onClientRoster?: (clientIds: string[]) => void;
+  /** The relay authoritatively rejected this device credential (close 4001). */
+  onCredentialRevoked?: () => void;
   /** A browser client's webview->host message (already relayed + parsed). */
-  onClientMessage: (msg: WebviewMsg) => void;
+  onClientMessage: (clientId: string, msg: WebviewMsg) => void;
   log: (line: string) => void;
 }
 
@@ -34,6 +43,8 @@ export class RemoteUplink {
   private backoff = INITIAL_BACKOFF_MS;
   private reconnectTimer?: NodeJS.Timeout;
   private disposed = false;
+  private awaitingRosterCount = false;
+  private reconnectRoster?: { expected: number; clientIds: Set<string> };
 
   constructor(private readonly opts: RemoteUplinkOptions) {}
 
@@ -58,6 +69,16 @@ export class RemoteUplink {
     }
   }
 
+  /** Send one host message only to the named browser clients. */
+  broadcastTo(clientIds: string[], msg: HostMsg): void {
+    if (!clientIds.length || this.ws?.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify(hostToFrame([...new Set(clientIds)], msg)));
+    } catch {
+      /* teardown race; reconnect handles it */
+    }
+  }
+
   dispose(): void {
     this.disposed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -77,6 +98,8 @@ export class RemoteUplink {
     this.ws = ws;
     ws.on("open", () => {
       this.backoff = INITIAL_BACKOFF_MS;
+      this.awaitingRosterCount = true;
+      this.reconnectRoster = undefined;
       this.opts.log(`[remote] uplink connected to ${this.opts.relayUrl}`);
       ws.send(JSON.stringify(helloFrame(this.opts.deviceName)));
     });
@@ -88,16 +111,36 @@ export class RemoteUplink {
           // The relay-side twin of the LAN bridge's ready->snapshot: catch this
           // one browser client up, routed back through the relay by clientId.
           try {
-            ws.send(JSON.stringify(snapshotFrame(frame.clientId, this.opts.snapshot())));
+            this.opts.onClientReady?.(frame.clientId, frame.tabToken);
+            ws.send(JSON.stringify(snapshotFrame(frame.clientId, this.opts.snapshot(frame.clientId))));
           } catch {
             /* teardown race */
           }
+          if (this.reconnectRoster) {
+            this.reconnectRoster.clientIds.add(frame.clientId);
+            this.finishRosterIfComplete();
+          }
           return;
         case "msg":
-          this.opts.onClientMessage(frame.msg);
+          try {
+            this.opts.onClientMessage(frame.clientId, frame.msg);
+          } catch (e) {
+            this.opts.log(`[remote] dropped malformed client message: ${(e as Error)?.message ?? String(e)}`);
+          }
+          return;
+        case "client-left":
+          this.opts.onClientLeft?.(frame.clientId);
+          this.reconnectRoster?.clientIds.delete(frame.clientId);
           return;
         case "clients":
           this.opts.log(`[remote] relay clients: ${frame.count}`);
+          if (this.awaitingRosterCount) {
+            this.awaitingRosterCount = false;
+            this.reconnectRoster = { expected: frame.count, clientIds: new Set() };
+          } else if (this.reconnectRoster) {
+            this.reconnectRoster.expected = frame.count;
+          }
+          this.finishRosterIfComplete();
           return;
       }
     });
@@ -106,7 +149,12 @@ export class RemoteUplink {
       // 4001 = relay rejected the token — retrying with the same token is
       // pointless; the user must re-link. Stop, loudly.
       if (code === 4001) {
-        this.opts.log(`[remote] uplink rejected (bad/expired device token) — run "Grok: Link Remote Device" again`);
+        this.opts.log(`[remote] uplink rejected (revoked device token) — run "AFK Pilot: Link this device" again`);
+        try {
+          this.opts.onCredentialRevoked?.();
+        } catch (e) {
+          this.opts.log(`[remote] failed to handle revoked credential: ${(e as Error)?.message ?? String(e)}`);
+        }
         return;
       }
       this.opts.log(`[remote] uplink disconnected (code ${code}); retrying in ${Math.round(this.backoff / 1000)}s`);
@@ -121,5 +169,12 @@ export class RemoteUplink {
         /* triggers the close handler's retry */
       }
     });
+  }
+
+  private finishRosterIfComplete(): void {
+    const roster = this.reconnectRoster;
+    if (!roster || roster.clientIds.size < roster.expected) return;
+    this.reconnectRoster = undefined;
+    this.opts.onClientRoster?.([...roster.clientIds]);
   }
 }

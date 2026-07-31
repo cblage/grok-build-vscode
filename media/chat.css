@@ -1683,6 +1683,15 @@ textarea#input {
   cursor: pointer;
 }
 .icon-btn svg { width: 16px; height: 16px; }
+/* The author `display: inline-flex` above beats the UA's `[hidden]` rule (same
+   trap as .msg-actions), so a hidden icon button would still paint. */
+.icon-btn[hidden] { display: none; }
+/* "Continue remotely" (local client, linked machines only). Deliberately the
+   one tinted glyph in the top bar: it's an invitation to move to another
+   device, not a peer of the neutral session controls. Uses the theme's own
+   link accent so it stays legible in every VS Code theme. */
+.remote-btn { color: var(--vscode-textLink-foreground, #3794ff); }
+.remote-btn:hover { color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground, #3794ff)); }
 .icon-btn:hover {
   color: var(--vscode-foreground);
   background: var(--vscode-toolbar-hoverBackground);
@@ -2153,6 +2162,7 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
   margin-top: 10px;
   border-top: 1px solid var(--vscode-editorWidget-border);
 }
+.card-actions button.danger.arming { pointer-events: none; }
 .card-actions button:disabled { opacity: 0.4; cursor: default; }
 .card.resolved { opacity: 0.5; border-left-color: var(--vscode-editorWidget-border); }
 
@@ -2244,6 +2254,21 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
 .card button.question-option:disabled { opacity: 0.4; cursor: default; }
 .card .question-option-label { font-weight: 600; }
 .card .question-option-desc { color: var(--vscode-descriptionForeground); font-size: 11px; }
+.card .question-other-input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 2px;
+  padding: 7px 8px;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--vscode-editorWidget-border));
+  border-radius: var(--radius);
+  font: inherit;
+}
+.card .question-other-input:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
 .card button.question-skip {
   align-self: flex-start;
   background: transparent;
@@ -2841,6 +2866,61 @@ mjx-container[display="true"] {
 }
 .confirm-btn.confirm-danger:hover {
   filter: brightness(1.12);
+}
+.remote-explainer-panel {
+  position: relative;
+}
+.remote-explainer-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  cursor: pointer;
+}
+.remote-explainer-close:hover {
+  color: var(--vscode-foreground);
+  background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+}
+.remote-explainer-body ol {
+  margin: 10px 0 0;
+  padding-left: 22px;
+}
+.remote-explainer-body li + li {
+  margin-top: 7px;
+}
+.remote-explainer-body p {
+  margin: 12px 0 0;
+}
+.remote-url-copy {
+  display: inline;
+  padding: 0;
+  border: 0;
+  color: var(--vscode-textLink-foreground);
+  background: transparent;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.remote-url-copy:hover {
+  color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+}
+.remote-url-copy.copied {
+  color: var(--vscode-charts-green, #4ec9b0);
+}
+.remote-url-copied {
+  margin-left: 5px;
+  color: var(--vscode-charts-green, #4ec9b0);
+  font-size: 11px;
 }
 
 /* Touch devices have no hover: keep the history-row actions visible. Besides

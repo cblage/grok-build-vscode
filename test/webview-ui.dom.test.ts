@@ -12,6 +12,18 @@ import { bootWebview, dispatch, click, Posted } from "./webview-harness";
 
 const $ = (doc: Document, id: string) => doc.getElementById(id) as HTMLElement;
 const types = (posted: Posted[]) => posted.map((p) => p.type);
+// Mirrors chat.js's formatTime EXACTLY. That function is not locale-aware — it
+// always emits `h:mm AM/PM` — so building the expectation with
+// toLocaleTimeString made this assertion pass only in 12-hour locales and fail
+// with "8:14 AM" vs "8:14" wherever the runtime resolves to a 24-hour one.
+// Deriving from local time (getHours) is deliberate: it keeps the test
+// timezone-independent, which a literal expected string would not be.
+const clock = (timestampMs: number) => {
+  const d = new Date(timestampMs);
+  const ampm = d.getHours() >= 12 ? "PM" : "AM";
+  const h = d.getHours() % 12 || 12;
+  return `${h}:${String(d.getMinutes()).padStart(2, "0")} ${ampm}`;
+};
 
 describe("history popover (regression: popover that never closed)", () => {
   it("opens on the history button and requests the session list", () => {
@@ -403,8 +415,10 @@ describe("session status dots (Agent Dashboard)", () => {
   });
 
   it("keeps the dot's tooltip in sync with its state", () => {
-    const { doc } = openWithDots({ s1: "working" });
+    const { doc } = openWithDots({ s1: "working", s2: "unread", s3: "error" });
     expect(dotOf(doc, "s1").title).toBe("Working");
+    expect(dotOf(doc, "s2").title).toBe("Finished while no view was watching");
+    expect(dotOf(doc, "s3").title).toBe("Errored while no view was watching");
   });
 });
 
@@ -820,6 +834,139 @@ describe("gear settings lock (model + effort disabled while busy / priming)", ()
 
     expect(($(doc, "gear-popover") as any).hidden).toBe(false); // popover stays open
     expect(modelBtn(doc).disabled).toBe(false); // now unlocked
+  });
+});
+
+describe("gear menu — AFK Pilot onboarding", () => {
+  const gearItem = (doc: Document, label: string) =>
+    [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")].find(
+      (el) => el.textContent?.includes(label),
+    ) as HTMLElement | undefined;
+  const button = (doc: Document, label: string) =>
+    [...doc.querySelectorAll(".confirm-panel button")].find(
+      (el) => el.textContent?.trim() === label,
+    ) as HTMLButtonElement | undefined;
+
+  it("offers linked devices an immediate hinted Continue remotely action with a phone icon", () => {
+    const { window, posted, doc } = bootWebview();
+    dispatch(window, { type: "remoteStatus", linked: true });
+    click(window, $(doc, "gear-btn"));
+
+    const item = gearItem(doc, "Continue remotely");
+    expect(item).toBeTruthy();
+    expect(item!.querySelector("svg rect")).not.toBeNull();
+
+    click(window, item!);
+    expect(posted).toContainEqual({ type: "openRemotePortal", withHint: true });
+    expect(($(doc, "gear-popover") as HTMLElement).hidden).toBe(true);
+  });
+
+  it("offers no link/account action until the host has answered with the link status", () => {
+    // The host reads the device token from secret storage asynchronously, so
+    // there is a real window with no answer. Defaulting to "not linked" told
+    // an already-linked machine to "Sign in (link this device)" — the owner
+    // started re-linking a device that was working (2026-07-30). Unknown must
+    // show nothing, and the section must appear when the answer lands, even
+    // while the popover is open.
+    const { window, doc } = bootWebview();
+    click(window, $(doc, "gear-btn"));
+
+    const labels = () => [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
+      .map((el) => el.textContent || "");
+    expect(labels().some((l) => /link this device|Your account|Continue remotely/i.test(l))).toBe(false);
+
+    dispatch(window, { type: "remoteStatus", linked: false });
+    expect(labels().some((l) => /Sign in \(link this device\)/i.test(l))).toBe(true);
+  });
+
+  it("sends linked devices to the portal for account management, never a one-tap unlink", () => {
+    // Unlinking strands every other device the user works from, so it must not
+    // sit one slip away from "Continue remotely" (owner, 2026-07-30). The
+    // portal owns account + device management; `AFK Pilot: Unlink this device`
+    // remains for the deliberate case.
+    const { window, posted, doc } = bootWebview();
+    dispatch(window, { type: "remoteStatus", linked: true });
+    click(window, $(doc, "gear-btn"));
+
+    const labels = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
+      .map((el) => el.textContent || "");
+    expect(labels.some((l) => /unlink this device/i.test(l))).toBe(false);
+
+    const account = gearItem(doc, "Your account");
+    expect(account).toBeTruthy();
+    click(window, account!);
+    expect(posted).toContainEqual({ type: "openRemotePortal" });
+    expect(posted.some((m) => m.type === "remoteSignOut")).toBe(false);
+  });
+
+  it("offers a top-bar Continue remotely button only in a linked local client", () => {
+    // The desk is where someone decides to get up and keep going on a phone —
+    // one tap, not buried in the gear menu. Hidden until this machine links.
+    const { window, posted, doc } = bootWebview();
+    const remoteBtn = $(doc, "remote-btn") as HTMLButtonElement;
+    expect(remoteBtn.hidden).toBe(true);
+
+    dispatch(window, { type: "remoteStatus", linked: true });
+    expect(remoteBtn.hidden).toBe(false);
+
+    click(window, remoteBtn);
+    expect(posted).toContainEqual({ type: "openRemotePortal", withHint: true });
+
+    dispatch(window, { type: "remoteStatus", linked: false });
+    expect(remoteBtn.hidden).toBe(true);
+  });
+
+  it("opens the How it works explainer locally without navigating", () => {
+    const { window, posted, doc } = bootWebview();
+    dispatch(window, { type: "remoteStatus", linked: false });
+    click(window, $(doc, "gear-btn"));
+    click(window, gearItem(doc, "How it works")!);
+
+    expect(posted.filter((msg) => msg.type === "openRemotePortal")).toEqual([]);
+    const panel = doc.querySelector(".remote-explainer-panel");
+    expect(panel).not.toBeNull();
+    expect(panel!.textContent).toContain("Link this device. Sign in with your account.");
+    expect(panel!.textContent).toContain("Keep VS Code, Cursor, or Antigravity open.");
+    expect(panel!.textContent).toContain("Open afkpilot.com on your phone and sign in.");
+    expect(panel!.textContent).toContain(
+      "You can then work 100% remotely — it keeps this device awake, and never stores your prompts or code.",
+    );
+    expect(button(doc, "More & FAQ")).toBeTruthy();
+  });
+
+  it("copies afkpilot.com with success feedback and keeps More & FAQ unhinted", async () => {
+    const copied: string[] = [];
+    const { window, posted, doc } = bootWebview({
+      beforeScripts: (w) => {
+        Object.defineProperty((w as any).navigator, "clipboard", {
+          configurable: true,
+          value: { writeText: async (value: string) => { copied.push(value); } },
+        });
+      },
+    });
+    dispatch(window, { type: "remoteStatus", linked: false }); // an unlinked machine, stated not assumed
+    click(window, $(doc, "gear-btn"));
+    click(window, gearItem(doc, "How it works")!);
+
+    click(window, doc.querySelector(".remote-url-copy")!);
+    await Promise.resolve();
+    expect(copied).toEqual(["https://afkpilot.com"]);
+    expect(doc.querySelector(".remote-url-copied")!.textContent).toBe("Copied");
+
+    click(window, button(doc, "More & FAQ")!);
+    expect(posted).toContainEqual({ type: "openRemotePortal" });
+    expect(doc.querySelector(".remote-explainer-panel")).toBeNull();
+  });
+
+  it("closes the explainer without navigating", () => {
+    const { window, posted, doc } = bootWebview();
+    dispatch(window, { type: "remoteStatus", linked: false }); // an unlinked machine, stated not assumed
+    click(window, $(doc, "gear-btn"));
+    click(window, gearItem(doc, "How it works")!);
+    click(window, doc.querySelector(".remote-explainer-close")!);
+
+    expect(doc.querySelector(".remote-explainer-panel")).toBeNull();
+    expect(posted.filter((msg) => msg.type === "openRemotePortal")).toEqual([]);
   });
 });
 
@@ -1444,6 +1591,159 @@ describe("thinking traces toggle (#26)", () => {
     expect(posted.some((p) => p.type === "setReadRepliesAloud" && p.value === false)).toBe(true);
     expect(cancellations).toBe(2); // once before speaking, once when toggled off
     expect(readAloudToggle().querySelector(".popover-switch.on")).toBeNull();
+  });
+
+  it("keeps summarize visible but inert while local read-aloud is off", () => {
+    class Utterance {
+      constructor(public text: string) {}
+    }
+    const { window, posted, doc } = bootWebview({
+      beforeScripts: (w) => {
+        (w as any).SpeechSynthesisUtterance = Utterance;
+        (w as any).speechSynthesis = { cancel() {}, speak() {} };
+      },
+    });
+    click(window, $(doc, "gear-btn"));
+    const cfg = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")].find(
+      (el) => el.textContent?.includes("Config & debug"),
+    ) as HTMLElement;
+    click(window, cfg);
+    const summarize = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")].find(
+      (el) => el.textContent?.includes("Summarize before speaking"),
+    ) as HTMLElement;
+
+    expect(summarize).toBeTruthy();
+    expect(summarize.classList.contains("disabled")).toBe(true);
+    expect(summarize.getAttribute("aria-disabled")).toBe("true");
+    expect(summarize.title).toContain("Turn on Read replies aloud");
+    expect(summarize.textContent).not.toContain("uses your xAI API key");
+    click(window, summarize);
+    expect(posted.some((p) => p.type === "setSummarizeRepliesAloud")).toBe(false);
+    expect(summarize.querySelector(".popover-switch.on")).toBeNull();
+  });
+
+  it("turning local read-aloud off clears and persists summarize in the open popover", () => {
+    class Utterance {
+      constructor(public text: string) {}
+    }
+    const { window, posted, doc } = bootWebview({
+      beforeScripts: (w) => {
+        (w as any).SpeechSynthesisUtterance = Utterance;
+        (w as any).speechSynthesis = { cancel() {}, speak() {} };
+      },
+    });
+    dispatch(window, { type: "readRepliesAloud", value: true });
+    dispatch(window, { type: "summarizeRepliesAloud", value: true });
+    posted.length = 0;
+    click(window, $(doc, "gear-btn"));
+    const cfg = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")].find(
+      (el) => el.textContent?.includes("Config & debug"),
+    ) as HTMLElement;
+    click(window, cfg);
+    const gearToggle = (label: string) => [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")].find(
+      (el) => el.textContent?.includes(label),
+    ) as HTMLElement;
+
+    expect(gearToggle("Summarize before speaking").querySelector(".popover-switch.on")).not.toBeNull();
+    click(window, gearToggle("Read replies aloud"));
+
+    expect(posted).toContainEqual({ type: "setReadRepliesAloud", value: false });
+    expect(posted).toContainEqual({ type: "setSummarizeRepliesAloud", value: false });
+    const summarize = gearToggle("Summarize before speaking");
+    expect(summarize.classList.contains("disabled")).toBe(true);
+    expect(summarize.querySelector(".popover-switch.on")).toBeNull();
+  });
+
+  it("summarizes only the spoken text and ignores stale summary results", () => {
+    const spoken: string[] = [];
+    class Utterance {
+      constructor(public text: string) {}
+    }
+    const { window, posted } = bootWebview({
+      beforeScripts: (w) => {
+        (w as any).SpeechSynthesisUtterance = Utterance;
+        (w as any).speechSynthesis = {
+          cancel() {},
+          speak(value: Utterance) { spoken.push(value.text); },
+        };
+      },
+    });
+    dispatch(window, { type: "readRepliesAloud", value: true });
+    dispatch(window, { type: "summarizeRepliesAloud", value: true });
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, { type: "messageChunk", text: "Full reply.\n```ts\nhidden();\n```" });
+    dispatch(window, { type: "agentEnd" });
+
+    const request = posted.find((p) => p.type === "summarizeSpeech") as any;
+    expect(request.text).toBe("Full reply.");
+    expect(spoken).toEqual([]);
+
+    dispatch(window, { type: "questionRequest", req: {
+      id: 7,
+      questions: [{ question: "Which option should I use?", options: [], multiSelect: false }],
+    } });
+    const latest = posted.filter((p) => p.type === "summarizeSpeech").at(-1) as any;
+    dispatch(window, { type: "speechSummary", requestId: request.requestId, text: "Stale." });
+    dispatch(window, { type: "speechSummary", requestId: latest.requestId, text: "Choose an option." });
+    expect(spoken).toEqual(["Choose an option."]);
+  });
+
+  it("speaks live question text and a tool-detail-free permission cue while waiting", () => {
+    const spoken: string[] = [];
+    class Utterance {
+      constructor(public text: string) {}
+    }
+    const { window } = bootWebview({
+      beforeScripts: (w) => {
+        (w as any).SpeechSynthesisUtterance = Utterance;
+        (w as any).speechSynthesis = {
+          cancel() {},
+          speak(value: Utterance) { spoken.push(value.text); },
+        };
+      },
+    });
+    dispatch(window, { type: "readRepliesAloud", value: true });
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, { type: "messageChunk", text: "I need your input." });
+    dispatch(window, { type: "questionRequest", req: {
+      id: 8,
+      questions: [{ question: "Which database should I use?", options: [], multiSelect: false }],
+    } });
+    dispatch(window, { type: "agentEnd" });
+    dispatch(window, { type: "permissionRequest", req: {
+      id: 9,
+      toolCall: { toolCallId: "secret", kind: "execute", title: "Delete private-file.txt" },
+      options: [{ optionId: "allow", kind: "allow_once", name: "Allow once" }],
+    } });
+
+    expect(spoken).toEqual([
+      "Which database should I use?",
+      "Grok is waiting for your permission. Review the request and choose an option.",
+    ]);
+    expect(spoken.join(" ")).not.toContain("private-file.txt");
+  });
+
+  it("never speaks a completed local reply inside a history replay bracket", () => {
+    const spoken: string[] = [];
+    class Utterance {
+      constructor(public text: string) {}
+    }
+    const { window } = bootWebview({
+      beforeScripts: (w) => {
+        (w as any).SpeechSynthesisUtterance = Utterance;
+        (w as any).speechSynthesis = {
+          cancel() {},
+          speak(value: Utterance) { spoken.push(value.text); },
+        };
+      },
+    });
+    dispatch(window, { type: "readRepliesAloud", value: true });
+    dispatch(window, { type: "historyReplay", active: true });
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, { type: "messageChunk", text: "Already heard." });
+    dispatch(window, { type: "agentEnd" });
+    dispatch(window, { type: "historyReplay", active: false });
+    expect(spoken).toEqual([]);
   });
 });
 
@@ -2140,6 +2440,51 @@ describe("agent message footer (copy + timestamp) — one per turn", () => {
 
     expect(doc.querySelectorAll(".msg.agent .msg-actions")).toHaveLength(2);
   });
+
+  it("uses original user and turn-end times during history replay", () => {
+    const { window, doc } = bootWebview();
+    const userAt = Date.UTC(2026, 6, 30, 6, 14);
+    const agentAt = Date.UTC(2026, 6, 30, 6, 19);
+
+    dispatch(window, { type: "historyReplay", active: true });
+    dispatch(window, { type: "userMessageChunk", text: "yesterday's question", timestampMs: userAt });
+    dispatch(window, { type: "messageChunk", text: "yesterday's answer" });
+    dispatch(window, {
+      type: "subagentUpdate",
+      update: { sessionUpdate: "turn_completed" },
+      timestampMs: agentAt,
+    });
+    dispatch(window, { type: "historyReplay", active: false });
+
+    expect(doc.querySelector(".msg.user .msg-timestamp")!.textContent).toBe(clock(userAt));
+    expect(doc.querySelector(".msg.agent .msg-timestamp")!.textContent).toBe(clock(agentAt));
+  });
+
+  it("leaves replay timestamps blank when an old CLI sends no timing metadata", () => {
+    const { window, doc } = bootWebview();
+
+    dispatch(window, { type: "historyReplay", active: true });
+    dispatch(window, { type: "userMessageChunk", text: "old question" });
+    dispatch(window, { type: "messageChunk", text: "old answer" });
+    dispatch(window, {
+      type: "subagentUpdate",
+      update: { sessionUpdate: "turn_completed" },
+    });
+    dispatch(window, { type: "historyReplay", active: false });
+
+    expect(doc.querySelector(".msg.user .msg-timestamp")!.textContent).toBe("");
+    expect(doc.querySelector(".msg.agent .msg-timestamp")!.textContent).toBe("");
+  });
+
+  it("continues stamping live messages with the current clock", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "userMessage", text: "live question" });
+    dispatch(window, { type: "messageChunk", text: "live answer" });
+    dispatch(window, { type: "agentEnd" });
+
+    expect(doc.querySelector(".msg.user .msg-timestamp")!.textContent).not.toBe("");
+    expect(doc.querySelector(".msg.agent .msg-timestamp")!.textContent).not.toBe("");
+  });
 });
 
 describe("composer autosize", () => {
@@ -2184,5 +2529,311 @@ describe("welcome screen visibility (logo/byline hides once real content exists)
     dispatch(window, { type: "historyReplay", active: false });
 
     expect(($(doc, "welcome") as any).hidden).toBe(false);
+  });
+});
+describe("remote tab session reconnect", () => {
+  function broadcastChannelFixture() {
+    const channels: Array<{
+      name: string;
+      closed: boolean;
+      onmessage?: (event: { data: unknown }) => void;
+    }> = [];
+    return class FakeBroadcastChannel {
+      closed = false;
+      onmessage?: (event: { data: unknown }) => void;
+
+      constructor(readonly name: string) {
+        channels.push(this);
+      }
+
+      postMessage(data: unknown) {
+        for (const peer of channels) {
+          if (peer !== this && !peer.closed && peer.name === this.name) {
+            setTimeout(() => peer.onmessage?.({ data }), 0);
+          }
+        }
+      }
+
+      close() {
+        this.closed = true;
+      }
+    };
+  }
+
+  it("regenerates copied tab state before a duplicated page identifies or resumes", async () => {
+    const FakeBroadcastChannel = broadcastChannelFixture();
+    const remembered = {
+      id: "copied-session",
+      repoCwd: "/work/repo-b",
+      cwd: "/work/repo-b",
+    };
+    const original = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        (w as any).BroadcastChannel = FakeBroadcastChannel;
+        w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify(remembered));
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const originalToken = original.window.sessionStorage.getItem("grok.remote.tabToken:default");
+    const originalOwner = original.window.sessionStorage.getItem("grok.remote.tabOwner:default");
+
+    const duplicate = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        (w as any).BroadcastChannel = FakeBroadcastChannel;
+        w.sessionStorage.setItem("grok.remote.tabToken:default", originalToken!);
+        w.sessionStorage.setItem("grok.remote.tabOwner:default", originalOwner!);
+        w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify(remembered));
+      },
+    });
+    const tokenReady = (duplicate.window as any).__grokTabTokenReady as Promise<string | undefined>;
+    expect(typeof tokenReady?.then).toBe("function");
+    expect(duplicate.posted.find((message) => message.type === "ready")).toBeUndefined();
+    const settledToken = await tokenReady;
+    await Promise.resolve();
+
+    const duplicateToken = duplicate.window.sessionStorage.getItem("grok.remote.tabToken:default");
+    expect(duplicateToken).not.toBe(originalToken);
+    expect(settledToken).toBe(duplicateToken);
+    expect(duplicate.window.sessionStorage.getItem("grok.remote.tabSession:default")).toBeNull();
+    expect(duplicate.posted.find((message) => message.type === "ready")).toEqual({
+      type: "ready",
+      tabToken: duplicateToken,
+    });
+
+    duplicate.posted.length = 0;
+    dispatch(duplicate.window, { type: "initialState", cwd: "/work/repo-a" });
+    expect(duplicate.posted.filter((message) =>
+      message.type === "selectRepo" || message.type === "resumeSession"
+    )).toEqual([]);
+  });
+
+  it("resolves tab-token readiness promptly when BroadcastChannel is unavailable", async () => {
+    const { window } = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        (w as any).BroadcastChannel = undefined;
+      },
+    });
+    const stored = window.sessionStorage.getItem("grok.remote.tabToken:default");
+
+    await expect((window as any).__grokTabTokenReady).resolves.toBe(stored);
+  });
+
+  it("starts fresh from copied state when BroadcastChannel is unavailable", async () => {
+    const oldToken = "copied-token";
+    const { window } = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        (w as any).BroadcastChannel = undefined;
+        w.sessionStorage.setItem("grok.remote.tabToken:default", oldToken);
+        w.sessionStorage.setItem("grok.remote.tabOwner:default", "other-page");
+        w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify({
+          id: "copied-session",
+          repoCwd: "/work/repo-b",
+        }));
+      },
+    });
+
+    const token = await (window as any).__grokTabTokenReady;
+    expect(token).not.toBe(oldToken);
+    expect(window.sessionStorage.getItem("grok.remote.tabSession:default")).toBeNull();
+  });
+
+  it("starts fresh from copied state when BroadcastChannel construction throws", async () => {
+    const oldToken = "copied-token";
+    const { window } = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        (w as any).BroadcastChannel = class {
+          constructor() { throw new Error("disabled"); }
+        };
+        w.sessionStorage.setItem("grok.remote.tabToken:default", oldToken);
+        w.sessionStorage.setItem("grok.remote.tabOwner:default", "other-page");
+        w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify({
+          id: "copied-session",
+          repoCwd: "/work/repo-b",
+        }));
+      },
+    });
+
+    const token = await (window as any).__grokTabTokenReady;
+    expect(token).not.toBe(oldToken);
+    expect(window.sessionStorage.getItem("grok.remote.tabSession:default")).toBeNull();
+  });
+
+  it("retains identity and conversation when a stale owner marker has no live channel participant", async () => {
+    const oldToken = "discarded-tab-token";
+    const remembered = {
+      id: "discarded-session",
+      repoCwd: "/work/repo-b",
+      cwd: "/work/repo-b",
+    };
+    const { window, posted } = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        (w as any).BroadcastChannel = class {
+          onmessage?: (event: { data: unknown }) => void;
+          postMessage() {}
+          close() {}
+        };
+        w.sessionStorage.setItem("grok.remote.tabToken:default", oldToken);
+        w.sessionStorage.setItem("grok.remote.tabOwner:default", "dead-renderer");
+        w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify(remembered));
+      },
+    });
+
+    await expect((window as any).__grokTabTokenReady).resolves.toBe(oldToken);
+    expect(window.sessionStorage.getItem("grok.remote.tabToken:default")).toBe(oldToken);
+    expect(window.sessionStorage.getItem("grok.remote.tabSession:default")).toBe(JSON.stringify(remembered));
+
+    dispatch(window, { type: "initialState", cwd: "/work/repo-a" });
+    expect(posted).toContainEqual({ type: "selectRepo", cwd: "/work/repo-b" });
+    expect(posted).toContainEqual({
+      type: "resumeSession",
+      id: "discarded-session",
+      cwd: "/work/repo-b",
+    });
+  });
+
+  it("keeps tab identity and remembered conversation across an ordinary reload", async () => {
+    const FakeBroadcastChannel = broadcastChannelFixture();
+    const remembered = {
+      id: "reload-session",
+      repoCwd: "/work/repo-b",
+      cwd: "/work/repo-b",
+    };
+    const priorPage = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        (w as any).BroadcastChannel = FakeBroadcastChannel;
+        w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify(remembered));
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const token = priorPage.window.sessionStorage.getItem("grok.remote.tabToken:default");
+    priorPage.window.dispatchEvent(new priorPage.window.Event("pagehide"));
+
+    const reloaded = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        (w as any).BroadcastChannel = FakeBroadcastChannel;
+        w.sessionStorage.setItem("grok.remote.tabToken:default", token!);
+        w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify(remembered));
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(reloaded.window.sessionStorage.getItem("grok.remote.tabToken:default")).toBe(token);
+    dispatch(reloaded.window, { type: "initialState", cwd: "/work/repo-a" });
+    expect(reloaded.posted).toContainEqual({ type: "selectRepo", cwd: "/work/repo-b" });
+    expect(reloaded.posted).toContainEqual({
+      type: "resumeSession",
+      id: "reload-session",
+      cwd: "/work/repo-b",
+    });
+  });
+
+  it("reasserts the tab's remembered repository and session on a fresh host snapshot", () => {
+    const remembered = {
+      id: "session-tab-a",
+      repoCwd: "/work/repo-b",
+      cwd: "/work/repo-b",
+    };
+    const { window, posted } = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify(remembered));
+      },
+    });
+
+    dispatch(window, { type: "initialState", cwd: "/work/repo-a" });
+
+    expect(posted).toEqual([
+      { type: "selectRepo", cwd: "/work/repo-b" },
+      { type: "resumeSession", id: "session-tab-a", cwd: "/work/repo-b" },
+    ]);
+  });
+
+  it("stores the active session in tab-scoped storage and clears it only on explicit New", () => {
+    const { window, doc } = bootWebview({ remote: true });
+    dispatch(window, {
+      type: "repos",
+      entries: [{ cwd: "/work/repo-b", label: "repo-b", available: true }],
+      selectedCwd: "/work/repo-b",
+      activeCwd: "/work/repo-b",
+    });
+    dispatch(window, {
+      type: "sessions",
+      entries: [{ id: "session-tab-b", cwd: "/work/repo-b" }],
+      activeId: "session-tab-b",
+    });
+
+    expect(JSON.parse(window.sessionStorage.getItem("grok.remote.tabSession:default")!)).toEqual({
+      id: "session-tab-b",
+      repoCwd: "/work/repo-b",
+      cwd: "/work/repo-b",
+    });
+
+    click(window, $(doc, "new-btn"));
+    expect(window.sessionStorage.getItem("grok.remote.tabSession:default")).toBeNull();
+  });
+
+  it("does not replace reconnect identity until the host accepts a history selection", () => {
+    const { window, posted, doc } = bootWebview({ remote: true });
+    dispatch(window, {
+      type: "repos",
+      entries: [{ cwd: "/work/repo-b", label: "repo-b", available: true }],
+      selectedCwd: "/work/repo-b",
+      activeCwd: "/work/repo-b",
+    });
+    dispatch(window, {
+      type: "sessions",
+      entries: [
+        { id: "current", cwd: "/work/repo-b", displayName: "Current" },
+        { id: "rejected", cwd: "/work/repo-b", displayName: "Rejected" },
+      ],
+      activeId: "current",
+    });
+    click(window, $(doc, "history-btn"));
+    posted.length = 0;
+
+    const rejected = [...doc.querySelectorAll(".history-row")]
+      .find((row) => row.textContent?.includes("Rejected")) as HTMLElement;
+    click(window, rejected);
+
+    expect(posted).toContainEqual({
+      type: "resumeSession",
+      id: "rejected",
+      cwd: "/work/repo-b",
+    });
+    expect(JSON.parse(window.sessionStorage.getItem("grok.remote.tabSession:default")!))
+      .toMatchObject({ id: "current", repoCwd: "/work/repo-b" });
+
+    dispatch(window, {
+      type: "sessions",
+      entries: [{ id: "current", cwd: "/work/repo-b", displayName: "Current" }],
+      activeId: "current",
+    });
+    expect(JSON.parse(window.sessionStorage.getItem("grok.remote.tabSession:default")!))
+      .toMatchObject({ id: "current", repoCwd: "/work/repo-b" });
+  });
+
+  it("clears a stale reconnect identity when the host authoritatively reports no active session", () => {
+    const { window } = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify({
+          id: "stale",
+          repoCwd: "/work/repo-b",
+          cwd: "/work/repo-b",
+        }));
+      },
+    });
+
+    dispatch(window, { type: "sessions", entries: [], activeId: null });
+
+    expect(window.sessionStorage.getItem("grok.remote.tabSession:default")).toBeNull();
   });
 });
