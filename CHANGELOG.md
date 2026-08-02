@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.3.2-sandbox.1 — 2026-08-02
+## 2.3.2-sandbox.2 — 2026-08-02
 
 ### Added
 
@@ -11,6 +11,10 @@
   - **Session behavior:** the chosen profile is fixed for the life of a conversation and restored when that conversation resumes. Built-in application failures warn and continue like Grok; invalid or unapplied custom profiles refuse to start; and loss of the live delegated-operation sandbox ends the affected session instead of silently weakening it.
   - **Sandbox controls:** supported macOS hosts get a compact lock/unlock indicator stacked between the voice and Send controls; profile names, distinct source icons, and source labels for built-in, user-defined, and workspace-defined profiles live in its picker. The sandbox control stays disabled from session startup through the full active turn because its boundary is fixed for the conversation, while Agent Mode remains available mid-turn; changing the profile of an existing conversation opens the Summarize or Just Restart flow required to start a new session under the new boundary.
   - See the [macOS sandbox architecture guide](docs/macos-sandbox-architecture.md) for the full access matrix, profile resolution rules, process topology, and enforcement boundary.
+
+### Fixed
+
+- **The “Read simplified summaries” toggle no longer errors during a live extension upgrade.** If a VS Code-derived host has not yet refreshed its contributed-settings registry, the extension temporarily preserves the choice in extension state instead of rejecting it as an unregistered `grok.summarizeRepliesAloud` setting. The contributed User setting remains authoritative as soon as the host registers the current manifest.
 
 ---
 

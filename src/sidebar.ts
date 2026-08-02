@@ -190,6 +190,10 @@ const SESSION_META_KEY = "grok.sessionMeta";
  * rejects the contributed `grok.sandboxProfile` key during an upgrade. */
 const SANDBOX_PROFILE_FALLBACK_KEY = "grok.sandboxProfileFallback";
 const SANDBOX_PROFILE_WORKSPACE_FALLBACK_KEY = "grok.sandboxProfileWorkspaceFallback";
+/** Fallback for the same live-schema upgrade race affecting the newer
+ * `grok.summarizeRepliesAloud` preference. The contributed User setting stays
+ * authoritative as soon as the host registers it (normally after reload). */
+const SUMMARIZE_REPLIES_ALOUD_FALLBACK_KEY = "grok.summarizeRepliesAloudFallback";
 const REPO_PINS_KEY = "grok.repoPins";
 /** globalState key for the anonymous per-install telemetry GUID (survives updates). */
 const INSTALL_ID_KEY = "grok.installId";
@@ -535,6 +539,9 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
         });
       }
       if (e.affectsConfiguration("grok.summarizeRepliesAloud")) {
+        // A real configuration change supersedes any transient upgrade
+        // fallback, including one left by a previous Extension Host process.
+        void this.context.globalState.update(SUMMARIZE_REPLIES_ALOUD_FALLBACK_KEY, undefined);
         this.post({
           type: "summarizeRepliesAloud",
           value: vscode.workspace.getConfiguration("grok").get<boolean>("summarizeRepliesAloud", true),
@@ -4471,9 +4478,7 @@ See design doc for the full state machine diagram.`;
           .update("readRepliesAloud", !!msg.value, vscode.ConfigurationTarget.Global);
         break;
       case "setSummarizeRepliesAloud":
-        await vscode.workspace
-          .getConfiguration("grok")
-          .update("summarizeRepliesAloud", !!msg.value, vscode.ConfigurationTarget.Global);
+        await this.updateSummarizeRepliesAloudSetting(!!msg.value);
         break;
       case "runInstallCmd": {
         const term = vscode.window.createTerminal("Install Grok");
@@ -6928,8 +6933,9 @@ See design doc for the full state machine diagram.`;
     this.post(this.buildInitialStateMsg());
     this.post({
       type: "summarizeRepliesAloud",
-      value: vscode.workspace.getConfiguration("grok").get<boolean>("summarizeRepliesAloud", true),
+      value: this.summarizeRepliesAloudSetting(),
     });
+    void this.promoteSummarizeRepliesAloudFallback();
     // Sync the active-editor context chip into the fresh webview (the config
     // gate + no-editor case live inside refreshImplicitChip).
     this.refreshImplicitChip(true);
@@ -6942,6 +6948,47 @@ See design doc for the full state machine diagram.`;
     void this.startSession().then(() => {
       this.sweepEmptyPrimerSessions();
     });
+  }
+
+  private summarizeRepliesAloudSetting(): boolean {
+    const cfg = vscode.workspace.getConfiguration("grok");
+    return this.context.globalState.get<boolean>(
+      SUMMARIZE_REPLIES_ALOUD_FALLBACK_KEY,
+      cfg.get<boolean>("summarizeRepliesAloud", true),
+    );
+  }
+
+  private async promoteSummarizeRepliesAloudFallback(): Promise<void> {
+    const fallback = this.context.globalState.get<boolean>(SUMMARIZE_REPLIES_ALOUD_FALLBACK_KEY);
+    const cfg = vscode.workspace.getConfiguration("grok");
+    // `inspect` is undefined while a derived host is still using the old live
+    // contribution schema. Keep the fallback until a later activation then.
+    if (fallback === undefined || !cfg.inspect<boolean>("summarizeRepliesAloud")) return;
+    try {
+      await cfg.update("summarizeRepliesAloud", fallback, vscode.ConfigurationTarget.Global);
+      await this.context.globalState.update(SUMMARIZE_REPLIES_ALOUD_FALLBACK_KEY, undefined);
+    } catch (error) {
+      if (isUnregisteredConfigurationError(error)) return;
+      this.output.appendLine(
+        `[voice] could not migrate the summarize-replies preference into User settings: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  private async updateSummarizeRepliesAloudSetting(value: boolean): Promise<void> {
+    try {
+      await vscode.workspace
+        .getConfiguration("grok")
+        .update("summarizeRepliesAloud", value, vscode.ConfigurationTarget.Global);
+      await this.context.globalState.update(SUMMARIZE_REPLIES_ALOUD_FALLBACK_KEY, undefined);
+    } catch (error) {
+      if (!isUnregisteredConfigurationError(error)) throw error;
+      await this.context.globalState.update(SUMMARIZE_REPLIES_ALOUD_FALLBACK_KEY, value);
+      this.post({ type: "summarizeRepliesAloud", value });
+      this.output.appendLine(
+        "[voice] host rejected grok.summarizeRepliesAloud as unregistered; saved the choice in global extension state",
+      );
+    }
   }
 
   private postChips(session: Session = this.focused): void {
