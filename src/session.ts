@@ -1,5 +1,4 @@
 import { AcpClient } from "./acp";
-import type { PromptUsage } from "./acp";
 import type { HostMsg } from "./protocol";
 import type { FileChip } from "./chips";
 import { permissionOptionsForPlan } from "./plan-gate";
@@ -22,6 +21,19 @@ export interface PendingPermission {
   options: PendingPermissionOption[];
   /** Subset safe to expose while the client-side Plan gate remains active. */
   planOptions: PendingPermissionOption[];
+}
+
+export interface PendingExitPlan {
+  planText: string;
+}
+
+/** A submitted plan comment owned by one live ACP process until its interject
+ * response arrives. This is intentionally memory-only; process exit hands the
+ * text to the ordinary queue/composer recovery path. */
+export interface InFlightPlanComment {
+  text: string;
+  client: AcpClient;
+  gen: number;
 }
 
 export function createPendingPermission(
@@ -72,62 +84,35 @@ export class Session {
   /** Plan-mode gate is up for this session (client-side enforcement mirror). */
   planActive = false;
 
-  /**
-   * Deferred post-turn action. The CLI's exit_plan_mode arrives *during* an
-   * in-flight session/prompt, so we can't send a new prompt/set_mode from the
-   * approval handler — we'd collide with the running turn. We stash the action
-   * here and run it once the current prompt resolves (see handleSend).
-   */
-  afterTurn?: () => Promise<void>;
+  /** Whether this session's CLI is new enough for native plan verdicts. */
+  planModeAvailable = true;
+  planModeUnavailableReason?: string;
+
+  /** Latest attempt to force an unavailable Plan session back to Agent. */
+  planModeRecoveryAttempt = 0;
+
+  /** Two-phase unavailable-Plan recovery. The write gate may drop only after
+   * both the forced Agent mode change and any live planning turn have settled. */
+  planModeRecovery?: {
+    attempt: number;
+    modeConfirmed: boolean;
+    turnSettled: boolean;
+    warningTimer?: ReturnType<typeof setTimeout>;
+  };
 
   /** This session has conversational history (vs. a fresh, empty one). */
   hasHistory = false;
 
-  /**
-   * True for the whole session-start window (spawn → newSession/load → primer).
-   * Model/effort changes are settings that restart or race the session, so they
-   * are ignored while priming — the webview also disables the controls (busy),
-   * this is the host-side backstop for a click that slips through that window.
-   */
+  /** True for the session-start window (spawn → newSession/load). Model/effort
+   * changes that would race startup are ignored; the webview also locks busy. */
   priming = false;
 
-  /**
-   * False until the hidden primer has been sent on THIS session load. The primer
-   * is no longer sent at session start — it's deferred to the first outbound
-   * prompt (ensurePrimed), so a startup or glance-only restore costs nothing.
-   * It's (re-)sent on the first send of every load, new OR restored: a primer
-   * buried in a restored session's replayed history isn't reliably honored by
-   * grok (a /compact can drop it from effective context), so we re-assert it
-   * once before the first post-restore turn rather than trusting history.
-   */
-  primed = false;
-
-  /**
-   * In-flight (or settled) hidden-primer turn for THIS session load, if one has
-   * been kicked off. The primer now fires eagerly + non-blocking the moment a
-   * session goes live (ensurePrimed in sidebar), so the user can send straight
-   * away; their first real prompt awaits this promise (grok can't run two turns
-   * at once) and is released the instant the silent primer acks. Reused so a
-   * concurrent send doesn't start a second primer; cleared on failure so the
-   * next send retries. undefined until the primer is first requested.
-   */
-  primingPromise?: Promise<void>;
-
-  /** Drop streaming content from the webview (primer / summary injection). */
+  /** Drop streaming content from hidden summary/context-injection turns. */
   suppressContent = false;
 
   /**
-   * True once a live `auto_compact_completed` notification (with a usable
-   * `tokens_after`) has updated the donut for the CURRENT manual /compact. Reset
-   * to false just before each manual compact prompt. Gates the pre-rail
-   * `/session-info` fallback + the signals.json backup so they run ONLY when the
-   * live rail didn't already give us the exact post-compact count.
-   */
-  sawCompactNotification = false;
-
-  /**
    * True when an `auto_compact_failed` notification arrived for the CURRENT
-   * manual /compact (reset with `sawCompactNotification` before each). Gates the
+   * manual /compact (reset before each). Gates the
    * "Compacted." confirmation so a failed compaction doesn't paint a false
    * success next to the failure note.
    */
@@ -142,21 +127,6 @@ export class Session {
    */
   authRecoveryTried = false;
 
-  /**
-   * When set (to ""), the sidebar's messageChunk handler accumulates the
-   * agent's streamed text here instead of only forwarding it — used by the
-   * pre-rail post-/compact /session-info fallback, whose reply text carries the
-   * fresh context count. undefined = no capture.
-   */
-  captureAgentText?: string;
-
-  /**
-   * Plan-reject specific suppression: drop streaming output (the false-approval
-   * ramble) but let lifecycle events through so the webview clears `busy` and
-   * re-enables the send button when the cancelled turn finally ends.
-   */
-  suppressPlanReject = false;
-
   /** Live permission requests awaiting an answer, by request id. Set when the
    *  card is shown, read when the user answers so we can persist the resolved
    *  card (title + outcome) for replay on a resumed session, then deleted. */
@@ -165,13 +135,26 @@ export class Session {
   /** Most recent plan text seen for this session (exit_plan_mode fallback). */
   lastPlanText = "";
 
-  /**
-   * Plan text currently shown in the live exit_plan_mode card. Set when we post
-   * the card to the webview, read by persistPlanVerdict when the user picks a
-   * verdict, then cleared. Decoupled from lastPlanText (which gets nuked the
-   * moment we render the card) so the saved history actually has content.
-   */
-  pendingPlanText = "";
+  /** Live exit_plan_mode requests awaiting one answer, keyed by ACP request id. */
+  pendingExitPlans = new Map<number | string, PendingExitPlan>();
+
+  /** Submitted plan comments still awaiting `_x.ai/interject` acceptance. */
+  inFlightPlanComments = new Map<number | string, InFlightPlanComment>();
+
+  /** Accepted mid-turn interjections in this session. This is the secondary
+   * replay coordinate for multiple native plan reviews inside one prompt. */
+  interjectionCount = 0;
+
+  /** Number of replay-stable assistant update events observed in this session.
+   * Persisted records use this common boundary to order plans, permissions, and
+   * usage inside a turn rather than waiting for the next user message. */
+  historyEventCount = 0;
+
+  /** Accumulator used to classify replayed user-message chunks even when the
+   * CLI splits the interjection envelope across updates. */
+  replayUserRaw = "";
+  replayUserCounted = false;
+  replayUserIsInterjection = false;
 
   /**
    * Count of user messages that have entered this session (replayed + live).
@@ -199,12 +182,6 @@ export class Session {
   /** Process-lifetime sandbox profile for this live/saved conversation.
    * `off` means no sandbox; cold resumes restore summary.json's saved value. */
   sandboxProfile?: string;
-  /** Last browser-reported AFK Pilot preferences, in displayed percent + boolean.
-   * Undefined until a remote client reports them for this focused session. */
-  remoteFontScale?: number;
-  remoteReadRepliesAloud?: boolean;
-  remoteUsesTouch?: boolean;
-
   /**
    * Effective working directory for this session's `grok agent stdio` process.
    * Usually the workspace root; for a worktree-isolated session (P2-8) this is
@@ -304,16 +281,6 @@ export class Session {
    * two risks duplicate delivery or work loss. */
   queuedSendRequiresRelay = false;
 
-  /** The last completed prompt's billing usage (#53) — grok's `_meta.usage`. */
-  lastTurnUsage?: PromptUsage;
-
-  /**
-   * Session-cumulative billing (#53), summed by US across the session's turns.
-   * grok reports usage per prompt only and `signals.json` persists just context
-   * size, so nothing on disk can seed this — it is restored from our own
-   * globalState (`SessionMetaOverride.usage`) and re-persisted as turns land.
-   */
-  sessionUsage?: PromptUsage;
 }
 
 export function beginQueuedSendCommit(session: Session, text: string): { text: string } | undefined {
@@ -348,12 +315,21 @@ export function finishQueuedSendCommit(
 }
 
 /** Current non-chat UI state for rebuilding a view of this live session. */
-export function sessionUiSnapshot(session: Session, modeId: string): HostMsg[] {
+export function sessionUiSnapshot(
+  session: Session,
+  modeId: string,
+  chips: FileChip[] = session.chips,
+): HostMsg[] {
   const messages: HostMsg[] = [];
   if (session.client?.currentModelId) {
     messages.push({ type: "modelChanged", modelId: session.client.currentModelId });
   }
   messages.push({ type: "modeChanged", modeId });
+  messages.push({
+    type: "planModeAvailability",
+    available: session.planModeAvailable,
+    reason: session.planModeUnavailableReason,
+  });
   for (const [requestId, pending] of session.pendingPermissions) {
     messages.push({
       type: "permissionOptions",
@@ -361,7 +337,7 @@ export function sessionUiSnapshot(session: Session, modeId: string): HostMsg[] {
       options: pendingPermissionOptions(pending, session.planActive),
     });
   }
-  messages.push({ type: "chips", chips: session.chips });
+  messages.push({ type: "chips", chips });
   messages.push({ type: "queuedSends", items: [...session.queuedSends] });
   return messages;
 }

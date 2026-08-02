@@ -1,6 +1,6 @@
 # What the 0.2.112 re-verification unlocks — recommended next steps
 
-**Status: recommendation, not a plan. Nothing here is implemented.** Written 2026-07-29 alongside
+**Status: recommendation log. Sections 1 and 3 are implemented; in §4 the context-envelope and active-auth wins are implemented, while the other items remain open.** Written 2026-07-29 alongside
 the [ACP-feedback](ACP-feedback.md) re-verification pass (live basis: grok **0.2.112**; source
 basis: the OSS daily sync, now `5da6962`). Every claim below is either **live-verified** on 0.2.112
 or explicitly marked otherwise — see *Evidence discipline* at the end, which is the part most worth
@@ -14,28 +14,30 @@ hardest unsolved problem.
 
 ---
 
-## 1. Retire the hidden primer; adopt the CLI's native plan verdicts
+## 1. Retired the hidden primer; adopted the CLI's native plan verdicts
 
-**Live-verified (0.2.112).** Replying to `_x.ai/exit_plan_mode` with a JSON-RPC **success**
-`{outcome: "approved" | "cancelled" | "abandoned"}` — instead of the JSON-RPC error we send today —
-does the right thing: the plan turn ends `end_turn` (not `cancelled`), mode stays `["plan"]` on
-`cancelled`, and the model volunteers *"You asked me to **revise** the plan (not approve or reject),
-and **yes — I am still in plan mode**."* That is the whole job the primer performs, done natively,
-with no synthetic turn.
+**Live-verified (0.2.117).** Replying to `_x.ai/exit_plan_mode` with a JSON-RPC **success**
+`{outcome: "approved" | "cancelled" | "abandoned"}` does the right thing inside the original
+turn. Approval changes the mode to `default` and implements once; cancellation stays in Plan and
+grok revises and re-asks without a synthetic prompt. A user comment can be queued with
+`_x.ai/interject` while grok is blocked on `exit_plan_mode`, before the verdict response releases
+the turn, so it influences either implementation or re-planning at the first native continuation.
 
-This is the highest-leverage item by a wide margin, because the primer is load-bearing for a
-surprising amount of machinery that exists *only* to clean up after it:
+This was the highest-leverage item by a wide margin, because the primer was load-bearing for a
+surprising amount of machinery that existed *only* to clean up after it:
 
-| Goes away | Why it existed |
+| Retired write-side machinery | Why it existed |
 |---|---|
-| `src/grok-primer.ts`, `ensurePrimed`, `primingPromise` | Teaching the model the bracket protocol |
-| `isPrimerText` / `isPrimerSummary` | Hiding the primer when grok replays it |
-| The empty-primer sweep + `parkFocused` recycle (`sessions.ts`) | Primer-only sessions littering history |
-| Primer-derived title repair, incl. `forkDisplayName`'s carve-out | grok titles from message #1 = the primer |
+| `GROK_PRIMER`, `ensurePrimed`, `primingPromise` | Teaching the model the bracket protocol |
 | Marker-only `[Plan approved/rejected/cancelled]` hidden turns | The protocol itself |
-| `suppressContent` / `SUPPRESS_TYPES` plumbing | Hiding the primer's turn |
 | Post-`/compact` re-priming | `/compact` folds the primer away |
-| Prompt-index compensation in rewind/plan positioning | The primer counts as a user message |
+| Verdict-time cancel, follow-up prompt, and synthetic turn lifecycle | Preventing the primer-trained filler from painting |
+
+The legacy read side deliberately remains. Existing sessions still contain primer turns, so
+`isPrimerText` / `isPrimerSummary`, replay hiding (including `media/chat.js`'s mirror), the
+empty-primer sweep, title repair, and prompt-index compensation must continue to recognize them.
+`suppressContent` / `SUPPRESS_TYPES` also remain: hidden summary and context-maintenance turns use
+the same generic suppression mechanism even though priming no longer does.
 
 **Keep the client-side gate.** This is not "trust native plan mode." `terminal/create` still escapes
 the CLI's plan gate — re-confirmed live on 0.2.112 for the third consecutive build (4 `terminal/create`
@@ -79,7 +81,7 @@ before we shipped. Here we don't yet.
 
 ---
 
-## 3. Usage: harvest `costUsdTicks`, but do **not** retire our ledger
+## 3. Usage: harvest `costUsdTicks`, but do **not** retire our ledger — implemented
 
 This is the item most likely to be over-read, so the finding first:
 
@@ -88,9 +90,9 @@ numTurns: 2, costUsdTicks: 178580000` after two turns → **all zeros** on the n
 `session/load` in a fresh agent process. A cumulative-looking counter that silently resets is worse
 for users than no counter, because it keeps looking authoritative while under-reporting. So:
 
-- **Keep** `SessionMetaOverride.usageLog` and the derived total. It is still the only thing that
+- **Kept:** `SessionMetaOverride.usageLog` and the derived total. It is still the only thing that
   survives a reload *and* the only thing a rewind can subtract from.
-- **Do** start capturing **`costUsdTicks`**, which rides the per-turn `_meta.usage` we already parse.
+- **Implemented:** capture **`costUsdTicks`**, which rides the per-turn `_meta.usage` we already parse.
   It is the first real money figure anywhere on the wire and the number users actually ask for; we
   have never been able to show it. This is a small change to an existing path, not a new subsystem.
 - Optionally use `_x.ai/session/usage` as a per-run cross-check, labelled **"this run"** — never as
@@ -106,7 +108,7 @@ remains blocked upstream.
 
 Each is small, independent, and deletes a workaround we currently maintain:
 
-- **Replace the `/session-info` prose scrape** with the envelope `_meta.totalTokens` that rides
+- **Implemented — replaced the `/session-info` prose scrape** with the envelope `_meta.totalTokens` that rides
   every `session/update` (observed climbing 5487 → 15781 → 16015 within one turn, matching the prose
   exactly). Kills the regex ACP-feedback §2.3 calls "as fragile as it sounds", and the hidden turn
   that feeds it.
@@ -114,7 +116,7 @@ Each is small, independent, and deletes a workaround we currently maintain:
   — retires the send-reordering dance for the command where it was most fragile.
 - **`initialize._meta.modelState`** carries the full model catalog *before* `session/new`, so the
   model picker no longer needs a live session to populate.
-- **`initialize._meta.defaultAuthMethodId`** is populated (`"cached_token"`), so we can finally warn
+- **Implemented — `initialize._meta.defaultAuthMethodId`** is populated (`"cached_token"`), so we warn once per install
   about the OAuth-shadows-`XAI_API_KEY` trap instead of regexing an error string.
 - **`_x.ai/sessions/changed`** pushes an incremental session catalog with `activity`, `yolo`,
   `reasoningEffort`, `isWorktree`. It is strictly better than the paginated list we asked upstream

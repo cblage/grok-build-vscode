@@ -8,10 +8,13 @@ import {
   repoScopeFor,
   sessionForRequest,
   sessionCwdBelongsToRepo,
+  shouldAdoptDeskSession,
   inlineMediaForRemote,
   mediaMimeFromPath,
   transformHostMsgForRemote,
+  REMOTE_HISTORY_BYTE_LIMIT,
   MAX_REMOTE_MEDIA_BYTES,
+  MAX_REMOTE_THUMBNAIL_BYTES,
   type MediaInlineDeps,
 } from "../src/remote-policy";
 import { HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, type HostMsg } from "../src/protocol";
@@ -57,7 +60,8 @@ describe("remote-policy classification tables", () => {
     expect(INBOUND_DISPOSITION.setSandbox).toBe("host-local");
     expect(INBOUND_DISPOSITION.setReadRepliesAloud).toBe("host-local");
     expect(INBOUND_DISPOSITION.setSummarizeRepliesAloud).toBe("host-local");
-    expect(INBOUND_DISPOSITION.summarizeSpeech).toBe("host-local");
+    expect(INBOUND_DISPOSITION.summarizeSpeech).toBe("propose");
+    expect(INBOUND_DISPOSITION.requestImageFull).toBe("propose");
     // worktree/rewind flows run native host dialogs (input box / QuickPick) —
     // desktop-only until they get remote-capable UI (2026-07-24)
     expect(INBOUND_DISPOSITION.newWorktreeSession).toBe("host-local");
@@ -71,7 +75,7 @@ describe("remote-policy classification tables", () => {
     expect(OUTBOUND_DISPOSITION.remoteStatus).toBe("host-local");
     expect(OUTBOUND_DISPOSITION.readRepliesAloud).toBe("host-local");
     expect(OUTBOUND_DISPOSITION.summarizeRepliesAloud).toBe("host-local");
-    expect(OUTBOUND_DISPOSITION.speechSummary).toBe("host-local");
+    expect(OUTBOUND_DISPOSITION.speechSummary).toBe("mirror");
     // Local call sites stay local-only; the same output shapes carry remote STT.
     expect(OUTBOUND_DISPOSITION.voiceState).toBe("mirror");
     expect(OUTBOUND_DISPOSITION.voiceConfigured).toBe("mirror");
@@ -129,6 +133,8 @@ describe("allowFromRemote tier gating", () => {
     expect(allowFromRemote("send", "read-only")).toBe(false);
     expect(allowFromRemote("send", "propose")).toBe(true);
     expect(allowFromRemote("send", "full")).toBe(true);
+    expect(allowFromRemote("summarizeSpeech", "read-only")).toBe(false);
+    expect(allowFromRemote("summarizeSpeech", "propose")).toBe(true);
   });
 
   it("approvals and destructive ops need full", () => {
@@ -226,6 +232,116 @@ describe("transformHostMsgForRemote", () => {
     const out = transformHostMsgForRemote(mediaMsg({ src: "x", path: "/img.webp" }), deps(new Uint8Array([7])));
     expect((out as { src?: string })?.src?.startsWith("data:image/webp;base64,")).toBe(true);
   });
+
+  it("inlines image-chip previews while preserving the chip when the source is missing", () => {
+    const chip = {
+      id: "image-1",
+      path: "/img.png",
+      relPath: "Image #1",
+      hidden: false,
+      imageIndex: 1,
+      mimeType: "image/png",
+    };
+    const out = transformHostMsgForRemote({ type: "chips", chips: [chip] }, deps(new Uint8Array([7]))) as Extract<HostMsg, { type: "chips" }>;
+    expect(out.chips[0].previewSrc).toBe("data:image/png;base64,Bw==");
+
+    const missing = transformHostMsgForRemote({ type: "chips", chips: [chip] }, deps(null)) as Extract<HostMsg, { type: "chips" }>;
+    expect(missing.chips[0]).toEqual(chip);
+    expect(missing.chips[0].previewSrc).toBeUndefined();
+  });
+
+  it("uses the thumbnail hook and keeps replayed image tags usable remotely", () => {
+    const imageDeps: MediaInlineDeps = {
+      ...deps(new Uint8Array([1, 2, 3])),
+      // The encoder picks a format per image, so the hook reports the mime of
+      // what it produced — here a JPEG from a PNG source, which is exactly the
+      // case a source-mime label would get wrong.
+      thumbnail: () => ({ bytes: new Uint8Array([9]), mime: "image/jpeg" }),
+    };
+    const out = transformHostMsgForRemote({
+      type: "userMessageChunk",
+      text: "[Image #1] (C:\\staged\\image.png — attached inline; do not Read it)",
+      images: [{ imageIndex: 1, path: "C:\\staged\\image.png" }],
+    }, imageDeps) as Extract<HostMsg, { type: "userMessageChunk" }>;
+    expect(out.images?.[0].previewSrc).toBe("data:image/jpeg;base64,CQ==");
+    expect(MAX_REMOTE_THUMBNAIL_BYTES).toBe(96 * 1024);
+  });
+
+  it("issues an enlarge handle only where a thumbnail actually goes out", () => {
+    // The handle is what a remote exchanges for a full-size render, so the set
+    // of enlargeable images must equal the set already shown. Minting one for an
+    // image we could not thumbnail would hand out reach the remote never had.
+    const registered: string[] = [];
+    const withHandles = (bytes: Uint8Array | null): MediaInlineDeps => ({
+      readFile: () => bytes,
+      toBase64: (b) => Buffer.from(b).toString("base64"),
+      thumbnail: () => ({ bytes: new Uint8Array([9]), mime: "image/png" }),
+      registerFullImage: (p) => {
+        registered.push(p);
+        return `handle-${registered.length}`;
+      },
+    });
+    const chip = {
+      id: "image-1",
+      path: "/img.png",
+      relPath: "Image #1",
+      hidden: false,
+      imageIndex: 1,
+      mimeType: "image/png",
+    };
+
+    const shown = transformHostMsgForRemote(
+      { type: "chips", chips: [chip] },
+      withHandles(new Uint8Array([1, 2, 3])),
+    ) as Extract<HostMsg, { type: "chips" }>;
+    expect(shown.chips[0].fullId).toBe("handle-1");
+    expect(registered).toEqual(["/img.png"]);
+
+    // Unreadable source: no thumbnail crosses, so no handle may either.
+    registered.length = 0;
+    const hidden = transformHostMsgForRemote(
+      { type: "chips", chips: [chip] },
+      withHandles(null),
+    ) as Extract<HostMsg, { type: "chips" }>;
+    expect(hidden.chips[0].previewSrc).toBeUndefined();
+    expect(hidden.chips[0].fullId).toBeUndefined();
+    expect(registered).toEqual([]);
+  });
+
+  it("memoizes a thumbnail by source path and mtime across message shapes", () => {
+    let reads = 0;
+    let thumbnails = 0;
+    const imageDeps: MediaInlineDeps = {
+      readFile: () => {
+        reads += 1;
+        return new Uint8Array([1, 2, 3]);
+      },
+      toBase64: (bytes) => Buffer.from(bytes).toString("base64"),
+      thumbnail: () => {
+        thumbnails += 1;
+        return { bytes: new Uint8Array([9]), mime: "image/png" };
+      },
+      mtimeMs: () => 42,
+      thumbnailCache: new Map(),
+    };
+    const chip = {
+      id: "image-1",
+      path: "/img.png",
+      relPath: "Image #1",
+      hidden: false,
+      imageIndex: 1,
+      mimeType: "image/png",
+    };
+    transformHostMsgForRemote({ type: "chips", chips: [chip] }, imageDeps);
+    const out = transformHostMsgForRemote({
+      type: "userMessageChunk",
+      text: "[Image #1] (img.png)",
+      images: [{ imageIndex: 1, path: "/img.png" }],
+    }, imageDeps) as Extract<HostMsg, { type: "userMessageChunk" }>;
+    expect(out.images?.[0].previewSrc).toBe("data:image/png;base64,CQ==");
+    expect(reads).toBe(1);
+    expect(thumbnails).toBe(1);
+  });
 });
 
 describe("mediaMimeFromPath", () => {
@@ -275,10 +391,25 @@ describe("requesting session and repo boundary", () => {
     expect(sessionCwdBelongsToRepo("C:/Repo/B", ["c:/repo/b", "c:/repo/b-worktree"], same)).toBe(true);
     expect(sessionCwdBelongsToRepo("C:/Repo/A", ["c:/repo/b", "c:/repo/b-worktree"], same)).toBe(false);
   });
+
+  it("adopts the desk session only for an arriving tab in the same repo", () => {
+    const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+    expect(shouldAdoptDeskSession("C:/Repo/B", ["c:/repo/b"], false, same)).toBe(true);
+    expect(shouldAdoptDeskSession("C:/Repo/A", ["c:/repo/b"], false, same)).toBe(false);
+    expect(shouldAdoptDeskSession("C:/Repo/B", ["c:/repo/b"], true, same)).toBe(false);
+  });
 });
 
 describe("remote reconnect snapshot replay", () => {
-  it("brackets the full buffered transcript so completed turns are replay-only", () => {
+  const batched = (buffer: HostMsg[]) => {
+    const snapshot = bracketRemoteSnapshot(buffer);
+    expect(snapshot[0]).toEqual({ type: "historyReplay", active: true });
+    expect(snapshot[2]).toEqual({ type: "historyReplay", active: false });
+    expect(snapshot[1].type).toBe("historyBatch");
+    return (snapshot[1] as Extract<HostMsg, { type: "historyBatch" }>).messages;
+  };
+
+  it("batches a below-limit transcript without changing its contents", () => {
     const buffer: HostMsg[] = [
       { type: "agentStart" },
       { type: "messageChunk", text: "already finished" },
@@ -286,8 +417,138 @@ describe("remote reconnect snapshot replay", () => {
     ];
     expect(bracketRemoteSnapshot(buffer)).toEqual([
       { type: "historyReplay", active: true },
-      ...buffer,
+      { type: "historyBatch", messages: buffer },
       { type: "historyReplay", active: false },
     ]);
+  });
+
+  it("permits the targeted speech-summary result to cross remotely", () => {
+    const msg: HostMsg = { type: "speechSummary", requestId: 7, text: "Brief update." };
+    expect(transformHostMsgForRemote(msg, deps(null))).toBe(msg);
+  });
+
+  it("uses only the outer replay brackets when the buffered load had its own", () => {
+    const messages = batched([
+      { type: "historyReplay", active: true },
+      { type: "userMessageChunk", text: "loaded prompt" },
+      { type: "messageChunk", text: "loaded answer" },
+      { type: "historyReplay", active: false },
+    ]);
+    expect(messages).toEqual([
+      { type: "userMessageChunk", text: "loaded prompt" },
+      { type: "messageChunk", text: "loaded answer" },
+    ]);
+  });
+
+  it("starts the last-ten-user window at a user boundary, not mid-tool-group", () => {
+    const buffer: HostMsg[] = [];
+    for (let n = 1; n <= 12; n++) {
+      buffer.push({ type: "userMessage", text: `user ${n}` });
+      buffer.push({ type: "agentStart" });
+      buffer.push({ type: "toolCall", call: { toolCallId: `tool-${n}`, title: `tool ${n}` } });
+      buffer.push({ type: "toolCallUpdate", call: { toolCallId: `tool-${n}`, status: "completed" } });
+      buffer.push({ type: "agentEnd" });
+    }
+
+    const messages = batched(buffer);
+    expect(messages[0]).toEqual({ type: "userMessage", text: "user 3" });
+    expect(messages.filter((m) => m.type === "userMessage")).toHaveLength(10);
+    expect(messages.some((m) => m.type === "toolCall" && m.call.toolCallId === "tool-2")).toBe(false);
+    expect(messages.some((m) => m.type === "toolCall" && m.call.toolCallId === "tool-3")).toBe(true);
+  });
+
+  it("counts a chunked replay prompt once and cuts at its first chunk", () => {
+    const buffer: HostMsg[] = [];
+    for (let n = 1; n <= 12; n++) {
+      buffer.push({ type: "userMessageChunk", text: `user ${n} part A ` });
+      buffer.push({ type: "userMessageChunk", text: "part B" });
+      buffer.push({ type: "messageChunk", text: `answer ${n}` });
+    }
+
+    const messages = batched(buffer);
+    expect(messages[0]).toEqual({ type: "userMessageChunk", text: "user 3 part A " });
+    expect(messages.filter((m) => m.type === "userMessageChunk")).toHaveLength(20);
+  });
+
+  it("drops cards before the cut and renumbers cards that straddle it", () => {
+    const buffer: HostMsg[] = [
+      {
+        type: "permissionHistoryQueue",
+        permissions: [
+          { title: "before", outcome: "allowed", afterUserMessage: 2, afterHistoryEvent: 2 },
+          { title: "first kept", outcome: "allowed", afterUserMessage: 3, afterHistoryEvent: 3 },
+          { title: "last kept", outcome: "rejected", afterUserMessage: 12, afterHistoryEvent: 12 },
+        ],
+      },
+      {
+        type: "planHistoryQueue",
+        plans: [
+          { text: "before", verdict: "rejected", afterUserMessage: 1, afterHistoryEvent: 1 },
+          { text: "first kept", verdict: "rejected", afterUserMessage: 3, afterHistoryEvent: 3 },
+          { text: "last kept", verdict: "approved", afterUserMessage: 12, afterHistoryEvent: 12 },
+        ],
+      },
+      ...Array.from({ length: 12 }, (_, i): HostMsg[] => [
+        { type: "userMessage", text: `user ${i + 1}` },
+        { type: "messageChunk", text: `answer ${i + 1}` },
+        { type: "usage", session: { inputTokens: i + 1 }, afterUserMessage: i + 1, afterHistoryEvent: i + 1 },
+      ]).flat(),
+    ];
+
+    const messages = batched(buffer);
+    const permissions = messages.find((m) => m.type === "permissionHistoryQueue");
+    const plans = messages.find((m) => m.type === "planHistoryQueue");
+    const usage = messages.filter((m) => m.type === "usage");
+    expect(permissions).toEqual({
+      type: "permissionHistoryQueue",
+      permissions: [
+        { title: "first kept", outcome: "allowed", afterUserMessage: 1, afterHistoryEvent: 1 },
+        { title: "last kept", outcome: "rejected", afterUserMessage: 10, afterHistoryEvent: 10 },
+      ],
+    });
+    expect(plans).toEqual({
+      type: "planHistoryQueue",
+      plans: [
+        { text: "first kept", verdict: "rejected", afterUserMessage: 1, afterHistoryEvent: 1 },
+        { text: "last kept", verdict: "approved", afterUserMessage: 10, afterHistoryEvent: 10 },
+      ],
+    });
+    expect(usage).toHaveLength(10);
+    expect(usage[0]).toMatchObject({ afterUserMessage: 1, afterHistoryEvent: 1, session: { inputTokens: 3 } });
+    expect(usage[9]).toMatchObject({ afterUserMessage: 10, afterHistoryEvent: 10, session: { inputTokens: 12 } });
+    const transcript = messages.filter((m) => m.type !== "permissionHistoryQueue" && m.type !== "planHistoryQueue");
+    expect(transcript[0]).toEqual({ type: "userMessage", text: "user 3" });
+  });
+
+  it("drops the oldest oversized turn at a user boundary until the batch fits", () => {
+    const buffer: HostMsg[] = [
+      { type: "userMessage", text: "old prompt" },
+      { type: "messageChunk", text: "x".repeat(REMOTE_HISTORY_BYTE_LIMIT - 100) },
+      { type: "userMessage", text: "new prompt" },
+      { type: "messageChunk", text: "new answer" },
+    ];
+
+    const messages = batched(buffer);
+    expect(messages[0]).toEqual({ type: "userMessage", text: "new prompt" });
+    expect(messages).not.toContainEqual(expect.objectContaining({ text: "old prompt" }));
+    expect(Buffer.byteLength(JSON.stringify({ type: "historyBatch", messages }))).toBeLessThanOrEqual(
+      REMOTE_HISTORY_BYTE_LIMIT,
+    );
+  });
+
+  it("delivers an over-budget single turn rather than truncating it", () => {
+    // The budget keeps a phone's reconnect cheap; it is not a safety mechanism.
+    // The relay's frame ceiling is 4.5x it, so this still arrives — and the
+    // largest real conversation measured on disk is 2.8 MB in total, so one
+    // turn past 8 MiB is well outside anything observed.
+    const buffer: HostMsg[] = [
+      { type: "userMessage", text: "only prompt" },
+      { type: "messageChunk", text: "z".repeat(REMOTE_HISTORY_BYTE_LIMIT + 1000) },
+      { type: "messageChunk", text: "the newest words" },
+    ];
+
+    const messages = batched(buffer);
+    expect(messages[0]).toEqual({ type: "userMessage", text: "only prompt" });
+    expect(messages[messages.length - 1]).toEqual({ type: "messageChunk", text: "the newest words" });
   });
 });

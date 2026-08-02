@@ -164,6 +164,8 @@ a:hover {
    .top-bar is justify-content:flex-end, so the icons keep their position. */
 .repo-chip[hidden] { display: none; }
 .repo-chip:hover { background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); color: var(--vscode-foreground); }
+.repo-chip.disabled { cursor: wait; opacity: 0.7; }
+.repo-chip.disabled:hover { background: transparent; }
 .repo-chip.browsing { border-color: var(--vscode-focusBorder); color: var(--vscode-foreground); }
 .repo-chip-icon, .repo-chip > svg { display: inline-flex; flex: none; }
 .repo-chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -284,6 +286,22 @@ a:hover {
   width: 1.2em;
   text-align: left;
   animation: loading-ellipsis 1.4s steps(1, end) infinite;
+}
+
+/* The welcome panel's busy status line. Shares the send button's loader-circle
+   and its rotation, so every "working" affordance in the UI reads the same. */
+#welcome-version.welcome-status-busy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+#welcome-version.welcome-status-busy svg {
+  flex: none;
+  animation: send-spinner-rotate 0.9s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  #welcome-version.welcome-status-busy svg { animation: none; }
 }
 
 /* ---- onboarding panel ---- */
@@ -691,6 +709,23 @@ body.thinking-hidden .msg.thinking { display: none; }
   color: var(--vscode-descriptionForeground);
   opacity: 0.8;
 }
+.msg-chip-preview {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 3px;
+  background: var(--vscode-editor-background);
+  cursor: zoom-in;
+}
+.msg-chip-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
 /* Full name + line range in the DOM (tests and hover need it); a long one
    ellipsizes here instead of being cut in JS. nowrap is required — .msg-chip
    doesn't inherit one (unlike .chip, which sets its own). */
@@ -1035,6 +1070,13 @@ body.thinking-hidden .msg.thinking { display: none; }
 }
 .tool-cmd {
   color: var(--vscode-editor-foreground, var(--vscode-foreground));
+  white-space: pre;
+  overflow-x: hidden;
+  overflow-wrap: normal;
+}
+.tool-cmd.command-full {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .tool-cmd-output {
   color: var(--vscode-foreground);
@@ -1496,10 +1538,25 @@ textarea#input {
   word-break: break-word;
 }
 /* The recognized command, shown as a subtle accent pill behind the live text. */
+/* The composer marks two different things, and the weights are deliberate.
+   Text still being dictated is PROVISIONAL — the next partial replaces it — so
+   it gets a light wash. A trailing send phrase is a COMMAND about to fire, so it
+   gets a much heavier fill plus a solid ring.
+
+   Neither can set the TEXT colour: .input-highlight is a `color: transparent`
+   backdrop and the glyphs you actually read belong to the <textarea> above it,
+   which cannot colour a substring. So the fills stay translucent rather than
+   opaque — solid blue would leave near-black text on blue in a light theme.
+   Real white-on-blue would mean replacing the textarea with a contenteditable,
+   which is not worth risking IME and mobile keyboards for a colour. */
+.input-highlight .voice-token {
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 15%, transparent);
+}
 .input-highlight .cmd-token {
   border-radius: 3px;
-  background: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 26%, transparent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 50%, transparent);
+  background: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 45%, transparent);
+  box-shadow: 0 0 0 1px var(--vscode-charts-blue, #3794ff);
 }
 
 /* ---- mic / voice-input button (top-right corner of the textbox) ---- */
@@ -1966,6 +2023,87 @@ textarea#input {
   width: 11px;
   height: 11px;
 }
+.attachment-preview {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 3px;
+  background: var(--vscode-editor-background);
+  cursor: zoom-in;
+}
+.attachment-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.image-preview-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgba(0, 0, 0, 0.72);
+}
+.image-preview-overlay[hidden] { display: none; }
+.image-preview-overlay img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 6px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+/* Shown while the host renders the full-size version. The low-res image stays
+   visible underneath rather than being blanked — you get something to look at
+   immediately — so the spinner needs its own semi-transparent disc to stay
+   legible over a bright picture as well as a dark one. Same loader-circle and
+   rotation as the send button and the welcome status. */
+.image-preview-spinner {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  pointer-events: none;
+}
+/* `display: flex` above beats the UA stylesheet's rule for [hidden], so without
+   this the spinner keeps turning after the render lands. The overlay carries the
+   same guard a few rules up, for the same reason. */
+.image-preview-spinner[hidden] { display: none; }
+.image-preview-spinner svg {
+  /* 24px glyph in a 32px disc — deliberately tight, the ring reads as the
+     affordance and the backdrop only has to keep it legible over the picture. */
+  width: 24px;
+  height: 24px;
+  animation: send-spinner-rotate 0.9s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .image-preview-spinner svg { animation: none; }
+}
+.image-preview-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
 .attachment-remove {
   display: inline-flex;
   align-items: center;
@@ -2425,7 +2563,6 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
   outline: 1px solid var(--vscode-focusBorder);
   outline-offset: -1px;
 }
-.card textarea.plan-feedback:disabled { opacity: 0.5; }
 .card-actions button.chosen {
   outline: 2px solid var(--vscode-focusBorder);
   outline-offset: -1px;
@@ -2442,35 +2579,6 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
 .plan-verdict-label.plan-verdict-approved { color: var(--vscode-charts-green, #4ec9b0); }
 .plan-verdict-label.plan-verdict-rejected { color: var(--vscode-charts-orange, #ce9178); }
 .plan-verdict-label.plan-verdict-abandoned { color: var(--vscode-descriptionForeground); }
-
-/* Indicator shown below a resolved plan card while grok processes the verdict.
-   Cleared when the next agent chunk arrives. Three pulsing dots. */
-.plan-processing {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 12px;
-  margin: 4px 0 8px 12px;
-  color: var(--vscode-descriptionForeground);
-  font-size: 12px;
-}
-.plan-processing-dots {
-  display: inline-flex;
-  gap: 4px;
-}
-.plan-processing-dots span {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--vscode-descriptionForeground);
-  animation: plan-processing-pulse 1.2s ease-in-out infinite;
-}
-.plan-processing-dots span:nth-child(2) { animation-delay: 0.2s; }
-.plan-processing-dots span:nth-child(3) { animation-delay: 0.4s; }
-@keyframes plan-processing-pulse {
-  0%, 80%, 100% { opacity: 0.25; }
-  40% { opacity: 1; }
-}
 
 /* ---- history popover ---- */
 .repo-popover {

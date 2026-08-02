@@ -2,7 +2,7 @@
   "name": "grok-vscode-phuryn",
   "displayName": "Grok Build for VS Code (Community)",
   "description": "GUI for Grok Build CLI (incl. Grok 4.5). Voice control, multiple sessions, images and videos, Mermaid diagrams, and LaTeX. Works with SuperGrok, X Premium+, and xAI API key. Fair Source (FSL-1.1-MIT — becomes MIT after two years). Not affiliated with or endorsed by xAI.",
-  "version": "2.1.2-sandbox.1",
+  "version": "2.3.2-sandbox.1",
   "publisher": "PawelHuryn",
   "author": {
     "name": "Paweł Huryn",
@@ -337,8 +337,8 @@
         },
         "grok.summarizeRepliesAloud": {
           "type": "boolean",
-          "default": false,
-          "markdownDescription": "Summarize text with xAI before reading it aloud. Off by default because each spoken message adds a billed API request and a network delay. Uses the same credential resolution as Voice input and falls back to the full reply if summarization fails. VS Code sidebar only."
+          "default": true,
+          "markdownDescription": "Read simplified summaries of spoken Grok replies. Each reply costs an extra xAI call and adds network delay; the full reply is used if summarization fails. Uses the same credential resolution as Voice input. AFK Pilot keeps its own per-device browser preference."
         },
         "grok.remote.keepAwake": {
           "type": "boolean",
@@ -425,6 +425,7 @@
     "vitest": "^1.6.0"
   },
   "dependencies": {
+    "jpeg-js": "^0.4.4",
     "ws": "^8.21.0"
   }
 }

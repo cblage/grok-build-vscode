@@ -125,6 +125,48 @@ describe("restored [Image #N] rendering", () => {
     expect(chip.getAttribute("title")).toBe("assets/hero.png");
   });
 
+  it("renders a live history thumbnail when the host supplies it", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "userMessage",
+      text: "describe this",
+      chips: [{
+        id: "image-1",
+        path: "/staging/hero.png",
+        relPath: "Image #1",
+        hidden: false,
+        imageIndex: 1,
+        previewSrc: "data:image/png;base64,AAAA",
+      }],
+    });
+    expect(doc.querySelector(".msg-chip-preview img")?.getAttribute("src"))
+      .toBe("data:image/png;base64,AAAA");
+  });
+
+  it("renders a restored history thumbnail and falls back cleanly without it", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "historyReplay", active: true });
+    dispatch(window, {
+      type: "userMessageChunk",
+      text: "describe this\n\n[Image #1] (C:\\staging\\hero.png — attached inline; do not Read it)",
+      images: [{ imageIndex: 1, path: "C:\\staging\\hero.png", previewSrc: "data:image/png;base64,AAAA" }],
+    });
+    dispatch(window, { type: "historyReplay", active: false });
+    expect(doc.querySelector(".msg-chip-preview img")?.getAttribute("src"))
+      .toBe("data:image/png;base64,AAAA");
+
+    dispatch(window, { type: "clearMessages" });
+    dispatch(window, { type: "historyReplay", active: true });
+    dispatch(window, {
+      type: "userMessageChunk",
+      text: "describe this\n\n[Image #1] (C:\\staging\\missing.png — attached inline; do not Read it)",
+      images: [{ imageIndex: 1, path: "C:\\staging\\missing.png" }],
+    });
+    dispatch(window, { type: "historyReplay", active: false });
+    expect(doc.querySelector(".msg-chip-preview")).toBeNull();
+    expect(doc.querySelector(".msg-chip")?.textContent).toContain("Image #1");
+  });
+
   it("leaves a literal [Image #N] in the middle of the user's words alone", () => {
     const { window, doc } = bootWebview();
     replayUserMessage(window, "the TUI prints [Image #1] before the text — why?");
@@ -162,5 +204,146 @@ describe("image chips in the composer", () => {
     expect(row).not.toBeNull();
     expect(row.getAttribute("title")).toBe("assets/a.png");
     expect(row.querySelector(".attachment-remove")).not.toBeNull();
+  });
+
+  it("renders the host's staged-file thumbnail and opens a large preview", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "chips",
+      chips: [{
+        id: "image:/staging/a.png:1:7",
+        path: "/staging/a.png",
+        relPath: "Image #1",
+        hidden: false,
+        imageIndex: 1,
+        mimeType: "image/png",
+        previewSrc: "vscode-webview://preview/image.png",
+      }],
+    });
+
+    const thumbnail = doc.querySelector(".attachment-preview")!;
+    expect(thumbnail.querySelector("img")!.getAttribute("src")).toBe("vscode-webview://preview/image.png");
+    click(window, thumbnail);
+    const overlay = doc.querySelector(".image-preview-overlay") as HTMLElement;
+    expect(overlay.hidden).toBe(false);
+    expect(overlay.querySelector("img")!.getAttribute("src")).toBe("vscode-webview://preview/image.png");
+  });
+
+  it("reuses browser-owned paste bytes for a remote thumbnail", async () => {
+    const { window, doc, posted } = bootWebview({ remote: true });
+    dispatch(window, { type: "session", sessionId: "session-a", models: [] });
+    const input = doc.getElementById("input")!;
+    input.dispatchEvent(pasteEvent(window, [{ kind: "file", type: "image/png", file: pngFile(window) }]));
+    await vi.waitFor(() => expect(posted.some((m) => m.type === "pasteImage")).toBe(true));
+    const paste = posted.find((m) => m.type === "pasteImage")!;
+    expect(typeof paste.previewId).toBe("string");
+
+    dispatch(window, {
+      type: "chips",
+      chips: [{
+        id: "image:/staging/remote.png:1:8",
+        path: "/staging/remote.png",
+        relPath: "Image #1",
+        hidden: false,
+        imageIndex: 1,
+        mimeType: "image/png",
+        previewId: paste.previewId,
+      }],
+    });
+    expect(doc.querySelector(".attachment-preview img")!.getAttribute("src"))
+      .toMatch(/^data:image\/png;base64,/);
+  });
+
+  it("keeps a paste made before the first session id is assigned", async () => {
+    const { window, doc, posted } = bootWebview({ remote: true });
+    const input = doc.getElementById("input")!;
+    input.dispatchEvent(pasteEvent(window, [{ kind: "file", type: "image/png", file: pngFile(window) }]));
+    await vi.waitFor(() => expect(posted.some((m) => m.type === "pasteImage")).toBe(true));
+    const previewId = posted.find((m) => m.type === "pasteImage")!.previewId;
+    dispatch(window, { type: "session", sessionId: "assigned-after-paste", models: [] });
+    dispatch(window, {
+      type: "chips",
+      chips: [{
+        id: "image-after-start",
+        path: "/staging/after-start.png",
+        relPath: "Image #1",
+        hidden: false,
+        imageIndex: 1,
+        mimeType: "image/png",
+        previewId,
+      }],
+    });
+    expect(doc.querySelector(".attachment-preview img")?.getAttribute("src"))
+      .toMatch(/^data:image\/png;base64,/);
+  });
+
+  it("keeps a pasted thumbnail when switching away from its session and back", async () => {
+    const { window, doc, posted } = bootWebview({ remote: true });
+    dispatch(window, { type: "session", sessionId: "session-a", models: [] });
+    const input = doc.getElementById("input")!;
+    input.dispatchEvent(pasteEvent(window, [{ kind: "file", type: "image/png", file: pngFile(window) }]));
+    await vi.waitFor(() => expect(posted.some((m) => m.type === "pasteImage")).toBe(true));
+    const previewId = posted.find((m) => m.type === "pasteImage")!.previewId;
+    const chip = {
+      id: "image:/staging/remote.png:1:9",
+      path: "/staging/remote.png",
+      relPath: "Image #1",
+      hidden: false,
+      imageIndex: 1,
+      mimeType: "image/png",
+      previewId,
+    };
+    dispatch(window, { type: "chips", chips: [chip] });
+    expect(doc.querySelector(".attachment-preview img")).not.toBeNull();
+
+    dispatch(window, { type: "clearMessages" });
+    dispatch(window, { type: "session", sessionId: "session-b", models: [] });
+    dispatch(window, { type: "chips", chips: [] });
+    dispatch(window, { type: "clearMessages" });
+    dispatch(window, { type: "session", sessionId: "session-a", models: [] });
+    dispatch(window, { type: "chips", chips: [chip] });
+
+    expect(doc.querySelector(".attachment-preview img")!.getAttribute("src"))
+      .toMatch(/^data:image\/png;base64,/);
+  });
+
+  it("evicts the oldest browser preview after 24 pasted images", async () => {
+    const { window, doc, posted } = bootWebview({ remote: true });
+    const input = doc.getElementById("input")!;
+    for (let i = 0; i < 25; i++) {
+      input.dispatchEvent(pasteEvent(window, [{ kind: "file", type: "image/png", file: pngFile(window) }]));
+    }
+    await vi.waitFor(() => {
+      expect(posted.filter((m) => m.type === "pasteImage")).toHaveLength(25);
+    });
+    const previewIds = posted
+      .filter((m) => m.type === "pasteImage")
+      .map((m) => m.previewId as string);
+    dispatch(window, {
+      type: "chips",
+      chips: [
+        {
+          id: "oldest",
+          path: "/staging/oldest.png",
+          relPath: "Image #1",
+          hidden: false,
+          imageIndex: 1,
+          mimeType: "image/png",
+          previewId: previewIds[0],
+        },
+        {
+          id: "newest",
+          path: "/staging/newest.png",
+          relPath: "Image #25",
+          hidden: false,
+          imageIndex: 25,
+          mimeType: "image/png",
+          previewId: previewIds[24],
+        },
+      ],
+    });
+    expect(doc.querySelectorAll(".attachment-preview img")).toHaveLength(1);
+    expect(doc.querySelector(".attachment-preview img")!.getAttribute("src"))
+      .toMatch(/^data:image\/png;base64,/);
   });
 });

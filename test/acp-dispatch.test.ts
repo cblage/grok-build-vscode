@@ -5,6 +5,8 @@ import {
   sumUsage,
   collectToolImages,
   contextUsedFromCompactNotification,
+  contextUsedFromUpdateEnvelope,
+  enforceCompleteSessionCost,
   autoCompactStartedNote,
   isSubagentLifecycleUpdate,
   extractGeneratedMediaPaths,
@@ -28,13 +30,13 @@ import {
   usageIsRealMeasurement,
   makeAckResponse,
   makeExitPlanResponse,
+  makeExitPlanUnavailableResponse,
   makePermissionCancelledResponse,
   makePermissionResponse,
   makeQuestionCancelledResponse,
   makeQuestionResponse,
   makeRequest,
   parseAcpLine,
-  parseSessionInfoContext,
   permissionOutcomeFor,
   resolveModelId,
   routeSessionUpdate,
@@ -277,34 +279,17 @@ describe("gateZeroTokenMeta (#39)", () => {
   });
 });
 
-describe("parseSessionInfoContext (hidden post-/compact /session-info)", () => {
-  // Verbatim reply captured over ACP from grok 0.2.x
-  // (research/signals-refresh-probe.cjs).
-  const REAL_REPLY =
-    "**Title:** Context Size Probe With Seeded Reply Request\n\n" +
-    "**Session ID:** 019f5266-f0e3-75f3-a99f-13d40fbd1b28\n\n" +
-    "**Working directory:** C:\\Users\\Dell\\AppData\\Local\\Temp\\grok-signals-probe-dt7QZZ\n\n" +
-    "**Model:** grok-build\n\n**Turn:** 1\n\n" +
-    "**Context:** 16017 / 512000 tokens (3%)";
-
-  it("parses the real grok reply shape", () => {
-    expect(parseSessionInfoContext(REAL_REPLY)).toEqual({ used: 16017, window: 512000 });
+describe("contextUsedFromUpdateEnvelope (live session/update context)", () => {
+  it("reads the observed 0.2.117 envelope count", () => {
+    expect(contextUsedFromUpdateEnvelope({ totalTokens: 16015 })).toBe(16015);
   });
 
-  it("tolerates unbolded / recased lines and thousands separators", () => {
-    expect(parseSessionInfoContext("context: 16,017 / 512,000 tokens (3%)")).toEqual({ used: 16017, window: 512000 });
-    expect(parseSessionInfoContext("CONTEXT:**1 / 200000 tokens")).toEqual({ used: 1, window: 200000 });
-  });
-
-  it("returns null when the line is missing or malformed", () => {
-    expect(parseSessionInfoContext("")).toBeNull();
-    expect(parseSessionInfoContext("**Model:** grok-build")).toBeNull();
-    expect(parseSessionInfoContext("Context: lots / many tokens")).toBeNull();
-  });
-
-  it("rejects non-positive counts (0 is never a real measurement, #39)", () => {
-    expect(parseSessionInfoContext("Context: 0 / 512000 tokens")).toBeNull();
-    expect(parseSessionInfoContext("Context: 100 / 0 tokens")).toBeNull();
+  it("rejects the placeholder zero and malformed values", () => {
+    expect(contextUsedFromUpdateEnvelope({ totalTokens: 0 })).toBeNull();
+    expect(contextUsedFromUpdateEnvelope({ totalTokens: -1 })).toBeNull();
+    expect(contextUsedFromUpdateEnvelope({ totalTokens: "16015" })).toBeNull();
+    expect(contextUsedFromUpdateEnvelope({ totalTokens: Number.NaN })).toBeNull();
+    expect(contextUsedFromUpdateEnvelope(undefined)).toBeNull();
   });
 });
 
@@ -393,18 +378,33 @@ describe("response builders", () => {
     });
   });
 
-  it("makeExitPlanResponse: approved sends result, rejected/abandoned send error", () => {
-    expect(makeExitPlanResponse(9, "approved").result).toEqual({ outcome: "approved" });
-    expect(makeExitPlanResponse(9, "rejected").error?.code).toBe(-32000);
-    expect(makeExitPlanResponse(9, "rejected").result).toBeUndefined();
-    expect(makeExitPlanResponse(9, "abandoned").error?.code).toBe(-32000);
-    expect(makeExitPlanResponse(9, "abandoned").result).toBeUndefined();
+  it("makeExitPlanResponse maps UI verdicts to native successful outcomes", () => {
+    expect(makeExitPlanResponse(9, "approved")).toEqual({
+      jsonrpc: "2.0", id: 9, result: { outcome: "approved" },
+    });
+    expect(makeExitPlanResponse(9, "rejected")).toEqual({
+      jsonrpc: "2.0", id: 9, result: { outcome: "cancelled" },
+    });
+    expect(makeExitPlanResponse(9, "abandoned")).toEqual({
+      jsonrpc: "2.0", id: 9, result: { outcome: "abandoned" },
+    });
   });
 
   it("makeExitPlanResponse wraps in jsonrpc 2.0 envelope", () => {
     const r = makeExitPlanResponse(42, "approved");
     expect(r.jsonrpc).toBe("2.0");
     expect(r.id).toBe(42);
+  });
+
+  it("rejects exit-plan requests instead of sending an unsafe success below the floor", () => {
+    expect(makeExitPlanUnavailableResponse(43)).toEqual({
+      jsonrpc: "2.0",
+      id: 43,
+      error: {
+        code: -32000,
+        message: "Plan mode is unavailable for this Grok CLI version",
+      },
+    });
   });
 
   it("makeAckResponse defaults to empty result", () => {
@@ -963,12 +963,14 @@ describe("extractPromptUsage (#53)", () => {
       usage: {
         inputTokens: 32330, outputTokens: 158, totalTokens: 32488, cachedReadTokens: 27264,
         reasoningTokens: 128, modelCalls: 2, apiDurationMs: 3770, numTurns: 2,
+        costUsdTicks: 89_290_000,
         modelUsage: { "grok-4.5": { inputTokens: 32330 } },
       },
     };
     expect(extractPromptUsage(meta)).toEqual({
       inputTokens: 32330, outputTokens: 158, totalTokens: 32488, cachedReadTokens: 27264,
       reasoningTokens: 128, modelCalls: 2, apiDurationMs: 3770, numTurns: 2,
+      costUsdTicks: 89_290_000,
     });
   });
 
@@ -988,8 +990,10 @@ describe("extractPromptUsage (#53)", () => {
 
 describe("addUsage (#53)", () => {
   it("sums the session total field-wise", () => {
-    expect(addUsage({ inputTokens: 10, outputTokens: 2 }, { inputTokens: 5, outputTokens: 3 }))
-      .toEqual({ inputTokens: 15, outputTokens: 5 });
+    expect(addUsage(
+      { inputTokens: 10, outputTokens: 2, costUsdTicks: 20_000_000 },
+      { inputTokens: 5, outputTokens: 3, costUsdTicks: 70_000_000 },
+    )).toEqual({ inputTokens: 15, outputTokens: 5, costUsdTicks: 90_000_000 });
   });
 
   it("never invents a field neither side reported", () => {
@@ -1053,10 +1057,10 @@ describe("isMethodNotFoundError (#52, #48)", () => {
 describe("sumUsage (session total is derived, not patched)", () => {
   it("sums the surviving turns", () => {
     const out = sumUsage([
-      { usage: { inputTokens: 100, outputTokens: 10, modelCalls: 1 } },
-      { usage: { inputTokens: 250, outputTokens: 40, modelCalls: 3 } },
+      { usage: { inputTokens: 100, outputTokens: 10, modelCalls: 1, costUsdTicks: 10_000_000 } },
+      { usage: { inputTokens: 250, outputTokens: 40, modelCalls: 3, costUsdTicks: 25_000_000 } },
     ]);
-    expect(out).toEqual({ inputTokens: 350, outputTokens: 50, modelCalls: 4 });
+    expect(out).toEqual({ inputTokens: 350, outputTokens: 50, modelCalls: 4, costUsdTicks: 35_000_000 });
   });
 
   it("makePermissionCancelledResponse declines without inventing an option id", () => {
@@ -1083,20 +1087,57 @@ describe("sumUsage (session total is derived, not patched)", () => {
     expect(out).toEqual({ inputTokens: 10, reasoningTokens: 9 });
   });
 
+  it("withholds session cost when a pre-cost turn is mixed with a cost-bearing turn", () => {
+    const out = sumUsage([
+      { usage: { inputTokens: 100, outputTokens: 10 } },
+      { usage: { inputTokens: 200, outputTokens: 20, costUsdTicks: 25_000_000 } },
+    ]);
+    expect(out).toEqual({ inputTokens: 300, outputTokens: 30 });
+    expect("costUsdTicks" in (out as object)).toBe(false);
+  });
+
   it("skips entries with no usage rather than throwing", () => {
     expect(sumUsage([{ usage: undefined }, { usage: { inputTokens: 3 } }])).toEqual({ inputTokens: 3 });
   });
 
   it("re-summing a truncated log yields the pre-turn total (the rewind contract)", () => {
     const log = [
-      { afterUserMessage: 1, usage: { inputTokens: 100, outputTokens: 10 } },
-      { afterUserMessage: 2, usage: { inputTokens: 200, outputTokens: 20 } },
-      { afterUserMessage: 3, usage: { inputTokens: 400, outputTokens: 40 } },
+      { afterUserMessage: 1, usage: { inputTokens: 100, outputTokens: 10, costUsdTicks: 10_000_000 } },
+      { afterUserMessage: 2, usage: { inputTokens: 200, outputTokens: 20, costUsdTicks: 20_000_000 } },
+      { afterUserMessage: 3, usage: { inputTokens: 400, outputTokens: 40, costUsdTicks: 40_000_000 } },
     ];
-    expect(sumUsage(log)).toEqual({ inputTokens: 700, outputTokens: 70 });
+    expect(sumUsage(log)).toEqual({ inputTokens: 700, outputTokens: 70, costUsdTicks: 70_000_000 });
     // Rewound so only 1 user message survives -> only its turn is billed.
     const kept = log.filter((e) => e.afterUserMessage <= 1);
-    expect(sumUsage(kept)).toEqual({ inputTokens: 100, outputTokens: 10 });
+    expect(sumUsage(kept)).toEqual({ inputTokens: 100, outputTokens: 10, costUsdTicks: 10_000_000 });
+  });
+});
+
+describe("enforceCompleteSessionCost", () => {
+  const total = { inputTokens: 600, costUsdTicks: 60_000_000 };
+
+  it("withholds cost when the ledger has a prompt-coordinate gap", () => {
+    expect(enforceCompleteSessionCost(total, [
+      { afterUserMessage: 1, usage: { costUsdTicks: 10_000_000 } },
+      { afterUserMessage: 3, usage: { costUsdTicks: 50_000_000 } },
+    ], 3)).toEqual({ inputTokens: 600 });
+  });
+
+  it("withholds cost when an existing conversation has an empty ledger", () => {
+    expect(enforceCompleteSessionCost(total, [], 4)).toEqual({ inputTokens: 600 });
+  });
+
+  it("keeps the total for a genuinely fresh conversation covered from prompt one", () => {
+    expect(enforceCompleteSessionCost(total, [
+      { afterUserMessage: 1, usage: { costUsdTicks: 60_000_000 } },
+    ], 1)).toEqual(total);
+  });
+
+  it("counts a successful zero-inference marker as covered", () => {
+    expect(enforceCompleteSessionCost(total, [
+      { afterUserMessage: 1, usage: { costUsdTicks: 60_000_000 } },
+      { afterUserMessage: 2, usage: undefined },
+    ], 2)).toEqual(total);
   });
 });
 

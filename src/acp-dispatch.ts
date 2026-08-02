@@ -277,6 +277,8 @@ export interface PromptUsage {
   modelCalls?: number;
   apiDurationMs?: number;
   numTurns?: number;
+  /** USD billing in Grok's fixed-point unit: 10^10 ticks = $1. */
+  costUsdTicks?: number;
 }
 
 export interface PromptResultMeta {
@@ -305,6 +307,7 @@ export function extractPromptUsage(meta: any): PromptUsage | undefined {
     modelCalls: num(u.modelCalls),
     apiDurationMs: num(u.apiDurationMs),
     numTurns: num(u.numTurns),
+    costUsdTicks: num(u.costUsdTicks),
   };
   return Object.values(out).some((v) => v !== undefined) ? out : undefined;
 }
@@ -330,7 +333,9 @@ export function extractPromptMeta(result: any): PromptResultMeta {
  *
  * `undefined + undefined` stays undefined (never invents a 0 for a field the CLI
  * doesn't report), but a present field added to an absent one keeps the present
- * value. `apiDurationMs` and `numTurns` sum too — both are per-prompt totals.
+ * value. Cost is stricter: it stays absent unless every contributing turn
+ * reported it, because a partial sum must not be presented as a session total.
+ * `apiDurationMs` and `numTurns` sum too — both are per-prompt totals.
  */
 export function addUsage(a: PromptUsage | undefined, b: PromptUsage | undefined): PromptUsage | undefined {
   if (!a) return b ? { ...b } : undefined;
@@ -338,12 +343,15 @@ export function addUsage(a: PromptUsage | undefined, b: PromptUsage | undefined)
   const keys: (keyof PromptUsage)[] = [
     "inputTokens", "outputTokens", "totalTokens", "cachedReadTokens",
     "reasoningTokens", "modelCalls", "apiDurationMs", "numTurns",
+    "costUsdTicks",
   ];
   const out: PromptUsage = {};
   for (const k of keys) {
     const x = a[k];
     const y = b[k];
     if (x === undefined && y === undefined) continue;
+    // A cost is a truthful total only when every contributing turn reported it.
+    if (k === "costUsdTicks" && (x === undefined || y === undefined)) continue;
     out[k] = (x ?? 0) + (y ?? 0);
   }
   return out;
@@ -355,6 +363,36 @@ export function sumUsage(entries: Array<{ usage?: PromptUsage }>): PromptUsage |
   let out: PromptUsage | undefined;
   for (const e of entries) out = addUsage(out, e.usage);
   return out;
+}
+
+/**
+ * A dollar SESSION total is honest only when our ledger spans every real user
+ * prompt in the conversation. `afterUserMessage` is the replay-stable prompt
+ * coordinate shared by live sends and cold `session/load`; entries without
+ * usage may deliberately cover successful zero-inference turns such as
+ * `/compact`. Missing coordinates remain unknown gaps.
+ *
+ * Token fields keep their existing best-known aggregate semantics. Only cost is
+ * removed when coverage is incomplete; per-turn usage is never passed here and
+ * therefore always retains its own honest cost.
+ */
+export function enforceCompleteSessionCost(
+  usage: PromptUsage | undefined,
+  entries: readonly { afterUserMessage?: number; usage?: PromptUsage }[],
+  userMessageCount: number,
+): PromptUsage | undefined {
+  if (usage?.costUsdTicks === undefined) return usage;
+  const covered = new Set<number>();
+  for (const entry of entries) {
+    const position = entry.afterUserMessage;
+    if (typeof position === "number" && Number.isSafeInteger(position) && position >= 1 && position <= userMessageCount) {
+      covered.add(position);
+    }
+  }
+  const complete = userMessageCount > 0 && covered.size === userMessageCount;
+  if (complete) return usage;
+  const { costUsdTicks: _incompleteCost, ...withoutCost } = usage;
+  return withoutCost;
 }
 
 /**
@@ -398,6 +436,16 @@ export function isMethodNotFoundError(e: any): boolean {
 export function gateZeroTokenMeta(meta: PromptResultMeta): PromptResultMeta {
   if (meta.totalTokens !== 0) return meta;
   return { ...meta, totalTokens: undefined };
+}
+
+/**
+ * The trustworthy live context count is carried by each `session/update`
+ * envelope's `_meta.totalTokens`, not the prompt result (which can be a
+ * placeholder zero). Invalid values leave the last real donut value intact.
+ */
+export function contextUsedFromUpdateEnvelope(meta: unknown): number | null {
+  const used = (meta as { totalTokens?: unknown } | null | undefined)?.totalTokens;
+  return typeof used === "number" && Number.isFinite(used) && used > 0 ? used : null;
 }
 
 /**
@@ -460,27 +508,6 @@ export function autoCompactStartedNote(update: unknown): string | null {
     : `Auto-compacting context…`;
 }
 
-/**
- * Parse the context line out of `/session-info`'s reply text — grok 0.2.x
- * renders `**Context:** 16017 / 512000 tokens (3%)`. The post-/compact donut
- * refresh prefers the live `auto_compact_completed` notification
- * (`contextUsedFromCompactNotification`); this parser drives the hidden
- * /session-info FALLBACK for CLIs that predate that rail (e.g. the Windows
- * downgrade target). Tolerant of bold markers, casing, and thousands
- * separators; null when the line is missing or the numbers don't parse
- * (callers fall back silently — the post-compact re-prime's signals.json read
- * is the second backup).
- */
-export function parseSessionInfoContext(text: string): { used: number; window: number } | null {
-  const m = /context:\*{0,2}\s*([\d][\d,]*)\s*\/\s*([\d][\d,]*)\s*tokens/i.exec(text ?? "");
-  if (!m) return null;
-  const num = (s: string) => Number(s.replace(/,/g, ""));
-  const used = num(m[1]);
-  const window = num(m[2]);
-  if (!Number.isFinite(used) || used <= 0 || !Number.isFinite(window) || window <= 0) return null;
-  return { used, window };
-}
-
 export function makePermissionResponse(id: number | string, optionId: string) {
   return {
     jsonrpc: "2.0",
@@ -501,20 +528,22 @@ export function makeExitPlanResponse(
   id: number | string,
   verdict: "approved" | "abandoned" | "rejected",
 ) {
-  if (verdict === "approved") {
-    return { jsonrpc: "2.0", id, result: { outcome: "approved" } };
-  }
-  // Reject and Abandon are sent as JSON-RPC errors. NOTE: the old rationale here
-  // ("the CLI treats any successful result as approval") is obsolete — grok
-  // 0.2.101 DOES honor a success `{outcome:"cancelled"|"abandoned"}` (mode stays
-  // plan on cancel; probe: research/oss-surfaces-probe.cjs --scenario=planoutcome).
-  // We keep the error form for now on purpose: our verdict UX is driven by the
-  // hidden primer + `[Plan approved/rejected/cancelled]` follow-up markers and the
-  // client-side gate, and switching to the outcome protocol touches that whole
-  // flow — deferred until plan-mode enforcement stabilizes CLI-side (§2.1). The
-  // error path keeps the session in plan mode, which is what we need meanwhile.
-  const message = verdict === "rejected" ? "User rejected the plan" : "User abandoned the plan";
-  return { jsonrpc: "2.0", id, error: { code: -32000, message } };
+  const outcome = verdict === "rejected" ? "cancelled" : verdict;
+  return { jsonrpc: "2.0", id, result: { outcome } };
+}
+
+/** Fail a stray plan-exit request when this session's CLI is below (or could
+ * not be verified against) the native-verdict floor. A successful outcome is
+ * unsafe here: older CLIs can interpret every success as approval. */
+export function makeExitPlanUnavailableResponse(id: number | string) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code: -32000,
+      message: "Plan mode is unavailable for this Grok CLI version",
+    },
+  };
 }
 
 /**
@@ -570,9 +599,9 @@ export function summarizeBackgroundCommand(cmd: string, max = 80): string {
 /**
  * True when `session/set_model` was rejected because the target model belongs
  * to a different agent than the one this session is bound to. The CLI binds the
- * agent at spawn time and locks it after the first turn (including our hidden
- * primer), so the model can only be applied on a fresh session — `newSession`
- * sets it before the primer runs, while the agent is still rebindable. The host
+ * agent at spawn time and locks it after the first turn, so the model can only
+ * be applied on a fresh session — `newSession` sets it before that turn, while
+ * the agent is still rebindable. The host
  * uses this to fall back to a restart instead of surfacing the raw error.
  */
 export function isIncompatibleAgentError(err: any): boolean {

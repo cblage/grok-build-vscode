@@ -1,16 +1,67 @@
 # Changelog
 
-## 2.1.2-sandbox.1 - 2026-07-31
+## 2.3.2-sandbox.1 — 2026-08-02
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v2.1.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v2.3.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
   - **Session behavior:** the chosen profile is fixed for the life of a conversation and restored when that conversation resumes. Built-in application failures warn and continue like Grok; invalid or unapplied custom profiles refuse to start; and loss of the live delegated-operation sandbox ends the affected session instead of silently weakening it.
   - **Sandbox controls:** supported macOS hosts get a compact lock/unlock indicator stacked between the voice and Send controls; profile names, distinct source icons, and source labels for built-in, user-defined, and workspace-defined profiles live in its picker. The sandbox control stays disabled from session startup through the full active turn because its boundary is fixed for the conversation, while Agent Mode remains available mid-turn; changing the profile of an existing conversation opens the Summarize or Just Restart flow required to start a new session under the new boundary.
   - See the [macOS sandbox architecture guide](docs/macos-sandbox-architecture.md) for the full access matrix, profile resolution rules, process topology, and enforcement boundary.
+
+---
+
+## 2.3.1 — 2026-08-02
+
+### Changed
+
+- **Dictation inserts where your cursor is** instead of always appending to the end, and replaces the text you had selected — so you can pause, correct a sentence in the middle, and carry on in place. Authored by [@tarcisiomiranda](https://github.com/tarcisiomiranda) in [#72](https://github.com/phuryn/grok-build-vscode/pull/72), co-authored here; it was ported onto the current voice transport rather than merged, because the branch predated the shared-PCM rewrite.
+- **Clicking Send or Queue now turns the microphone off** and sends exactly the text you can see. A transcript still in flight can no longer refill the composer you just cleared. Saying **"grok send"** still submits hands-free and keeps listening — that flow is unchanged on purpose.
+
+### Fixed
+
+- **Dictation could wipe a draft you had already typed.** The composer position was only remembered when the extension believed voice was configured, but recording is the host's call — so when the two disagreed, the first words transcribed replaced everything in the box.
+
+---
+
+## 2.3.0 — 2026-08-01
+
+### Added
+
+- **You can see what you attached** ([#88](https://github.com/phuryn/grok-build-vscode/issues/88)). Images preview as thumbnails in the composer and in the conversation itself, in VS Code and in AFK Pilot, live and after a restore. Click or tap one to open it full size — on a phone that version is fetched on demand, so it arrives a moment after the preview instead of being carried around with every conversation. Photos work, not just screenshots: JPEG is decoded and downscaled on your own machine.
+- **What a conversation cost.** A running total per conversation, taken from what the CLI reports and shown only when the whole conversation can be accounted for — a partial figure is worse than none.
+- **AFK Pilot can read a shorter, speech-friendly version of each reply** ([#94](https://github.com/phuryn/grok-build-vscode/issues/94)), matching the switch VS Code already had. Each browser keeps its own preference.
+
+### Changed
+
+- **"Summarize before speaking" is now "Read simplified summaries", and defaults on.** The setting key is unchanged. If the summary fails or never arrives, the original reply is spoken rather than nothing.
+- **Switching repository lands somewhere predictable** — that repository's newest conversation, or a new one if it has none — and says "Loading conversation" while it does, with the switcher held until it finishes.
+
+### Fixed
+
+- **Opening an older conversation from history no longer re-types itself** ([#93](https://github.com/phuryn/grok-build-vscode/issues/93)). It arrives in one update, as a reconnect already did.
+- **The scrollbar reaches the bottom with "Expand tool detail" on** ([#92](https://github.com/phuryn/grok-build-vscode/issues/92)), and a clipped command can be revealed by tapping on a touch screen.
+- **A phone no longer bounces between two repositories.** Reconnecting — which happens every time a phone tab goes to the background — re-asserted a repository that disagreed with the conversation it then restored, so the view flipped back and forth.
+- **An attachment can no longer arrive in the wrong conversation.** If a phone reconnected while an image was still being written to disk, that image could land in whichever conversation VS Code happened to be showing.
+- **Reading replies aloud no longer stops after switching conversation** on a phone.
+
+---
+
+## 2.2.0 — 2026-07-31
+
+### Changed
+
+- **Plan mode now uses the CLI's own approve/reject, instead of a workaround.** Older Grok Build CLIs treated *any* answer to a plan card as approval, so the extension shipped a hidden instruction message teaching the model to read your real verdict from a follow-up, and cancelled the planning turn to re-drive the work itself. The CLI fixed that, so all of it is gone. **Approve & implement** now continues straight into the work in the same turn rather than starting a second one, and **Keep planning** leaves Grok planning — sometimes it revises immediately, sometimes it waits for you to say what to change. A comment you attach to a verdict still reaches Grok *before* it starts implementing.
+- **Plan mode needs Grok Build CLI 0.2.117 or newer.** Updating the extension updates the CLI on your next session. If it can't be updated — or its version can't be read — Plan is shown disabled with the reason, while Agent and Auto-accept carry on working. That's deliberate: the verdict handling above isn't safe on an older CLI.
+
+### Fixed
+
+- **A conversation opened on your phone no longer re-types itself.** Mobile browsers discard a backgrounded tab, so coming back to AFK Pilot rebuilt the conversation one message at a time. It now arrives in a single update, showing your recent exchanges. Opening an *older* session from the history list still streams — that one is next.
+- **Grok Build CLI installs that resolve to a `grok.cmd` shim** (common on Windows) failed the version read, which in turn disabled Plan mode.
+- **Conversations recorded by earlier versions still restore cleanly.** They contain the old hidden instruction message; it stays hidden, and plan cards stay where they belong.
 
 ---
 

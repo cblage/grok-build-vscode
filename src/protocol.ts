@@ -45,6 +45,9 @@ export interface ToolCallPayload {
 export interface PlanHistoryItem {
   text: string;
   verdict?: "approved" | "rejected" | "abandoned" | undefined;
+  afterUserMessage?: number;
+  afterInterjection?: number;
+  afterHistoryEvent?: number;
   planPath?: string;
   planName?: string;
 }
@@ -57,6 +60,7 @@ export const HOST_CAPABILITIES = {
 
 export type HostMsg =
   | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform; steerByDefault: boolean; soundNotifications: boolean; processingSound: boolean; readRepliesAloud: boolean; capabilities: { uploadFile: boolean; remoteVoice: boolean } }
+  | { type: "planModeAvailability"; available: boolean; reason?: string }
   | { type: "showThinking"; value: boolean }
   // grok.soundNotifications — live toggle for the turn-complete/error sound (#59).
   | { type: "soundNotifications"; value: boolean }
@@ -102,11 +106,22 @@ export type HostMsg =
   | { type: "thoughtChunk"; text: string }
   | { type: "messageChunk"; text: string }
   | { type: "media"; media: string; src?: string; url?: string; mimeType?: string; path?: string }
-  | { type: "userMessageChunk"; text: string; timestampMs?: number }
+  | {
+      type: "userMessageChunk";
+      text: string;
+      timestampMs?: number;
+      images?: Array<{ imageIndex: number; path?: string; previewSrc?: string; fullId?: string }>;
+    }
+  /** Answer to {@link WebviewMsg} `requestImageFull`. Sent only to the tab that
+   *  asked; `src` absent means the source is gone (swept, or deleted). */
+  | { type: "imageFull"; fullId: string; src?: string }
   | { type: "historyReplay"; active: boolean }
+  /** Remote reconnect snapshot delivered as one browser event. Updated clients
+   *  render every nested message synchronously; older per-message frames remain
+   *  valid and continue through their existing handlers. */
+  | { type: "historyBatch"; messages: HostMsg[] }
   | { type: "permissionHistoryQueue"; permissions: unknown[] }
   | { type: "planHistoryQueue"; plans: PlanHistoryItem[] }
-  | { type: "planProcessing" }
   | { type: "toolCall"; call: ToolCallPayload }
   | { type: "toolCallUpdate"; call: ToolCallPayload }
   | { type: "permissionRequest"; req: PermissionRequest }
@@ -115,8 +130,6 @@ export type HostMsg =
   // The host spreads the plan-review snapshot (planPath/planName) into the bare
   // ExitPlanRequest before posting, so the wire shape is wider than acp's type.
   | { type: "exitPlanRequest"; req: ExitPlanRequest & { planPath?: string; planName?: string } }
-  // Buffered right after the user's verdict (mirrors permissionResolved) so a
-  // re-focus replays the plan card collapsed instead of actionable.
   | { type: "planResolved"; requestId: number | string; verdict: "approved" | "abandoned" | "rejected" }
   | { type: "questionRequest"; req: QuestionRequest }
   | { type: "planNotice"; text: string }
@@ -193,13 +206,13 @@ export type HostMsg =
   // Session-cumulative billing (#53), summed by the host across the session's
   // turns. `turn` is the last prompt's own usage. Both omitted when the CLI sent
   // no `_meta.usage` — the popover then shows only the context row, never zeros.
-  | { type: "usage"; turn?: PromptUsage; session?: PromptUsage };
+  | { type: "usage"; turn?: PromptUsage; session?: PromptUsage; afterUserMessage?: number; afterHistoryEvent?: number };
 
 /** webview -> host */
 export type WebviewMsg =
   | { type: "ready"; tabToken?: string }
   // Browser-owned remote preferences reported for session_start telemetry.
-  | { type: "remotePreferences"; fontScale: number; readRepliesAloud: boolean; usesTouch: boolean }
+  | { type: "remotePreferences"; fontScale: number; readRepliesAloud: boolean; summarizeRepliesAloud?: boolean; usesTouch: boolean }
   | { type: "send"; text: string; chips?: FileChip[]; bare?: boolean; queuedSendId?: string; submissionId?: string }
   | { type: "newSession" }
   | { type: "cancel" }
@@ -235,6 +248,10 @@ export type WebviewMsg =
   | { type: "setReadRepliesAloud"; value: boolean }
   | { type: "setSummarizeRepliesAloud"; value: boolean }
   | { type: "summarizeSpeech"; requestId: number; text: string }
+  /** Ask the host to render a full-size version of an image it already sent a
+   *  thumbnail for. `fullId` is an opaque handle the HOST issued — deliberately
+   *  not a path, so a remote can only ask for pictures it was already shown. */
+  | { type: "requestImageFull"; fullId: string }
   | { type: "composerFocus"; focused: boolean }
   | { type: "setExpandCommandOutputs"; value: boolean }
   | { type: "setSteerByDefault"; value: boolean }
@@ -267,12 +284,14 @@ export type WebviewMsg =
   // (same pipeline as drop / the + picker). The `@rel/path` text stays in the
   // composer, so the prompt carries both the prose reference and the chip.
   | { type: "addMentionFile"; relPath: string }
-  | { type: "pasteImage"; mimeType: string; data: string }
+  | { type: "pasteImage"; mimeType: string; data: string; previewId?: string }
   // Remote browser upload: an untrusted basename plus base64 bytes. The host
   // allowlists/sanitizes/stages it, then routes it through addDroppedFile.
   | { type: "uploadFile"; name: string; data: string }
   | { type: "voiceStart" }
-  | { type: "voiceStop" }
+  /** Stop voice input. Manual Send/Queue sets discard so late transcription
+   * cannot refill the composer that was just sent. */
+  | { type: "voiceStop"; discard?: boolean }
   // AFK Pilot microphone input. Audio remains raw PCM16 LE / 16 kHz / mono;
   // the relay treats these opaque messages like every other WebviewMsg.
   | { type: "remoteVoiceStart" }
@@ -320,21 +339,21 @@ export type WebviewMsg =
 // error). The runtime arrays are just the keys, so they can never drift from the
 // union without failing the build.
 const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
-  initialState: true, showThinking: true, fontScale: true, grokUpdateStatus: true,
+  initialState: true, planModeAvailability: true, showThinking: true, fontScale: true, grokUpdateStatus: true,
   initialized: true, cliUpdating: true, session: true, modelChanged: true,
   modeChanged: true, modePolicy: true, sandboxState: true, openModePopover: true,
   voiceState: true, voiceConfigured: true,
   voicePartial: true, voiceSubmit: true, voiceTranscript: true, voiceError: true,
   chips: true, commandsUpdate: true, mentionResults: true, userMessage: true, agentStart: true,
   thoughtChunk: true, messageChunk: true, media: true, userMessageChunk: true,
-  historyReplay: true, permissionHistoryQueue: true, planHistoryQueue: true,
-  planProcessing: true, toolCall: true, toolCallUpdate: true, permissionRequest: true, permissionOptions: true,
+  historyReplay: true, historyBatch: true, permissionHistoryQueue: true, planHistoryQueue: true,
+  toolCall: true, toolCallUpdate: true, permissionRequest: true, permissionOptions: true,
   permissionResolved: true, exitPlanRequest: true, planResolved: true, questionRequest: true,
   planNotice: true, autoCompactNotice: true, planBlocked: true, promptComplete: true, contextUsage: true, agentReset: true,
   agentError: true, agentEnd: true, exit: true, setBusy: true, summarizing: true,
   sessionContext: true, clearMessages: true, onboarding: true, error: true, hostNotice: true,
   xaiNotification: true, subagentUpdate: true, runProgress: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true,
-  soundNotifications: true, processingSound: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, moveComposerCaret: true, remoteStatus: true,
+  soundNotifications: true, processingSound: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, imageFull: true, moveComposerCaret: true, remoteStatus: true,
   setAllToolDetails: true, focusInput: true, restoreComposer: true, truncateMessages: true, uiConfirmRequest: true,
   sessions: true, repos: true, sessionDot: true, queuedSends: true, submitQueuedSend: true,
   steerUnavailable: true, usage: true,
@@ -346,7 +365,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   openText: true, openDiff: true, exportExpr: true, setEffort: true, openGlobalConfig: true,
   openProjectConfig: true, runMcpList: true, showLogs: true, moveView: true,
   setShowThinking: true, setExpandCommandOutputs: true, setSteerByDefault: true,
-  setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, summarizeSpeech: true, composerFocus: true,
+  setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, summarizeSpeech: true, requestImageFull: true, composerFocus: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
   questionCancel: true, setModel: true, runInstallCmd: true, runGrokLogin: true,
   logout: true, checkGrokUpdate: true, updateGrok: true, recheckConnection: true,

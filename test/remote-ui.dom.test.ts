@@ -14,7 +14,94 @@ function key(window: any, el: Element, init: Record<string, unknown>) {
   return event;
 }
 
+function bootRemotePcm() {
+  let node: any;
+  const harness = bootWebview({
+    remote: true,
+    beforeScripts: (w) => {
+      const track = { stop() {}, addEventListener() {} };
+      Object.defineProperty((w as any).navigator, "mediaDevices", {
+        configurable: true,
+        value: { getUserMedia: async () => ({ getTracks: () => [track] }) },
+      });
+      class FakeNode {
+        port = { onmessage: undefined as any, postMessage() {} };
+        constructor() { node = this; }
+        connect() {}
+        disconnect() {}
+      }
+      class FakeAudioContext {
+        state = "running";
+        audioWorklet = { addModule: async () => {} };
+        destination = {};
+        createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+        createGain() { return { gain: { value: 1 }, connect() {}, disconnect() {} }; }
+        close() { return Promise.resolve(); }
+      }
+      (w as any).AudioWorkletNode = FakeNode;
+      (w as any).AudioContext = FakeAudioContext;
+    },
+  });
+  return { ...harness, getNode: () => node };
+}
+
 describe("AFK Pilot shared webview controls", () => {
+  it("inserts remote dictation at the caret and preserves the suffix", async () => {
+    const { window, posted, doc } = bootRemotePcm();
+    const input = doc.getElementById("input") as HTMLTextAreaElement;
+    input.value = "Please now";
+    input.setSelectionRange(6, 6);
+
+    click(window, doc.getElementById("mic-btn")!);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    dispatch(window, { type: "voiceState", status: "listening" });
+    dispatch(window, { type: "voicePartial", text: "fix the tests" });
+
+    expect(input.value).toBe("Please fix the tests now");
+    expect(input.selectionStart).toBe(20);
+    expect(posted).toContainEqual({ type: "remoteVoiceStart" });
+    click(window, doc.getElementById("mic-btn")!);
+  });
+
+  it("manual remote Send discards capture and ignores a late transcript", async () => {
+    const { window, posted, doc } = bootRemotePcm();
+    const input = doc.getElementById("input") as HTMLTextAreaElement;
+
+    click(window, doc.getElementById("mic-btn")!);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    dispatch(window, { type: "voiceState", status: "listening" });
+    dispatch(window, { type: "voicePartial", text: "send this visible draft" });
+    click(window, doc.getElementById("send-btn")!);
+
+    expect(posted).toContainEqual({ type: "remoteVoiceStop", cancel: true });
+    expect(posted.find((message) => message.type === "send")).toMatchObject({
+      type: "send",
+      text: "send this visible draft",
+    });
+    dispatch(window, { type: "voicePartial", text: "late partial" });
+    dispatch(window, { type: "voiceTranscript", text: "late transcript" });
+    dispatch(window, { type: "voiceSubmit", text: "late submit" });
+    expect(input.value).toBe("");
+    expect(doc.getElementById("mic-btn")!.classList.contains("listening")).toBe(false);
+  });
+
+  it("clears both usage ledgers when a browser tab switches conversations", () => {
+    const { window, doc } = bootWebview({ remote: true });
+    dispatch(window, {
+      type: "usage",
+      turn: { inputTokens: 16000, costUsdTicks: 80_000_000 },
+      session: { inputTokens: 32000, costUsdTicks: 180_384_000 },
+    });
+
+    dispatch(window, { type: "clearMessages" });
+    click(window, doc.getElementById("donut") as HTMLElement);
+
+    const text = doc.getElementById("context-popover")!.textContent!;
+    expect(text).not.toContain("Session total");
+    expect(text).not.toContain("Last turn");
+    expect(text).not.toContain("Cost");
+  });
+
   it("keeps remote voice completion out of the host prompt path", () => {
     const continuous = sidebarSrc.slice(
       sidebarSrc.indexOf("private async commitRemoteVoice"),
@@ -722,6 +809,7 @@ describe("AFK Pilot shared webview controls", () => {
       type: "remotePreferences",
       fontScale: 100,
       readRepliesAloud: false,
+      summarizeRepliesAloud: false,
       usesTouch: false,
     });
 
@@ -765,6 +853,7 @@ describe("AFK Pilot shared webview controls", () => {
       type: "remotePreferences",
       fontScale: 150,
       readRepliesAloud: false,
+      summarizeRepliesAloud: false,
       usesTouch: false,
     });
 
@@ -775,8 +864,114 @@ describe("AFK Pilot shared webview controls", () => {
       type: "remotePreferences",
       fontScale: 140,
       readRepliesAloud: false,
+      summarizeRepliesAloud: false,
       usesTouch: false,
     });
+  });
+
+  it("keeps remote summarization per-device, paid-call explicit, and dependent on remote TTS", () => {
+    const spoken: string[] = [];
+    class Utterance {
+      constructor(public text: string) {}
+    }
+    const { window, posted, doc } = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        (w as any).localStorage.setItem("grok.remote.tts", "true");
+        (w as any).localStorage.setItem("grok.remote.ttsSummary", "true");
+        (w as any).SpeechSynthesisUtterance = Utterance;
+        (w as any).speechSynthesis = {
+          cancel() {},
+          speak(value: Utterance) { spoken.push(value.text); },
+        };
+      },
+    });
+    dispatch(window, { type: "initialState", readRepliesAloud: false });
+    click(window, doc.getElementById("gear-btn")!);
+    const config = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
+      .find((el) => el.textContent?.includes("Config & debug"))!;
+    click(window, config);
+    const gearToggle = (label: string) => [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
+      .find((el) => el.textContent?.includes(label)) as HTMLElement;
+
+    const summarize = gearToggle("Read simplified summaries");
+    expect(summarize.querySelector(".popover-switch.on")).not.toBeNull();
+    expect(summarize.querySelector("span")?.title).toContain("Costs an extra xAI call per spoken reply");
+
+    posted.length = 0;
+    dispatch(window, { type: "clearMessages" });
+    dispatch(window, {
+      type: "session",
+      sessionId: "switched-conversation",
+      models: [],
+      currentModelId: "grok-build",
+    });
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, { type: "messageChunk", text: "Full reply.\n```ts\nhidden();\n```" });
+    dispatch(window, { type: "agentEnd" });
+    const request = posted.find((message) => message.type === "summarizeSpeech") as any;
+    expect(request.text).toBe("Full reply.");
+    expect(spoken).toEqual([]);
+    dispatch(window, { type: "speechSummary", requestId: request.requestId, text: "Brief update." });
+    expect(spoken).toEqual(["Brief update."]);
+
+    click(window, gearToggle("Read replies aloud"));
+    expect((window as any).localStorage.getItem("grok.remote.tts")).toBe("false");
+    expect((window as any).localStorage.getItem("grok.remote.ttsSummary")).toBe("false");
+    const disabledSummary = gearToggle("Read simplified summaries");
+    expect(disabledSummary.classList.contains("disabled")).toBe(true);
+    expect(disabledSummary.querySelector(".popover-switch.on")).toBeNull();
+    expect(posted.at(-1)).toEqual({
+      type: "remotePreferences",
+      fontScale: 100,
+      readRepliesAloud: false,
+      summarizeRepliesAloud: false,
+      usesTouch: false,
+    });
+  });
+
+  it("speaks the original reply when a requested summary never arrives", () => {
+    const spoken: string[] = [];
+    let fireFallback: (() => void) | undefined;
+    class Utterance {
+      constructor(public text: string) {}
+    }
+    const { window, posted } = bootWebview({
+      remote: true,
+      beforeScripts: (w) => {
+        const nativeSetTimeout = (w as any).setTimeout.bind(w);
+        (w as any).setTimeout = (callback: () => void, delay: number, ...args: unknown[]) => {
+          if (delay === 12_000) {
+            fireFallback = () => callback();
+            return 12_000;
+          }
+          return nativeSetTimeout(callback, delay, ...args);
+        };
+        (w as any).localStorage.setItem("grok.remote.tts", "true");
+        (w as any).localStorage.setItem("grok.remote.ttsSummary", "true");
+        (w as any).SpeechSynthesisUtterance = Utterance;
+        (w as any).speechSynthesis = {
+          cancel() {},
+          speak(value: Utterance) { spoken.push(value.text); },
+        };
+      },
+    });
+    dispatch(window, { type: "initialState", readRepliesAloud: false });
+    posted.length = 0;
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, { type: "messageChunk", text: "The full reply remains useful." });
+    dispatch(window, { type: "agentEnd" });
+
+    const request = posted.find((message) => message.type === "summarizeSpeech") as any;
+    expect(request.text).toBe("The full reply remains useful.");
+    expect(spoken).toEqual([]);
+
+    expect(fireFallback).toBeTypeOf("function");
+    fireFallback!();
+    expect(spoken).toEqual(["The full reply remains useful."]);
+
+    dispatch(window, { type: "speechSummary", requestId: request.requestId, text: "Late summary." });
+    expect(spoken).toEqual(["The full reply remains useful."]);
   });
 
   it("does not expose the remote TTS hook in the VS Code webview", () => {
@@ -815,6 +1010,7 @@ describe("AFK Pilot shared webview controls", () => {
       remote: true,
       beforeScripts: (w) => {
         (w as any).localStorage.setItem("grok.remote.tts", "true");
+        (w as any).localStorage.setItem("grok.remote.ttsSummary", "false");
         (w as any).SpeechSynthesisUtterance = Utterance;
         (w as any).speechSynthesis = {
           cancel() {},
@@ -839,6 +1035,7 @@ describe("AFK Pilot shared webview controls", () => {
       remote: true,
       beforeScripts: (w) => {
         (w as any).localStorage.setItem("grok.remote.tts", "true");
+        (w as any).localStorage.setItem("grok.remote.ttsSummary", "false");
         (w as any).SpeechSynthesisUtterance = Utterance;
         (w as any).speechSynthesis = {
           cancel() {},
@@ -869,6 +1066,7 @@ describe("AFK Pilot shared webview controls", () => {
       remote: true,
       beforeScripts: (w) => {
         (w as any).localStorage.setItem("grok.remote.tts", "true");
+        (w as any).localStorage.setItem("grok.remote.ttsSummary", "false");
         (w as any).SpeechSynthesisUtterance = Utterance;
         (w as any).speechSynthesis = {
           cancel() {},
@@ -896,6 +1094,7 @@ describe("AFK Pilot shared webview controls", () => {
       remote: true,
       beforeScripts: (w) => {
         (w as any).localStorage.setItem("grok.remote.tts", "true");
+        (w as any).localStorage.setItem("grok.remote.ttsSummary", "false");
         (w as any).SpeechSynthesisUtterance = Utterance;
         (w as any).speechSynthesis = {
           cancel() {},
@@ -914,5 +1113,140 @@ describe("AFK Pilot shared webview controls", () => {
     dispatch(window, { type: "historyReplay", active: false });
 
     expect(spoken).toEqual([]);
+  });
+});
+
+describe("tap to enlarge (remote)", () => {
+  const chip = (extra: Record<string, unknown> = {}) => ({
+    id: "image-1",
+    path: "/staged/image-1.jpg",
+    relPath: "Image #1",
+    hidden: false,
+    imageIndex: 1,
+    mimeType: "image/jpeg",
+    previewSrc: "data:image/jpeg;base64,dGh1bWI=",
+    ...extra,
+  });
+
+  it("asks the host for a real render and swaps it into the open overlay", () => {
+    // A remote only holds a 320px thumbnail. Without this round trip, tapping
+    // enlarges the thumbnail — which is what issue #88 asked for and did not get
+    // away from the desk.
+    const { window, posted, doc } = bootWebview({ remote: true });
+    dispatch(window, { type: "chips", chips: [chip({ fullId: "handle-1" })] });
+
+    click(window, doc.querySelector(".attachment .chip-preview, .attachment button")!);
+
+    expect(posted.find((m) => m.type === "requestImageFull")).toMatchObject({ fullId: "handle-1" });
+    const img = doc.querySelector(".image-preview-overlay img") as HTMLImageElement;
+    expect(img.src).toBe("data:image/jpeg;base64,dGh1bWI="); // thumbnail until the render lands
+
+    dispatch(window, { type: "imageFull", fullId: "handle-1", src: "data:image/jpeg;base64,ZnVsbA==" });
+    expect(img.src).toBe("data:image/jpeg;base64,ZnVsbA==");
+  });
+
+  it("ignores a render for a picture the overlay has moved on from", () => {
+    // A slow reply must not replace whatever the user is looking at now.
+    const { window, doc } = bootWebview({ remote: true });
+    dispatch(window, { type: "chips", chips: [chip({ fullId: "handle-1" })] });
+    click(window, doc.querySelector(".attachment .chip-preview, .attachment button")!);
+
+    dispatch(window, { type: "imageFull", fullId: "some-other-handle", src: "data:image/jpeg;base64,d3Jvbmc=" });
+
+    const img = doc.querySelector(".image-preview-overlay img") as HTMLImageElement;
+    expect(img.src).toBe("data:image/jpeg;base64,dGh1bWI=");
+  });
+
+  it("sends nothing when the host offered no handle", () => {
+    // Capability detection: an older host never issues one, and the client must
+    // not emit a frame it cannot answer.
+    const { window, posted, doc } = bootWebview({ remote: true });
+    dispatch(window, { type: "chips", chips: [chip()] });
+
+    click(window, doc.querySelector(".attachment .chip-preview, .attachment button")!);
+
+    expect(posted.filter((m) => m.type === "requestImageFull")).toHaveLength(0);
+  });
+});
+
+describe("remembered remote session (the A→B→A→B repo bounce)", () => {
+  it("remembers the repo the SESSION lives in, not the one being browsed", () => {
+    // Browsing repo B's history while the live session is in repo A is a normal
+    // state — the chip says "Browsing B; live session is in A". Remembering B
+    // alongside A's session id makes the next reconnect send selectRepo(B) and
+    // then resumeSession(a session in A): two contradictory commands the host
+    // obeys in order, which is the bounce.
+    const { window } = bootWebview({ remote: true });
+    dispatch(window, {
+      type: "repos",
+      entries: [{ cwd: "/work/a", label: "a", available: true }, { cwd: "/work/b", label: "b", available: true }],
+      selectedCwd: "/work/b",
+      activeCwd: "/work/a",
+    });
+    dispatch(window, {
+      type: "sessions",
+      entries: [{ id: "s1", displayName: "live one", updatedAt: 1, cwd: "/work/a" }],
+      activeId: "s1",
+    });
+
+    const saved = JSON.parse(
+      window.sessionStorage.getItem(
+        Object.keys(window.sessionStorage).find((k) => k.startsWith("grok.remote.tabSession:"))!,
+      )!,
+    );
+    expect(saved.id).toBe("s1");
+    expect(saved.repoCwd).toBe("/work/a"); // the session's repo, NOT the browsed "/work/b"
+    expect(saved.cwd).toBe("/work/a");
+  });
+});
+
+describe("full-size loading spinner", () => {
+  const imgChip = {
+    id: "image-1",
+    path: "/staged/image-1.jpg",
+    relPath: "Image #1",
+    hidden: false,
+    imageIndex: 1,
+    mimeType: "image/jpeg",
+    previewSrc: "data:image/jpeg;base64,dGh1bWI=",
+    fullId: "handle-1",
+  };
+
+  it("spins while the render is in flight and stops when it lands", () => {
+    const { window, doc } = bootWebview({ remote: true });
+    dispatch(window, { type: "chips", chips: [imgChip] });
+    click(window, doc.querySelector(".attachment .chip-preview, .attachment button")!);
+
+    const spinner = doc.querySelector(".image-preview-spinner") as HTMLElement;
+    expect(spinner.hidden).toBe(false);
+    // The low-res picture stays on screen underneath rather than being blanked.
+    expect((doc.querySelector(".image-preview-overlay img") as HTMLImageElement).src)
+      .toBe("data:image/jpeg;base64,dGh1bWI=");
+
+    dispatch(window, { type: "imageFull", fullId: "handle-1", src: "data:image/jpeg;base64,ZnVsbA==" });
+    expect(spinner.hidden).toBe(true);
+  });
+
+  it("stops spinning when the host has no render to give", () => {
+    // A source that was swept or deleted answers with no src. Left alone the
+    // disc would turn forever over a picture that is never going to sharpen.
+    const { window, doc } = bootWebview({ remote: true });
+    dispatch(window, { type: "chips", chips: [imgChip] });
+    click(window, doc.querySelector(".attachment .chip-preview, .attachment button")!);
+    expect((doc.querySelector(".image-preview-spinner") as HTMLElement).hidden).toBe(false);
+
+    dispatch(window, { type: "imageFull", fullId: "handle-1" });
+
+    expect((doc.querySelector(".image-preview-spinner") as HTMLElement).hidden).toBe(true);
+    expect((doc.querySelector(".image-preview-overlay img") as HTMLImageElement).src)
+      .toBe("data:image/jpeg;base64,dGh1bWI=");
+  });
+
+  it("does not spin when there is nothing to wait for", () => {
+    const { window, doc } = bootWebview({ remote: true });
+    const { fullId: _drop, ...noHandle } = imgChip;
+    dispatch(window, { type: "chips", chips: [noHandle] });
+    click(window, doc.querySelector(".attachment .chip-preview, .attachment button")!);
+    expect((doc.querySelector(".image-preview-spinner") as HTMLElement).hidden).toBe(true);
   });
 });

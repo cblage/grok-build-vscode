@@ -59,14 +59,9 @@ When the panel opens (or you click **+** for a new session):
 5. Stream `session/update` notifications (messages, thoughts, tool calls,
    permission requests, mode changes) back into the chat.
 
-The composer unlocks as soon as the session is live. The extension's hidden
-"primer" message (below) fires **eagerly and silently** the moment the session
-goes live — in the background, without blocking the composer — so it's almost
-always finished before you send. Your first real prompt simply `await`s the same
-in-flight primer turn (grok runs one turn at a time) and is released the instant
-it acks. While any user turn is waiting on grok — including that brief held-behind-
-primer gap — the chat shows an animated **Grokking…** placeholder, replaced in
-place by the first thought / message / tool card.
+The composer unlocks as soon as the session is live. While a user turn is waiting
+on grok, the chat shows an animated **Grokking…** placeholder, replaced in place
+by the first thought / message / tool card.
 
 ## The session pool (Agent Dashboard)
 
@@ -139,12 +134,36 @@ it and fail with *"cannot rename locked executable"*. On Windows the kill is a
 children that a parent-only kill would orphan, and they keep the binary locked),
 and the update retries once if a lingering lock still slips through.
 
-## Plan Mode — the one part that isn't thin
+`maybeUpdateCliOnUpgrade` retains the normal session-start trigger: once per
+activation it compares `CLI_UPDATE_VERSION_KEY`, updating only after an extension
+version change; a fresh install records its baseline without updating. After that,
+every session start reads `grok --version`. On Windows, `maybePinBrokenCli` uses the
+bounded `isStdioBrokenGrokVersion` check to move 0.2.61–0.2.70 to the current
+`GROK_STDIO_DOWNGRADE_TARGET` before ACP spawn. `GROK_REQUIRED_VERSION` is the
+cross-platform ACP behavior floor and the current recovery target. A CLI below the floor, or whose version cannot be
+verified, still starts in Agent/Auto accept, but that `Session` carries
+`planModeAvailable:false`: the host emits `planModeAvailability`, the picker disables
+only Plan and shows the exact reason, and `setMode` rejects stale or forged Plan
+requests. Agent-initiated and restored Plan transitions raise the client safety gate.
+A live untrusted planning turn is cancelled, and the gate stays raised until both
+that `session/prompt` settles and `session/set_mode(default)` confirms Agent; a
+failure or stalled recovery stays gated and is surfaced explicitly.
+Any stray `exit_plan_mode` request is answered with an error rather than entering the
+native-verdict flow that this version floor exists to protect.
+Availability is session-scoped so a later successful update re-enables Plan only for
+newly started compatible processes, never for an older process that is still alive.
+Reactive Windows stdio recovery remains a separate single-retry backstop after an
+observed startup failure.
 
-Everything else mirrors the CLI. Plan Mode is enforced **client-side**, because
-the CLI's `x.ai/exit_plan_mode` is unreliable: it reports "approved" to *any*
-client reply — result or error — regardless of what the user actually chose. So
-the extension can't trust the wire verdict. Two mechanisms cover the gap:
+## Plan Mode — native verdicts plus a client-side safety gate
+
+The CLI owns plan-review continuation. The extension responds to
+`_x.ai/exit_plan_mode` with its native success result: `approved`, `cancelled`
+(Keep planning), or `abandoned` (Cancel). Approval continues into implementation
+inside the original turn; cancellation stays in Plan and lets grok revise and
+re-ask inside that same turn; abandon switches the CLI to its default mode and
+ends the turn without a continuation. There is no synthetic verdict prompt, turn
+cancel, or synthetic lifecycle.
 
 - **The gate** ([src/plan-gate.ts](../src/plan-gate.ts)). While Plan Mode is
   active, the two mandatory server→client choke points are policed: a
@@ -157,31 +176,51 @@ the extension can't trust the wire verdict. Two mechanisms cover the gap:
   plan mode *any* way — including the agent
   self-initiating it — raises the gate; only an explicit user action lowers it.
 
-- **The primer** ([src/grok-primer.ts](../src/grok-primer.ts)). A hidden system
-  message tells grok in plain English to ignore the bogus tool verdict and read
-  the real decision from the **next** user message instead, as a bracketed
-  marker: `[Plan approved]` / `[Plan rejected]` / `[Plan cancelled]` (optionally
-  followed by a free-form comment). Approve → drop the gate + send "implement it
-  now"; Keep planning → the gate stays up. The primer fires **eagerly and
-  non-blocking** (`ensurePrimed`) — its own hidden turn, kicked off the moment a
-  session goes live (new **and** restored, and after `/compact`) rather than in
-  front of the user's first prompt. It returns a reused `session.primingPromise`,
-  so a first send that races the background primer awaits the *same* turn and is
-  released when it acks. It is *re-sent* on go-live after a restore: a primer
-  buried in replayed history isn't reliably honored (a `/compact` can drop it from
-  effective context), so the extension re-asserts it rather than trusting the
-  replay. The silent turn is hidden by a session-level `suppressContent` flag,
-  which deliberately lets `userMessage`/`agentStart` through so a racing user send
-  still paints its own bubble + Grokking indicator. **Primer v4** is kept minimal
-  on purpose: grok-build is agentic, and the old v3 primer's product-blurb
-  paragraph + repo URL + "acknowledge briefly" line were tempting grok into a
-  15–40s pre-turn exploration of the workspace before the user's message even ran
-  — so v4 keeps only the plan protocol and adds an explicit *do not use tools /
-  read files / search the workspace / take any action; reply with just `ok`*
-  constraint. When grok replays an earlier primer as a user message on restore,
-  the pure `isPrimerText()` helper detects it so the bubble is hidden and not
-  counted toward plan positions — but that detection does **not** mark the session
-  primed.
+- **Verdict state and comments.** `handleExitPlan` settles all implementation-
+  relevant state *before* releasing the blocked response. Approval restores the
+  remembered pre-plan Auto accept choice and lowers the gate; Keep planning keeps
+  the gate raised; Cancel lowers it but deliberately lands on Agent. An
+  Approve/Keep-planning comment is sent through `_x.ai/interject` before the
+  verdict response, without awaiting it inline. Clicking a verdict collapses the
+  card immediately. A successful response write emits buffered `planResolved`;
+  a failed write leaves the pending request unconsumed and the verdict
+  unpersisted, so re-focus rebuilds an actionable card without a separate
+  pending/failure message. While the interject response is outstanding, a
+  memory-only `Session.inFlightPlanComments` entry owns the text. Acceptance
+  removes it synchronously; a controlled restart moves only unresolved entries
+  into the ordinary queue for the replacement process. A dead process drops its
+  queue. Session restart clears the map, so it cannot resurrect text
+  later. A write accepted by Node is never retried merely because its downstream
+  effect is unknown. If the
+  unadvertised RPC is unsupported or fails, the text is placed in the ordinary
+  queued-send path rather than being lost. An abandon comment always uses that
+  queue: the native abandoned turn has no continuation step that could drain an
+  interjection, so the comment becomes a real prompt after the turn settles. A
+  successful interjection emits the same `userMessage {steer:true}` shape as the
+  ordinary Steer path and does not increment `Session.userMessageCount`; it has
+  no prompt/rewind point, so counting it would inflate every later
+  `afterUserMessage` position and make rewind discard surviving extension records.
+  Plan, permission, and usage persistence share `afterHistoryEvent`, a replay-stable
+  assistant/tool update boundary. It places native approvals before same-turn
+  implementation output. `afterInterjection` remains the secondary compatibility
+  boundary for comment/revision cycles, with array-order inference for older entries. The webview
+  keeps the raw CLI envelope for classification but strips it and `<user_query>`
+  from the displayed/copied comment.
+  Each `Session` owns a `pendingExitPlans` map keyed by the ACP request id. The host
+  registers a request only after its async snapshot generation check, and an answer
+  must find that exact entry. Gate changes happen before the JSON-RPC response so
+  same-turn implementation is safe, but consuming the entry and persisting the
+  verdict happen only after `respondExitPlan` reports an accepted stdin write.
+  Re-focus can replay the card without consuming it; stale and duplicate answers
+  have no effect.
+
+- **Legacy primer reads.** Older sessions on disk contain the retired v4 hidden
+  primer and bracket-marker turns. `src/grok-primer.ts` therefore keeps only the
+  version-agnostic `isPrimerText()` / `isPrimerSummary()` readers. Replay hiding,
+  title repair, the empty-session sweep, and rewind/plan-position mapping continue
+  to account for those historical turns. `suppressContent` / `SUPPRESS_TYPES` are
+  also retained for other hidden maintenance turns; they are no longer a priming
+  mechanism.
 
 The full pedagogical write-up lives in
 [research/understanding-plan-mode.md](../research/understanding-plan-mode.md).
@@ -195,18 +234,18 @@ The full pedagogical write-up lives in
 | [src/diff-view.ts](../src/diff-view.ts) | Pure whole-file native-diff reconstruction (#66) — combines Grok's replaced regions + positioned sites with disk content, bounds expansion size, and finds the first changed line |
 | [src/acp.ts](../src/acp.ts) | ACP client — spawns CLI, manages session lifecycle, emits events, and awaits its per-client execution backend so sandbox brokers own ACP fs/terminal teardown. `interject` (#52 Steer), `forkSession` (#48), and worktree RPCs (P2-8) call the unadvertised `_x.ai/*` methods, returning `"unsupported"` on -32601 rather than throwing |
 | [src/worktree.ts](../src/worktree.ts) | Pure worktree helpers (P2-8) — parse create/list/apply/remove/status, multi-cwd history merge; wire notes in [research/worktree.md](../research/worktree.md) |
-| [src/session.ts](../src/session.ts) | Per-session state bag — one `Session` per live `grok agent stdio` process (the sidebar holds a *pool* of these + one focused); carries the send queue (#37), billing (#53), and optional worktree binding (`cwd` / `worktree`) |
+| [src/session.ts](../src/session.ts) | Per-session state bag — one `Session` per live `grok agent stdio` process (the sidebar holds a *pool* of these + one focused); carries the send queue (#37) and optional worktree binding (`cwd` / `worktree`), while cumulative billing stays solely in session-id-keyed metadata (#53) |
 | [src/session-pool.ts](../src/session-pool.ts) | Pure reaping policy (`selectReapable`) — idle-TTL + LRU cap over the live-session pool |
-| [src/acp-dispatch.ts](../src/acp-dispatch.ts) | Pure protocol helpers — line parsing, update routing, response + generated-media extraction (`isMediaGenToolCall`/`extractGeneratedMediaPaths`), and the live `_x.ai/session_notification` consumers (`contextUsedFromCompactNotification`, `autoCompactStartedNote`, `isSubagentLifecycleUpdate`), the billing-usage helpers (`extractPromptUsage`/`addUsage`/`usageIsRealMeasurement`, #53), and `isMethodNotFoundError` — the -32601 capability gate behind Steer/Fork |
+| [src/acp-dispatch.ts](../src/acp-dispatch.ts) | Pure protocol helpers — line parsing, update routing, response + generated-media extraction, live context extraction (`contextUsedFromUpdateEnvelope` plus compact notifications), billing helpers (`extractPromptUsage`/`addUsage`/`usageIsRealMeasurement`, including `costUsdTicks`), and the -32601 capability gate behind private RPCs |
 | [src/protocol.ts](../src/protocol.ts) | Single source of truth for the host↔webview message contract — `HostMsg`/`WebviewMsg` unions + the runtime `HOST_MESSAGE_TYPES`/`WEBVIEW_MESSAGE_TYPES` arrays (kept exhaustive by compile-time `Record` maps). Pure types + two arrays, no runtime deps |
-| [src/cli-locator.ts](../src/cli-locator.ts) | Locate the `grok` binary; cross-platform |
+| [src/cli-locator.ts](../src/cli-locator.ts) / [src/cli-process.ts](../src/cli-process.ts) | Locate and invoke the `grok` binary cross-platform; one shim-aware execution policy covers ACP spawn plus version/update commands |
 | [src/terminal-manager.ts](../src/terminal-manager.ts) | Headless shells for the agent's `terminal/*` calls; POSIX commands run in killable process groups |
 | [src/seatbelt-policy.ts](../src/seatbelt-policy.ts) | Pure parser/resolver/compiler for built-in + recursively inherited user/project sandbox profiles |
 | [src/seatbelt-broker.ts](../src/seatbelt-broker.ts) | Per-session `sandbox-exec` process + correlated NDJSON execution client |
 | [src/seatbelt-broker-child.ts](../src/seatbelt-broker-child.ts) | Sandboxed filesystem/terminal executor whose child commands inherit Seatbelt |
 | [src/plan-gate.ts](../src/plan-gate.ts) | Plan-mode policy (pure) — workspace-write containment + read-only command allowlist |
 | [src/plan-restore.ts](../src/plan-restore.ts) | Plan persist + restore decision (pure) |
-| [src/grok-primer.ts](../src/grok-primer.ts) | The hidden primer text + replay-detection helper (pure) |
+| [src/grok-primer.ts](../src/grok-primer.ts) | Legacy primer replay/title detection helpers (pure) |
 | [src/chips.ts](../src/chips.ts) | File-chip CRUD (pure) |
 | [src/prompt-builder.ts](../src/prompt-builder.ts) | Chip → prompt-string with `@path` refs and fenced blocks (pure) |
 | [src/slash-filter.ts](../src/slash-filter.ts) | Slash-command autocomplete filter + `matchSlashCommand` dispatch gate + hidden-command filter (`filterAdvertisedCommands` drops the config-mutating `/always-approve`) (pure) |
@@ -220,9 +259,9 @@ The full pedagogical write-up lives in
 | [src/plan-review.ts](../src/plan-review.ts) | Plan-snapshot Markdown filename generation (pure) |
 | [src/voice.ts](../src/voice.ts) | Voice-input pure helpers — STT request/response, ffmpeg args, device parsing, key resolution |
 | [src/voice-recorder.ts](../src/voice-recorder.ts) | Batch capture (`ffmpeg` → WAV) + STT REST upload |
-| [src/voice-streamer.ts](../src/voice-streamer.ts) | Shared live STT transport: `PcmVoiceStreamer` accepts raw PCM from any producer; `VoiceStreamer` composes it with local ffmpeg capture |
+| [src/voice-streamer.ts](../src/voice-streamer.ts) | Shared live STT transport: `PcmVoiceStreamer` accepts raw PCM from any producer; `VoiceStreamer` composes it with local ffmpeg capture. Transcripts insert at the composer selection captured on start; a manual Send/Queue discards capture and invalidates late voice callbacks, while spoken `grok send` keeps listening |
 | [src/telemetry.ts](../src/telemetry.ts) | Anonymous Aptabase telemetry — pure payload builders + a fire-and-forget `session_start` (opt-out via `grok.telemetry.enabled`; see [privacy.md](privacy.md)) |
-| [src/remote-policy.ts](../src/remote-policy.ts) / [src/remote-frames.ts](../src/remote-frames.ts) / [src/remote-uplink.ts](../src/remote-uplink.ts) / [src/remote-client-state.ts](../src/remote-client-state.ts) | AFK Pilot client — exhaustive protocol policy, relay frames/transport, and host-owned `clientId → {cwd, active Session}` tab state. Chat/session UI/voice traffic uses targeted `host-to` frames; `client-left` removes ephemeral ownership while the live pool member remains reclaimable; only device-global state uses relay broadcast |
+| [src/remote-policy.ts](../src/remote-policy.ts) / [src/remote-frames.ts](../src/remote-frames.ts) / [src/remote-uplink.ts](../src/remote-uplink.ts) / [src/remote-client-state.ts](../src/remote-client-state.ts) | AFK Pilot client — exhaustive protocol policy, relay frames/transport, and host-owned `clientId → {cwd, active Session, browser preferences}` tab state. `bracketRemoteSnapshot` caps reconnect and cold-load history at the last ten user messages, re-bases counter-positioned cards, and sends the transcript in one additive `historyBatch` frame inside replay brackets; cold `session/load` events remain live only on the desk until the complete remote snapshot replaces them. Chat/session UI/voice traffic uses targeted `host-to` frames; this includes speech summaries, whose inbound request fields and logical-tab TTS preferences are validated before the host spends the extra xAI call, with the result returned only to the requester. The browser speaks its retained original after a bounded wait if no result returns and ignores a late result. `client-left` removes ephemeral ownership while the live pool member remains reclaimable; only device-global state uses relay broadcast |
 | [src/remote-voice.ts](../src/remote-voice.ts) / [media/pcm-worklet.js](../media/pcm-worklet.js) | Remote microphone boundary — one independent producer/stream per browser client, strict PCM chunk/duration/cumulative-byte caps, bounded buffering while that client's hands-free STT reconnects, targeted partial/state messages, and browser AudioWorklet downsampling to signed PCM16 LE / 16 kHz / mono. Send-phrase completion returns `voiceSubmit` to the owning browser, which submits through the ordinary relay-metered `send` or busy-turn queue path; STT never prompts ACP directly |
 | [src/keep-awake.ts](../src/keep-awake.ts) | OS wake lock held for exactly the uplink's lifetime, so an AFK machine can't idle-suspend mid-turn. Pure plan builders per platform (`buildKeepAwakePlan`) + the `KeepAwake` runner; `grok.remote.keepAwake` is the opt-out. See [research/keep-awake.md](../research/keep-awake.md) |
 | [media/chat.{js,css}](../media/) | Webview UI |
@@ -282,9 +321,13 @@ claims it with a host-issued submission id and sends `submitQueuedSend` to that 
 only after the active turn settles. The browser echoes the text and id on the ordinary
 `send` path, so both relay limiters run before ACP is prompted. Reconnect snapshots
 reuse the claim, and both the browser and host deduplicate its id; duplicate persisted
-outbox frames therefore execute one prompt. The host clears the queue only when that
-identified frame returns; a quota rejection leaves a visible **Not sent** block that
-can be edited or removed.
+outbox frames therefore execute one prompt. `beginQueuedSendCommit` claims the ready
+prefix and `finishQueuedSendCommit` removes it at the pre-prompt commit point, before
+attachments are consumed and `session/prompt` is attempted. A quota rejection leaves a visible **Not sent**
+block that can be edited or removed.
+
+If the owning grok process exits, the host clears its pending queue and dispatch state;
+queued text is not restored to the composer.
 
 Destructive history actions follow the same ownership boundary. A delete is refused
 while the target session is owned by any browser tab or by the local VS Code view, and
@@ -382,27 +425,27 @@ the steady-state fix.
 - **Model switching is agent-aware.** Models belong to *agent types*
   (`grok-build`/`grok-build-plan` vs. the `cursor` agent that owns the Composer
   models). The CLI binds the agent when the process spawns and locks it after the
-  first turn (including our primer), so a live `session/set_model` only works
+  first turn, so a live `session/set_model` only works
   *within* the same agent — a cross-agent switch errors
   `MODEL_SWITCH_INCOMPATIBLE_AGENT`. So `switchModel` tries the live switch and,
   on that specific error (`isIncompatibleAgentError` in
   [src/acp-dispatch.ts](../src/acp-dispatch.ts)), persists the pick to
-  `grok.defaultModel` and restarts — `newSession` re-applies the model *before* the
-  primer runs, while the agent is still rebindable. No history → transparent
+  `grok.defaultModel` and restarts — `newSession` re-applies the model before the
+  first turn, while the agent is still rebindable. No history → transparent
   restart; with history → a Summarize / Just-Restart choice. (An **effort** change,
   by contrast, no longer restarts on recent CLIs — see the live-effort bullet
-  below.) A restart on a *primer-only* session (no real conversation — common when
+  below.) A restart on an empty session (no real conversation — common when
   you flip models/effort right after opening) takes the no-prompt path **and**
   discards the abandoned grok session dir afterward, so repeated switches don't pile
   up identical empty sessions in history; the pure `carrySessionName` moves any user
   rename onto the fresh session so the chosen name survives. The same cleanup runs on
   the effort-change empty-session branch, guarded so a dead client on a session *with*
   history keeps its history.
-- **Empty primer sessions never accumulate (#24).** Beyond the model/effort restart
-  case above, *any* time you leave an empty (primer-only, `hasHistory === false`)
+- **Empty sessions never accumulate (#24).** Beyond the model/effort restart
+  case above, *any* time you leave an empty (`hasHistory === false`)
   session — New Session or switching to another — `parkFocused` deletes its on-disk
   dir, so at most one untitled **New session** exists at a time. A one-shot startup
-  sweep (`sweepEmptyPrimerSessions`) clears empties left by earlier runs, each
+  legacy sweep (`sweepEmptyPrimerSessions`) clears primer-only empties left by earlier runs, each
   confirmed by reading `chat_history.jsonl` (`isEmptyPrimerSession`): swept only if
   the session received our primer and **zero real user queries**. Detection is
   content-based and agent-agnostic — `extractUserQueries` counts both

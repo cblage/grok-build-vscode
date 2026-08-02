@@ -14,16 +14,16 @@
   // copy and test/protocol.test.ts asserts the two are set-equal in both
   // directions (and that chat.js actually handles every host type).
   const HOST_MESSAGE_TYPES = [
-    "initialState", "showThinking", "fontScale", "grokUpdateStatus", "initialized",
+    "initialState", "planModeAvailability", "showThinking", "fontScale", "grokUpdateStatus", "initialized",
     "cliUpdating", "session", "modelChanged", "modeChanged", "modePolicy", "sandboxState", "openModePopover",
     "voiceState", "voiceConfigured", "voicePartial", "voiceSubmit", "voiceTranscript",
     "voiceError", "chips", "commandsUpdate", "mentionResults", "userMessage", "agentStart", "thoughtChunk",
-    "messageChunk", "media", "userMessageChunk", "historyReplay", "permissionHistoryQueue",
-    "planHistoryQueue", "planProcessing", "toolCall", "toolCallUpdate", "permissionRequest", "permissionOptions",
+    "messageChunk", "media", "userMessageChunk", "historyReplay", "historyBatch", "permissionHistoryQueue",
+    "planHistoryQueue", "toolCall", "toolCallUpdate", "permissionRequest", "permissionOptions",
     "permissionResolved", "exitPlanRequest", "planResolved", "questionRequest", "planNotice", "autoCompactNotice", "planBlocked",
     "promptComplete", "contextUsage", "commandOutput", "expandCommandOutputs", "setAllToolDetails", "focusInput", "restoreComposer", "truncateMessages", "uiConfirmRequest", "agentReset", "agentError", "agentEnd", "exit", "setBusy", "summarizing",
     "sessionContext", "clearMessages", "onboarding", "error", "hostNotice", "xaiNotification", "subagentUpdate", "runProgress", "sessions", "repos",
-    "sessionDot", "queuedSends", "submitQueuedSend", "steerUnavailable", "usage", "steerByDefault", "soundNotifications", "processingSound", "readRepliesAloud", "summarizeRepliesAloud", "speechSummary", "moveComposerCaret",
+    "sessionDot", "queuedSends", "submitQueuedSend", "steerUnavailable", "usage", "steerByDefault", "soundNotifications", "processingSound", "readRepliesAloud", "summarizeRepliesAloud", "speechSummary", "imageFull", "moveComposerCaret",
     "remoteStatus",
   ];
   const WEBVIEW_MESSAGE_TYPES = [
@@ -37,7 +37,7 @@
       "clearAllSessions", "pickFile", "mentionQuery", "addMentionFile", "pasteImage", "uploadFile", "voiceStart", "voiceStop",
       "remoteVoiceStart", "remoteVoiceChunk", "remoteVoiceStop",
     "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "forkSession", "setSteerByDefault",
-    "setSoundNotifications", "setProcessingSound", "setReadRepliesAloud", "setSummarizeRepliesAloud", "summarizeSpeech", "composerFocus",
+    "setSoundNotifications", "setProcessingSound", "setReadRepliesAloud", "setSummarizeRepliesAloud", "summarizeSpeech", "requestImageFull", "composerFocus",
     "newWorktreeSession", "applyWorktree", "removeWorktree", "rewindSession", "editLastMessage", "uiConfirmAnswer", "workflowControl",
     "remoteSignIn", "remoteSignOut", "openRemotePortal",
   ];
@@ -590,6 +590,8 @@
     const HINT = " — attached inline";
     const pathFromTag = (raw) => {
       if (!raw || raw.indexOf("attached inline") === 0) return undefined;
+      const staged = raw.indexOf(" — local staged copy; thumbnail only; do not access this path");
+      if (staged !== -1) return raw.slice(0, staged);
       const cut = raw.indexOf(HINT);
       return cut === -1 ? raw : raw.slice(0, cut);
     };
@@ -647,6 +649,16 @@
 
   function isInterjectionText(text) {
     return INTERJECTION_RE.test(String(text || ""));
+  }
+
+  /** Remove the CLI's replay-only interjection envelope while preserving the
+   * user's original text. Classification still uses the untouched raw value. */
+  function stripInterjectionEnvelope(text) {
+    const raw = String(text || "");
+    if (!isInterjectionText(raw)) return raw;
+    const body = raw.replace(INTERJECTION_RE, "");
+    const wrapped = /^\s*<user_query>\s*\r?\n?([\s\S]*?)\r?\n?\s*<\/user_query>\s*$/i.exec(body);
+    return (wrapped ? wrapped[1] : body).trim();
   }
 
   // Permission-card option order (#68). The CLI sends `options` in its own
@@ -772,7 +784,7 @@
     return { lines, added, removed, truncated: false };
   }
 
-  const api = { FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, spokenTextFromMarkdown, isRelaySendRejection };
+  const api = { FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;

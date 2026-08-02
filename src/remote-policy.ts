@@ -11,13 +11,159 @@
 //   - outbound (host -> remote client): HostMsg, mirrored / transformed / suppressed.
 
 import type { HostMsg, WebviewMsg } from "./protocol";
+import { isImageChip, type FileChip } from "./chips";
+import { isPrimerText } from "./grok-primer";
+import { countsAsUserBubble } from "./plan-restore";
+import { historyEventCount } from "./rewind";
 
-/** Mark a reconnect snapshot as replayed UI state. Buffers may already contain
- * their own load-session replay brackets, so the webview treats these as nested. */
+export const REMOTE_HISTORY_USER_LIMIT = 10;
+/** Keep reconnect history comfortably below the relay's 36 MiB WS ceiling. */
+export const REMOTE_HISTORY_BYTE_LIMIT = 8 * 1024 * 1024;
+
+function remoteUserMessageIndexes(buffer: readonly HostMsg[]): number[] {
+  const indexes: number[] = [];
+  let chunkStart = -1;
+  let chunkText = "";
+  const finishChunks = () => {
+    if (chunkStart >= 0 && !isPrimerText(chunkText) && countsAsUserBubble(chunkText)) {
+      indexes.push(chunkStart);
+    }
+    chunkStart = -1;
+    chunkText = "";
+  };
+  buffer.forEach((msg, index) => {
+    if (msg.type === "userMessageChunk") {
+      if (chunkStart < 0) chunkStart = index;
+      chunkText += msg.text;
+      return;
+    }
+    finishChunks();
+    if (msg.type === "userMessage" && !msg.steer) indexes.push(index);
+  });
+  finishChunks();
+  return indexes;
+}
+
+type CounterPositioned = {
+  afterUserMessage?: number;
+  afterHistoryEvent?: number;
+  [key: string]: unknown;
+};
+
+function shiftCounterEntries(
+  entries: readonly unknown[],
+  droppedUsers: number,
+  droppedHistoryEvents: number,
+): unknown[] {
+  return entries.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [entry];
+    const positioned = entry as CounterPositioned;
+    const hasUserPosition = typeof positioned.afterUserMessage === "number";
+    const hasHistoryPosition = typeof positioned.afterHistoryEvent === "number";
+    if (hasUserPosition && positioned.afterUserMessage! <= droppedUsers) return [];
+    if (!hasUserPosition && hasHistoryPosition && positioned.afterHistoryEvent! <= droppedHistoryEvents) return [];
+    return [{
+      ...positioned,
+      ...(hasUserPosition
+        ? { afterUserMessage: positioned.afterUserMessage! - droppedUsers }
+        : {}),
+      ...(hasHistoryPosition
+        ? { afterHistoryEvent: positioned.afterHistoryEvent! - droppedHistoryEvents }
+        : {}),
+    }];
+  });
+}
+
+function shiftCounterMessage(
+  msg: HostMsg,
+  droppedUsers: number,
+  droppedHistoryEvents: number,
+): HostMsg | null {
+  if (msg.type === "planHistoryQueue") {
+    return {
+      ...msg,
+      plans: shiftCounterEntries(msg.plans, droppedUsers, droppedHistoryEvents) as typeof msg.plans,
+    };
+  }
+  if (msg.type === "permissionHistoryQueue") {
+    return {
+      ...msg,
+      permissions: shiftCounterEntries(msg.permissions, droppedUsers, droppedHistoryEvents),
+    };
+  }
+  if (msg.type === "usage" && typeof msg.afterUserMessage === "number") {
+    if (msg.afterUserMessage <= droppedUsers) return null;
+    return {
+      ...msg,
+      afterUserMessage: msg.afterUserMessage - droppedUsers,
+      ...(typeof msg.afterHistoryEvent === "number"
+        ? { afterHistoryEvent: msg.afterHistoryEvent - droppedHistoryEvents }
+        : {}),
+    };
+  }
+  return msg;
+}
+
+function snapshotMessages(
+  buffer: readonly HostMsg[],
+  userIndexes: readonly number[],
+  start: number,
+): HostMsg[] {
+  const droppedUsers = userIndexes.filter((index) => index < start).length;
+  const droppedHistoryEvents = historyEventCount(buffer.slice(0, start));
+  const preamble = droppedUsers > 0
+    ? buffer.slice(0, start)
+      .filter((msg) => msg.type === "planHistoryQueue" || msg.type === "permissionHistoryQueue")
+      .flatMap((msg) => {
+        const shifted = shiftCounterMessage(msg, droppedUsers, droppedHistoryEvents);
+        return shifted ? [shifted] : [];
+      })
+    : [];
+  return [
+    ...preamble,
+    ...buffer.slice(start)
+      .filter((msg) => msg.type !== "historyReplay")
+      .flatMap((msg) => {
+        const shifted = shiftCounterMessage(msg, droppedUsers, droppedHistoryEvents);
+        return shifted ? [shifted] : [];
+      }),
+  ];
+}
+
+function historyBatchBytes(messages: readonly HostMsg[]): number {
+  return new TextEncoder().encode(JSON.stringify({ type: "historyBatch", messages })).length;
+}
+
+/** Mark a reconnect snapshot as replayed UI state. The batch owns one outer
+ * bracket pair, so buffered load-session brackets are removed before delivery. */
 export function bracketRemoteSnapshot(buffer: readonly HostMsg[]): HostMsg[] {
+  const userIndexes = remoteUserMessageIndexes(buffer);
+  const droppedUsers = Math.max(0, userIndexes.length - REMOTE_HISTORY_USER_LIMIT);
+  let start = droppedUsers > 0 ? userIndexes[droppedUsers] : 0;
+  let messages = snapshotMessages(buffer, userIndexes, start);
+
+  // A user boundary is the smallest PREFERRED unit to discard: removing anything
+  // inside it makes the replay begin halfway through a turn. Rebuild the
+  // counters after every byte-budget cut because the final dropped prefix may
+  // contain more user/history events than the turn cap alone did. Bounded by
+  // the turn cap, so this runs at most REMOTE_HISTORY_USER_LIMIT times.
+  while (historyBatchBytes(messages) > REMOTE_HISTORY_BYTE_LIMIT) {
+    const next = userIndexes.find((index) => index > start);
+    if (next === undefined) break;
+    start = next;
+    messages = snapshotMessages(buffer, userIndexes, start);
+  }
+
+  // If the newest turn busts the budget on its own, deliver it anyway. The
+  // budget exists to keep a phone's reconnect cheap, NOT as a safety mechanism:
+  // the relay's frame ceiling is 4.5x this, so an over-budget single turn still
+  // arrives intact. Measured before deciding — the largest real conversation on
+  // disk is 2.8 MB in total, so anything past 8 MiB in ONE turn is far outside
+  // what this codebase has ever seen, and machinery to trim inside a turn cost
+  // more surface than the case was worth.
   return [
     { type: "historyReplay", active: true },
-    ...buffer,
+    { type: "historyBatch", messages },
     { type: "historyReplay", active: false },
   ];
 }
@@ -137,7 +283,13 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   setSandbox: "host-local",
   setReadRepliesAloud: "host-local",
   setSummarizeRepliesAloud: "host-local",
-  summarizeSpeech: "host-local",
+  // A remote may spend one extra xAI call to shorten text it is about to speak.
+  // The host independently requires that tab's reported TTS + summary prefs.
+  summarizeSpeech: "propose",
+  // Reads a file, so it looks host-local — but the handle was issued BY the host
+  // for a picture it already sent this tab, so it grants no reach the remote did
+  // not already have. Path-based would be a different question entirely.
+  requestImageFull: "propose",
   composerFocus: "host-local",
   // relay account actions (link/unlink/portal) manage THIS machine's device
   // token — only the local webview may drive them
@@ -198,6 +350,16 @@ export function sessionCwdBelongsToRepo(
   return repoCwds.some((cwd) => sameCwd(actualCwd, cwd));
 }
 
+/** The narrow desk-adoption path for a tab that arrives without a session. */
+export function shouldAdoptDeskSession(
+  deskCwd: string,
+  repoCwds: readonly string[],
+  deskSessionVisible: boolean,
+  sameCwd: (a: string, b: string) => boolean,
+): boolean {
+  return !deskSessionVisible && sessionCwdBelongsToRepo(deskCwd, repoCwds, sameCwd);
+}
+
 /** Which side a webview message came from. */
 export type MsgOrigin = "local" | "remote";
 
@@ -245,6 +407,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   modeChanged: "mirror",
   modePolicy: "mirror",
   sandboxState: "mirror",
+  planModeAvailability: "mirror",
   openModePopover: "mirror",
   chips: "mirror",
   commandsUpdate: "mirror",
@@ -255,9 +418,9 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   messageChunk: "mirror",
   userMessageChunk: "mirror",
   historyReplay: "mirror",
+  historyBatch: "mirror",
   permissionHistoryQueue: "mirror",
   planHistoryQueue: "mirror",
-  planProcessing: "mirror",
   toolCall: "mirror",
   toolCallUpdate: "mirror",
   permissionRequest: "mirror",
@@ -292,7 +455,11 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   processingSound: "host-local",
   readRepliesAloud: "host-local",
   summarizeRepliesAloud: "host-local",
-  speechSummary: "host-local",
+  // Only the shortened text is returned; sidebar targets it to the requester.
+  speechSummary: "mirror",
+  // Like speechSummary: sidebar targets it at the requesting tab only, so one
+  // phone's enlarged picture never lands in another tab's overlay.
+  imageFull: "mirror",
   moveComposerCaret: "host-local",
   remoteStatus: "host-local",
   setAllToolDetails: "mirror",
@@ -313,6 +480,9 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
 
 /** Base64 expansion is ~4/3; 25MiB of file stays well under a sane ws frame. */
 export const MAX_REMOTE_MEDIA_BYTES = 25 * 1024 * 1024;
+/** Chip/history previews are decoration, so keep their relay payload small. */
+export const MAX_REMOTE_THUMBNAIL_BYTES = 96 * 1024;
+const MAX_REMOTE_THUMBNAIL_CACHE_ENTRIES = 32;
 
 const EXT_MIME: Record<string, string> = {
   ".png": "image/png",
@@ -337,6 +507,26 @@ export interface MediaInlineDeps {
   /** Base64-encode bytes (Buffer.toString("base64") on the host). */
   toBase64: (bytes: Uint8Array) => string;
   maxBytes?: number;
+  /** Optional host-native image resizer. It returns the encoded mime alongside
+   *  the bytes because the encoder picks per image — a PNG source can come back
+   *  as JPEG when that is smaller — and a data: URI labelled with the SOURCE
+   *  mime would then describe bytes that are not in that format. A missing
+   *  resizer falls back to the thumbnail byte budget and still refuses
+   *  oversized source files. */
+  thumbnail?: (
+    bytes: Uint8Array,
+    mimeType: string,
+    maxDimension: number,
+  ) => { bytes: Uint8Array; mime: string } | null;
+  /** Issue (or reuse) the opaque handle a remote can later exchange for a
+   *  full-size render of this path. Called only where a thumbnail is actually
+   *  being sent, so the set of fetchable images stays exactly the set already
+   *  shown. */
+  registerFullImage?: (path: string) => string | undefined;
+  /** Optional bounded cache supplied by the host for repeated history replays. */
+  thumbnailCache?: Map<string, string | null>;
+  /** File mtime used with {@link thumbnailCache} to invalidate changed images. */
+  mtimeMs?: (path: string) => number | undefined;
 }
 
 type MediaMsg = Extract<HostMsg, { type: "media" }>;
@@ -362,9 +552,108 @@ export function inlineMediaForRemote(msg: MediaMsg, deps: MediaInlineDeps): Medi
   return { ...msg, mimeType: mime, src: `data:${mime};base64,${deps.toBase64(bytes)}` };
 }
 
+function thumbnailDataUri(path: string | undefined, mimeType: string | undefined, deps: MediaInlineDeps): string | undefined {
+  if (!path) return undefined;
+  const mtimeMs = deps.mtimeMs?.(path);
+  const cacheKey = mtimeMs !== undefined && Number.isFinite(mtimeMs) ? `${path}\0${mtimeMs}` : undefined;
+  if (cacheKey && deps.thumbnailCache?.has(cacheKey)) {
+    const cached = deps.thumbnailCache.get(cacheKey);
+    if (cached) {
+      deps.thumbnailCache.delete(cacheKey);
+      deps.thumbnailCache.set(cacheKey, cached);
+    }
+    return cached ?? undefined;
+  }
+  const bytes = deps.readFile(path);
+  if (!bytes) return undefined;
+  const mime = mimeType || mediaMimeFromPath(path);
+  if (!mime.startsWith("image/")) return undefined;
+  const thumb = deps.thumbnail
+    ? deps.thumbnail(bytes, mime, 320)
+    : { bytes, mime };
+  const result = thumb && thumb.bytes.byteLength > 0 && thumb.bytes.byteLength <= MAX_REMOTE_THUMBNAIL_BYTES
+    ? `data:${thumb.mime};base64,${deps.toBase64(thumb.bytes)}`
+    : undefined;
+  if (cacheKey && deps.thumbnailCache) {
+    deps.thumbnailCache.delete(cacheKey);
+    deps.thumbnailCache.set(cacheKey, result ?? null);
+    while (deps.thumbnailCache.size > MAX_REMOTE_THUMBNAIL_CACHE_ENTRIES) {
+      const oldest = deps.thumbnailCache.keys().next().value;
+      if (oldest === undefined) break;
+      deps.thumbnailCache.delete(oldest);
+    }
+  }
+  return result;
+}
+
+function dataUriFitsThumbnailBudget(src: string): boolean {
+  const comma = src.indexOf(",");
+  if (comma < 0) return false;
+  const payload = src.slice(comma + 1);
+  if (/;base64$/i.test(src.slice(0, comma))) {
+    return Math.ceil(payload.length * 3 / 4) <= MAX_REMOTE_THUMBNAIL_BYTES;
+  }
+  return payload.length <= MAX_REMOTE_THUMBNAIL_BYTES;
+}
+
+function inlineChipPreviewForRemote(chip: FileChip, deps: MediaInlineDeps): FileChip {
+  if (!isImageChip(chip)) return chip;
+  const src = chip.previewSrc?.startsWith("data:image/") && dataUriFitsThumbnailBudget(chip.previewSrc)
+    ? chip.previewSrc
+    : thumbnailDataUri(chip.path, chip.mimeType, deps);
+  if (!src) {
+    const { previewSrc: _previewSrc, ...withoutPreview } = chip;
+    return withoutPreview;
+  }
+  // The handle rides ALONGSIDE the thumbnail: a tab may only enlarge a picture
+  // it was actually shown, so issuing it anywhere else would widen that reach.
+  const fullId = deps.registerFullImage?.(chip.path);
+  return { ...chip, previewSrc: src, ...(fullId ? { fullId } : {}) };
+}
+
+type HistoryImage = { imageIndex: number; path?: string; previewSrc?: string; fullId?: string };
+
+function inlineHistoryImageForRemote(image: HistoryImage, deps: MediaInlineDeps): HistoryImage {
+  const src = image.previewSrc?.startsWith("data:image/") && dataUriFitsThumbnailBudget(image.previewSrc)
+    ? image.previewSrc
+    : thumbnailDataUri(image.path, undefined, deps);
+  if (!src) {
+    const { previewSrc: _previewSrc, ...withoutPreview } = image;
+    return withoutPreview;
+  }
+  const fullId = image.path ? deps.registerFullImage?.(image.path) : undefined;
+  return { ...image, previewSrc: src, ...(fullId ? { fullId } : {}) };
+}
+
 /** The single outbound choke point: what (if anything) crosses to a remote for
  *  this HostMsg. Returns the message to send, or null to suppress. */
 export function transformHostMsgForRemote(msg: HostMsg, deps: MediaInlineDeps): HostMsg | null {
+  if (msg.type === "historyBatch") {
+    return {
+      ...msg,
+      messages: msg.messages.flatMap((nested) => {
+        const transformed = transformHostMsgForRemote(nested, deps);
+        return transformed ? [transformed] : [];
+      }),
+    };
+  }
+  if (msg.type === "chips") {
+    return { ...msg, chips: msg.chips.map((chip) => inlineChipPreviewForRemote(chip, deps)) };
+  }
+  if (msg.type === "userMessage") {
+    return {
+      ...msg,
+      ...(msg.chips ? { chips: msg.chips.map((chip) => inlineChipPreviewForRemote(chip, deps)) } : {}),
+    };
+  }
+  if (msg.type === "userMessageChunk") {
+    return {
+      ...msg,
+      ...(msg.images
+        ? { images: msg.images.map((image) => inlineHistoryImageForRemote(image, deps)) }
+        : {}),
+    };
+  }
   switch (OUTBOUND_DISPOSITION[msg.type]) {
     case "mirror":
       return msg;

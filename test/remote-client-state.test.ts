@@ -17,6 +17,31 @@ describe("RemoteClientState", () => {
     expect(state.clientsForCwd("C:\\Work\\A")).toEqual(["tab-b"]);
   });
 
+  it("follows a tab across a reconnect, and reports nothing once it is gone", () => {
+    // This is what attachment ownership resolves through AFTER its await. If a
+    // departed tab resolved to anything at all, its image would be delivered to
+    // whatever conversation happened to be in view — content crossing
+    // conversations, which is worse than losing the attachment.
+    const state = new RemoteClientState<string>("/work/a", norm);
+    state.ready("relay-1");
+    state.identify("relay-1", "tab-token-aaaaaaaaaaaaaaaaaaaa");
+    state.setActive("relay-1", "session-1");
+
+    // The phone refreshes: same logical tab, new ephemeral relay id.
+    state.ready("relay-2");
+    state.identify("relay-2", "tab-token-aaaaaaaaaaaaaaaaaaaa");
+
+    // The stale id still resolves to the tab's CURRENT connection and session,
+    // so an upload that was mid-write lands where the user expects.
+    expect(state.currentClient("relay-1")).toBe("relay-2");
+    expect(state.active(state.currentClient("relay-1")!)).toBe("session-1");
+
+    // A tab that genuinely left resolves to nothing.
+    state.deleteClient("relay-2");
+    expect(state.currentClient("relay-1")).toBeUndefined();
+    expect(state.currentClient("never-seen")).toBeUndefined();
+  });
+
   it("cannot inspect a missing client's cwd by implicitly recreating it", () => {
     const state = new RemoteClientState<object>("/work/a", norm);
 
@@ -42,6 +67,21 @@ describe("RemoteClientState", () => {
     expect(state.active("tab-b")).toBe(sessionB);
     expect(state.clientsForCwd("/work/a")).toEqual(["tab-a", "tab-b"]);
     expect(state.clientsForCwd("/work/b")).toEqual(["tab-c"]);
+  });
+
+  it("keeps browser metadata across conversation switches and logical-tab reconnects", () => {
+    const state = new RemoteClientState<object, { tts: boolean }>("/work/a", norm);
+    const preferences = { tts: true };
+    state.identify("old-client", "stable-tab-token");
+    state.ready("old-client");
+    state.setMetadata("old-client", preferences);
+    state.setActive("old-client", { id: "first" });
+
+    state.setActive("old-client", { id: "second" });
+    expect(state.metadata("old-client")).toBe(preferences);
+
+    expect(state.identify("replacement", "stable-tab-token")).toBe("old-client");
+    expect(state.metadata("replacement")).toBe(preferences);
   });
 
   it("removes a departed client from cwd groups", () => {
@@ -130,6 +170,22 @@ describe("RemoteClientState", () => {
 
     expect(state.active("tab")).toBeUndefined();
     expect(state.cwd("tab")).toBe("/work/b");
+  });
+
+  it("resolves a staged attachment against the session active when it commits", async () => {
+    const state = new RemoteClientState<{ id: string }>("/work/a", norm);
+    const local = { id: "local" };
+    const first = { id: "first" };
+    const second = { id: "second" };
+    state.ready("tab");
+    state.setActive("tab", first);
+    const ownerAtCommit = () => state.active("tab") ?? local;
+    const staged = Promise.resolve().then(ownerAtCommit);
+
+    state.select("tab", "/work/b");
+    state.setActive("tab", second);
+
+    expect(await staged).toBe(second);
   });
 
   it("evicts a disposed session from every cwd active map", () => {

@@ -172,6 +172,35 @@ function parseRemoteWebviewMsg(msg: unknown): WebviewMsg | null {
         ...(value.submissionId !== undefined ? { submissionId: value.submissionId } : {}),
       };
     }
+    case "remotePreferences":
+      if (
+        typeof value.fontScale !== "number" ||
+        !Number.isFinite(value.fontScale) ||
+        value.fontScale < 80 ||
+        value.fontScale > 160 ||
+        typeof value.readRepliesAloud !== "boolean" ||
+        (value.summarizeRepliesAloud !== undefined && typeof value.summarizeRepliesAloud !== "boolean") ||
+        typeof value.usesTouch !== "boolean"
+      ) return null;
+      return {
+        type: "remotePreferences",
+        fontScale: value.fontScale,
+        readRepliesAloud: value.readRepliesAloud,
+        ...(value.summarizeRepliesAloud !== undefined
+          ? { summarizeRepliesAloud: value.summarizeRepliesAloud }
+          : {}),
+        usesTouch: value.usesTouch,
+      };
+    case "summarizeSpeech":
+      return Number.isSafeInteger(value.requestId) && typeof value.text === "string"
+        ? { type: "summarizeSpeech", requestId: value.requestId as number, text: value.text }
+        : null;
+    case "requestImageFull":
+      // Shape-check only; the host still has to recognise the handle. This just
+      // keeps anything path-like from reaching that lookup in the first place.
+      return typeof value.fullId === "string" && REMOTE_TAB_TOKEN_RE.test(value.fullId)
+        ? { type: "requestImageFull", fullId: value.fullId }
+        : null;
     case "selectRepo":
     case "clearAllSessions":
       return isRemoteCwd(value.cwd) ? msg as WebviewMsg : null;
@@ -191,6 +220,32 @@ function parseRemoteWebviewMsg(msg: unknown): WebviewMsg | null {
       return isRemoteMentionPath(value.relPath) ? msg as WebviewMsg : null;
     case "uploadFile":
       return isRemoteUploadName(value.name) ? msg as WebviewMsg : null;
+    case "pasteImage":
+      if (typeof value.mimeType !== "string" || typeof value.data !== "string") return null;
+      if (
+        value.previewId !== undefined &&
+        (typeof value.previewId !== "string" || !REMOTE_TAB_TOKEN_RE.test(value.previewId))
+      ) return null;
+      return {
+        type: "pasteImage",
+        mimeType: value.mimeType,
+        data: value.data,
+        ...(value.previewId !== undefined ? { previewId: value.previewId } : {}),
+      };
+    case "exitPlanAnswer": {
+      const validRequestId = typeof value.requestId === "string" || typeof value.requestId === "number";
+      if (
+        !validRequestId ||
+        (value.verdict !== "approved" && value.verdict !== "abandoned" && value.verdict !== "rejected")
+      ) return null;
+      if (value.comment !== undefined && typeof value.comment !== "string") return null;
+      return {
+        type: "exitPlanAnswer",
+        requestId: value.requestId as number | string,
+        verdict: value.verdict,
+        ...(value.comment !== undefined ? { comment: value.comment } : {}),
+      };
+    }
     default:
       return msg as WebviewMsg;
   }

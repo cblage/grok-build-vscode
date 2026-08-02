@@ -2,8 +2,6 @@ import * as vscode from "vscode";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { AcpClient, EffortLevel, ExitPlanRequest, PermissionRequest, QuestionRequest } from "./acp";
 import {
   Session,
@@ -20,10 +18,10 @@ import { resolveVoiceKey, extractGrokAuthKey, parseVoiceCommand, buildSttKeyterm
 import { VoiceRecorder, transcribeAudio, resolveWindowsAudioDevice } from "./voice-recorder";
 import { PcmVoiceStreamer, VoiceStreamer } from "./voice-streamer";
 import { summarizeForSpeech } from "./speech-summary";
-import type { PromptResultMeta } from "./acp-dispatch";
-import { MediaRef, addUsage, agentTimestampMsFromMeta, autoCompactStartedNote, contextUsedFromCompactNotification, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isRateLimitError, isSubagentLifecycleUpdate, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement } from "./acp-dispatch";
+import type { PromptResultMeta, PromptUsage } from "./acp-dispatch";
+import { MediaRef, agentTimestampMsFromMeta, autoCompactStartedNote, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isRateLimitError, isSubagentLifecycleUpdate, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement } from "./acp-dispatch";
 import { modeToRemember, startsInYolo } from "./mode-prefs";
-import { beginAuthRecovery } from "./auth-recovery";
+import { beginAuthRecovery, oauthShadowsXaiApiKey } from "./auth-recovery";
 import { GROK_VIEW_ID, moveViewContainerFor } from "./view-move";
 import {
   APTABASE_APP_KEY_PROD,
@@ -35,15 +33,17 @@ import {
   OFFICIAL_EXTENSION_ID,
 } from "./telemetry";
 import { randomUUID } from "node:crypto";
-const dbg = (l: string) => { try { fs.appendFileSync("C:/GitHub/grok-build-vscode/.dbg.log", l + "\n"); } catch { /* debug */ } };
+import { execGrokCli } from "./cli-process";
 import {
   locateGrokCli,
   extensionWasUpgraded,
+  isGrokVersionBelowRequired,
   isStdioBrokenGrokVersion,
   parseGrokVersion,
   grokUpdatePolicy,
   shouldReactivelyDowngrade,
   isLockedBinaryError,
+  GROK_REQUIRED_VERSION,
   GROK_STDIO_DOWNGRADE_TARGET,
 } from "./cli-locator";
 import {
@@ -112,17 +112,19 @@ import {
 } from "./file-upload";
 import { MAX_DIFF_EXPAND_BYTES, expandDiffToWholeFile } from "./diff-view";
 import { permissionAnswerAllowed, permissionOptionsForPlan, pickRejectOption, shouldRejectPermission } from "./plan-gate";
-import { appendPlanEntry, planRestoreSource, truncateResolvedAfter, countsAsUserBubble, decideRestoreState } from "./plan-restore";
+import { appendPlanEntry, planRestoreSource, truncateResolvedAfter, countsAsUserBubble, decideRestoreState, isInterjectionText } from "./plan-restore";
 import { planReviewFileName, sanitizePlanReviewFilePart } from "./plan-review";
-import { GROK_PRIMER, isPrimerText, isPrimerSummary } from "./grok-primer";
+import { isPrimerText, isPrimerSummary } from "./grok-primer";
 import { HOST_CAPABILITIES, HostMsg, WebviewMsg } from "./protocol";
 import { RemoteUplink } from "./remote-uplink";
 import { RemoteClientState, serializesRemoteSessionTransition } from "./remote-client-state";
 import { RemotePcmIngress, acceptRemotePcm } from "./remote-voice";
 import { SessionRequestState } from "./session-request-state";
-import { allowFromRemote, allowRemoteRepoTarget, bracketRemoteSnapshot, repoScopeFor, sessionCwdBelongsToRepo, sessionForRequest, transformHostMsgForRemote, type MediaInlineDeps, type MsgOrigin, type RemoteTier } from "./remote-policy";
+import { allowFromRemote, allowRemoteRepoTarget, bracketRemoteSnapshot, repoScopeFor, sessionCwdBelongsToRepo, sessionForRequest, shouldAdoptDeskSession, transformHostMsgForRemote, type MediaInlineDeps, type MsgOrigin, type RemoteTier } from "./remote-policy";
 import { deviceDisplayName, httpBaseFromRelayUrl, parseRelayFrame, REMOTE_RELAY_URL } from "./remote-frames";
 import { KeepAwake, shouldKeepAwake } from "./keep-awake";
+import { thumbnailImage, thumbnailMime } from "./image-thumbnail";
+import { historyImagePreviews } from "./image-history";
 import {
   SessionListEntry,
   SessionMetaOverrides,
@@ -137,6 +139,7 @@ import {
   indexSessions,
   isEmptyPrimerSession,
   isPathInside,
+  mostRecentSession,
   normalizeRepoPath,
   readContextUsage,
   readSessionEntries,
@@ -161,6 +164,7 @@ import {
 import {
   formatRewindPointDetail,
   formatRewindPointLabel,
+  historyEventCount,
   anyFilesAfter,
   bubbleMapIsConsistent,
   editRewindConfirmMessage,
@@ -195,6 +199,8 @@ const INSTALL_ID_KEY = "grok.installId";
  *  file — the #67 complaint. Persisted (not per-session) because a preference
  *  this deliberate should survive a reload, exactly like the setting would. */
 const IMPLICIT_CHIP_HIDDEN_KEY = "grok.implicitChipHidden";
+/** One helpful warning per install, even though every pooled process initializes. */
+const OAUTH_SHADOW_WARNING_KEY = "grok.oauthShadowWarningShown";
 
 interface RemoteVoiceEntry {
   credentialCwd: string;
@@ -223,15 +229,28 @@ interface RemoteRequester {
   tabToken?: string;
 }
 
+/** Resolved at commit time, AFTER any await. Undefined means the tab that asked
+ *  is gone and the attachment must be dropped — never redirected. */
+type AttachmentOwner = () => Session | undefined;
+
+interface RemoteBrowserPreferences {
+  fontScale: number;
+  readRepliesAloud: boolean;
+  summarizeRepliesAloud: boolean;
+  usesTouch: boolean;
+}
+
+interface CliCompatibilityResult {
+  planModeAvailable: boolean;
+  planModeUnavailableReason?: string;
+}
+
 // History pagination: rows fetched per "page" (initial open + each load-more / search page).
 const SESSION_PAGE_SIZE = 100;
 
-// Records the extension version at the last grok-CLI auto-update check, so the
-// silent `grok update` fires once per extension upgrade and never on a fresh
-// install. See maybeUpdateCliOnUpgrade.
+// Records the extension version at the last silent CLI-update check. A fresh
+// install establishes the baseline; a later extension upgrade updates once.
 const CLI_UPDATE_VERSION_KEY = "grok.cliUpdateExtVersion";
-
-const execFileAsync = promisify(execFile);
 
 // grok's non-plan ("act") mode id on the wire. The CLI reports this via
 // current_mode_update after leaving plan mode (verified against grok 0.2.3 —
@@ -314,13 +333,13 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   private static readonly IDLE_TTL_MS = 60 * 60 * 1000; // 1h
   private static readonly REAP_INTERVAL_MS = 5 * 60 * 1000; // sweep every 5 min
   private static readonly STAGING_ORPHAN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-  // The empty-session sweep only scans the newest N by mtime — empty primer
-  // sessions accumulate at the top (a fresh one each open), so this catches them
-  // while keeping the one-shot scan bounded on a large store.
+  // The legacy empty-primer sweep only scans the newest N by mtime, keeping its
+  // one-shot compatibility scan bounded on a large store.
   private static readonly SWEEP_SCAN_LIMIT = 300;
   private reaper?: ReturnType<typeof setInterval>;
   /** Guards {@link sweepEmptyPrimerSessions} to one run per activation. */
   private sweptEmptySessions = false;
+  private oauthShadowWarningShown = false;
   private output: vscode.OutputChannel;
   private get chips(): FileChip[] { return this.focused.chips; }
   private set chips(value: FileChip[]) { this.focused.chips = value; }
@@ -341,6 +360,8 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   private voiceTempPath?: string;
   private voiceStreamer?: VoiceStreamer;
   private voiceFinalizing = false;
+  /** Invalidates async voice callbacks after a manual discard or session swap. */
+  private voiceGeneration = 0;
   // Stored so a "grok send" can transparently restart a fresh stream (each
   // message = one clean utterance) without re-resolving the mic device.
   private voiceStreamCtx?: {
@@ -350,6 +371,7 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
     phrase: string;
     keyterms: string[];
     language?: string;
+    generation: number;
   };
   private localVoiceCwd?: string;
   private localVoiceCredentialCwd?: string;
@@ -363,7 +385,7 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   // sign-in flow). The taps in post()/emit() are no-ops when it's off, so the
   // shipping path is unaffected.
   private uplink?: RemoteUplink;
-  private readonly remoteClients: RemoteClientState<Session>;
+  private readonly remoteClients: RemoteClientState<Session, RemoteBrowserPreferences>;
   /** Cold session/load claims the persisted id before ACP has emitted `session`. */
   private readonly sessionLoadReservations = new Map<string, SessionLoadReservation>();
   /** Sessions being spawned on a remote tab's behalf — a reconnect burst must
@@ -386,12 +408,12 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   private cliPath?: string;
   /** History browsing scope. Deliberately independent of the live session cwd. */
   private selectedRepoCwd?: string;
-  // Guards the silent grok-CLI auto-update so it runs at most once per activation.
+  // The original update trigger: at most once per activation, and only after an
+  // extension-version change (never on the fresh-install baseline).
   private cliUpdateChecked = false;
-  // Guards the broken-CLI pin (issue #22) so the version probe + downgrade runs
-  // at most once per activation. Set only once the CLI is confirmed not-broken or
-  // a downgrade succeeds — a failed downgrade leaves it false so a manual restart
-  // can retry.
+
+  // Known-broken Windows builds are checked and pinned at most once per
+  // activation after the normal extension-upgrade update has run.
   private brokenCliPinned = false;
 
   // Re-entrancy guard for the reactive (post-init-failure) downgrade + retry in
@@ -418,7 +440,10 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   ) {
     this.output = output;
     this.lastUserSandboxSetting = this.readUserSandboxSetting();
-    this.remoteClients = new RemoteClientState<Session>(this.workspaceRoot(), normalizeRepoPath);
+    this.remoteClients = new RemoteClientState<Session, RemoteBrowserPreferences>(
+      this.workspaceRoot(),
+      normalizeRepoPath,
+    );
     context.subscriptions.push(
       vscode.workspace.registerTextDocumentContentProvider(GROK_DIFF_SCHEME, this.diffProvider),
     );
@@ -438,6 +463,7 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
       localResourceRoots: [
         vscode.Uri.joinPath(this.context.extensionUri, "media"),
         vscode.Uri.joinPath(this.context.extensionUri, "resources"),
+        vscode.Uri.file(this.imageStagingDir()),
         // grok writes generated media under ~/.grok/sessions/<cwd>/<id>/{images,videos};
         // serving it via asWebviewUri (instead of a base64 data: URI) lets the
         // webview stream a multi-MB video from disk — see postGeneratedMedia.
@@ -511,7 +537,7 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
       if (e.affectsConfiguration("grok.summarizeRepliesAloud")) {
         this.post({
           type: "summarizeRepliesAloud",
-          value: vscode.workspace.getConfiguration("grok").get<boolean>("summarizeRepliesAloud", false),
+          value: vscode.workspace.getConfiguration("grok").get<boolean>("summarizeRepliesAloud", true),
         });
       }
       if (e.affectsConfiguration("grok.includeActiveFileByDefault")) {
@@ -619,8 +645,8 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
    * cursor for the composer models); the CLI binds the agent at spawn and locks
    * it after the first turn, so a live `set_model` only works within the same
    * agent. When it's rejected for a cross-agent model we persist the choice and
-   * restart — `newSession` re-applies it before the primer runs, while the agent
-   * is still rebindable. Same-agent switches stay live (history intact).
+   * restart — `newSession` reapplies it before the first agent turn, while the
+   * agent is still rebindable. Same-agent switches stay live (history intact).
    */
   async switchModel(
     modelId: string,
@@ -628,11 +654,8 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
     requester?: RemoteRequester,
   ): Promise<void> {
     const client = session.client;
-    // Ignore switches fired during the session-start window: the live set_model
-    // would race the hidden primer (sometimes landing before the agent locks,
-    // sometimes after — see research/model-switch-race-probe.cjs), making the
-    // outcome unpredictable. The webview disables the control while busy; this
-    // is the backstop for a click already in flight.
+    // Ignore switches fired during session startup. The webview disables the
+    // control while busy; this is the backstop for a click already in flight.
     if (!client || session.priming || modelId === client.currentModelId) return;
     const cfg = vscode.workspace.getConfiguration("grok");
     try {
@@ -644,9 +667,8 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
         return;
       }
       if (!session.hasHistory) {
-        // Primer-only session (no real conversation): a cross-agent switch restarts it with a fresh
-        // grok id. There's nothing to summarize, so we never prompt here — and we don't leave the
-        // abandoned primer-only session cluttering history (repeated switches would pile them up).
+        // Empty session (no real conversation): a cross-agent switch restarts it
+        // with a fresh grok id. There is nothing to summarize or preserve.
         // Drop it after the restart, carrying over any rename the user made.
         const discardId = session.activeSessionId;
         await cfg.update("defaultModel", modelId, vscode.ConfigurationTarget.Global);
@@ -1042,6 +1064,21 @@ See design doc for the full state machine diagram.`;
     // setMode throws "no session" (and for Plan that error is surfaced to the user).
     // The mode button is disabled while busy; this backstops the toggle-mode command.
     if (!session.client || !session.client.sessionId || session.priming) return;
+    if (modeId === "plan" && !session.planModeAvailable) {
+      this.reportRequester(
+        requester,
+        "warning",
+        session.planModeUnavailableReason ?? "Plan mode is unavailable for this Grok CLI version.",
+      );
+      return;
+    }
+    if (!session.planModeAvailable && session.planActive) {
+      // An agent-initiated unavailable Plan transition is still being forced
+      // back to Agent. Agent/YOLO clicks must not lower the safety gate ahead
+      // of that confirmation; once recovered, the user can choose YOLO again.
+      this.recoverUnavailablePlanMode(session, session.client, session.gen);
+      return;
+    }
     // Remember the user's last non-plan mode so new sessions start in it (#25).
     // setMode is only ever called from the webview (user action), so this
     // captures intent, not restore/replay bookkeeping (those use client.setMode
@@ -1088,27 +1125,15 @@ See design doc for the full state machine diagram.`;
     }
   }
 
-  /**
-   * Resolve a plan-review card. The CLI's `exit_plan_mode` treats *any* response
-   * as approval, so the protocol verdict is cosmetic — our gate is the real
-   * decision. Crucially, this fires *during* the planning prompt's turn, so we
-   * only respond here and defer any new prompt/set_mode to `afterTurn`, which
-   * runs once that turn completes (handleSend).
+  /** Resolve a plan-review card inside the ORIGINAL planning turn.
    *
-   * Three verdicts:
-   *  - `approved`: drop gate, return CLI to act mode, send "implement now".
-   *  - `rejected`: keep gate up. If the user left a comment, send it as a plain
-   *    user message after the turn ends and let grok decide what to do next
-   *    (re-plan, ask clarifying questions, etc.) — we don't force a specific
-   *    "revise the plan" framing.
-   *  - `abandoned`: drop gate (exit plan mode entirely), no follow-up prompt.
-   *    The user wants to back out and continue freely.
-   *
-   * `rejected`/`abandoned` cut off the CLI's false-approval continuation via
-   * `cancel()` + a content-only suppression flag. Lifecycle events
-   * (`promptComplete`, `agentEnd`) still reach the webview so `busy` clears and
-   * the send button re-enables when the cancelled turn finally ends.
-   */
+   * Native outcomes drive grok's continuation: approved resumes into
+   * implementation, rejected stays in Plan so grok can revise, and abandoned
+   * ends the planning turn in Agent mode. Gate + permission state must be
+   * settled before the response releases the blocked tool call because
+   * implementation can begin immediately. Approve/reject comments are
+   * interjected first; abandon comments join the ordinary send queue because
+   * the abandoned turn ends without another model step to drain an interjection. */
   private handleExitPlan(
     requestId: number | string,
     verdict: "approved" | "abandoned" | "rejected",
@@ -1116,207 +1141,237 @@ See design doc for the full state machine diagram.`;
     session: Session = this.focused,
   ): void {
     const client = session.client;
-    if (!client) return;
-    const gen = session.gen;
-    client.respondExitPlan(requestId, verdict);
-    this.persistPlanVerdict(session, verdict);
-    // Record the resolution in the session buffer (mirrors permissionResolved)
-    // so a re-focus replays the plan card collapsed with its verdict instead of
-    // actionable — the live collapse is a webview-only DOM mutation the buffer
-    // never captured.
-    this.emit(session, { type: "planResolved", requestId, verdict });
-    this.setStatus(session, "working"); // a verdict always triggers a follow-up turn
-
+    const pending = session.pendingExitPlans.get(requestId);
+    if (!client || !pending) return;
     const feedback = comment?.trim();
-
+    const planText = pending.planText;
+    const gen = session.gen;
+    const sidebar = this;
+    const resolveCard = () => this.emit(session, { type: "planResolved", requestId, verdict });
     if (verdict === "approved") {
-      // Drop the gate now, then once the planning turn ends, return the CLI to
-      // act mode and have it implement. The wire-level prompt uses the same
-      // [Plan approved] marker the primer trained grok to recognize, so all
-      // three verdicts speak a consistent protocol. If the user attached a
-      // comment, post it as their user bubble immediately and append it to the
-      // wire-level prompt — same pattern as reject/cancel.
+      // Restore the mode chosen before Plan (#64) before native implementation
+      // can raise a permission request in this same turn.
+      session.autoApprove = vscode.workspace.getConfiguration("grok").get<string>("defaultMode", "") === "yolo";
       this.setPlanActive(session, false);
-      // Responding unblocked grok's planning turn (the CLI treats ANY
-      // exit_plan_mode response as approval), and the primer-trained
-      // continuation is contentless by design ("I'll wait for your verdict…").
-      // Cancel + content-suppress it exactly like reject/cancel do — grok
-      // doesn't persist it into replayed history, so live must hide it too;
-      // the [Plan approved] follow-up below is the real continuation. No
-      // agentReset here (unlike reject): pre-card narration the user already
-      // read stays on screen.
-      void client.cancel("plan-verdict approved");
-      session.suppressPlanReject = true;
-      if (feedback) {
-        session.userMessageCount += 1;
-        this.emit(session, { type: "userMessage", text: feedback, chips: [] });
-      }
-      this.emit(session, { type: "planProcessing" }); // indicator while we wait for grok
-      const promptToGrok = feedback ? `[Plan approved] ${feedback}` : "[Plan approved]";
-      session.afterTurn = async () => {
-        session.suppressPlanReject = false;
-        // Return to the mode the user was in BEFORE planning (#64): if that was
-        // Auto-accept, implementation runs without re-prompting; otherwise Agent.
-        // `defaultMode` is the last non-plan mode (Plan is never remembered), so
-        // it holds exactly the pre-plan choice. The gate was already dropped above.
-        const prePlanYolo = vscode.workspace.getConfiguration("grok").get<string>("defaultMode", "") === "yolo";
-        session.autoApprove = prePlanYolo;
-        this.emit(session, { type: "modeChanged", modeId: prePlanYolo ? "yolo" : "agent" });
-        try { await client.setMode(ACT_MODE_ID); } catch { /* CLI usually auto-exits already */ }
-        this.emit(session, { type: "agentStart" });
-        this.setStatus(session, "working");
-        try {
-          await this.ensurePrimed(client, session, gen);
-          if (gen !== session.gen) return;
-          const meta = await client.prompt(promptToGrok);
-          if (gen !== session.gen) return;
-          this.emit(session, { type: "agentEnd", meta });
-          this.setStatus(session, "done");
-        } catch (err) {
-          if (gen !== session.gen) return;
-          this.emit(session, { type: "agentError", text: promptErrorText(err) });
-          this.setStatus(session, "error");
-        }
-      };
-      return;
-    }
-
-    // rejected / abandoned: cancel the in-flight turn and suppress its content
-    // so the false-approval response doesn't reach the screen.
-    void client.cancel(`plan-verdict ${verdict}`);
-    this.emit(session, { type: "agentReset" });
-    session.suppressPlanReject = true;
-
-    // If the user attached a comment, post it as their user bubble IMMEDIATELY
-    // (not deferred to afterTurn) so it lands in the conversation right after
-    // the verdict click. Same text gets sent to grok later, verbatim — what the
-    // user sees IS what grok receives, no wire-level boilerplate prefix.
-    if (feedback) {
-      session.userMessageCount += 1;
-      this.emit(session, { type: "userMessage", text: feedback, chips: [] });
-      this.emit(session, { type: "planProcessing" }); // grok will process this comment
-    }
-
-    if (verdict === "rejected") {
-      // Stay in plan mode. The wire-level prompt is always prefixed with the
-      // [Plan rejected] marker the primer trained grok to recognize — even when
-      // the user typed a comment, grok needs the unambiguous verdict tag in
-      // front of it to distinguish "Reject + free-form note" from a regular
-      // user message. The webview's user bubble (posted earlier in this
-      // function) still shows just the user's words.
+    } else if (verdict === "rejected") {
+      session.autoApprove = false;
       this.setPlanActive(session, true);
-      if (!feedback) {
-        this.emit(session, {
-          type: "planNotice",
-          text: "Plan rejected — staying in Plan mode.",
-        });
-        this.emit(session, { type: "planProcessing" });
-      }
-      const promptToGrok = feedback ? `[Plan rejected] ${feedback}` : "[Plan rejected]";
-      session.afterTurn = async () => {
-        session.suppressPlanReject = false;
-        try { await client.setMode("plan"); } catch { /* gate still enforces */ }
-        this.emit(session, { type: "agentStart" });
-        this.setStatus(session, "working");
-        try {
-          await this.ensurePrimed(client, session, gen);
-          if (gen !== session.gen) return;
-          const meta = await client.prompt(promptToGrok);
-          if (gen !== session.gen) return;
-          this.emit(session, { type: "agentEnd", meta });
-          this.setStatus(session, "done");
-        } catch (err) {
-          if (gen !== session.gen) return;
-          this.emit(session, { type: "agentError", text: promptErrorText(err) });
-          this.setStatus(session, "error");
-        }
-      };
-      return;
+    } else {
+      // Preserve the existing safety choice: explicit Cancel lands in Agent,
+      // never back in remembered YOLO/Auto-accept.
+      session.autoApprove = false;
+      this.setPlanActive(session, false);
     }
 
-    // abandoned: drop the gate, return to agent mode. The wire-level prompt is
-    // always prefixed with the [Plan cancelled] marker (per the primer
-    // contract). With a comment, the marker precedes the user's words; without
-    // one, the marker stands alone.
-    this.setPlanActive(session, false);
-    if (!feedback) {
-      this.emit(session, {
-        type: "planNotice",
-        text: "Plan abandoned — switched to Agent mode.",
-      });
-    }
-    const promptToGrok = feedback ? `[Plan cancelled] ${feedback}` : "[Plan cancelled]";
-    session.afterTurn = async () => {
-      try { await client.setMode(ACT_MODE_ID); } catch { /* best-effort */ }
-      if (!feedback) {
-        // Plain cancel: the notice above is the whole UX — no dots, no
-        // follow-up bubble. The wire-level [Plan cancelled] still goes out
-        // (the primer contract needs the verdict), but grok's ack reply is
-        // noise: suppressPlanReject stays up through the turn so nothing
-        // paints, and agentEnd just releases the composer.
-        this.setStatus(session, "working");
-        try {
-          const meta = await client.prompt(promptToGrok);
-          if (gen !== session.gen) return;
-          this.emit(session, { type: "agentEnd", meta });
-        } catch (err) {
-          if (gen !== session.gen) return;
-          this.output.appendLine(`[plan-cancel] hidden ack turn failed: ${(err as Error).message}`);
-          this.emit(session, { type: "agentEnd" });
-        }
-        this.setStatus(session, "done");
+    if (verdict === "abandoned") {
+      // Native abandon ends this turn without another model step, so an
+      // interjection would remain undrained. Respond first, then queue any
+      // comment while status is still working; handleSend's finally flushes it
+      // as a real prompt after the abandoned turn settles.
+      if (!client.respondExitPlan(requestId, verdict)) {
+        session.autoApprove = false;
+        this.setPlanActive(session, true);
+        this.setStatus(session, "needs-you");
         return;
       }
-      session.suppressPlanReject = false;
-      this.emit(session, { type: "agentStart" });
-      this.setStatus(session, "working");
-      try {
-        const meta = await client.prompt(promptToGrok);
-        if (gen !== session.gen) return;
-        this.emit(session, { type: "agentEnd", meta });
-        this.setStatus(session, "done");
-      } catch (err) {
-        if (gen !== session.gen) return;
-        this.emit(session, { type: "agentError", text: promptErrorText(err) });
-        this.setStatus(session, "error");
+      commitVerdict();
+      if (feedback) this.divertRacingSend(session, feedback, false);
+      resolveCard();
+      return;
+    }
+
+    // Calling the async method writes before its first await. Keep this call
+    // before respondExitPlan so the comment is queued while grok is still
+    // blocked on exit_plan_mode; capability handling continues asynchronously.
+    const inFlightComment = feedback ? { text: feedback, client, gen } : undefined;
+    if (inFlightComment) session.inFlightPlanComments.set(requestId, inFlightComment);
+    const commentDelivery = feedback
+      ? client.interject(feedback, () => {
+          // The response dispatcher invokes this synchronously before resolving
+          // the Promise. Acceptance therefore retires exit recovery before a
+          // subsequent process-close event can reclaim the same text.
+          if (session.inFlightPlanComments.get(requestId) === inFlightComment) {
+            session.inFlightPlanComments.delete(requestId);
+          }
+          if (gen === session.gen && session.client === client) session.interjectionCount += 1;
+        })
+      : undefined;
+    const verdictWritten = client.respondExitPlan(requestId, verdict);
+    if (!verdictWritten) {
+      void commentDelivery?.catch(() => {});
+      session.autoApprove = false;
+      this.setPlanActive(session, true);
+      this.setStatus(session, "needs-you");
+      return;
+    }
+    commitVerdict();
+    resolveCard();
+
+    if (!feedback || !commentDelivery) return;
+
+    void commentDelivery.then((result) => {
+      if (!verdictWritten) return;
+      // Stale completions never emit into replacement session state. The old
+      // process's close handler already reclaimed any still-owned text before
+      // bumping gen; accepted text retired that ownership in onResolve above.
+      if (gen !== session.gen || session.client !== client) return;
+      if (result === "ok") {
+        this.emit(session, { type: "userMessage", text: feedback, chips: [], steer: true });
+        this.output.appendLine(`[plan-verdict] interjected ${feedback.length} comment chars`);
+      } else {
+        if (session.inFlightPlanComments.get(requestId) === inFlightComment) {
+          session.inFlightPlanComments.delete(requestId);
+        }
+        this.emit(session, { type: "steerUnavailable" });
+        this.divertRacingSend(session, feedback, false);
       }
-    };
+    }).catch((e: any) => {
+      if (!verdictWritten) return;
+      if (gen !== session.gen || session.client !== client) return;
+      if (session.inFlightPlanComments.get(requestId) === inFlightComment) {
+        session.inFlightPlanComments.delete(requestId);
+      }
+      this.emit(session, {
+        type: "error",
+        text: `Plan comment steering failed: ${e?.message ?? e}. Your comment was queued instead.`,
+      });
+      this.divertRacingSend(session, feedback, false);
+    });
+
+    function commitVerdict(): void {
+      session.pendingExitPlans.delete(requestId);
+      sidebar.persistPlanVerdict(session, verdict, planText);
+      sidebar.setStatus(session, "working");
+      if (verdict === "approved" && session.autoApprove) {
+        sidebar.autoApprovePendingPermissions(session);
+      }
+      if (verdict === "rejected" && !feedback) {
+        sidebar.emit(session, { type: "planNotice", text: "Plan rejected — staying in Plan mode." });
+      } else if (verdict === "abandoned" && !feedback) {
+        sidebar.emit(session, { type: "planNotice", text: "Plan abandoned — switched to Agent mode." });
+      }
+    }
   }
 
-  /** Send the extension's standing instructions ("primer") to grok exactly once
-   *  per grok session — teaching it the plan-verdict protocol the CLI's buggy
-   *  exit_plan_mode can't convey. It fires EAGERLY and NON-BLOCKING the moment a
-   *  session goes live (startSession kicks this off), so the composer is never
-   *  held: the user can send immediately, and their first real prompt awaits this
-   *  same promise (grok can't run two turns at once) — released the instant the
-   *  silent primer acks. The primer's turn is hidden from live chat
-   *  (suppressContent drops grok's "ok"); the user's own message bubble + the
-   *  Grokking indicator are NOT suppressed (they're not in SUPPRESS_TYPES), so a
-   *  send that overlaps the still-running primer shows as sent right away.
-   *
-   *  Idempotent: returns the existing in-flight promise so a fast send doesn't
-   *  start a second primer; resolves immediately once primed. Best-effort — a
-   *  failed primer clears the promise so the next send retries, and never throws
-   *  to the caller (the plan-gate, not the primer, is the actual enforcement). */
-  private ensurePrimed(client: AcpClient, session: Session, gen: number): Promise<void> {
-    if (session.primed) return Promise.resolve();
-    if (session.primingPromise) return session.primingPromise;
-    const promise = (async () => {
-      session.suppressContent = true;
-      try {
-        await client.prompt(GROK_PRIMER);
-        if (gen === session.gen) session.primed = true;
-      } catch (e) {
-        this.output.appendLine(`[primer] failed: ${(e as Error).message}`);
-      } finally {
-        if (gen === session.gen) session.suppressContent = false;
-        // On failure leave the session unprimed and drop the promise so the next
-        // outbound prompt retries instead of awaiting a dead one.
-        if (!session.primed) session.primingPromise = undefined;
-      }
-    })();
-    session.primingPromise = promise;
-    return promise;
+  /** Move comments still awaiting acceptance into the ordinary queue before a
+   * controlled restart replaces their owning process. */
+  private queueInFlightPlanCommentsOnExit(session: Session, client: AcpClient, gen: number): void {
+    const recovered: string[] = [];
+    for (const [requestId, pending] of session.inFlightPlanComments) {
+      if (pending.client !== client || pending.gen !== gen) continue;
+      session.inFlightPlanComments.delete(requestId);
+      recovered.push(pending.text);
+    }
+    if (!recovered.length) return;
+    const text = recovered.join("\n\n");
+    if (session.queuedSends.length) session.queuedSends[0] += "\n\n" + text;
+    else session.queuedSends.push(text);
+  }
+
+  /**
+   * An old/unverified CLI may still enter Plan on its own. Keep the client-side
+   * write/terminal gate raised until the CLI confirms it returned to Agent.
+   * Only the latest attempt may lower the gate, so overlapping mode updates or
+   * a defensive exit-plan request cannot let an earlier RPC win a race.
+   */
+  private recoverUnavailablePlanMode(
+    session: Session,
+    client: AcpClient,
+    gen: number,
+    exitPlanRequestId?: number | string,
+  ): void {
+    const attempt = ++session.planModeRecoveryAttempt;
+    if (session.planModeRecovery?.warningTimer) {
+      clearTimeout(session.planModeRecovery.warningTimer);
+    }
+    const recovery = {
+      attempt,
+      modeConfirmed: false,
+      turnSettled: !this.turnInFlight(session),
+      warningTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+    };
+    session.planModeRecovery = recovery;
+    session.autoApprove = false;
+    this.setPlanActive(session, true);
+    if (exitPlanRequestId !== undefined) {
+      client.respondExitPlanUnavailable(exitPlanRequestId);
+    }
+    if (!recovery.turnSettled) {
+      // This CLI's verdict behavior is not trusted, so there is no safe native
+      // continuation to preserve. Cancel it and wait for client.prompt() to
+      // settle; a set_mode acknowledgement alone cannot authorize writes.
+      void client.cancel("unavailable Plan recovery");
+    }
+    this.emit(session, {
+      type: "planNotice",
+      text:
+        `${session.planModeUnavailableReason ?? "Plan mode is unavailable for this Grok CLI version."} ` +
+        "Returning to Agent mode; write and terminal actions remain blocked until the planning turn stops and Agent mode is confirmed.",
+    });
+
+    recovery.warningTimer = setTimeout(() => {
+      if (
+        gen !== session.gen ||
+        session.client !== client ||
+        session.planModeRecovery !== recovery
+      ) return;
+      this.emit(session, {
+        type: "error",
+        text:
+          "Could not finish leaving unavailable Plan mode promptly. " +
+          "Write and terminal actions remain blocked for safety; start a new session if recovery does not complete.",
+      });
+    }, 10_000);
+
+    void client.setMode(ACT_MODE_ID).then(() => {
+      if (
+        gen !== session.gen ||
+        session.client !== client ||
+        session.planModeRecovery !== recovery
+      ) return;
+      recovery.modeConfirmed = true;
+      this.finishUnavailablePlanRecovery(session, client, gen, recovery);
+    }).catch((e: any) => {
+      if (
+        gen !== session.gen ||
+        session.client !== client ||
+        session.planModeRecovery !== recovery
+      ) return;
+      if (recovery.warningTimer) clearTimeout(recovery.warningTimer);
+      session.planModeRecovery = undefined;
+      this.emit(session, {
+        type: "error",
+        text:
+          `Could not leave unavailable Plan mode: ${e?.message ?? e}. ` +
+          "Write and terminal actions remain blocked for safety. Update Grok Build or start a new session.",
+      });
+    });
+  }
+
+  private finishUnavailablePlanRecovery(
+    session: Session,
+    client: AcpClient,
+    gen: number,
+    recovery: NonNullable<Session["planModeRecovery"]>,
+  ): void {
+    if (
+      gen !== session.gen ||
+      session.client !== client ||
+      session.planModeRecovery !== recovery ||
+      !recovery.modeConfirmed ||
+      !recovery.turnSettled
+    ) return;
+    if (recovery.warningTimer) clearTimeout(recovery.warningTimer);
+    session.planModeRecovery = undefined;
+    this.setPlanActive(session, false);
+    this.emit(session, { type: "planNotice", text: "Returned to Agent mode." });
+  }
+
+  private settleUnavailablePlanTurn(session: Session, client: AcpClient, gen: number): void {
+    const recovery = session.planModeRecovery;
+    if (!recovery || gen !== session.gen || session.client !== client) return;
+    recovery.turnSettled = true;
+    this.finishUnavailablePlanRecovery(session, client, gen, recovery);
   }
 
   /** Persist this plan (text + verdict) so the resume view can replay every plan
@@ -1336,13 +1391,17 @@ See design doc for the full state machine diagram.`;
    * discarded verdict there would restore plan mode from a turn that no longer
    * exists.
    */
-  private truncateSessionCardsAfterRewind(sessionId: string, surviving: number): void {
+  private async truncateSessionCardsAfterRewind(sessionId: string, surviving: number): Promise<void> {
     const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const cur = overrides[sessionId];
     if (!cur) return;
-    const plans = truncateResolvedAfter(cur.plans, surviving);
-    const permissions = truncateResolvedAfter(cur.permissions, surviving);
-    const usageLog = truncateResolvedAfter(cur.usageLog, surviving);
+    const boundarySession = [...this.pool].find((session) => session.activeSessionId === sessionId);
+    const survivingHistoryEvents = boundarySession
+      ? historyEventCount(truncateReplayBuffer(boundarySession.buffer, surviving))
+      : undefined;
+    const plans = truncateResolvedAfter(cur.plans, surviving, survivingHistoryEvents);
+    const permissions = truncateResolvedAfter(cur.permissions, surviving, survivingHistoryEvents);
+    const usageLog = truncateResolvedAfter(cur.usageLog, surviving, survivingHistoryEvents);
     const droppedPlans = (cur.plans?.length ?? 0) - plans.length;
     const droppedPerms = (cur.permissions?.length ?? 0) - permissions.length;
     const droppedTurns = (cur.usageLog?.length ?? 0) - usageLog.length;
@@ -1352,11 +1411,16 @@ See design doc for the full state machine diagram.`;
     // leaving the user billed in the UI for a turn that no longer exists. A
     // session with no `usageLog` (recorded before it existed) keeps its stored
     // total rather than dropping to zero: uncorrectable, but not wrong-by-a-lot.
-    const usage = cur.usageLog ? sumUsage(usageLog) : cur.usage;
+    const rawUsage = cur.usageLog ? sumUsage(usageLog) : cur.usage;
+    const usage = enforceCompleteSessionCost(
+      rawUsage,
+      usageLog,
+      surviving,
+    );
     this.output.appendLine(
       `[rewind] dropped ${droppedPlans} plan card(s) + ${droppedPerms} permission card(s) + ${droppedTurns} usage turn(s) past user message ${surviving}`,
     );
-    void this.context.globalState.update(SESSION_META_KEY, {
+    await this.context.globalState.update(SESSION_META_KEY, {
       ...overrides,
       [sessionId]: {
         ...cur,
@@ -1367,26 +1431,29 @@ See design doc for the full state machine diagram.`;
         lastPlanVerdict: plans.length ? plans[plans.length - 1].verdict : undefined,
       },
     });
-    // Keep the live session + popover in step with what we just persisted.
+    // Keep the live popover in step with what we just persisted. The ledger
+    // itself remains keyed by session id in meta; no live Session copy exists.
     const live = [...this.pool].find((s) => s.activeSessionId === sessionId);
     if (live) {
-      live.sessionUsage = usage;
-      live.lastTurnUsage = undefined;
-      this.emit(live, { type: "usage", session: usage });
+      this.emit(live, { type: "usage", session: usage, afterUserMessage: surviving, afterHistoryEvent: live.historyEventCount });
     }
   }
 
-  private persistPlanVerdict(session: Session, verdict: "approved" | "abandoned" | "rejected"): void {
+  private persistPlanVerdict(
+    session: Session,
+    verdict: "approved" | "abandoned" | "rejected",
+    planText: string,
+  ): void {
     const sid = session.activeSessionId ?? session.client?.sessionId;
     if (!sid) return;
     const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const cur = overrides[sid] ?? {};
-    const planText = session.pendingPlanText || "";
-    session.pendingPlanText = "";
     const plans = appendPlanEntry(cur.plans, {
       text: planText,
       verdict,
       afterUserMessage: session.userMessageCount,
+      afterInterjection: session.interjectionCount,
+      afterHistoryEvent: session.historyEventCount,
     });
     const next: SessionMetaOverrides = {
       ...overrides,
@@ -1409,7 +1476,7 @@ See design doc for the full state machine diagram.`;
     const cur = overrides[sid] ?? {};
     const permissions = [
       ...(cur.permissions ?? []),
-      { title: pending.title, outcome, toolCallId: pending.toolCallId, afterUserMessage: session.userMessageCount },
+      { title: pending.title, outcome, toolCallId: pending.toolCallId, afterUserMessage: session.userMessageCount, afterHistoryEvent: session.historyEventCount },
     ];
     void this.context.globalState.update(SESSION_META_KEY, {
       ...overrides,
@@ -1430,7 +1497,7 @@ See design doc for the full state machine diagram.`;
     for (const [requestId, pending] of [...session.pendingPermissions]) {
       const opt = preferredPermissionAllowOption(pending, session.planActive);
       if (!opt) continue;
-      client.respondPermission(requestId, opt.optionId);
+      if (!client.respondPermission(requestId, opt.optionId)) continue;
       this.emit(session, { type: "permissionResolved", requestId, optionId: opt.optionId });
       this.persistPermissionAnswer(session, requestId, opt.optionId);
       this.closeDiffForRequest(session, requestId);
@@ -1439,26 +1506,18 @@ See design doc for the full state machine diagram.`;
     if (resolved > 0) this.setStatus(session, "working"); // the turn resumes
   }
 
-  /** Run and clear any deferred post-turn action set by `handleExitPlan`. */
-  private async runAfterTurn(session: Session): Promise<void> {
-    const fn = session.afterTurn;
-    if (!fn) return;
-    session.afterTurn = undefined;
-    await fn();
-  }
-
   /**
    * Resolve the session's queued sends (#37) as ONE combined prompt — blank-line
    * separated, so grok gets a single turn with full context — once its turn is
    * truly over. Safe to call opportunistically: it no-ops while a turn is in
    * flight (`working`), while a card awaits the user (`needs-you`), while a
-   * verdict follow-up is pending (`afterTurn`), during the spawn window
-   * (`priming` — no session id to prompt yet), or with no live client. Works
+   * during the spawn window (`priming` — no session id to prompt yet), or with
+   * no live client. Works
    * for backgrounded sessions too.
    */
   private queuedSendReadyText(session: Session): string | undefined {
     if (!session.queuedSends.length) return undefined;
-    if (!session.client || session.priming || session.afterTurn) return undefined;
+    if (!session.client || session.priming) return undefined;
     if (session.status === "working" || session.status === "needs-you") return undefined;
     return session.queuedSends.join("\n\n");
   }
@@ -1515,7 +1574,11 @@ See design doc for the full state machine diagram.`;
     }
     this.emit(session, { type: "userMessage", text: body, chips: [], steer: true });
     try {
-      const r = await session.client.interject(body);
+      const client = session.client;
+      const gen = session.gen;
+      const r = await client.interject(body, () => {
+        if (gen === session.gen && session.client === client) session.interjectionCount += 1;
+      });
       if (r === "unsupported") {
         // Pre-~0.2.96 CLI: latch the button off and hand the text to the queue,
         // which is exactly the behavior Steer was offering to skip.
@@ -1649,13 +1712,6 @@ See design doc for the full state machine diagram.`;
     if (!session.client || !session.activeSessionId) {
       return void vscode.window.showWarningMessage("Start a session before editing a message.");
     }
-    // The hidden primer is a real in-flight prompt that never sets `status`, and
-    // grok runs one turn at a time — so without this an Edit clicked just after
-    // a reload raced the primer. Await it rather than refusing: it's short, and
-    // the user's click was legitimate.
-    if (session.primingPromise) {
-      await session.primingPromise.catch(() => {});
-    }
     if (session.status === "working" || session.status === "needs-you") {
       // Name the state. "Wait for the current turn" is useless when the turn
       // already finished and the status is merely stale — the user can't tell
@@ -1732,7 +1788,7 @@ See design doc for the full state machine diagram.`;
       );
       const resumeId = session.activeSessionId;
       const surviving = survivingUserMessagesAfterRewind(points, target);
-      this.truncateSessionCardsAfterRewind(resumeId, surviving);
+      await this.truncateSessionCardsAfterRewind(resumeId, surviving);
       this.applyRewindToView(session, surviving);
       this.emit(session, { type: "restoreComposer", text });
       if (nFiles > 0) {
@@ -1758,9 +1814,6 @@ See design doc for the full state machine diagram.`;
     if (!session.hasHistory) {
       return void vscode.window.showInformationMessage("Nothing to rewind yet — this session has no conversation.");
     }
-    // Same race Edit guards: the hidden primer is a real in-flight prompt that
-    // never sets `status`, and grok runs one turn at a time.
-    if (session.primingPromise) await session.primingPromise.catch(() => {});
     try {
       const points = await session.client.listRewindPoints();
       if (points === "unsupported") {
@@ -1782,7 +1835,7 @@ See design doc for the full state machine diagram.`;
       }
       let target: ReturnType<typeof resolveUserBubbleRewind> = null;
       if (typeof userBubbleIndex === "number") {
-        // Bubble button: map visible user bubble → wire prompt_index (skips primer).
+        // Bubble button: map visible user bubble → wire prompt_index (skips legacy hidden turns).
         target = resolveUserBubbleRewind(points, userBubbleIndex);
         if (!target) {
           return void vscode.window.showInformationMessage(
@@ -1801,8 +1854,8 @@ See design doc for the full state machine diagram.`;
           );
         }
         // Number each entry by its place among the user's VISIBLE messages, not
-        // by the wire prompt_index — that index counts the hidden primer and
-        // marker-only plan verdicts, so it renders as "#1 #2 … #6 #8": a
+        // by the wire prompt_index — old sessions include hidden primer and
+        // marker-only verdict points, so it can render as "#1 #2 … #6 #8": a
         // sequence the user can't match to anything on screen.
         const visiblePosition = new Map(facing.map((p, i) => [p.promptIndex, i + 1]));
         const items = [...selectable]
@@ -1862,7 +1915,7 @@ See design doc for the full state machine diagram.`;
       // Same as Edit: our plan/permission cards are not grok's, so the rewind
       // doesn't touch them and a replay would resurrect them at the bottom.
       const surviving = survivingUserMessagesAfterRewind(points, target);
-      this.truncateSessionCardsAfterRewind(resumeId, surviving);
+      await this.truncateSessionCardsAfterRewind(resumeId, surviving);
       this.applyRewindToView(session, surviving);
       // Rewind DISCARDS the message it targets, so hand its text back exactly
       // as Edit does — otherwise the button silently destroys what the user
@@ -2388,6 +2441,17 @@ See design doc for the full state machine diagram.`;
     }
   }
 
+  private sendRemoteRepoCatalog(clientId: string): void {
+    const cwd = this.remoteClients.cwd(clientId);
+    const active = this.remoteClients.active(clientId);
+    this.sendRemoteClient(clientId, {
+      type: "repos",
+      entries: this.repoCatalog(),
+      selectedCwd: cwd,
+      activeCwd: active ? this.sessionCwd(active) : cwd,
+    });
+  }
+
   private selectRepo(cwd: string): void {
     const hit = this.repoCatalog().find((r) => pathsEqual(r.cwd, cwd));
     if (!hit || !hit.available) return;
@@ -2396,14 +2460,40 @@ See design doc for the full state machine diagram.`;
     this.postSessionsList();
   }
 
-  private selectRemoteRepo(clientId: string, cwd: string): void {
+  private async selectRemoteRepo(clientId: string, cwd: string): Promise<void> {
     const hit = this.repoCatalog().find((r) => pathsEqual(r.cwd, cwd));
     if (!hit || !hit.available) return;
     if (this.remoteVoice.has(clientId)) void this.handleRemoteVoiceStop(clientId, true);
     this.parkRemoteSession(clientId);
     this.remoteClients.select(clientId, hit.cwd);
-    this.remoteSessionFor(clientId);
-    for (const msg of this.buildRemoteSnapshot(clientId)) this.sendRemoteClient(clientId, msg);
+    this.sendRemoteRepoCatalog(clientId);
+
+    // A deliberate repository switch has its own rule: choose that repository's
+    // newest real conversation, or create a fresh one when it has no history.
+    // Do not route this through remoteSessionFor(): that method deliberately
+    // keeps the desk-adoption behavior for a tab that arrives with nothing of
+    // its own (Continue remotely / first visit).
+    const history = this.buildSessionsList(
+      hit.cwd,
+      { limit: Number.MAX_SAFE_INTEGER },
+      undefined,
+    );
+    const live = new Map(
+      [...this.pool]
+        .filter((session) => session.activeSessionId)
+        .map((session) => [session.activeSessionId!, session]),
+    );
+    const newest = history.type === "sessions"
+      ? mostRecentSession(history.entries.filter((entry) => {
+          const session = live.get(entry.id);
+          // An empty live session is not repository history; selecting a repo
+          // with no history should still make a new session.
+          return !session || session.hasHistory;
+        }))
+      : undefined;
+    if (newest) await this.openRemoteSession(clientId, newest.id, newest.cwd, false);
+    else await this.newRemoteSession(clientId, false);
+    this.sendRemoteRepoCatalog(clientId);
   }
 
   private async toggleRepoPin(cwd: string, pinned: boolean): Promise<void> {
@@ -2654,10 +2744,10 @@ See design doc for the full state machine diagram.`;
     return this.startSession(session.activeSessionId, session);
   }
 
-  /** Read `grok --version` for the policy checks. Returns "" on failure (logged). */
-  private async readGrokVersion(cliPath: string): Promise<string> {
+  /** Read `grok --version` for policy checks. Returns "" on failure (logged). */
+  private async readGrokVersion(cliPath: string, timeout = 30_000): Promise<string> {
     try {
-      const { stdout } = await execFileAsync(cliPath, ["--version"], { timeout: 30_000 });
+      const { stdout } = await execGrokCli(cliPath, ["--version"], { timeout });
       return stdout?.trim() ?? "";
     } catch (e) {
       this.output.appendLine(`grok --version failed: ${(e as Error).message}`);
@@ -2665,85 +2755,86 @@ See design doc for the full state machine diagram.`;
     }
   }
 
-  /**
-   * Silently update the grok CLI when *our extension* was upgraded since the last
-   * run (the user opted into silent updates). Runs once per activation, before we
-   * spawn grok — so no grok process holds the binary open (matters on Windows) and
-   * the next `initialize` reports the new version on the welcome screen. Never on a
-   * fresh install (no prior version recorded), never blocking: a failed/slow update
-   * is logged and we proceed with the current binary. Respects the update policy
-   * (issue #22) so it never pulls the CLI onto an unsupported build on Windows.
-   */
+  /** Preserve the original silent-update contract: once per extension upgrade,
+   * from session start, with a fresh install only establishing the baseline. */
   private async maybeUpdateCliOnUpgrade(cliPath: string): Promise<void> {
     if (this.cliUpdateChecked) return;
     this.cliUpdateChecked = true;
     const current = (this.context.extension.packageJSON as { version?: string })?.version ?? "";
     const lastSeen = this.context.globalState.get<string>(CLI_UPDATE_VERSION_KEY);
     try {
-      if (extensionWasUpgraded(lastSeen, current)) {
-        const policy = grokUpdatePolicy(await this.readGrokVersion(cliPath), process.platform);
-        if (!policy.allow) {
-          // Already at/above the supported ceiling on Windows — updating would land
-          // on a broken build (#22). Skip; maybePinBrokenCli corrects a broken one.
-          this.output.appendLine(
-            `Extension upgraded ${lastSeen} → ${current}; skipping silent CLI update (${policy.note}).`,
-          );
-        } else {
-          const args = policy.target ? ["update", "--version", policy.target] : ["update"];
-          this.output.appendLine(
-            `Extension upgraded ${lastSeen} → ${current}; updating grok CLI (silent: ${args.join(" ")}).`,
-          );
-          this.post({ type: "cliUpdating" });
-          try {
-            const { stdout, stderr } = await execFileAsync(cliPath, args, { timeout: 180_000 });
-            if (stdout?.trim()) this.output.appendLine(stdout.trim());
-            if (stderr?.trim()) this.output.appendLine(stderr.trim());
-          } catch (e) {
-            this.output.appendLine(`grok update failed (continuing with current binary): ${(e as Error).message}`);
-          }
-        }
+      if (!extensionWasUpgraded(lastSeen, current)) return;
+      const policy = grokUpdatePolicy(await this.readGrokVersion(cliPath), process.platform);
+      if (!policy.allow) {
+        this.output.appendLine(
+          `Extension upgraded ${lastSeen} → ${current}; skipping silent CLI update (${policy.note}).`,
+        );
+        return;
+      }
+      const args = policy.target ? ["update", "--version", policy.target] : ["update"];
+      this.output.appendLine(
+        `Extension upgraded ${lastSeen} → ${current}; updating grok CLI (silent: ${args.join(" ")}).`,
+      );
+      this.post({ type: "cliUpdating" });
+      try {
+        const { stdout, stderr } = await execGrokCli(cliPath, args, { timeout: 180_000 });
+        if (stdout?.trim()) this.output.appendLine(stdout.trim());
+        if (stderr?.trim()) this.output.appendLine(stderr.trim());
+      } catch (e) {
+        this.output.appendLine(`grok update failed (continuing with current binary): ${(e as Error).message}`);
       }
     } finally {
-      // Record the current version regardless, so a fresh install sets the baseline
-      // (no update) and the *next* upgrade is the one that triggers.
       void this.context.globalState.update(CLI_UPDATE_VERSION_KEY, current);
     }
   }
 
-  /**
-   * Pin the grok CLI to the supported version when it's on a build with the Windows
-   * `agent stdio` regression (issue #22) — 0.2.61–0.2.70 hang at startup (the agent
-   * doesn't read stdin until EOF, which never comes for a live client), so a session
-   * can't start at all. We detect that bounded range from `grok --version` *before*
-   * spawning and run `grok update --version <supported>` to move onto the fixed build
-   * (0.2.72). Runs at most once per activation; best-effort — a failed probe or pin is
-   * logged and we proceed (the user still gets the actionable start-failure error).
-   * Once a newer Windows-verified build ships, bump `GROK_STDIO_DOWNGRADE_TARGET` and
-   * widen the broken range to include the now-superseded builds.
-   */
+  /** Read the installed version and decide Plan availability. This deliberately
+   * performs no update, availability check, caching, or pool orchestration. */
+  private async planModeCompatibility(cliPath: string): Promise<CliCompatibilityResult> {
+    const versionOutput = await this.readGrokVersion(cliPath);
+    const installed = parseGrokVersion(versionOutput)?.join(".");
+    if (!installed) {
+      const message = `Could not verify the grok CLI version; this extension requires grok ${GROK_REQUIRED_VERSION} or newer.`;
+      this.output.appendLine(`${message} Continuing best-effort with the current binary.`);
+      void vscode.window.showWarningMessage(message);
+      return {
+        planModeAvailable: false,
+        planModeUnavailableReason:
+          `Plan mode requires Grok CLI ${GROK_REQUIRED_VERSION} or newer; ` +
+          "the installed version could not be verified.",
+      };
+    }
+    if (isGrokVersionBelowRequired(versionOutput)) {
+      const message = `grok CLI ${installed} is below required version ${GROK_REQUIRED_VERSION}; Plan mode is unavailable.`;
+      this.output.appendLine(message);
+      void vscode.window.showWarningMessage(message);
+      return {
+        planModeAvailable: false,
+        planModeUnavailableReason:
+          `Plan mode requires Grok CLI ${GROK_REQUIRED_VERSION} or newer; installed version is ${installed}.`,
+      };
+    }
+    return { planModeAvailable: true };
+  }
+
+  /** Pin the bounded Windows stdio-hang range before spawning ACP. */
   private async maybePinBrokenCli(cliPath: string): Promise<void> {
     if (this.brokenCliPinned) return;
     const versionOutput = await this.readGrokVersion(cliPath);
-    if (!versionOutput) {
-      // Couldn't read the version — don't block startup; let the spawn proceed.
-      return;
-    }
+    if (!versionOutput) return;
     if (!isStdioBrokenGrokVersion(versionOutput, process.platform)) {
-      this.brokenCliPinned = true; // healthy build — no need to re-probe this activation
+      this.brokenCliPinned = true;
       return;
     }
     const detected = parseGrokVersion(versionOutput)?.join(".") ?? versionOutput;
-    // A failed downgrade leaves brokenCliPinned false so a manual restart can retry.
-    if (await this.downgradeBrokenCli(cliPath, detected, "proactive")) this.brokenCliPinned = true;
+    if (await this.downgradeBrokenCli(cliPath, detected, "proactive")) {
+      this.brokenCliPinned = true;
+    }
   }
 
   /**
-   * Run `grok update --version <supported>` (0.2.72) and notify the user, returning
-   * true on success. Shared by the proactive pin (`maybePinBrokenCli`, before spawn —
-   * moves a 0.2.61–0.2.70 build *up* to 0.2.72) and the reactive recovery (after an
-   * observed startup failure on a future build *above* 0.2.72 — a downgrade).
-   * Best-effort: a failure is logged and returns false. Every pin surfaces a one-time
-   * notification.
+   * Run `grok update --version <supported>` and notify the user, returning true
+   * on success during proactive or reactive recovery from a Windows stdio failure.
    */
   private async downgradeBrokenCli(
     cliPath: string,
@@ -2756,23 +2847,20 @@ See design doc for the full state machine diagram.`;
     );
     this.post({ type: "cliUpdating" });
     try {
-      const { stdout, stderr } = await execFileAsync(
+      const { stdout, stderr } = await execGrokCli(
         cliPath,
         ["update", "--version", GROK_STDIO_DOWNGRADE_TARGET],
         { timeout: 180_000 },
       );
       if (stdout?.trim()) this.output.appendLine(stdout.trim());
       if (stderr?.trim()) this.output.appendLine(stderr.trim());
-      void vscode.window.showInformationMessage(
-        reason === "reactive"
-          ? `Grok CLI ${fromVersion} failed to start a session (issue #22). Switched to the ` +
-              `supported version ${GROK_STDIO_DOWNGRADE_TARGET} and retrying.`
-          : `Grok CLI ${fromVersion} has the issue #22 stdio bug that prevents the extension from ` +
-              `starting a session. Pinned to the supported version ${GROK_STDIO_DOWNGRADE_TARGET}.`,
-      );
+      const detail = reason === "proactive"
+        ? `Grok CLI ${fromVersion} has a known Windows startup issue (issue #22). Switched to the supported version ${GROK_STDIO_DOWNGRADE_TARGET}.`
+        : `Grok CLI ${fromVersion} failed to start a session (issue #22). Switched to the supported version ${GROK_STDIO_DOWNGRADE_TARGET} and retrying.`;
+      void vscode.window.showInformationMessage(detail);
       return true;
     } catch (e) {
-      this.output.appendLine(`grok downgrade to ${GROK_STDIO_DOWNGRADE_TARGET} failed: ${(e as Error).message}`);
+      this.output.appendLine(`grok recovery update to ${GROK_STDIO_DOWNGRADE_TARGET} failed: ${(e as Error).message}`);
       return false;
     }
   }
@@ -2795,8 +2883,12 @@ See design doc for the full state machine diagram.`;
     // unsupported Windows build. Independent of the --check result below.
     const policy = grokUpdatePolicy(await this.readGrokVersion(cliPath), process.platform);
     try {
-      const { stdout } = await execFileAsync(cliPath, ["update", "--check", "--json"], { timeout: 30_000 });
-      const info = JSON.parse(stdout) as { currentVersion?: string; latestVersion?: string; updateAvailable?: boolean };
+      const { stdout } = await execGrokCli(cliPath, ["update", "--check", "--json"], { timeout: 30_000 });
+      const info = JSON.parse(stdout) as {
+        currentVersion?: string;
+        latestVersion?: string;
+        updateAvailable?: boolean;
+      };
       this.post({
         type: "grokUpdateStatus",
         current: info.currentVersion ?? null,
@@ -2815,8 +2907,7 @@ See design doc for the full state machine diagram.`;
    * open while running (a hard lock on Windows), so we tear the session down,
    * run `grok update`, then resume the *same* session on the fresh binary —
    * preserving the conversation. The welcome lifecycle (Updating… → Starting… →
-   * Connected · v<new>) shows progress. cliUpdateChecked is already set, so
-   * startSession's silent path won't re-run the update.
+   * Connected · v<new>) shows progress.
    */
   private async updateGrokCliOnDemand(): Promise<void> {
     const cliPath = this.cliPath || locateGrokCli(
@@ -2878,13 +2969,17 @@ See design doc for the full state machine diagram.`;
    *  Even after awaiting the pool teardown a lingering file lock can outlive the
    *  killed processes by a beat (antivirus / handle cleanup); a short pause-and-
    *  retry clears it. Any non-lock failure is real and surfaces immediately. */
-  private async runGrokUpdate(cliPath: string, updateArgs: string[]): Promise<void> {
+  private async runGrokUpdate(
+    cliPath: string,
+    updateArgs: string[],
+    notifyFailure = true,
+  ): Promise<boolean> {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const { stdout, stderr } = await execFileAsync(cliPath, updateArgs, { timeout: 180_000 });
+        const { stdout, stderr } = await execGrokCli(cliPath, updateArgs, { timeout: 180_000 });
         if (stdout?.trim()) this.output.appendLine(stdout.trim());
         if (stderr?.trim()) this.output.appendLine(stderr.trim());
-        return;
+        return true;
       } catch (e) {
         const msg = (e as Error).message;
         if (attempt === 0 && isLockedBinaryError(msg)) {
@@ -2893,10 +2988,13 @@ See design doc for the full state machine diagram.`;
           continue;
         }
         this.output.appendLine(`grok update failed: ${msg}`);
-        void vscode.window.showWarningMessage(`Grok Build update failed: ${msg}`);
-        return;
+        if (notifyFailure) {
+          void vscode.window.showWarningMessage(`Grok Build update failed: ${msg}`);
+        }
+        return false;
       }
     }
+    return false;
   }
 
   /** Confirm a restart for a setting that only applies on a fresh session
@@ -2938,14 +3036,9 @@ See design doc for the full state machine diagram.`;
     }
     const summary = chunks.join("").trim();
 
-    await this.startSession(undefined, session); // resets suppressContent + eagerly kicks off the primer
+    await this.startSession(undefined, session); // resets suppressContent
 
     if (summary && session.client) {
-      // Await the eager primer FIRST (it manages its own suppression and ends with
-      // suppressContent=false), THEN re-assert suppression for the hidden summary
-      // injection. Doing it the other way round would let the primer's completion
-      // clear the flag mid-summary and leak "[Context from previous session]".
-      await this.ensurePrimed(session.client, session, session.gen);
       this.emit(session, { type: "sessionContext" });
       session.suppressContent = true;
       try {
@@ -2956,7 +3049,7 @@ See design doc for the full state machine diagram.`;
     }
   }
 
-  /** A model/effort switch on a primer-only session (no real conversation) restarts it with a new
+  /** A model/effort switch on an empty session (no real conversation) restarts it with a new
    *  grok session id. grok already persisted the abandoned one, so without this each repeated switch
    *  would pile another empty session into history. Drop the old session's on-disk dir and carry any
    *  user rename (`customName`) onto the new session so the chosen name survives the restart. The
@@ -2999,6 +3092,10 @@ See design doc for the full state machine diagram.`;
     // Step D passes a pool member. Its handlers close over `session`/`gen` so a
     // backgrounded session's events stay bound to it even after focus moves.
     const session = target;
+    const replacedClient = session.client;
+    if (replacedClient) {
+      this.queueInFlightPlanCommentsOnExit(session, replacedClient, session.gen);
+    }
     const gen = ++session.gen;
     const testDelay = this.testSessionStartDelay;
     if (testDelay && testDelay.resumeId === resumeId) {
@@ -3013,8 +3110,14 @@ See design doc for the full state machine diagram.`;
     // new/resumed/restarted session (covers New Session, history resume, and
     // model/effort restarts — all of which route through here).
     this.stopVoiceInput(session);
-    session.client?.dispose();
     session.client = undefined;
+    // Detach and dispose as one structural operation. Nothing that can return
+    // belongs between these lines: the old ACP callbacks remain live until the
+    // process has actually exited.
+    if (replacedClient) {
+      await replacedClient.dispose();
+      if (gen !== session.gen) return undefined;
+    }
     // A brand-new session starts in the remembered mode (#25) immediately, so the
     // toolbar shows the right one from the first paint — no Agent → Auto accept
     // flash while the session spins up and primes. Resumed sessions stay
@@ -3037,14 +3140,18 @@ See design doc for the full state machine diagram.`;
     const configAutoApprove = this.configForcesAutoApprove(this.sessionCwd(session));
     session.autoApprove = rememberedYolo || configAutoApprove;
     session.planActive = false;
-    session.afterTurn = undefined;
     session.hasHistory = false;
-    session.primed = false;
-    session.primingPromise = undefined;
     session.suppressContent = false;
-    session.suppressPlanReject = false;
     session.lastPlanText = "";
-    session.pendingPlanText = "";
+    session.pendingExitPlans.clear();
+    session.inFlightPlanComments.clear();
+    if (session.planModeRecovery?.warningTimer) clearTimeout(session.planModeRecovery.warningTimer);
+    session.planModeRecovery = undefined;
+    session.interjectionCount = 0;
+    session.historyEventCount = 0;
+    session.replayUserRaw = "";
+    session.replayUserCounted = false;
+    session.replayUserIsInterjection = false;
     session.userMessageCount = 0;
     session.inUserMessage = false;
     session.activeSessionId = undefined;
@@ -3062,11 +3169,9 @@ See design doc for the full state machine diagram.`;
     if (configAutoApprove) this.noticeAlwaysApproveOnce();
     if (resumeId) this.emit(session, { type: "clearMessages" });
 
-    // Lock the composer (spinner, disabled) for the session-start window —
-    // start() + newSession()/load — so a prompt can't be sent before the session
-    // exists, which would otherwise throw "no session". The primer is NOT sent
-    // here; it's deferred to the first real send (ensurePrimed). The success path
-    // unlocks once the session is live (below); the failure paths clear it too.
+    // Lock the composer (spinner, disabled) for start() + newSession()/load so a
+    // prompt cannot be sent before the session exists. Success and failure paths
+    // both clear this startup lock below.
     this.emit(session, { type: "setBusy", value: true, locked: true });
 
     const cfg = vscode.workspace.getConfiguration("grok");
@@ -3081,17 +3186,21 @@ See design doc for the full state machine diagram.`;
       return undefined;
     }
 
-    // If our extension was upgraded, silently bring the CLI up to date *before*
-    // spawning it (once per activation). Bail if a newer start superseded us.
+    // Keep the established once-per-extension-upgrade update trigger, then read
+    // the resulting version solely to decide whether Plan is safe to expose.
     await this.maybeUpdateCliOnUpgrade(cliPath);
     if (gen !== session.gen) return undefined;
-
-    // If the (possibly just-updated) CLI is on a build with the Windows stdio
-    // regression (issue #22, builds 0.2.61–0.2.70), pin it to the supported version
-    // (0.2.72) before we spawn — otherwise the ACP handshake hangs forever. Runs after
-    // the silent update so it corrects an upgrade that landed on a still-broken build.
     await this.maybePinBrokenCli(cliPath);
     if (gen !== session.gen) return undefined;
+    const compatibility = await this.planModeCompatibility(cliPath);
+    if (gen !== session.gen) return undefined;
+    session.planModeAvailable = compatibility.planModeAvailable;
+    session.planModeUnavailableReason = compatibility.planModeUnavailableReason;
+    this.emit(session, {
+      type: "planModeAvailability",
+      available: compatibility.planModeAvailable,
+      reason: compatibility.planModeUnavailableReason,
+    });
 
     // Worktree sessions pin cwd at creation/open; everyone else uses the workspace root.
     const cwd = session.cwd || this.workspaceRoot();
@@ -3272,6 +3381,7 @@ See design doc for the full state machine diagram.`;
 
     client.on("initialized", (init) => {
       if (gen !== session.gen) return;
+      this.warnOAuthShadowOnce(init?._meta?.defaultAuthMethodId, env);
       this.emit(session, {
         type: "initialized",
         info: {
@@ -3300,15 +3410,23 @@ See design doc for the full state machine diagram.`;
     client.on("modeChanged", (id) => {
       if (gen !== session.gen) return;
       if (id === "plan") {
-        // CLI entered plan mode (covers the agent self-initiating it from a
-        // natural-language request). Raise our gate so the exit is enforced.
+        // Raise the safety gate synchronously for every Plan transition. During
+        // session/load, current_mode_update events replay before AcpClient has a
+        // sessionId, so defer the unavailable-mode set_mode RPC to the existing
+        // post-load restore block without ever leaving the gate down.
         session.autoApprove = false;
         this.setPlanActive(session, true);
+        if (!session.planModeAvailable) {
+          if (session.replaying) return;
+          this.recoverUnavailablePlanMode(session, client, gen);
+          return;
+        }
+        // CLI entered plan mode (covers the agent self-initiating it from a
+        // natural-language request). Raise our gate so the exit is enforced.
       } else if (session === this.focused) {
-        // CLI reports a non-plan mode. Do NOT auto-drop the gate here: the buggy
-        // exit_plan_mode emits "default" even when the user chose to keep
-        // planning. The gate is lowered only by explicit user action (approve,
-        // or pick Agent/YOLO). Just refresh the button label.
+        // A non-plan update is descriptive, not authority to lower the safety
+        // gate. The verdict handler settles that gate before its response; direct
+        // Agent/YOLO choices do so in setMode. Just refresh the button label.
         this.postMode();
       }
     });
@@ -3319,10 +3437,7 @@ See design doc for the full state machine diagram.`;
     client.on("messageChunk", (text: string) => {
       if (gen !== session.gen) return;
       session.inUserMessage = false;
-      // Hidden host-initiated turns (the pre-rail post-/compact /session-info
-      // fallback) need the reply text; the emit below is suppressed for them
-      // (suppressContent).
-      if (session.captureAgentText !== undefined) session.captureAgentText += text;
+      session.historyEventCount += 1;
       this.emit(session, { type: "messageChunk", text });
     });
     client.on("userMessageChunk", (text: string, meta?: any) => {
@@ -3333,19 +3448,16 @@ See design doc for the full state machine diagram.`;
       // echo would render a duplicate bubble and double-count. Only the CLI's
       // session/load *replay* should drive user bubbles from here.
       if (!session.replaying) return;
-      // Our own hidden primer(s) replay as user messages. Don't count them toward
-      // plan positions (the webview hides them too, via its matching
-      // PRIMER_PATTERN) but DO forward so the webview can suppress the whole
-      // primer turn (its bubble + grok's ack). We deliberately do NOT mark the
-      // session primed from this: a primer buried in replayed history isn't
-      // reliably honored by grok (a /compact can drop it), so the first
-      // post-restore send re-primes instead of trusting the replay.
+      // Older extension sessions contain a hidden primer user turn. Don't count
+      // it toward plan positions, but forward it so the webview's matching
+      // legacy pattern suppresses the primer bubble and grok's acknowledgement.
       if (!session.inUserMessage && isPrimerText(text)) {
         session.inUserMessage = true;
         this.emit(session, {
           type: "userMessageChunk",
           text,
           timestampMs: agentTimestampMsFromMeta(meta),
+          images: historyImagePreviews(text, this.imageStagingDir(), this.sessionCwd(session)),
         });
         return;
       }
@@ -3357,8 +3469,20 @@ See design doc for the full state machine diagram.`;
       // post-restore verdict position — those plan/permission cards then
       // landed at the END of the conversation on the next restore.
       if (!session.inUserMessage) {
-        if (countsAsUserBubble(text)) session.userMessageCount += 1;
+        session.replayUserRaw = "";
+        session.replayUserCounted = countsAsUserBubble(text);
+        session.replayUserIsInterjection = false;
+        if (session.replayUserCounted) session.userMessageCount += 1;
         session.inUserMessage = true;
+      }
+      session.replayUserRaw += text;
+      if (!session.replayUserIsInterjection && isInterjectionText(session.replayUserRaw)) {
+        session.replayUserIsInterjection = true;
+        session.interjectionCount += 1;
+        if (session.replayUserCounted) {
+          session.userMessageCount = Math.max(0, session.userMessageCount - 1);
+          session.replayUserCounted = false;
+        }
       }
       // Re-seed the session-scoped [Image #N] counter from replayed prompts so
       // images attached after a restore keep monotonically increasing tags
@@ -3371,11 +3495,17 @@ See design doc for the full state machine diagram.`;
         type: "userMessageChunk",
         text,
         timestampMs: agentTimestampMsFromMeta(meta),
+        images: historyImagePreviews(
+          session.replayUserRaw,
+          this.imageStagingDir(),
+          this.sessionCwd(session),
+        ),
       });
     });
     client.on("thoughtChunk", (text: string) => {
       if (gen !== session.gen) return;
       session.inUserMessage = false;
+      session.historyEventCount += 1;
       this.emit(session, { type: "thoughtChunk", text });
     });
     client.on("mediaContent", (m: MediaRef) => {
@@ -3408,11 +3538,13 @@ See design doc for the full state machine diagram.`;
     client.on("toolCall", (u) => {
       if (gen !== session.gen) return;
       session.inUserMessage = false;
+      session.historyEventCount += 1;
       this.emit(session, { type: "toolCall", call: u });
     });
     client.on("toolCallUpdate", (u) => {
       if (gen !== session.gen) return;
       session.inUserMessage = false;
+      session.historyEventCount += 1;
       this.emit(session, { type: "toolCallUpdate", call: u });
     });
     client.on("plan", (u) => {
@@ -3428,14 +3560,18 @@ See design doc for the full state machine diagram.`;
     client.on("promptComplete", (meta) => {
       if (gen !== session.gen) return;
       this.emit(session, { type: "promptComplete", meta: gateZeroTokenMeta(meta) });
-      this.accumulateUsage(session, meta);
+      void this.accumulateUsage(session, meta);
       // A zero report (stripped above) is /compact or /session-info; neither
       // warrants a donut update here. /session-info leaves the context
       // untouched, and after /compact the fresh count comes from the live
       // auto_compact_completed notification (primary; xaiNotification listener)
-      // or the hidden /session-info fallback — reading signals.json now would
+      // or the live session/update envelope — reading signals.json now would
       // fetch the stale pre-compact count (the CLI recomputes it only at the
       // next inference turn's end; research/signals-refresh-probe.cjs).
+    });
+    client.on("contextUsage", (used: number) => {
+      if (gen !== session.gen) return;
+      this.emit(session, { type: "contextUsage", used });
     });
     client.on("xaiNotification", (u) => {
       if (gen !== session.gen) return;
@@ -3450,16 +3586,12 @@ See design doc for the full state machine diagram.`;
       const compactUsed = contextUsedFromCompactNotification(u);
       if (compactUsed !== null) {
         this.emit(session, { type: "contextUsage", used: compactUsed });
-        // Mark the live rail as authoritative for the in-flight manual /compact
-        // so the pre-rail /session-info fallback + signals.json backup stand down.
-        session.sawCompactNotification = true;
       }
       // Compaction FAILED (either path — compaction.rs emits it on both). The
-      // context is unchanged, so the donut needs no refresh; mark handled so the
-      // /session-info fallback doesn't run, flag it so a manual /compact paints
-      // the failure instead of a false "Compacted.", and surface a note.
+      // context is unchanged, so the donut needs no refresh; flag it so a manual
+      // /compact paints the failure instead of a false "Compacted.", and surface
+      // a note.
       if (kind === "auto_compact_failed") {
-        session.sawCompactNotification = true;
         session.sawCompactFailed = true;
         const err = (u as { error?: unknown })?.error;
         this.emit(session, {
@@ -3587,6 +3719,10 @@ See design doc for the full state machine diagram.`;
     });
     client.on("exitPlanRequest", (req: ExitPlanRequest) => {
       if (gen !== session.gen) return;
+      if (!session.planModeAvailable) {
+        this.recoverUnavailablePlanMode(session, client, gen, req.id);
+        return;
+      }
       void this.postExitPlanRequest(req, session, gen);
     });
     client.on("questionRequest", (req: QuestionRequest) => {
@@ -3599,9 +3735,9 @@ See design doc for the full state machine diagram.`;
     client.on("exit", (code) => {
       if (gen !== session.gen) return; // suppress exit events from disposed/replaced clients
       this.emit(session, { type: "exit", code });
-      // The process is dead — anything queued for it can never send.
       if (session.queuedSends.length) {
         session.queuedSendDispatch = undefined;
+        session.queuedSendCommit = undefined;
         session.queuedSends = [];
         session.queuedSendRequiresRelay = false;
         this.emit(session, { type: "queuedSends", items: [] });
@@ -3674,27 +3810,22 @@ See design doc for the full state machine diagram.`;
           }
         }
 
-        // Bracket the replay so the webview can finalize historical turns and
-        // distinguish original agentTimestampMs values from live clock time.
-        this.emit(session, { type: "historyReplay", active: true });
-        session.replaying = true;
-        try {
-          await client.loadSession(resumeId, defaultModel || undefined);
-        } catch (e) {
-          // A resumed session's agent is fixed by its history, so a cross-agent
-          // default model (e.g. a Composer model while resuming a grok-build
-          // session, or vice-versa) can't be applied with a live set_model — it
-          // errors MODEL_SWITCH_INCOMPATIBLE_AGENT. The session itself already
-          // loaded and replayed; just keep its own model instead of letting the
-          // whole resume crash with "Grok exited (code null)".
-          if (!isIncompatibleAgentError(e)) throw e;
-          this.output.appendLine(
-            `[resume] kept the session's own model; default '${defaultModel}' needs a different agent`,
-          );
-        } finally {
-          session.replaying = false;
-          this.emit(session, { type: "historyReplay", active: false });
-        }
+        await this.replayLoadedHistory(session, async () => {
+          try {
+            await client.loadSession(resumeId, defaultModel || undefined);
+          } catch (e) {
+            // A resumed session's agent is fixed by its history, so a cross-agent
+            // default model (e.g. a Composer model while resuming a grok-build
+            // session, or vice-versa) can't be applied with a live set_model — it
+            // errors MODEL_SWITCH_INCOMPATIBLE_AGENT. The session itself already
+            // loaded and replayed; just keep its own model instead of letting the
+            // whole resume crash with "Grok exited (code null)".
+            if (!isIncompatibleAgentError(e)) throw e;
+            this.output.appendLine(
+              `[resume] kept the session's own model; default '${defaultModel}' needs a different agent`,
+            );
+          }
+        });
         session.activeSessionId = resumeId;
         session.titleGenerated = true; // existing session, name already in storage
         session.hasHistory = true;
@@ -3705,9 +3836,17 @@ See design doc for the full state machine diagram.`;
         // decision (see plan-restore.ts) so a Cancelled or Approved session
         // doesn't come back stuck in Plan mode.
         const decision = decideRestoreState(saved);
-        this.setPlanActive(session, decision.planActive);
-        const targetMode = decision.cliMode === "plan" ? "plan" : ACT_MODE_ID;
-        try { await client.setMode(targetMode); } catch { /* best-effort */ }
+        const unavailablePlan = !session.planModeAvailable && (
+          decision.planActive || session.planActive || client.currentModeId === "plan"
+        );
+        if (unavailablePlan) {
+          this.recoverUnavailablePlanMode(session, client, gen);
+        } else {
+          const restorePlan = decision.planActive && session.planModeAvailable;
+          this.setPlanActive(session, restorePlan);
+          const targetMode = restorePlan ? "plan" : ACT_MODE_ID;
+          try { await client.setMode(targetMode); } catch { /* best-effort */ }
+        }
 
         // Seed the context donut from grok's persisted signals.json — no turn
         // has run yet, so without this a restored session shows 0 until the
@@ -3746,24 +3885,14 @@ See design doc for the full state machine diagram.`;
         }
       }
 
-      // Session is live — unlock the composer now. The "system prompt" (primer)
-      // that teaches grok the plan-verdict protocol fires here EAGERLY and in the
-      // BACKGROUND (not awaited), on a new OR restored session, so the composer is
-      // never blocked waiting on it. The user can send immediately; their first
-      // real prompt awaits the same priming promise (ensurePrimed) and is released
-      // the instant the silent primer acks. A glance-only restore costs only one
-      // cheap background round-trip (the v4 primer no longer explores). See
-      // src/grok-primer.ts.
+      // Session is live — unlock the composer and flush anything typed during
+      // the startup window (#37).
       session.priming = false;
       this.pool.add(session);
       this.touch(session);
       this.reapPool(); // enforce the LRU cap now that the pool grew
       this.emit(session, { type: "setBusy", value: false });
-      // After the eager primer acks, fire anything type-ahead-queued during the
-      // startup window (#37). ensurePrimed never throws.
-      void this.ensurePrimed(client, session, gen).then(() => {
-        if (gen === session.gen) void this.maybeFlushQueuedSends(session);
-      });
+      if (gen === session.gen) void this.maybeFlushQueuedSends(session);
     } catch (err) {
       if (gen !== session.gen) { client.dispose(); return undefined; }
       const msg = (err as any).message ?? String(err);
@@ -3781,13 +3910,12 @@ See design doc for the full state machine diagram.`;
         // The signature of the Windows stdio regression (issue #22): a startup request
         // hangs because the agent won't read stdin until EOF. It spanned 0.2.61–0.2.70
         // (`initialize` on 0.2.61–0.2.64, `session/new` on 0.2.67/0.2.69/0.2.70) and was
-        // fixed in 0.2.71. The proactive pin (maybePinBrokenCli) covers that bounded
-        // range before spawning; this reactive net is the backstop for a *future*
-        // still-broken build above 0.2.72, or when the proactive pin couldn't run
-        // (version read failed, or the binary was locked so `grok update` couldn't
-        // rename it). We switch to 0.2.72 on the observed failure and retry the spawn
-        // once. After the pin the version is 0.2.72, so shouldReactivelyDowngrade()
-        // can't loop; a later manual re-upgrade above 0.2.72 re-arms the recovery.
+        // fixed in 0.2.71. The universal behavior floor replaces that old bounded
+        // proactive pin; this reactive net is the backstop for a future
+        // still-broken build above the Windows-verified target. We restore the
+        // current supported feature baseline on the observed failure and retry
+        // once. A target-or-older build cannot loop through this recovery; a
+        // later manual upgrade above the target re-arms it.
         const version = await this.readGrokVersion(cliPath);
         if (!this.reactiveDowngradeInFlight && shouldReactivelyDowngrade(version, process.platform)) {
           this.reactiveDowngradeInFlight = true;
@@ -3806,7 +3934,7 @@ See design doc for the full state machine diagram.`;
           type: "error",
           text:
             `Failed to start Grok: ${msg}. This matches the Grok CLI 0.2.61–0.2.70 stdio ` +
-            `regression (issue #22, fixed in ${GROK_STDIO_DOWNGRADE_TARGET}). Workaround: run ` +
+            `regression (issue #22, fixed after 0.2.70). Workaround: run ` +
             `\`grok update --version ${GROK_STDIO_DOWNGRADE_TARGET}\` in a terminal, then start a new session.`,
         });
       } else {
@@ -3831,12 +3959,13 @@ See design doc for the full state machine diagram.`;
     // remembers its own conversation never reaches here (it resumes), and a
     // deliberate New session still replaces this one.
     const deskSession = this.focused;
-    const deskCwdMatches = sessionCwdBelongsToRepo(
+    const canAdoptDesk = shouldAdoptDeskSession(
       this.sessionCwd(deskSession),
       this.sessionCwdsForRepo(cwd, this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {})),
+      this.remoteClients.isActiveValueVisible(deskSession),
       pathsEqual,
     );
-    if (deskCwdMatches && !this.remoteClients.isActiveValueVisible(deskSession)) {
+    if (canAdoptDesk) {
       this.remoteClients.setActive(clientId, deskSession);
       return deskSession;
     }
@@ -3847,10 +3976,15 @@ See design doc for the full state machine diagram.`;
   }
 
   private async onMessage(msg: WebviewMsg, origin: MsgOrigin, clientId?: string): Promise<void> {
-    const session = origin === "remote" && clientId ? this.remoteSessionFor(clientId) : this.focused;
+    const session = origin === "remote" && clientId
+      ? msg.type === "selectRepo"
+        ? this.remoteClients.active(clientId) ?? this.focused
+        : this.remoteSessionFor(clientId)
+      : this.focused;
     const requester = origin === "remote" && clientId
       ? this.captureRemoteRequester(clientId)
       : undefined;
+    const attachmentOwner: AttachmentOwner = () => this.attachmentOwner(origin, clientId);
     const messageCwd = origin === "remote" && clientId
       ? this.remoteClients.cwd(clientId)
       : this.workspaceRoot();
@@ -3860,19 +3994,19 @@ See design doc for the full state machine diagram.`;
         this.postRepoCatalog();
         break;
       case "remotePreferences":
-        if (origin === "remote") {
+        if (origin === "remote" && clientId) {
           if (
             Number.isFinite(msg.fontScale) &&
             msg.fontScale >= 80 &&
             msg.fontScale <= 160
           ) {
-            session.remoteFontScale = msg.fontScale;
-          }
-          if (typeof msg.readRepliesAloud === "boolean") {
-            session.remoteReadRepliesAloud = msg.readRepliesAloud;
-          }
-          if (typeof msg.usesTouch === "boolean") {
-            session.remoteUsesTouch = msg.usesTouch;
+            this.remoteClients.setMetadata(clientId, {
+              fontScale: msg.fontScale,
+              readRepliesAloud: msg.readRepliesAloud,
+              summarizeRepliesAloud:
+                msg.readRepliesAloud && msg.summarizeRepliesAloud === true,
+              usesTouch: msg.usesTouch,
+            });
           }
         }
         break;
@@ -3882,13 +4016,35 @@ See design doc for the full state machine diagram.`;
         }
         break;
       case "summarizeSpeech": {
-        if (origin !== "local") break;
+        const remotePreferences = origin === "remote" && clientId
+          ? this.remoteClients.metadata(clientId)
+          : undefined;
+        if (
+          origin === "remote" &&
+          (!requester ||
+            remotePreferences?.readRepliesAloud !== true ||
+            remotePreferences?.summarizeRepliesAloud !== true)
+        ) break;
         const text = await summarizeForSpeech(
           msg.text,
           this.resolveVoiceApiKey(session.cwd || this.workspaceRoot()),
           (line) => this.output.appendLine(line),
         );
-        this.post({ type: "speechSummary", requestId: msg.requestId, text });
+        const response: HostMsg = { type: "speechSummary", requestId: msg.requestId, text };
+        if (requester) this.sendRemoteRequester(requester, response);
+        else this.postLocal(response);
+        break;
+      }
+      case "requestImageFull": {
+        // Local webviews open the real file directly, so this exists for remotes,
+        // which otherwise can only enlarge the 320px thumbnail.
+        if (origin !== "remote" || !requester) break;
+        const source = this.fullImagePaths.get(msg.fullId);
+        // Unknown handle: say nothing. The overlay keeps showing the thumbnail,
+        // and a probe learns nothing about what does or does not exist on disk.
+        if (!source) break;
+        const src = await this.renderFullImage(source);
+        this.sendRemoteRequester(requester, { type: "imageFull", fullId: msg.fullId, src });
         break;
       }
       case "send":
@@ -4120,21 +4276,22 @@ See design doc for the full state machine diagram.`;
         await this.exportExpr(msg, session);
         break;
       case "dropFile":
-        await this.trackAttach(this.addDroppedFile(msg.path, msg.shift, session));
+        await this.trackAttach(this.addDroppedFile(msg.path, msg.shift, attachmentOwner));
         break;
       case "pasteImage":
         await this.trackAttach(this.addPastedImage(
           msg.data,
           msg.mimeType,
-          session,
+          attachmentOwner,
           requester,
+          msg.previewId,
         ));
         break;
       case "uploadFile":
         await this.trackAttach(this.addUploadedFile(
           msg.name,
           msg.data,
-          session,
+          attachmentOwner,
           requester,
         ));
         break;
@@ -4147,7 +4304,7 @@ See design doc for the full state machine diagram.`;
             session.planActive,
             pending.toolKind,
           )) break;
-          session.client?.respondPermission(msg.requestId, msg.optionId);
+          if (!session.client?.respondPermission(msg.requestId, msg.optionId)) break;
           // Record the resolution in the session buffer so re-focusing this session
           // replays the card collapsed instead of active (the live collapse is a
           // webview-only DOM mutation that the buffer never captured).
@@ -4163,12 +4320,14 @@ See design doc for the full state machine diagram.`;
         this.handleExitPlan(msg.requestId, msg.verdict, msg.comment, session);
         break;
       case "questionAnswer":
-        session.client?.respondQuestion(msg.requestId, msg.answers ?? {}, msg.annotations ?? {});
-        this.setStatus(session, "working");
+        if (session.client?.respondQuestion(msg.requestId, msg.answers ?? {}, msg.annotations ?? {})) {
+          this.setStatus(session, "working");
+        }
         break;
       case "questionCancel":
-        session.client?.respondQuestionCancelled(msg.requestId);
-        this.setStatus(session, "working");
+        if (session.client?.respondQuestionCancelled(msg.requestId)) {
+          this.setStatus(session, "working");
+        }
         break;
       case "setModel":
         await this.switchModel(msg.modelId, session, requester);
@@ -4180,7 +4339,7 @@ See design doc for the full state machine diagram.`;
 
         if (!session.hasHistory || !session.client) {
           // As with a model switch on an empty session: restart without the summarize-vs-restart
-          // prompt and discard the abandoned primer-only session — but only when it truly had no
+          // prompt and discard the abandoned empty session — but only when it truly had no
           // history (a dead client on a session WITH history must keep that history).
           const wasEmpty = !session.hasHistory;
           const discardId = session.activeSessionId;
@@ -4407,7 +4566,7 @@ See design doc for the full state machine diagram.`;
         break;
       }
       case "addMentionFile": {
-        const workspaceRoot = this.sessionCwd(session);
+        const workspaceRoot = this.sessionCwd(attachmentOwner());
         if (!workspaceRoot) break;
 
         let catalogMatch: string | undefined;
@@ -4453,14 +4612,15 @@ See design doc for the full state machine diagram.`;
           // Stale/garbage catalog entries remain a no-op, as before.
           break;
         }
-        await this.trackAttach(this.addDroppedFile(abs, false, session));
+        await this.trackAttach(this.addDroppedFile(abs, false, attachmentOwner));
         break;
       }
       case "voiceStart":
         await this.handleVoiceStart(session);
         break;
       case "voiceStop":
-        await this.handleVoiceStop();
+        if (msg.discard) this.stopVoiceInput();
+        else await this.handleVoiceStop();
         break;
       case "remoteVoiceStart":
         if (origin === "remote" && clientId) await this.handleRemoteVoiceStart(clientId, session);
@@ -4613,8 +4773,8 @@ See design doc for the full state machine diagram.`;
       }
     }
 
-    // A live, still-empty (primer-only) session must read "New session", never grok's
-    // primer-derived summary — even after grok flushes summary.json. The truth is in
+    // A live, still-empty session must read "New session", never a stale disk-derived
+    // summary — even after grok flushes summary.json. The truth is in
     // memory (hasHistory), so override the disk-derived name here. This is the single
     // untitled session the user starts from; abandoning it deletes it (parkFocused).
     const liveEmpty = new Set<string>();
@@ -4661,12 +4821,10 @@ See design doc for the full state machine diagram.`;
    *  first (that IS the row's label for any session that has one), then grok's
    *  own `session_summary` from disk, then the first user message.
    *
-   *  The one deliberate departure: a **primer-derived** summary is skipped. We
-   *  prime every session with a hidden message, and grok titles the session from
-   *  it, so `session_summary` is routinely "… Primer v4 Plan Mode …" — an
-   *  internal name for a message the user cannot even see. Inheriting that into a
-   *  fork's name propagates the noise forever (fork-of-a-fork), so `isPrimerSummary`
-   *  rejects it and we fall through to something real. */
+   *  The one deliberate departure: a **legacy primer-derived** summary is
+   *  skipped. Older builds sent the primer as message #1, so inheriting that
+   *  invisible internal title into a fork would propagate it forever.
+   *  `isPrimerSummary` rejects it and we fall through to something real. */
   private sessionDisplayName(session: Session): string {
     const id = session.activeSessionId;
     if (!id) return "";
@@ -5220,7 +5378,7 @@ See design doc for the full state machine diagram.`;
   }
 
   /** Fire the single `session_start` telemetry event for the first real user
-   *  message of `session` (callers gate on isFirstSend, so primers/empty sessions
+   *  message of `session` (callers gate on isFirstSend, so empty sessions
    *  never reach here). Respects VS Code's global telemetry setting + our own
    *  `grok.telemetry.enabled`; fully fire-and-forget. */
   private reportSessionStart(session: Session, origin: MsgOrigin): void {
@@ -5238,6 +5396,12 @@ See design doc for the full state machine diagram.`;
       if (!enabled) return;
       const cfg = vscode.workspace.getConfiguration("grok");
       const appVersion = (this.context.extension.packageJSON as { version?: string })?.version ?? "";
+      const remoteClientId = origin === "remote"
+        ? this.remoteClients.clientsForActiveValue(session)[0]
+        : undefined;
+      const remotePreferences = remoteClientId
+        ? this.remoteClients.metadata(remoteClientId)
+        : undefined;
       const event = buildSessionStartEvent(
         {
           installId: this.installId(),
@@ -5252,9 +5416,9 @@ See design doc for the full state machine diagram.`;
           chatFontScale: Math.round(this.chatFontScale() * 100),
           readRepliesAloud: cfg.get<boolean>("readRepliesAloud", false),
           soundNotifications: cfg.get<boolean>("soundNotifications", false),
-          remoteFontScale: session.remoteFontScale,
-          remoteReadRepliesAloud: session.remoteReadRepliesAloud,
-          ...sessionStartSurface(origin, session.remoteUsesTouch),
+          remoteFontScale: remotePreferences?.fontScale,
+          remoteReadRepliesAloud: remotePreferences?.readRepliesAloud,
+          ...sessionStartSurface(origin, remotePreferences?.usesTouch),
           host: vscode.env.appName || undefined,
         },
         {
@@ -5367,6 +5531,7 @@ See design doc for the full state machine diagram.`;
   }
 
   private async handleVoiceStart(session: Session = this.focused): Promise<void> {
+    const generation = ++this.voiceGeneration;
     const cwd = this.sessionCwd(session);
     const credentialCwd = this.sessionCwd(session);
     const key = this.resolveVoiceApiKey(credentialCwd);
@@ -5387,16 +5552,25 @@ See design doc for the full state machine diagram.`;
     // Streaming (default): live transcription over the STT WebSocket, so "grok
     // send" can submit hands-free without a stop-click. Batch is the fallback.
     if (cfg.get<boolean>("voiceStreaming", true)) {
-      await this.startVoiceStream(key, ffmpegPath, device, cwd);
+      await this.startVoiceStream(key, ffmpegPath, device, cwd, generation);
       return;
     }
 
     const tmp = path.join(os.tmpdir(), `grok-voice-${Date.now()}.wav`);
     try {
       await this.voiceRecorder.start({ ffmpegPath, outputPath: tmp, device, log: (m) => this.output.appendLine(m) });
+      if (generation !== this.voiceGeneration) {
+        this.voiceRecorder.cancel();
+        try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+        return;
+      }
       this.voiceTempPath = tmp;
       this.postLocal({ type: "voiceState", status: "listening" });
     } catch (e) {
+      if (generation !== this.voiceGeneration) {
+        try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+        return;
+      }
       const msg = (e as Error).message;
       this.output.appendLine(`[voice] start failed: ${msg}`);
       // ffmpeg-missing is the common, fixable case — offer a jump to its setting.
@@ -5423,6 +5597,7 @@ See design doc for the full state machine diagram.`;
     ffmpegPath: string,
     device: string | undefined,
     cwd: string,
+    generation: number,
   ): Promise<void> {
     const phrase = this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE);
     const keyterms = buildSttKeyterms(
@@ -5435,7 +5610,8 @@ See design doc for the full state machine diagram.`;
     if (process.platform === "win32" && !resolved) {
       try { resolved = await resolveWindowsAudioDevice(ffmpegPath, (m) => this.output.appendLine(m)); } catch { /* streamer surfaces it */ }
     }
-    this.voiceStreamCtx = { key, ffmpegPath, device: resolved, phrase, keyterms, language };
+    if (generation !== this.voiceGeneration) return;
+    this.voiceStreamCtx = { key, ffmpegPath, device: resolved, phrase, keyterms, language, generation };
     this.voiceFinalizing = false;
     await this.openVoiceStream();
   }
@@ -5454,7 +5630,8 @@ See design doc for the full state machine diagram.`;
     if (fresh) ctx.key = fresh;
     const streamer = new VoiceStreamer();
     this.voiceStreamer = streamer;
-    const isCurrent = () => this.voiceStreamer === streamer;
+    const isCurrent = () =>
+      this.voiceStreamer === streamer && ctx.generation === this.voiceGeneration;
 
     streamer.on("partial", (ev: { text: string; speechFinal: boolean }) => {
       if (!isCurrent()) return;
@@ -5533,6 +5710,8 @@ See design doc for the full state machine diagram.`;
   /** "grok send": submit the message and KEEP listening by restarting a fresh
    *  stream (each message = one clean utterance). No clicks needed. */
   private commitVoiceStream(text: string): void {
+    const ctx = this.voiceStreamCtx;
+    if (!ctx || ctx.generation !== this.voiceGeneration) return;
     const old = this.voiceStreamer;
     this.voiceStreamer = undefined; // detach so late events are ignored
     old?.cancel();
@@ -5544,6 +5723,7 @@ See design doc for the full state machine diagram.`;
    *  remaining transcript and return to idle. */
   private async finalizeVoiceStream(): Promise<void> {
     if (this.voiceFinalizing) return;
+    const generation = this.voiceGeneration;
     this.voiceFinalizing = true;
     const streamer = this.voiceStreamer;
     this.voiceStreamer = undefined;
@@ -5552,6 +5732,10 @@ See design doc for the full state machine diagram.`;
     this.postLocal({ type: "voiceState", status: "transcribing" });
     let finalText = "";
     try { finalText = await streamer.stop(); } catch { finalText = streamer.transcript; }
+    if (generation !== this.voiceGeneration) {
+      this.voiceFinalizing = false;
+      return;
+    }
     const cwd = this.localVoiceCredentialCwd ?? this.workspaceRoot();
     const phrase = this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE);
     const { text, send } = parseVoiceCommand(finalText, phrase);
@@ -5570,7 +5754,13 @@ See design doc for the full state machine diagram.`;
    *  Called on session switch/restart so listening never bleeds across sessions. */
   private stopVoiceInput(session?: Session): void {
     if (!session || session === this.focused) {
-      const wasActive = !!this.voiceStreamer || this.voiceRecorder.active;
+      const wasActive =
+        !!this.voiceStreamer ||
+        !!this.voiceStreamCtx ||
+        this.voiceRecorder.active ||
+        this.voiceFinalizing ||
+        !!this.voiceTempPath;
+      this.voiceGeneration += 1;
       this.voiceStreamer?.cancel();
       this.voiceStreamer = undefined;
       this.voiceStreamCtx = undefined;
@@ -5594,6 +5784,7 @@ See design doc for the full state machine diagram.`;
 
   /** Stop recording, transcribe via xAI STT, and send the text to the composer. */
   private async handleVoiceStop(): Promise<void> {
+    const generation = this.voiceGeneration;
     // Streaming path: finalize the live stream.
     if (this.voiceStreamer) {
       await this.finalizeVoiceStream();
@@ -5616,7 +5807,12 @@ See design doc for the full state machine diagram.`;
     let wavPath: string;
     try {
       wavPath = await this.voiceRecorder.stop();
+      if (generation !== this.voiceGeneration) {
+        try { fs.unlinkSync(wavPath); } catch { /* best effort */ }
+        return;
+      }
     } catch (e) {
+      if (generation !== this.voiceGeneration) return;
       this.output.appendLine(`[voice] stop failed: ${(e as Error).message}`);
       vscode.window.showErrorMessage(`Voice recording failed: ${(e as Error).message}`);
       this.releaseVoice(this.localVoiceCwd);
@@ -5625,9 +5821,11 @@ See design doc for the full state machine diagram.`;
       this.postLocal({ type: "voiceError" });
       return;
     }
+    const tempPath = this.voiceTempPath;
     this.postLocal({ type: "voiceState", status: "transcribing" });
     try {
       const raw = await transcribeAudio(wavPath, key, (m) => this.output.appendLine(m));
+      if (generation !== this.voiceGeneration) return;
       // Strip a trailing "grok send" (configurable) so dictation can submit
       // hands-free. The webview inserts `text` and, if `send`, fires the send.
       const sendPhrase = this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE);
@@ -5639,12 +5837,13 @@ See design doc for the full state machine diagram.`;
       }
       this.postLocal({ type: "voiceTranscript", text, send });
     } catch (e) {
+      if (generation !== this.voiceGeneration) return;
       this.output.appendLine(`[voice] transcription failed: ${(e as Error).message}`);
       vscode.window.showErrorMessage((e as Error).message);
       this.postLocal({ type: "voiceError" });
     } finally {
-      try { if (this.voiceTempPath) fs.unlinkSync(this.voiceTempPath); } catch { /* best effort */ }
-      this.voiceTempPath = undefined;
+      try { if (tempPath) fs.unlinkSync(tempPath); } catch { /* best effort */ }
+      if (this.voiceTempPath === tempPath) this.voiceTempPath = undefined;
       this.releaseVoice(this.localVoiceCwd);
       this.localVoiceCwd = undefined;
       this.localVoiceCredentialCwd = undefined;
@@ -5780,10 +5979,10 @@ See design doc for the full state machine diagram.`;
 
   private async handleRemoteVoiceStop(clientId: string, cancel: boolean): Promise<void> {
     const entry = this.remoteVoice.get(clientId);
-    if (!entry || entry.finalizing) {
-      this.sendRemoteClient(clientId, { type: "voiceError" });
-      return;
-    }
+    // A cancelled stream can still emit an ended/error callback while its stop
+    // promise is settling. Its entry identity is the generation guard; do not
+    // turn that late completion into a new client-visible event.
+    if (!entry || entry.finalizing) return;
     entry.finalizing = true;
     entry.ingress.close();
     this.sendRemoteClient(clientId, { type: "voiceState", status: cancel ? "idle" : "transcribing" });
@@ -5933,9 +6132,9 @@ See design doc for the full state machine diagram.`;
       this.output.appendLine(`[plan-review] ${(e as Error).message}`);
     }
     if (gen !== session.gen) return;
-    // Hold onto the plan text until the user picks a verdict so persistPlanVerdict
-    // can save it. Cleared (via resolved/pending) so the next plan starts fresh.
-    session.pendingPlanText = plan;
+    // Host ownership begins only after the snapshot's generation check. Re-focus
+    // can replay the card without consuming this pending request.
+    session.pendingExitPlans.set(req.id, { planText: plan });
     session.lastPlanText = "";
     this.emit(session, {
       type: "exitPlanRequest",
@@ -5991,6 +6190,7 @@ See design doc for the full state machine diagram.`;
   private applyRewindToView(session: Session, surviving: number): void {
     session.buffer = truncateReplayBuffer(session.buffer, surviving);
     session.userMessageCount = surviving;
+    session.historyEventCount = historyEventCount(session.buffer);
     // Positions for anything persisted after this point are counted against the
     // same number the webview now holds.
     this.emit(session, { type: "truncateMessages", surviving });
@@ -6064,11 +6264,33 @@ See design doc for the full state machine diagram.`;
    *  not serialize async onDidReceiveMessage handlers), so handleSend settles
    *  this set before snapshotting chips: the chip must make THIS send, not the
    *  next one. */
-  private trackAttach(op: Promise<void>): Promise<void> {
-    this.pendingAttach.add(op);
-    const done = () => { this.pendingAttach.delete(op); };
-    void op.then(done, done);
-    return op;
+  private trackAttach(op: Promise<unknown>): Promise<void> {
+    const tracked = op.then(() => undefined);
+    this.pendingAttach.add(tracked);
+    const done = () => { this.pendingAttach.delete(tracked); };
+    void tracked.then(done, done);
+    return tracked;
+  }
+
+  /** Resolve attachment ownership at commit time. Session transitions can
+   * replace the active session while staging is awaiting the filesystem; a
+   * captured Session would then deliver the chip to the conversation the tab
+   * has already left.
+   *
+   * Returns undefined when the asking tab is gone, and callers MUST drop the
+   * attachment rather than pick somewhere for it. Falling back to `this.focused`
+   * looks harmless and is not: a phone that uploads and then reconnects gets a
+   * new relay id, so the staging that was still awaiting resolves to no client
+   * and the image lands in whatever conversation the DESK happens to be showing.
+   * That is content crossing conversations, which is worse than losing it.
+   *
+   * The ephemeral relay id is resolved through `currentClient`, which follows
+   * the tab across a reconnect via its stable token — so the ordinary
+   * refresh-mid-upload keeps working and only a genuinely departed tab drops. */
+  private attachmentOwner(origin: MsgOrigin, clientId?: string): Session | undefined {
+    if (origin !== "remote") return this.focused;
+    const current = clientId ? this.remoteClients.currentClient(clientId) : undefined;
+    return current ? this.remoteClients.active(current) : undefined;
   }
 
   /**
@@ -6134,7 +6356,7 @@ See design doc for the full state machine diagram.`;
   private async addUploadedFile(
     suppliedName: string,
     data: string,
-    session: Session = this.focused,
+    owner: AttachmentOwner = () => this.focused,
     requester?: RemoteRequester,
   ): Promise<void> {
     const prepared = prepareFileUpload(suppliedName, data, MAX_VISION_IMAGE_BYTES);
@@ -6156,7 +6378,7 @@ See design doc for the full state machine diagram.`;
     try {
       await fs.promises.mkdir(dir, { recursive: true });
       await fs.promises.writeFile(absPath, prepared.bytes, { flag: "wx" });
-      await this.addDroppedFile(absPath, false, session);
+      const session = await this.addDroppedFile(absPath, false, owner);
       if (session === this.focused) this.revealAndFocusComposer();
     } catch (e) {
       void fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -6208,16 +6430,34 @@ See design doc for the full state machine diagram.`;
   private async stageImageAttachment(
     bytes: Buffer,
     mimeType: string,
-    originRelPath?: string,
-    session: Session = this.focused,
-  ): Promise<void> {
+    originPath?: string,
+    owner: AttachmentOwner = () => this.focused,
+    previewId?: string,
+  ): Promise<Session | undefined> {
     const dir = this.imageStagingDir();
     await fs.promises.mkdir(dir, { recursive: true });
     const absPath = path.join(dir, `image-${randomUUID()}${extFromMime(mimeType)}`);
     await fs.promises.writeFile(absPath, bytes);
+    const session = owner();
+    if (!session) {
+      // The asking tab left while this was writing. Delivering it anywhere else
+      // would put its image in someone else's conversation; the staged copy is
+      // left for the seven-day sweep rather than deleted, in case the write
+      // raced a reconnect that is about to come back.
+      return undefined;
+    }
+    const rel = originPath
+      ? normalizeRelPath(path.relative(this.sessionCwd(session), originPath))
+      : undefined;
+    // asRelativePath returns the input unchanged for files outside the
+    // workspace — only carry the origin when it's a real workspace-relative path.
+    const originRelPath = rel && rel !== ".." && !rel.startsWith("../") && !path.isAbsolute(rel)
+      ? rel
+      : undefined;
     const imageIndex = ++session.imageCounter;
-    session.chips.push(makeImageChip(absPath, imageIndex, mimeType, originRelPath));
+    session.chips.push(makeImageChip(absPath, imageIndex, mimeType, originRelPath, previewId));
     this.postChips(session);
+    return session;
   }
 
   /** Clipboard paste from the webview (base64 + mime, already prefiltered to
@@ -6226,8 +6466,9 @@ See design doc for the full state machine diagram.`;
   private async addPastedImage(
     base64: string,
     mimeType: string,
-    session: Session = this.focused,
+    owner: AttachmentOwner = () => this.focused,
     requester?: RemoteRequester,
+    previewId?: string,
   ): Promise<void> {
     try {
       if (!isVisionMime(mimeType)) {
@@ -6240,7 +6481,7 @@ See design doc for the full state machine diagram.`;
         this.reportRequester(requester, "error", "Grok: pasted image exceeds the 20 MiB vision limit.");
         return;
       }
-      await this.stageImageAttachment(bytes, mimeType, undefined, session);
+      const session = await this.stageImageAttachment(bytes, mimeType, undefined, owner, previewId);
       if (session === this.focused) this.revealAndFocusComposer();
     } catch (e) {
       this.output.appendLine(`[image] paste failed: ${(e as Error).message}`);
@@ -6250,23 +6491,26 @@ See design doc for the full state machine diagram.`;
 
   /** Copy an on-disk raster image into staging as a vision attachment, keeping
    *  the workspace-relative origin so the prompt tag can carry the real file
-   *  identity. Returns false when the file should stay a plain path chip
-   *  (oversized, or unreadable as a regular file). */
-  private async importImageFromDisk(srcPath: string, session: Session = this.focused): Promise<boolean> {
+   *  identity. Three outcomes, and they are not interchangeable: the owning
+   *  session when it attached, `false` when the file should stay a plain path
+   *  chip (oversized, or unreadable as a regular file), and `undefined` when the
+   *  asking tab left — which must drop the attachment rather than degrade it to
+   *  a path chip in someone else's conversation. */
+  private async importImageFromDisk(
+    srcPath: string,
+    owner: AttachmentOwner = () => this.focused,
+  ): Promise<Session | false | undefined> {
     const stat = await fs.promises.stat(srcPath);
     if (!stat.isFile() || stat.size === 0 || stat.size > MAX_VISION_IMAGE_BYTES) return false;
     const bytes = await fs.promises.readFile(srcPath);
-    const rel = normalizeRelPath(path.relative(this.sessionCwd(session), srcPath));
-    // asRelativePath returns the input unchanged for files outside the
-    // workspace — only carry the origin when it's a real workspace-relative path.
-    const originRelPath = rel !== ".." && !rel.startsWith("../") && !path.isAbsolute(rel)
-      ? rel
-      : undefined;
-    await this.stageImageAttachment(bytes, mimeFromPath(srcPath), originRelPath, session);
-    return true;
+    return this.stageImageAttachment(bytes, mimeFromPath(srcPath), srcPath, owner);
   }
 
-  private async addDroppedFile(dropped: string, shiftHeld: boolean, session: Session = this.focused): Promise<void> {
+  private async addDroppedFile(
+    dropped: string,
+    shiftHeld: boolean,
+    owner: AttachmentOwner = () => this.focused,
+  ): Promise<Session | undefined> {
     // The webview posts the raw file:// URI (it has no path library); accept a
     // plain path too so older webview builds degrade instead of breaking.
     let absPath = dropped;
@@ -6280,13 +6524,17 @@ See design doc for the full state machine diagram.`;
     if (!fs.existsSync(absPath)) return;
     if (!shiftHeld && isVisionImagePath(absPath)) {
       try {
-        if (await this.importImageFromDisk(absPath, session)) return;
+        const imported = await this.importImageFromDisk(absPath, owner);
+        if (imported === undefined) return undefined; // tab gone — not a path chip either
+        if (imported) return imported;
       } catch (e) {
         this.output.appendLine(`[image] import failed for ${absPath}: ${(e as Error).message}`);
       }
       // Oversized / unreadable-as-image → fall through to a plain path chip,
       // the pre-vision behavior (grok decides how to consume the path).
     }
+    const session = owner();
+    if (!session) return undefined; // asking tab gone — drop, never redirect
     const relPath = normalizeRelPath(path.relative(this.sessionCwd(session), absPath));
     if (shiftHeld) {
       // Only read the whole file (to count lines for an inline selection) when
@@ -6309,12 +6557,13 @@ See design doc for the full state machine diagram.`;
       session.chips.push(makeExplicitChip(absPath, relPath));
     }
     this.postChips(session);
+    return session;
   }
 
   /** A prompt is running or pending user action — a new prompt now would
    *  cancel it (a second `session/prompt` kills the in-flight turn). */
   private turnInFlight(session: Session): boolean {
-    return session.status === "working" || session.status === "needs-you" || !!session.afterTurn;
+    return session.status === "working" || session.status === "needs-you";
   }
 
   /** A send that raced into a running turn (desk↔remote co-attach: the other
@@ -6410,6 +6659,7 @@ See design doc for the full state machine diagram.`;
           index: chip.imageIndex!,
           mimeType: chip.mimeType ?? "image/png",
           data: bytes.toString("base64"),
+          path: chip.path,
           relPath: chip.originRelPath,
         });
       } catch (e) {
@@ -6480,10 +6730,9 @@ See design doc for the full state machine diagram.`;
       if (session === this.focused) this.refreshImplicitChip(true);
       else this.postChips(session);
     }
-    // Staged files are one-shot: their bytes ride the prompt inline now.
-    for (const chip of chips) {
-      if (isImageChip(chip)) void fs.promises.unlink(chip.path).catch(() => {});
-    }
+    // Keep staged image sources until the seven-day orphan sweeper. The prompt
+    // carries each path so live and restored history can render a thumbnail;
+    // a missing/expired source simply falls back to the image tag.
 
     const isFirstSend = !session.hasHistory;
     session.hasHistory = true;
@@ -6492,8 +6741,7 @@ See design doc for the full state machine diagram.`;
       // generated summary shows through, instead of pinning a permanent
       // "[Image #1]" customName over every screenshot-first session.
       session.firstUserMessageForTitle = text;
-      // One `session_start` per session, on the first real user message — never
-      // the primer (that takes a separate prompt path that doesn't set hasHistory).
+      // One `session_start` per session, on the first real user message.
       this.reportSessionStart(session, origin);
     }
     const sentChips = chips.filter((c) => !c.hidden);
@@ -6504,17 +6752,9 @@ See design doc for the full state machine diagram.`;
     this.setStatus(session, "working");
 
     try {
-      // The hidden primer was kicked off eagerly when the session went live, so
-      // this usually just awaits an already-settled promise. If the user sent
-      // before it acked, we hold the real prompt here until it does (grok runs one
-      // turn at a time) — the user's bubble already shows as sent and the Grokking
-      // indicator covers the gap. If the eager primer failed, this retries it.
-      await this.ensurePrimed(client, session, gen);
-      if (gen !== session.gen) return;
       // Arm the compact-notification watch BEFORE the prompt: the live
       // auto_compact_completed / auto_compact_failed land DURING this turn.
       if (slashCommand === "compact") {
-        session.sawCompactNotification = false;
         session.sawCompactFailed = false;
       }
       const meta = await client.prompt(promptBlocks);
@@ -6528,50 +6768,11 @@ See design doc for the full state machine diagram.`;
         // not persisted: grok's own history has no such message, so re-focus keeps
         // it but a disk restore won't.
         if (!session.sawCompactFailed) this.emit(session, { type: "messageChunk", text: "Compacted." });
-        // Donut refresh, dynamic by CLI capability: the fresh post-compact size
-        // lands DURING this turn on the live `_x.ai/session_notification` rail
-        // (auto_compact_completed.tokens_after → the xaiNotification listener,
-        // which sets sawCompactNotification). If that rail didn't fire — a CLI
-        // that predates it, e.g. the Windows downgrade target 0.2.72 — fall back
-        // to the hidden /session-info scrape (exact, CLI-local, before agentEnd).
-        if (!session.sawCompactNotification) {
-          await this.refreshContextAfterCompact(client, session, gen);
-          if (gen !== session.gen) return;
-        }
       }
-      // Skip agentEnd if a verdict was clicked mid-turn (afterTurn is queued).
-      // Otherwise busy clears here, then the user could send during the brief
-      // gap before afterTurn's own client.prompt starts. afterTurn emits its
-      // own agentEnd at the end of its prompt, so busy stays true throughout.
-      if (!session.afterTurn) {
-        this.emit(session, { type: "agentEnd", meta });
-        this.setStatus(session, "done");
-      }
+      this.emit(session, { type: "agentEnd", meta });
+      this.setStatus(session, "done");
       session.authRecoveryTried = false; // a clean turn re-arms token auto-recovery
       this.maybeGenerateTitle(session);
-      if (slashCommand === "compact") {
-        // A native compact rewrites the history around a summary, which can fold
-        // the hidden primer away with everything else — silently breaking the
-        // plan-verdict protocol for the rest of the session. Re-prime eagerly
-        // (non-blocking, same as session start); this must run AFTER the compact
-        // turn's own agentEnd above, or the primer's suppressContent window
-        // would swallow it. Both flags reset: a settled primingPromise would
-        // otherwise short-circuit ensurePrimed without sending anything.
-        session.primed = false;
-        session.primingPromise = undefined;
-        // The re-prime doubles as the donut BACKUP for /compact, but only when
-        // it can be TRUSTED: skip it if the live rail already gave us the exact
-        // count (sawCompactNotification), and require a SUCCESSFUL primer
-        // (session.primed) — a failed primer means no inference turn ended, so
-        // signals.json still holds the STALE pre-compact count and reading it
-        // would clobber the good value. When it does run, the CLI has recomputed
-        // signals.json at the primer turn's end (research/signals-refresh-probe.cjs).
-        void this.ensurePrimed(client, session, gen).then(() => {
-          if (gen === session.gen && !session.sawCompactNotification && session.primed) {
-            this.emitContextUsageSoon(session, gen);
-          }
-        });
-      }
     } catch (err) {
       if (gen !== session.gen) return; // prompt rejected because we disposed the old client — don't leak the error into the new session
       const e = err as any;
@@ -6594,14 +6795,11 @@ See design doc for the full state machine diagram.`;
       this.emit(session, { type: "agentError", text: promptErrorText(e) });
       this.setStatus(session, "error");
     } finally {
-      // If the user approved/declined a plan mid-turn, the follow-up action was
-      // deferred until now (a new prompt can't overlap the one above).
-      try { await this.runAfterTurn(session); }
-      finally { session.suppressPlanReject = false; } // safety net for plan-reject suppression
-      // The turn (incl. any verdict follow-up) is fully over — fire anything
-      // queued during it (#37). No-ops when the queue is empty or the session
-      // was torn down mid-turn.
-      if (gen === session.gen) void this.maybeFlushQueuedSends(session);
+      // The turn is fully over — fire anything queued during it (#37).
+      if (gen === session.gen) {
+        this.settleUnavailablePlanTurn(session, client, gen);
+        void this.maybeFlushQueuedSends(session);
+      }
     }
   }
 
@@ -6641,7 +6839,6 @@ See design doc for the full state machine diagram.`;
     // session-scoped, so unrelated local/remote turns remain independent.
     const client = await this.startSession(resumeId, session);
     if (!client || session.client !== client) return true; // startSession surfaced its own failure/onboarding
-    await (session.primingPromise ?? Promise.resolve()); // grok runs one turn at a time
     const gen = session.gen;
     if (gen !== session.gen) return true;
 
@@ -6731,7 +6928,7 @@ See design doc for the full state machine diagram.`;
     this.post(this.buildInitialStateMsg());
     this.post({
       type: "summarizeRepliesAloud",
-      value: vscode.workspace.getConfiguration("grok").get<boolean>("summarizeRepliesAloud", false),
+      value: vscode.workspace.getConfiguration("grok").get<boolean>("summarizeRepliesAloud", true),
     });
     // Sync the active-editor context chip into the fresh webview (the config
     // gate + no-editor case live inside refreshImplicitChip).
@@ -6740,7 +6937,7 @@ See design doc for the full state machine diagram.`;
     this.postModePolicy();
     this.postSandboxState();
     void this.postRemoteStatus();
-    // Sweep stale empty primer sessions once the first session is live (so the
+    // Sweep legacy empty-primer sessions once the first session is live (so the
     // newly-focused session is excluded from the sweep).
     void this.startSession().then(() => {
       this.sweepEmptyPrimerSessions();
@@ -6748,32 +6945,48 @@ See design doc for the full state machine diagram.`;
   }
 
   private postChips(session: Session = this.focused): void {
-    const message: HostMsg = { type: "chips", chips: session.chips };
-    if (session === this.focused) this.view?.webview.postMessage(message);
-    this.sendRemoteSession(session, message);
+    const remoteMessage: HostMsg = { type: "chips", chips: session.chips };
+    if (session === this.focused && this.view) {
+      const webview = this.view.webview;
+      const localMessage: HostMsg = { type: "chips", chips: this.localPreviewChips(session, webview) };
+      void webview.postMessage(localMessage);
+    }
+    this.sendRemoteSession(session, remoteMessage);
   }
 
-  // grok's OUTPUT for a hidden turn (primer / summary injection) — dropped from
-  // both the buffer and the live view. Deliberately excludes `userMessage` and
-  // `agentStart`: those are the user's own input bubble + the "grok is starting"
-  // lifecycle marker, emitted only by genuine user-initiated turns. With the
-  // eager non-blocking primer, a user send can overlap the still-running silent
-  // primer; suppressing those two would swallow the user's own message and the
-  // Grokking indicator. The primer/summary injections never emit them, so leaving
-  // them out costs those flows nothing.
+  private localPreviewChips(session: Session, webview: vscode.Webview): FileChip[] {
+    return session.chips.map((chip) => isImageChip(chip)
+      ? { ...chip, previewSrc: webview.asWebviewUri(vscode.Uri.file(chip.path)).toString() }
+      : chip);
+  }
+
+  private localizeHistoryMessage(message: HostMsg, webview: vscode.Webview): HostMsg {
+    if (message.type === "userMessage" && message.chips) {
+      return { ...message, chips: message.chips.map((chip) => isImageChip(chip)
+        ? { ...chip, ...(fs.existsSync(chip.path)
+          ? { previewSrc: webview.asWebviewUri(vscode.Uri.file(chip.path)).toString() }
+          : {}) }
+        : chip) };
+    }
+    if (message.type === "userMessageChunk" && message.images) {
+      return {
+        ...message,
+        images: message.images.map((image) => image.path && fs.existsSync(image.path)
+          ? { ...image, previewSrc: webview.asWebviewUri(vscode.Uri.file(image.path)).toString() }
+          : image),
+      };
+    }
+    return message;
+  }
+
+  // grok's output for hidden summary/context-injection turns, dropped from both
+  // the session buffer and live view. User input/lifecycle messages are excluded.
   private static readonly SUPPRESS_TYPES = new Set([
     "messageChunk", "userMessageChunk", "thoughtChunk", "toolCall", "toolCallUpdate",
     "promptComplete", "xaiNotification", "subagentUpdate", "runProgress", "commandOutput", "agentEnd",
   ]);
-  // Subset: content only, not lifecycle. Lets promptComplete/agentEnd through so
-  // the webview's `busy` state clears when the false-approval turn ends.
-  private static readonly PLAN_REJECT_SUPPRESS = new Set([
-    "messageChunk", "userMessageChunk", "thoughtChunk", "toolCall", "toolCallUpdate", "xaiNotification", "subagentUpdate", "runProgress", "commandOutput",
-  ]);
-
   private post(message: HostMsg): void {
     if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
-    if (this.focused.suppressPlanReject && GrokSidebar.PLAN_REJECT_SUPPRESS.has(message.type)) return;
     this.view?.webview.postMessage(message);
     if (GrokSidebar.DEVICE_GLOBAL_REMOTE_TYPES.has(message.type)) {
       this.broadcastRemoteDevice(message);
@@ -6791,14 +7004,14 @@ See design doc for the full state machine diagram.`;
   /** Target one opaque relay clientId. */
   private sendRemoteClient(clientId: string, message: HostMsg): void {
     this.postTap?.("remote", message, [clientId]);
-    const out = transformHostMsgForRemote(message, GrokSidebar.REMOTE_MEDIA_DEPS);
+    const out = transformHostMsgForRemote(message, this.remoteMediaDeps);
     if (out) this.uplink?.broadcastTo([clientId], out);
   }
 
   private sendRemoteRepo(cwd: string, message: HostMsg): void {
     const clientIds = this.remoteClients.clientsForCwd(cwd);
     this.postTap?.("remote", message, clientIds);
-    const out = transformHostMsgForRemote(message, GrokSidebar.REMOTE_MEDIA_DEPS);
+    const out = transformHostMsgForRemote(message, this.remoteMediaDeps);
     if (!out) return;
     this.uplink?.broadcastTo(clientIds, out);
   }
@@ -6811,9 +7024,18 @@ See design doc for the full state machine diagram.`;
     }
   }
 
+  private sendRemoteHistorySnapshot(session: Session): void {
+    const clientIds = this.remoteClients.clientsForActiveValue(session);
+    if (clientIds.length === 0) return;
+    const snapshot = bracketRemoteSnapshot(session.buffer);
+    for (const clientId of clientIds) {
+      for (const message of snapshot) this.sendRemoteClient(clientId, message);
+    }
+  }
+
   private broadcastRemoteDevice(message: HostMsg): void {
     this.postTap?.("remote", message, this.remoteClients.clients());
-    const out = transformHostMsgForRemote(message, GrokSidebar.REMOTE_MEDIA_DEPS);
+    const out = transformHostMsgForRemote(message, this.remoteMediaDeps);
     if (out) this.uplink?.broadcast(out);
   }
 
@@ -6835,6 +7057,7 @@ See design doc for the full state machine diagram.`;
     fromRemote(message: WebviewMsg, clientId?: string): void;
     fromRelayFrame(raw: string): void;
     emitRemote(clientId: string, message: HostMsg): void;
+    replayRemote(clientId: string, messages: HostMsg[], during?: () => void, fail?: boolean): Promise<void>;
     seedRemoteSession(
       clientId: string,
       id: string,
@@ -6859,6 +7082,23 @@ See design doc for the full state machine diagram.`;
     finishRemoteStartup(clientId: string): void;
     seedRemoteVoice(clientId: string): { cancelled(): boolean };
     emitContextUsage(clientId: string): void;
+    seedUsageLedger(
+      clientId: string,
+      entries: { afterUserMessage: number; afterHistoryEvent?: number; usage?: PromptUsage }[],
+      userMessageCount: number,
+    ): Promise<void>;
+    restartUsageSession(
+      clientId: string,
+      id: string,
+      mode: "clear" | "summarize",
+      summaryUsage?: PromptUsage,
+    ): Promise<void>;
+    rewindUsageLedger(clientId: string, surviving: number): Promise<void>;
+    completeUsageTurn(clientId: string, usage: PromptUsage): Promise<void>;
+    reloadUsageLedger(clientId: string, userMessageCount: number): {
+      usageLog: NonNullable<SessionMetaOverrides[string]["usageLog"]>;
+      sessionUsage: PromptUsage | undefined;
+    };
     delayNextSessionStart(resumeId?: string): { started: Promise<void>; release(): void };
     waitForSessionLoad(id: string): Promise<void>;
     setSessionStatus(id: string, status: SessionStatus): void;
@@ -6886,6 +7126,14 @@ See design doc for the full state machine diagram.`;
       emitRemote: (clientId, message) => {
         const session = this.remoteSessionFor(clientId);
         this.emit(session, message);
+      },
+      replayRemote: async (clientId, messages, during, fail = false) => {
+        const session = this.remoteSessionFor(clientId);
+        await this.replayLoadedHistory(session, async () => {
+          for (const message of messages) this.emit(session, message);
+          during?.();
+          if (fail) throw new Error("synthetic session/load failure");
+        });
       },
       seedRemoteSession: (clientId, id, cwd, messages = [], hasHistory = false, chips = []) => {
         this.remoteClients.ready(clientId);
@@ -6946,13 +7194,12 @@ See design doc for the full state machine diagram.`;
         session.client = {
           availableCommands: [],
           dispose() {},
-          prompt: async () => {
+          prompt: async (_blocks: Parameters<AcpClient["prompt"]>[0]) => {
             prompts += 1;
             return {};
           },
         } as unknown as AcpClient;
         session.hasHistory = true;
-        session.primed = true;
         session.status = "done";
         session.chips = chips;
         session.queuedSends = [queuedText];
@@ -6997,6 +7244,57 @@ See design doc for the full state machine diagram.`;
         return { cancelled: () => cancelled };
       },
       emitContextUsage: (clientId) => this.emitContextUsage(this.remoteSessionFor(clientId)),
+      seedUsageLedger: async (clientId, entries, userMessageCount) => {
+        const session = this.remoteSessionFor(clientId);
+        const id = session.activeSessionId;
+        if (!id) throw new Error("Seeded usage session has no id");
+        session.userMessageCount = userMessageCount;
+        const usageLog = entries.map((entry) => ({
+          ...entry,
+          usage: entry.usage ? { ...entry.usage } : undefined,
+        }));
+        const usage = enforceCompleteSessionCost(
+          sumUsage(usageLog),
+          usageLog,
+          userMessageCount,
+        );
+        const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+        await this.context.globalState.update(SESSION_META_KEY, {
+          ...overrides,
+          [id]: {
+            ...(overrides[id] ?? {}),
+            usage,
+            usageLog,
+          },
+        });
+      },
+      restartUsageSession: async (clientId, id, mode, summaryUsage) => {
+        const session = this.remoteSessionFor(clientId);
+        session.activeSessionId = id;
+        session.userMessageCount = 0;
+        session.historyEventCount = 0;
+        if (mode === "summarize" && summaryUsage) {
+          await this.accumulateUsage(session, { totalTokens: 1, usage: summaryUsage });
+        }
+      },
+      rewindUsageLedger: async (clientId, surviving) => {
+        const session = this.remoteSessionFor(clientId);
+        if (!session.activeSessionId) throw new Error("Seeded usage session has no id");
+        await this.truncateSessionCardsAfterRewind(session.activeSessionId, surviving);
+        session.userMessageCount = surviving;
+      },
+      completeUsageTurn: async (clientId, usage) => {
+        const session = this.remoteSessionFor(clientId);
+        session.userMessageCount += 1;
+        await this.accumulateUsage(session, { totalTokens: 1, usage });
+      },
+      reloadUsageLedger: (clientId, userMessageCount) => {
+        const current = this.remoteSessionFor(clientId);
+        const id = current.activeSessionId;
+        if (!id) return { usageLog: [], sessionUsage: undefined };
+        const ledger = this.persistedUsageLedger(id, userMessageCount);
+        return { usageLog: ledger.usageLog, sessionUsage: ledger.usage };
+      },
       delayNextSessionStart: (resumeId) => {
         let markStarted!: () => void;
         let release!: () => void;
@@ -7031,7 +7329,7 @@ See design doc for the full state machine diagram.`;
    * Session-scoped post. Records the message in that session's view buffer (so a
    * focus switch can rebuild its chat losslessly — clearMessages + replay) and,
    * when the session is the focused one, forwards it to the webview. Per-session
-   * suppress flags drop primer/summary content from BOTH the buffer and the live
+   * suppress flags drop hidden summary/context content from BOTH buffer and live
    * view (so they never reappear on replay). `clearMessages` resets the buffer —
    * the replay path issues its own clear before replaying, and a (re)started
    * session begins empty. Background sessions buffer silently; nothing reaches
@@ -7040,13 +7338,26 @@ See design doc for the full state machine diagram.`;
    */
   private emit(session: Session, message: HostMsg): void {
     if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
-    if (session.suppressPlanReject && GrokSidebar.PLAN_REJECT_SUPPRESS.has(message.type)) return;
     if (message.type === "clearMessages") session.buffer = [];
     else session.buffer.push(message);
     if (session === this.focused) {
-      this.view?.webview.postMessage(message);
+      this.postTap?.("local", message);
+      const webview = this.view?.webview;
+      if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
     }
-    this.sendRemoteSession(session, message);
+    if (!session.replaying) this.sendRemoteSession(session, message);
+  }
+
+  private async replayLoadedHistory(session: Session, load: () => Promise<void>): Promise<void> {
+    session.replaying = true;
+    this.emit(session, { type: "historyReplay", active: true });
+    try {
+      await load();
+    } finally {
+      this.emit(session, { type: "historyReplay", active: false });
+      session.replaying = false;
+      this.sendRemoteHistorySnapshot(session);
+    }
   }
 
   // ---------- session pool ----------
@@ -7174,8 +7485,14 @@ See design doc for the full state machine diagram.`;
     const wv = this.view?.webview;
     if (wv) {
       wv.postMessage({ type: "clearMessages" });
-      for (const m of bracketRemoteSnapshot(session.buffer)) wv.postMessage(m);
-      for (const m of sessionUiSnapshot(session, this.displayMode(session))) wv.postMessage(m);
+      wv.postMessage({ type: "historyReplay", active: true });
+      for (const m of session.buffer) wv.postMessage(this.localizeHistoryMessage(m, wv));
+      wv.postMessage({ type: "historyReplay", active: false });
+      for (const m of sessionUiSnapshot(
+        session,
+        this.displayMode(session),
+        this.localPreviewChips(session, wv),
+      )) wv.postMessage(m);
     }
     // Remote clients don't share the webview, so replay the same clear + buffer
     // to them over the uplink — otherwise re-focusing a session that's still
@@ -7208,13 +7525,13 @@ See design doc for the full state machine diagram.`;
     const cur = this.focused;
     const busy = cur.status === "working" || cur.status === "needs-you";
     // A worktree session backs a real git checkout the user explicitly created —
-    // never auto-delete it as an "empty primer session", even before the first
+    // never auto-delete it as an empty session, even before the first
     // message (that's what made creating/leaving a worktree replace the current
     // one). It's removed only via Remove worktree.
-    if (cur.hasHistory || cur.afterTurn || busy || cur.chips.length > 0 || cur.worktree) return; // real/active work — keep it parked & alive
+    if (cur.hasHistory || busy || cur.chips.length > 0 || cur.worktree) return; // real/active work — keep it parked & alive
     // Co-attached: a remote tab still shows this session — not ours to tear down.
     if (this.remoteClients.clientsForActiveValue(cur).length > 0) return;
-    // Empty (primer-only) session being left behind (New Session, or switching to
+    // Empty session being left behind (New Session, or switching to
     // another): tear down its process AND delete its on-disk dir so it doesn't pile
     // up in history (#24). The next focused session becomes the single live "New
     // session"; abandoning this one removes it entirely.
@@ -7223,7 +7540,7 @@ See design doc for the full state machine diagram.`;
     this.postSessionsList();
   }
 
-  /** Remote counterpart of parkFocused: abandoning a primer-only tab session
+  /** Remote counterpart of parkFocused: abandoning an empty tab session
    * must not leave an ownerless process or history row behind. */
   private parkRemoteSession(clientId: string, next?: Session): void {
     const current = this.remoteClients.active(clientId);
@@ -7231,7 +7548,6 @@ See design doc for the full state machine diagram.`;
     const busy = current.status === "working" || current.status === "needs-you";
     if (
       current.hasHistory ||
-      current.afterTurn ||
       busy ||
       current.priming ||
       current.queuedSends.length > 0 ||
@@ -7270,7 +7586,7 @@ See design doc for the full state machine diagram.`;
   }
 
   /** Delete a session's on-disk dir + drop its meta override and read-cache entry.
-   *  Used when an empty (primer-only) session is abandoned or swept. Best-effort —
+   *  Used when an empty session is abandoned or a legacy primer-only session is swept. Best-effort —
    *  a locked/already-gone dir is logged, not thrown. */
   private removeSessionFromDisk(id: string | undefined, sessionCwd?: string): void {
     if (!id) return;
@@ -7485,25 +7801,50 @@ See design doc for the full state machine diagram.`;
    * The total is persisted per session id because nothing on disk can rebuild
    * it: grok reports usage per prompt and `signals.json` keeps only context size.
    */
-  private accumulateUsage(session: Session, meta: PromptResultMeta): void {
-    if (!usageIsRealMeasurement(meta)) return;
-    session.lastTurnUsage = meta.usage;
-    session.sessionUsage = addUsage(session.sessionUsage, meta.usage);
-    this.emit(session, { type: "usage", turn: session.lastTurnUsage, session: session.sessionUsage });
+  private accumulateUsage(session: Session, meta: PromptResultMeta): PromiseLike<void> | undefined {
+    const measured = usageIsRealMeasurement(meta);
+    // totalTokens:0 is the CLI's reliable no-inference result for native slash
+    // turns such as /compact. Record that successful prompt as covered without
+    // counting its stale usage siblings. A real inference with missing usage is
+    // NOT covered: its cost is unknown, so the aggregate must remain withheld.
+    if (!measured && meta.totalTokens !== 0) return;
     const id = session.activeSessionId;
-    if (!id || !session.sessionUsage) return;
+    if (!id) return;
     const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const cur = overrides[id] ?? {};
-    // Log the turn as well as the total: a rewind must be able to subtract the
-    // discarded turns, and a running total alone can't be undone.
     const usageLog = [
       ...(cur.usageLog ?? []),
-      { afterUserMessage: session.userMessageCount, usage: meta.usage! },
+      {
+        afterUserMessage: session.userMessageCount,
+        afterHistoryEvent: session.historyEventCount,
+        usage: measured ? meta.usage : undefined,
+      },
     ];
-    void this.context.globalState.update(SESSION_META_KEY, {
+    const sessionUsage = enforceCompleteSessionCost(
+      sumUsage(usageLog),
+      usageLog,
+      session.userMessageCount,
+    );
+    if (measured) {
+      this.emit(session, { type: "usage", turn: meta.usage, session: sessionUsage, afterUserMessage: session.userMessageCount, afterHistoryEvent: session.historyEventCount });
+    }
+    return this.context.globalState.update(SESSION_META_KEY, {
       ...overrides,
-      [id]: { ...cur, usage: session.sessionUsage, usageLog },
+      [id]: { ...cur, usage: sessionUsage, usageLog },
     });
+  }
+
+  private persistedUsageLedger(sessionId: string, userMessageCount: number): {
+    usageLog: NonNullable<SessionMetaOverrides[string]["usageLog"]>;
+    usage: PromptUsage | undefined;
+  } {
+    const persisted = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {})[sessionId];
+    const usageLog = [...(persisted?.usageLog ?? [])];
+    const rawUsage = persisted?.usageLog ? sumUsage(usageLog) : persisted?.usage;
+    return {
+      usageLog,
+      usage: enforceCompleteSessionCost(rawUsage, usageLog, userMessageCount),
+    };
   }
 
   /** Seed a (re)opened session's cumulative billing from our own globalState and
@@ -7512,66 +7853,22 @@ See design doc for the full state machine diagram.`;
   private restoreUsage(session: Session): void {
     const id = session.activeSessionId;
     if (!id) return;
-    const stored = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]?.usage;
+    // Re-derive from the id-keyed ledger instead of trusting an aggregate that may have summed
+    // cost-bearing turns over historical turns where cost was not recorded.
+    const stored = this.persistedUsageLedger(id, session.userMessageCount).usage;
     if (!stored) return;
-    session.sessionUsage = stored;
-    this.emit(session, { type: "usage", session: stored });
+    this.emit(session, { type: "usage", session: stored, afterUserMessage: session.userMessageCount, afterHistoryEvent: session.historyEventCount });
   }
 
   /** Push the context size from grok's on-disk signals.json to the webview —
-   *  the source that has a real count when the ACP turn meta can't: a cold
-   *  restore (no turn has run), the hidden post-/compact re-prime (its meta is
-   *  suppressed), and zero-reporting turns like /session-info (stripped by
-   *  gateZeroTokenMeta). Best-effort: no readable count, no message (the
-   *  donut keeps whatever it has). */
+   *  chiefly the cold-restore source before any turn has run. Best-effort: no
+   *  readable count, no message (the donut keeps whatever it has). */
   private emitContextUsage(session: Session): void {
     const id = session.activeSessionId;
     if (!id) return;
     const cwd = this.sessionCwd(session);
     const usage = readContextUsage({ fs: defaultFs, grokHome: resolveGrokHome(process.env), cwd, id });
     if (usage) this.emit(session, { type: "contextUsage", used: usage.used, window: usage.window });
-  }
-
-  /** emitContextUsage now + once more after the CLI's turn-end file flush has
-   *  certainly landed (the write races the ACP response by a beat). */
-  private emitContextUsageSoon(session: Session, gen: number): void {
-    this.emitContextUsage(session);
-    setTimeout(() => {
-      if (gen === session.gen) this.emitContextUsage(session);
-    }, 1500);
-  }
-
-  /** Pre-rail fallback for the post-/compact donut: fetch the fresh context size
-   *  via a hidden /session-info turn. Runs ONLY when the live
-   *  auto_compact_completed notification didn't fire (a CLI older than that rail,
-   *  e.g. the Windows downgrade target). The turn is CLI-local (~25ms, no model
-   *  call) and is NOT persisted to chat history, so nothing shows live or on
-   *  restore; its reply text is the only place the fresh count exists this early
-   *  on such builds (research/signals-refresh-probe.cjs). Runs before the compact
-   *  turn's agentEnd clears busy, so no user send can interleave. Parse failure is
-   *  silent — the post-compact re-prime's signals.json read is the second backup. */
-  private async refreshContextAfterCompact(client: AcpClient, session: Session, gen: number): Promise<void> {
-    // Drift guard: if a future CLI stops advertising /session-info, sending it
-    // anyway would become a REAL inference turn (and a restore-visible bubble).
-    // Skip entirely — a donut that lags until the next turn beats that.
-    if (!client.availableCommands.some((c) => c?.name === "session-info")) return;
-    session.suppressContent = true;
-    session.captureAgentText = "";
-    try {
-      await client.prompt("/session-info");
-      if (gen !== session.gen) return;
-      // parseSessionInfoContext is null-safe and never throws: a reply-format
-      // change means no donut update (it lags until the next turn), never an
-      // error surfaced to the user.
-      const parsed = parseSessionInfoContext(session.captureAgentText ?? "");
-      if (parsed) this.emit(session, { type: "contextUsage", used: parsed.used, window: parsed.window });
-    } catch (e) {
-      // Even a failed hidden turn stays silent — log-only, no error bubble.
-      this.output.appendLine(`[compact] hidden /session-info failed: ${(e as Error).message}`);
-    } finally {
-      if (gen === session.gen) session.suppressContent = false;
-      session.captureAgentText = undefined;
-    }
   }
 
   /** Clear a session's unread badge (it's being opened/viewed) and refresh its dot. */
@@ -7621,7 +7918,7 @@ See design doc for the full state machine diagram.`;
     this.postRepoCatalog();
   }
 
-  private focusRemoteSession(clientId: string, session: Session): void {
+  private focusRemoteSession(clientId: string, session: Session, notifyCatalog = true): void {
     const cwd = this.remoteClients.cwd(clientId);
     this.remoteClients.setActive(clientId, session);
     this.touch(session);
@@ -7629,11 +7926,11 @@ See design doc for the full state machine diagram.`;
     this.sendRemoteClient(clientId, { type: "clearMessages" });
     for (const msg of bracketRemoteSnapshot(session.buffer)) this.sendRemoteClient(clientId, msg);
     for (const msg of sessionUiSnapshot(session, this.displayMode(session))) this.sendRemoteClient(clientId, msg);
-    this.postRepoCatalog();
+    if (notifyCatalog) this.postRepoCatalog();
     this.sendRemoteClient(clientId, this.buildSessionsList(cwd, undefined, this.remoteActiveSessionId(clientId)));
   }
 
-  private async newRemoteSession(clientId: string): Promise<void> {
+  private async newRemoteSession(clientId: string, notifyCatalog = true): Promise<void> {
     const ownerTabToken = this.remoteClients.tabToken(clientId);
     const cwd = this.remoteClients.cwd(clientId);
     this.parkRemoteSession(clientId);
@@ -7644,11 +7941,16 @@ See design doc for the full state machine diagram.`;
     this.emit(session, { type: "clearMessages" });
     await this.startSession(undefined, session);
     await this.persistWorktreeBinding(session);
-    this.postRepoCatalog();
+    if (notifyCatalog) this.postRepoCatalog();
     this.sendRemoteSessionList(session, ownerTabToken);
   }
 
-  private async openRemoteSession(clientId: string, id: string, sessionCwd?: string): Promise<void> {
+  private async openRemoteSession(
+    clientId: string,
+    id: string,
+    sessionCwd?: string,
+    notifyCatalog = true,
+  ): Promise<void> {
     const claim = this.reserveSessionLoad(id, this.remoteClients.tabToken(clientId));
     if (!claim) {
       const selectedCwd = this.remoteClients.cwd(clientId);
@@ -7674,7 +7976,7 @@ See design doc for the full state machine diagram.`;
     }
     let failure: unknown;
     try {
-      await this.openRemoteSessionReserved(clientId, id, claim.reservation, sessionCwd);
+      await this.openRemoteSessionReserved(clientId, id, claim.reservation, sessionCwd, notifyCatalog);
     } catch (error) {
       failure = error;
       throw error;
@@ -7688,6 +7990,7 @@ See design doc for the full state machine diagram.`;
     id: string,
     reservation: SessionLoadReservation,
     sessionCwd?: string,
+    notifyCatalog = true,
   ): Promise<void> {
     const selectedCwd = this.remoteClients.cwd(clientId);
     const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
@@ -7736,7 +8039,7 @@ See design doc for the full state machine diagram.`;
         }
         this.parkRemoteSession(clientId, session);
         this.dropRemoteVoice(clientId);
-        this.focusRemoteSession(clientId, session);
+        this.focusRemoteSession(clientId, session, notifyCatalog);
         return;
       }
     }
@@ -7799,7 +8102,7 @@ See design doc for the full state machine diagram.`;
     this.sendRemoteClient(clientId, { type: "clearMessages" });
     await this.startSession(id, session);
     this.markRead(session);
-    this.postRepoCatalog();
+    if (notifyCatalog) this.postRepoCatalog();
     this.sendRemoteSessionList(session, reservation.ownerTabToken);
   }
 
@@ -7981,6 +8284,16 @@ See design doc for the full state machine diagram.`;
     return dotEnv;
   }
 
+  private warnOAuthShadowOnce(defaultAuthMethodId: unknown, env: NodeJS.ProcessEnv): void {
+    if (!oauthShadowsXaiApiKey(defaultAuthMethodId, env)) return;
+    if (this.oauthShadowWarningShown || this.context.globalState.get<boolean>(OAUTH_SHADOW_WARNING_KEY, false)) return;
+    this.oauthShadowWarningShown = true;
+    void this.context.globalState.update(OAUTH_SHADOW_WARNING_KEY, true);
+    void vscode.window.showWarningMessage(
+      "Grok is using its cached OAuth session, so XAI_API_KEY is currently ignored. To use the API key, run `grok logout`, then start a new session.",
+    );
+  }
+
   private buildEnv(cwd: string): NodeJS.ProcessEnv {
     const dotEnv = this.readDotEnv(cwd);
     const env = mergeWorkspaceEnv(process.env, dotEnv);
@@ -8017,9 +8330,63 @@ See design doc for the full state machine diagram.`;
    *  later per-device setting. */
   private static readonly REMOTE_TIER: RemoteTier = "full";
 
+  /** Longest edge of the render a remote gets when it taps a thumbnail. Big
+   *  enough to read a screenshot on a phone, small enough not to push a
+   *  multi-megabyte frame over a mobile connection for a single tap. */
+  private static readonly FULL_IMAGE_MAX_EDGE = 1600;
+  private static readonly FULL_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+  /** How many enlargeable images a session remembers. Bounded because the map
+   *  is keyed by a handle we mint per path and never otherwise expire. */
+  private static readonly FULL_IMAGE_HANDLE_LIMIT = 300;
+
+  /** handle -> path, and its inverse so the same picture keeps one handle
+   *  across replays instead of minting a new one on every reconnect. */
+  private readonly fullImagePaths = new Map<string, string>();
+  private readonly fullImageHandles = new Map<string, string>();
+
+  /** Mint (or reuse) the handle for a path we are about to show a remote. */
+  private registerFullImage(imagePath: string): string {
+    const existing = this.fullImageHandles.get(imagePath);
+    if (existing) return existing;
+    const handle = randomUUID().replace(/-/g, "");
+    this.fullImageHandles.set(imagePath, handle);
+    this.fullImagePaths.set(handle, imagePath);
+    while (this.fullImagePaths.size > GrokSidebar.FULL_IMAGE_HANDLE_LIMIT) {
+      const oldest = this.fullImagePaths.keys().next().value;
+      if (oldest === undefined) break;
+      const stalePath = this.fullImagePaths.get(oldest);
+      this.fullImagePaths.delete(oldest);
+      if (stalePath && this.fullImageHandles.get(stalePath) === oldest) {
+        this.fullImageHandles.delete(stalePath);
+      }
+    }
+    return handle;
+  }
+
+  /** Render a bigger version for a remote's tap. Undefined when the source is
+   *  gone (the seven-day sweep, or a deleted original) or will not fit — the
+   *  browser then keeps the thumbnail it already has rather than blanking. */
+  private async renderFullImage(imagePath: string): Promise<string | undefined> {
+    try {
+      const bytes = await fs.promises.readFile(imagePath);
+      const thumb = thumbnailImage(bytes, guessMediaMime(imagePath), GrokSidebar.FULL_IMAGE_MAX_EDGE);
+      if (!thumb || thumb.byteLength === 0 || thumb.byteLength > GrokSidebar.FULL_IMAGE_MAX_BYTES) {
+        return undefined;
+      }
+      return `data:${thumbnailMime(thumb)};base64,${Buffer.from(thumb).toString("base64")}`;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Impure half of the media inline transform (the decision logic is the pure
-   *  remote-policy). Sync read keeps broadcast ordering; media is rare + capped. */
-  private static readonly REMOTE_MEDIA_DEPS: MediaInlineDeps = {
+   *  remote-policy). Sync read keeps broadcast ordering; media is rare + capped.
+   *  Per-instance rather than static: the full-image handles it issues belong to
+   *  this provider, and a shared registry would let one window hand out handles
+   *  into another's files. */
+  private readonly remoteMediaDeps: MediaInlineDeps = {
+    registerFullImage: (p) => this.registerFullImage(p),
+    thumbnailCache: new Map<string, string | null>(),
     readFile: (p) => {
       try {
         return fs.readFileSync(p);
@@ -8028,6 +8395,17 @@ See design doc for the full state machine diagram.`;
       }
     },
     toBase64: (bytes) => Buffer.from(bytes).toString("base64"),
+    thumbnail: (bytes, mimeType, maxDimension) => {
+      const thumb = thumbnailImage(bytes, mimeType, maxDimension);
+      return thumb ? { bytes: thumb, mime: thumbnailMime(thumb) } : null;
+    },
+    mtimeMs: (p) => {
+      try {
+        return fs.statSync(p).mtimeMs;
+      } catch {
+        return undefined;
+      }
+    },
   };
 
   /** The single inbound choke point for remote clients: capability-gate, then
@@ -8068,7 +8446,7 @@ See design doc for the full state machine diagram.`;
         } else if (m.type === "resumeSession") {
           await this.openRemoteSession(currentClientId, m.id, m.cwd);
         } else if (m.type === "selectRepo") {
-          this.selectRemoteRepo(currentClientId, m.cwd);
+          await this.selectRemoteRepo(currentClientId, m.cwd);
         }
       };
       const operation = serializesRemoteSessionTransition(m.type)
@@ -8322,7 +8700,7 @@ See design doc for the full state machine diagram.`;
     const snap: HostMsg[] = [];
     snap.push(initial);
     snap.push({ type: "clearMessages" });
-    snap.push(...bracketRemoteSnapshot(session.buffer));
+    if (!session.replaying) snap.push(...bracketRemoteSnapshot(session.buffer));
     snap.push(...sessionUiSnapshot(session, this.displayMode(session)));
     if (session.queuedSendRequiresRelay && !session.queuedSendDispatch) {
       const text = this.queuedSendReadyText(session);
@@ -8349,7 +8727,7 @@ See design doc for the full state machine diagram.`;
     snap.push(this.buildSessionsList(cwd, undefined, this.remoteActiveSessionId(clientId)));
     const out: HostMsg[] = [];
     for (const m of snap) {
-      const t = transformHostMsgForRemote(m, GrokSidebar.REMOTE_MEDIA_DEPS);
+      const t = transformHostMsgForRemote(m, this.remoteMediaDeps);
       if (t) out.push(t);
     }
     return out;
@@ -8396,7 +8774,7 @@ See design doc for the full state machine diagram.`;
       <span class="welcome-mark" role="img" aria-label="Grok" style="--welcome-mark:url('${resourceUri("grok-icon.svg")}')"></span>
       <h2>Grok Build (Community)</h2>
       <p class="welcome-byline muted">by Paweł Huryn (<a href="https://www.productcompass.pm/" class="muted-link">The Product Compass</a>)</p>
-      <p id="welcome-version" class="muted loading-dots">Starting</p>
+      <p id="welcome-version" class="muted welcome-status-busy"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg><span>Starting</span></p>
       <div id="welcome-onboarding"></div>
     </div>
   </main>

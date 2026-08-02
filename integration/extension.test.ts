@@ -63,10 +63,13 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     path.join(grokHome, "sessions", encodeURIComponent(cwd), id);
   const storedSessionDir = (id: string) => storedSessionDirFor(repoB, id);
 
-  const writeStoredSession = (id: string, cwd = repoB) => {
+  const writeStoredSession = (id: string, cwd = repoB, updatedAt?: string) => {
     const dir = storedSessionDirFor(cwd, id);
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "summary.json"), "{}");
+    fs.writeFileSync(
+      path.join(dir, "summary.json"),
+      updatedAt ? JSON.stringify({ updated_at: updatedAt }) : "{}",
+    );
   };
 
   suiteSetup(async () => {
@@ -131,24 +134,113 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     // whether a client is kept up to date.
   });
 
-  test("remote Clear all acknowledges an empty history on the requesting tab", async () => {
+  test("speech summaries survive a session switch, require that tab's preferences, and return only there", async () => {
     const posts: Array<{ dest: string; msg: any; clientIds?: string[] }> = [];
     hooks.onPost((dest: string, msg: any, clientIds?: string[]) => posts.push({ dest, msg, clientIds }));
-
-    hooks.fromRemote({ type: "selectRepo", cwd: repoB }, "tab-a");
-    await new Promise((r) => setTimeout(r, 1500));
+    hooks.fromRemote({
+      type: "remotePreferences",
+      fontScale: 100,
+      readRepliesAloud: true,
+      summarizeRepliesAloud: true,
+      usesTouch: true,
+    }, "tab-a");
+    hooks.fromRemote({
+      type: "remotePreferences",
+      fontScale: 100,
+      readRepliesAloud: false,
+      summarizeRepliesAloud: true,
+      usesTouch: true,
+    }, "tab-b");
+    // Browser preferences belong to the logical tab, not the Session it happened
+    // to be showing when it reported them. Replace tab A's active conversation
+    // without another remotePreferences message and keep summarization enabled.
+    hooks.seedRemoteSession("tab-a", `speech-switched-${Date.now()}`, repoB, [], true);
     posts.length = 0;
-    hooks.fromRemote({ type: "clearAllSessions", cwd: repoB }, "tab-a");
-    await new Promise((r) => setTimeout(r, 100));
 
+    // Empty text makes summarizeForSpeech return locally without credential or
+    // network access; this test is about the host gate and reply routing.
+    hooks.fromRemote({ type: "summarizeSpeech", requestId: 41, text: "" }, "tab-a");
+    hooks.fromRemote({ type: "summarizeSpeech", requestId: 42, text: "" }, "tab-b");
+    await new Promise((r) => setTimeout(r, 50));
+
+    const summaries = posts.filter((p) => p.msg?.type === "speechSummary");
+    assert.deepStrictEqual(summaries, [{
+      dest: "remote",
+      msg: { type: "speechSummary", requestId: 41, text: "" },
+      clientIds: ["tab-a"],
+    }]);
+  });
+
+  test("switching to a history-free repo starts fresh without misrouting Clear all", async () => {
+    const posts: Array<{ dest: string; msg: any; clientIds?: string[] }> = [];
+    hooks.onPost((dest: string, msg: any, clientIds?: string[]) => posts.push({ dest, msg, clientIds }));
+    const emptyRepo = path.join(hooks.workspaceRoot(), `.int-empty-repo-${Date.now()}`);
+    fs.mkdirSync(emptyRepo, { recursive: true });
+    fs.mkdirSync(path.join(grokHome, "sessions", encodeURIComponent(emptyRepo)), { recursive: true });
+    const clientId = `clear-empty-${Date.now()}`;
+
+    hooks.fromRemote({ type: "selectRepo", cwd: emptyRepo }, clientId);
+    await new Promise((r) => setTimeout(r, 1500));
     assert.ok(posts.some((p) =>
       p.clientIds?.length === 1 &&
-      p.clientIds[0] === "tab-a" &&
-      p.msg?.type === "hostNotice" &&
-      p.msg.level === "info" &&
-      p.msg.text === "No history to clear."
+      p.clientIds[0] === clientId &&
+      p.msg?.type === "repos" &&
+      p.msg.selectedCwd === emptyRepo
     ), JSON.stringify(posts));
-    assert.ok(!posts.some((p) => p.dest === "local" && p.msg?.text === "No history to clear."));
+    // Switching to a history-free repo now STARTS a session there instead of
+    // landing nowhere, so this wait covers a real CLI spawn. A shared CI runner
+    // is slower at exactly that than a dev box, so the deadline is generous and —
+    // unlike before — expiring it fails HERE. Falling through silently meant the
+    // rest of the test ran against a half-started session and the blame landed on
+    // the assertion below, which is what made this look like a product bug.
+    const startupDeadline = Date.now() + 60000;
+    const startupDone = () => posts.some((p) =>
+      p.clientIds?.includes(clientId) && p.msg?.type === "setBusy" && p.msg.value === false
+    );
+    while (Date.now() < startupDeadline && !startupDone()) await new Promise((r) => setTimeout(r, 200));
+    assert.ok(startupDone(), "the empty repo's session never finished starting");
+
+    posts.length = 0;
+    hooks.fromRemote({ type: "clearAllSessions", cwd: emptyRepo }, clientId);
+
+    // What this test is named for is ROUTING: the clear must be answered to the
+    // tab that asked and must not leak to the VS Code view.
+    //
+    // It used to also assert the answer was a `sessions` refresh and never "No
+    // history to clear." That expectation belonged to the old world where
+    // switching to a history-free repo left you nowhere, so the clear had
+    // something to act on. Switching now STARTS a session there, Clear all never
+    // deletes the conversation you are sitting in, and so the only thing present
+    // is protected — "No history to clear." is the correct answer, not a bug.
+    // Locally the old assertion still passed by accident, depending on whether
+    // the new session had reached disk in time; CI, being slower, told the truth.
+    // Poll rather than sleep a fixed interval, for the same reason.
+    const clearDeadline = Date.now() + 15000;
+    const answeredRequester = () => posts.some((p) =>
+      p.clientIds?.length === 1 &&
+      p.clientIds[0] === clientId &&
+      (p.msg?.type === "sessions" ||
+        (p.msg?.type === "hostNotice" && p.msg.text === "No history to clear."))
+    );
+    while (Date.now() < clearDeadline && !answeredRequester()) await new Promise((r) => setTimeout(r, 100));
+
+    assert.ok(answeredRequester(), JSON.stringify(posts));
+    // The misrouting guard, which is the actual point: a remote's clear is never
+    // answered into the VS Code view. Deliberately narrow — the local view and
+    // other tabs legitimately receive their own list refreshes, so asserting
+    // "nothing else was posted" would fail on unrelated, correct traffic.
+    assert.ok(!posts.some((p) => p.dest === "local" && p.msg?.text === "No history to clear."),
+      JSON.stringify(posts));
+    hooks.remoteClientLeft(clientId);
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      fs.rmSync(emptyRepo, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (error) {
+      // On Windows the extension host can retain a just-used cwd until the host
+      // exits. The unique fixture is harmless and is cleaned by the outer test
+      // process; do not turn that platform handle lifetime into a product failure.
+      if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+    }
   });
 
   test("two tabs on the same repo have independent, non-crosstalking sessions", async () => {
@@ -170,6 +262,101 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     ]);
     assert.ok(!chunks.some((p) => p.msg.text === "only-a" && p.clientIds?.includes("tab-b")));
     assert.ok(!chunks.some((p) => p.msg.text === "only-b" && p.clientIds?.includes("tab-a")));
+  });
+
+  test("cold replay stays live on the desk and reaches remote once as a completed batch", async () => {
+    const suffix = Date.now();
+    const id = `cold-replay-${suffix}`;
+    const original = `cold-replay-old-${suffix}`;
+    const replacement = `cold-replay-new-${suffix}`;
+    const tabToken = "3456789abcdef0123456789abcdef012";
+    hooks.fromRelayFrame(JSON.stringify({ t: "client-ready", clientId: original, tabToken }));
+    hooks.seedRemoteSession(original, id, repoB, [], true);
+    await hooks.openLocalSession(id, repoB);
+
+    const posts: Array<{ dest: string; msg: any; clientIds?: string[] }> = [];
+    hooks.onPost((dest: string, msg: any, clientIds?: string[]) => posts.push({ dest, msg, clientIds }));
+    let attachSnapshot: typeof posts = [];
+    await hooks.replayRemote(original, [
+      { type: "userMessageChunk", text: "loaded question" },
+      { type: "messageChunk", text: "loaded answer" },
+    ], () => {
+      const before = posts.length;
+      hooks.fromRelayFrame(JSON.stringify({ t: "client-ready", clientId: replacement, tabToken }));
+      attachSnapshot = posts.slice(before);
+    });
+
+    assert.ok(attachSnapshot.some((post) =>
+      post.clientIds?.includes(replacement) && post.msg?.type === "clearMessages"
+    ), JSON.stringify(attachSnapshot));
+    assert.ok(!attachSnapshot.some((post) =>
+      post.clientIds?.includes(replacement) &&
+      ["historyBatch", "historyReplay", "userMessageChunk", "messageChunk"].includes(post.msg?.type)
+    ), `a client attaching mid-load received partial history: ${JSON.stringify(attachSnapshot)}`);
+
+    const remoteTranscript = posts.filter((post) =>
+      post.clientIds?.includes(replacement) &&
+      ["historyBatch", "historyReplay", "userMessageChunk", "messageChunk"].includes(post.msg?.type)
+    ).map((post) => post.msg);
+    assert.deepStrictEqual(remoteTranscript, [
+      { type: "historyReplay", active: true },
+      {
+        type: "historyBatch",
+        messages: [
+          { type: "userMessageChunk", text: "loaded question" },
+          { type: "messageChunk", text: "loaded answer" },
+        ],
+      },
+      { type: "historyReplay", active: false },
+    ]);
+    assert.ok(!posts.some((post) =>
+      post.clientIds?.includes(original) &&
+      ["historyBatch", "historyReplay", "userMessageChunk", "messageChunk"].includes(post.msg?.type)
+    ), "the superseded relay client must not receive replay frames");
+
+    assert.deepStrictEqual(
+      posts.filter((post) => post.dest === "local").map((post) => post.msg),
+      [
+        { type: "historyReplay", active: true },
+        { type: "userMessageChunk", text: "loaded question" },
+        { type: "messageChunk", text: "loaded answer" },
+        { type: "historyReplay", active: false },
+      ],
+      "the desk should continue receiving the replay stream live",
+    );
+
+    posts.length = 0;
+    hooks.emitRemote(replacement, { type: "messageChunk", text: "live after load" });
+    assert.deepStrictEqual(posts, [
+      { dest: "local", msg: { type: "messageChunk", text: "live after load" }, clientIds: undefined },
+      { dest: "remote", msg: { type: "messageChunk", text: "live after load" }, clientIds: [replacement] },
+    ]);
+    hooks.remoteClientLeft(replacement);
+  });
+
+  test("a failed cold replay still sends one balanced snapshot of what loaded", async () => {
+    const suffix = Date.now();
+    const clientId = `failed-cold-replay-${suffix}`;
+    const id = `failed-cold-session-${suffix}`;
+    hooks.seedRemoteSession(clientId, id, repoB, [], true);
+    await hooks.openLocalSession(id, repoB);
+    const posts: Array<{ msg: any; clientIds?: string[] }> = [];
+    hooks.onPost((_dest: string, msg: any, clientIds?: string[]) => posts.push({ msg, clientIds }));
+
+    await assert.rejects(
+      hooks.replayRemote(clientId, [{ type: "messageChunk", text: "partial load" }], undefined, true),
+      /synthetic session\/load failure/,
+    );
+
+    assert.deepStrictEqual(
+      posts.filter((post) => post.clientIds?.includes(clientId)).map((post) => post.msg),
+      [
+        { type: "historyReplay", active: true },
+        { type: "historyBatch", messages: [{ type: "messageChunk", text: "partial load" }] },
+        { type: "historyReplay", active: false },
+      ],
+    );
+    hooks.remoteClientLeft(clientId);
   });
 
   test("remote context usage is read from the session repo, not the VS Code workspace", () => {
@@ -197,6 +384,79 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
       [{ msg: { type: "contextUsage", used: 222, window: 200000 }, clientIds: ["context-tab"] }],
     );
   });
+
+  test("rewind keeps discarded usage out after another turn and a reload", async () => {
+    const suffix = Date.now();
+    const clientId = `usage-rewind-${suffix}`;
+    const id = `usage-session-${suffix}`;
+    hooks.seedRemoteSession(clientId, id, repoB, [], true);
+    await hooks.seedUsageLedger(clientId, [
+      { afterUserMessage: 1, usage: { inputTokens: 100, outputTokens: 10, costUsdTicks: 10_000_000 } },
+      { afterUserMessage: 2, usage: { inputTokens: 200, outputTokens: 20, costUsdTicks: 20_000_000 } },
+      { afterUserMessage: 3, usage: { inputTokens: 300, outputTokens: 30, costUsdTicks: 30_000_000 } },
+    ], 3);
+
+    await hooks.rewindUsageLedger(clientId, 1);
+    await hooks.completeUsageTurn(clientId, {
+      inputTokens: 400,
+      outputTokens: 40,
+      costUsdTicks: 40_000_000,
+    });
+    const restored = hooks.reloadUsageLedger(clientId, 2);
+
+    assert.deepStrictEqual(
+      restored.usageLog.map((entry: any) => ({
+        afterUserMessage: entry.afterUserMessage,
+        inputTokens: entry.usage?.inputTokens,
+        costUsdTicks: entry.usage?.costUsdTicks,
+      })),
+      [
+        { afterUserMessage: 1, inputTokens: 100, costUsdTicks: 10_000_000 },
+        { afterUserMessage: 2, inputTokens: 400, costUsdTicks: 40_000_000 },
+      ],
+    );
+    assert.deepStrictEqual(restored.sessionUsage, {
+      inputTokens: 500,
+      outputTokens: 50,
+      costUsdTicks: 50_000_000,
+    });
+    hooks.remoteClientLeft(clientId);
+  });
+
+  for (const mode of ["clear", "summarize"] as const) {
+    test(`${mode} restart derives cost from the replacement session id`, async () => {
+      const suffix = `${mode}-${Date.now()}`;
+      const clientId = `usage-restart-${suffix}`;
+      const oldId = `usage-old-${suffix}`;
+      const newId = `usage-new-${suffix}`;
+      hooks.seedRemoteSession(clientId, oldId, repoB, [], true);
+      await hooks.seedUsageLedger(clientId, [{
+        afterUserMessage: 1,
+        usage: { inputTokens: 100, outputTokens: 10, costUsdTicks: 90_000_000 },
+      }], 1);
+
+      const summaryUsage = mode === "summarize"
+        ? { inputTokens: 5, outputTokens: 2, costUsdTicks: 5_000_000 }
+        : undefined;
+      await hooks.restartUsageSession(clientId, newId, mode, summaryUsage);
+      await hooks.completeUsageTurn(clientId, {
+        inputTokens: 40,
+        outputTokens: 4,
+        costUsdTicks: 40_000_000,
+      });
+      const restored = hooks.reloadUsageLedger(clientId, 1);
+
+      assert.deepStrictEqual(
+        restored.usageLog.map((entry: any) => entry.usage?.costUsdTicks),
+        mode === "summarize" ? [5_000_000, 40_000_000] : [40_000_000],
+      );
+      assert.strictEqual(
+        restored.sessionUsage?.costUsdTicks,
+        mode === "summarize" ? 45_000_000 : 40_000_000,
+      );
+      hooks.remoteClientLeft(clientId);
+    });
+  }
 
   test("ordinary history actions cannot destroy another tab's live conversation", async () => {
     const worktree = path.join(repoB, ".clear-all-worktree");
@@ -428,18 +688,21 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     await new Promise((r) => setTimeout(r, 1500));
 
     const replayToReconnect = posts.filter((p) => p.clientIds?.includes("reload-replacement"));
+    const carriesHistoryText = (post: { msg: any }, text: string) =>
+      (post.msg?.type === "messageChunk" && post.msg.text === text) ||
+      (post.msg?.type === "historyBatch" && post.msg.messages?.some(
+        (nested: any) => nested?.type === "messageChunk" && nested.text === text,
+      ));
     assert.ok(
-      replayToReconnect.some((p) => p.msg?.type === "messageChunk" && p.msg.text === "reload-history"),
+      replayToReconnect.some((p) => carriesHistoryText(p, "reload-history")),
       JSON.stringify(replayToReconnect.map((p) => p.msg)),
     );
-    assert.ok(!replayToReconnect.some((p) => p.msg?.type === "messageChunk" && p.msg.text === "only-b"));
+    assert.ok(!replayToReconnect.some((p) => carriesHistoryText(p, "only-b")));
     assert.ok(replayToReconnect.some((p) =>
       p.msg?.type === "sessions" && p.msg.activeId === id
     ));
     assert.ok(!posts.some((p) =>
-      p.msg?.type === "messageChunk" &&
-      p.msg.text === "reload-history" &&
-      p.clientIds?.includes("tab-b")
+      carriesHistoryText(p, "reload-history") && p.clientIds?.includes("tab-b")
     ));
 
     hooks.remoteClientLeft("reload-old");
@@ -717,9 +980,9 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     const repoHistory = `repo-history-${Date.now()}`;
     const workspaceHistory = `workspace-history-${Date.now()}`;
     const resumeId = `resume-delayed-${Date.now()}`;
-    writeStoredSession(repoHistory);
-    writeStoredSession(resumeId);
-    writeStoredSession(workspaceHistory, hooks.workspaceRoot());
+    writeStoredSession(repoHistory, repoB, "2020-01-01T00:00:00.000Z");
+    writeStoredSession(resumeId, repoB, "2020-01-02T00:00:00.000Z");
+    writeStoredSession(workspaceHistory, hooks.workspaceRoot(), "2099-01-01T00:00:00.000Z");
 
     hooks.fromRemote({ type: "selectRepo", cwd: repoB }, clientId);
     await new Promise((r) => setTimeout(r, 100));
@@ -746,21 +1009,28 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
       // pre-warmed the spawn path, and failed in isolation or after suite
       // reordering. Poll instead of sleeping a fixed slice.
       const deadline = Date.now() + 15000;
-      while (Date.now() < deadline && !posts.some((p) =>
-        p.clientIds?.includes(clientId) &&
-        p.msg?.type === "repos" &&
-        p.msg.selectedCwd === hooks.workspaceRoot()
-      )) await new Promise((r) => setTimeout(r, 200));
-      const switchedAt = posts.findIndex((p) =>
-        p.clientIds?.includes(clientId) &&
-        p.msg?.type === "repos" &&
-        p.msg.selectedCwd === hooks.workspaceRoot()
-      );
+      let switchedAt = -1;
+      let finalHistory: any;
+      while (Date.now() < deadline) {
+        switchedAt = posts.findIndex((p) =>
+          p.clientIds?.includes(clientId) &&
+          p.msg?.type === "repos" &&
+          p.msg.selectedCwd === hooks.workspaceRoot()
+        );
+        if (switchedAt >= 0) {
+          const histories = posts.slice(switchedAt).filter((p) =>
+            p.clientIds?.includes(clientId) && p.msg?.type === "sessions"
+          );
+          finalHistory = histories[histories.length - 1]?.msg;
+          if (finalHistory?.entries.some((entry: any) => entry.id === workspaceHistory)) break;
+        }
+        await new Promise((r) => setTimeout(r, 200));
+      }
       assert.ok(switchedAt >= 0, `delayed ${transition} should eventually yield to selectRepo`);
-      const finalHistory = posts.slice(switchedAt).find((p) =>
-        p.clientIds?.includes(clientId) && p.msg?.type === "sessions"
-      )?.msg;
-      assert.ok(finalHistory, "the selected repository should receive a history snapshot");
+      assert.ok(
+        finalHistory,
+        "the selected repository should receive a history snapshot",
+      );
       assert.ok(finalHistory.entries.some((entry: any) => entry.id === workspaceHistory));
       assert.ok(!finalHistory.entries.some((entry: any) => entry.id === repoHistory));
 
@@ -799,7 +1069,8 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     const clearOwnId = `clear-own-worktree-${suffix}`;
     const clearForeignId = `clear-foreign-worktree-${suffix}`;
     writeStoredSession(foreignId, repoBWorktree);
-    writeStoredSession(ownId, repoAWorktree);
+    writeStoredSession(ownId, repoAWorktree, "2020-01-01T00:00:00.000Z");
+    writeStoredSession(`primary-${suffix}`, hooks.workspaceRoot(), "2099-01-01T00:00:00.000Z");
     const clientId = `scope-client-${suffix}`;
     hooks.fromRemote({ type: "selectRepo", cwd: hooks.workspaceRoot() }, clientId);
     await new Promise((r) => setTimeout(r, 100));
@@ -1083,7 +1354,7 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     hooks.fromRemote({ type: "selectRepo", cwd: hooks.workspaceRoot() }, "primer-owner");
     await new Promise((r) => setTimeout(r, 100));
 
-    assert.strictEqual(hooks.activeRemoteSessionId("primer-owner"), undefined);
+    assert.notStrictEqual(hooks.activeRemoteSessionId("primer-owner"), id);
     assert.ok(!hooks.hasLiveSession(id), "the abandoned primer process must be disposed");
     assert.ok(!fs.existsSync(storedSessionDir(id)), "the primer-only history row must be deleted");
   });

@@ -8,6 +8,7 @@
   const IS_REMOTE = !!window.grokRemoteClient;
   const REMOTE_FONT_SCALE_KEY = "grok.remote.fontScale";
   const REMOTE_TTS_KEY = "grok.remote.tts";
+  const REMOTE_TTS_SUMMARY_KEY = "grok.remote.ttsSummary";
   const REMOTE_STORAGE_SUFFIX = (
     typeof location !== "undefined"
       ? new URLSearchParams(location.search || "").get("device") || "default"
@@ -262,6 +263,10 @@
     return [...known, ...extra];
   }
 
+  const storedRemoteTts = IS_REMOTE && storedBool(REMOTE_TTS_KEY, false);
+  const storedRemoteTtsSummary = storedRemoteTts && storedBool(REMOTE_TTS_SUMMARY_KEY, true);
+  if (IS_REMOTE && !storedRemoteTts) storeRemotePref(REMOTE_TTS_SUMMARY_KEY, false);
+
   const state = {
     welcomeVisible: true,
     currentModelId: null,
@@ -294,16 +299,26 @@
     // Whether the host found a voice API key. Optimistic until the host says
     // otherwise; remote clients cannot configure the host themselves.
     voiceConfigured: true,
-    // Streaming dictation: text typed before the mic started ("base"), and
-    // whether live partials have begun replacing the tail.
-    voiceBase: "",
+    // Dictation insertion point: text before and after the selection that was
+    // active when the mic started. Live partials replace only the text between
+    // these anchors.
+    voiceBefore: "",
+    voiceAfter: "",
+    voiceInsertionActive: false,
     voiceLive: false,
+    // Manual Send/Queue discards the active capture and blocks late results
+    // until the next mic start.
+    voiceDiscarded: false,
     // The configured send phrase (for highlighting it in the composer).
     voiceSendPhrase: "grok send",
     remoteFontScale: IS_REMOTE ? storedNumber(REMOTE_FONT_SCALE_KEY, 1) : 1,
     hostFontScale: Number(document.body.style.getPropertyValue("--chat-zoom")) || 1,
-    remoteTts: IS_REMOTE && storedBool(REMOTE_TTS_KEY, false),
+    remoteTts: storedRemoteTts,
+    remoteSummarizeRepliesAloud: storedRemoteTtsSummary,
     readRepliesAloud: false,
+    // The host posts the configured value immediately after initialState. Keep
+    // the pre-sync render conservative so a read-aloud toggle cannot summon a
+    // summary request before that config message arrives.
     summarizeRepliesAloud: false,
     remotePreferencesSupported: false,
     ttsTurnText: "",
@@ -338,6 +353,15 @@
     // is held while > 0 so a paste-then-Enter can't race the image onto the
     // NEXT message — the pasteImage post must reach the host before send does.
     pendingPaste: 0,
+    // Browser-owned data URLs for pasted image previews, keyed by opaque id.
+    // previewId is random and globally unique; keeping one map lets a paste
+    // survive the session id being assigned after the first send and survives
+    // switching away from a conversation.
+    imagePreviews: new Map(),
+    // The full-size render the overlay is currently waiting on, so a late reply
+    // for a closed or replaced preview is dropped rather than painted.
+    pendingImageFullId: null,
+    imageFullTimer: null,
     activeThoughtEl: null,
     activeThoughtHdrEl: null,
     thoughtStartTime: null,
@@ -363,6 +387,9 @@
     // Set by the first `repos` frame — the host's proof that it supports the
     // switcher at all. Older extensions never send one (see repoSwitcherAvailable).
     reposKnown: false,
+    // A deliberate repo switch stays locked until its transition settles. The
+    // replay bracket also keeps the lock honest for an old conversation load.
+    repoSwitchPending: false,
     selectedRepoCwd: "",
     activeRepoCwd: "",
     activeSessionId: null,
@@ -408,33 +435,25 @@
     // snapshot or a later update with the same toolCallId.
     restoredCardsByToolCallId: new Map(),
     // Saved plan cards waiting to be rendered inline as the conversation replays.
-    // Each entry has { text, verdict, afterUserMessage? }. We drain entries whose
-    // afterUserMessage matches the current userMsgCount as user messages stream
-    // in, and dump anything left (legacy plans w/o position, or plans after the
-    // last replayed user msg) at the end of replay.
+    // `afterUserMessage` is the prompt coordinate; `afterInterjection` orders
+    // repeated native reject/revise cycles inside one prompt.
     planHistoryQueue: [],
     // Answered permission cards from a resumed session, drained inline like plans
     // (each { title, outcome, afterUserMessage? }). The CLI doesn't replay the
     // request, so the host persists + re-queues these.
     permissionHistoryQueue: [],
     userMsgCount: 0,
-    // Element rendered below a resolved plan card while the host is waiting on
-    // grok's response to the verdict (or its comment). Visible only between
-    // the verdict click and the first incoming agent chunk; cleared by any
-    // arriving content or by reset.
-    planProcessingEl: null,
+    interjectionCount: 0,
+    historyEventCount: 0,
     // The "Grokking…" placeholder shown while a user-initiated turn is waiting on
     // grok — from the moment the user sends (agentStart) until the first real
     // content arrives (a thought, message, tool card, …), which replaces it in
     // place. Same font + animated dots as the Thinking header, minus the expand
-    // chevron. Covers the held-behind-primer gap too: the message shows as sent,
-    // this spins, then the real Thinking block takes over. Never shown for the
-    // silent primer turn (which emits no agentStart). One at a time with
-    // planProcessing (each hides the other).
+    // chevron. The real Thinking block replaces it once content arrives.
     grokkingEl: null,
     // When true, the busy state is "locked" (e.g. session-start priming): the
     // send button shows a spinner and is disabled. When false, busy is
-    // "stoppable" (regular prompts, verdict afterTurn) and the send button
+    // "stoppable" (regular prompts) and the send button
     // shows a stop icon that the user can click to cancel grok mid-stream.
     // Starts true so the very first paint is the disabled spinner (see `busy`).
     busyLocked: true,
@@ -444,6 +463,8 @@
     // priming spinner clears (setBusy:false). See the initialized/setBusy cases.
     cliVersion: "",
     startingPhase: false,
+    planModeAvailable: true,
+    planModeUnavailableReason: "",
     // Extension version (from initialState) — shown in the gear → About panel.
     extVersion: "",
     // Which gear-popover view is showing ("main"|"model"|"about"|"config"), so an
@@ -452,10 +473,8 @@
     // Latest `grok update --check` result for the About panel: { checking } while
     // in flight, then { current, latest, updateAvailable, error }.
     grokUpdate: null,
-    // While replaying, suppress everything from the start of the current user
-    // message (a primer turn) through the end of grok's response to it — until
-    // the next user message starts. Keeps the chat clean of our session-start
-    // priming when the user resumes a session.
+    // While replaying an older session, suppress a legacy primer user turn and
+    // grok's response until the next user message starts.
     suppressReplayTurn: false,
     // While replaying, suppress just the user bubble for a marker-only verdict
     // message ([Plan cancelled] with no comment) — grok's response to it still
@@ -512,9 +531,8 @@
     toolExpandOverride: null,
   };
 
-  // Matches any version of the extension's primer (v1, v2, …). Used during
-  // session replay to detect and hide the primer + grok's ack from the
-  // restored conversation.
+  // Matches legacy primers persisted by older extension versions so their user
+  // bubble and grok acknowledgement stay hidden on replay.
   const PRIMER_PATTERN = /^\s*\[grok-build-vscode primer v\d+\]/;
 
   // The CLI feeds background-task notices (and similar plumbing) back to the
@@ -623,7 +641,9 @@
   // instead of the old morphing "…" ellipsis (#26 follow-up).
   const BLINK_DOTS = `<span class="blink-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>`;
   let composerPreferredColumn = null;
+  const SPEECH_SUMMARY_FALLBACK_MS = 12_000;
   let speechRequestId = 0;
+  let pendingSpeechSummary = null;
 
   // ---------- helpers ----------
 
@@ -821,7 +841,7 @@
 
   // ---------- markdown ----------
 
-  const { looksLikeFileRef, formatRelativeTime, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, spokenTextFromMarkdown, isRelaySendRejection } = globalThis.GrokWebviewHelpers;
+  const { looksLikeFileRef, formatRelativeTime, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection } = globalThis.GrokWebviewHelpers;
 
   function escapeAttr(s) {
     return String(s == null ? "" : s)
@@ -1556,6 +1576,18 @@
       (parent || contextPopover).appendChild(el);
     };
     const tok = (n) => Number(n).toLocaleString();
+    // Grok's fixed-point billing unit is 10^10 ticks per USD (xAI's published
+    // UsageTotals contract). Keep the divisor explicit; it is not cents/micros.
+    const usdTicks = (ticks) => {
+      const usd = Number(ticks) / 10_000_000_000;
+      if (usd > 0 && usd < 0.000001) return "<$0.000001";
+      return new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 6,
+      }).format(usd);
+    };
 
     const used = state.usedTokens || 0;
     const pct = Math.min(100, Math.round((used / state.contextWindow) * 100));
@@ -1594,6 +1626,7 @@
       row(sess, "Input", "inputTokens");
       row(sess, "↳ cache read", "cachedReadTokens");
       row(sess, "Output", "outputTokens");
+      row(sess, "Cost", "costUsdTicks", usdTicks);
     }
     if (turn) {
       const open = !!uiState().lastTurnOpen;
@@ -1608,6 +1641,7 @@
       row(turn, "↳ cache read", "cachedReadTokens", null, body);
       row(turn, "Output", "outputTokens", null, body);
       row(turn, "↳ reasoning", "reasoningTokens", null, body);
+      row(turn, "Cost", "costUsdTicks", usdTicks, body);
       // The row that makes the arithmetic legible: a turn re-sends the whole
       // conversation on EVERY model call, so billed input ≈ context × calls and
       // routinely dwarfs "Context used". Without this the two numbers look like
@@ -1873,9 +1907,8 @@
     const row = document.createElement("div");
     row.className = "model-effort-row";
 
-    // Model + effort both restart or race the session, so they're locked while
-    // a turn is in flight or the session is still priming (the hidden primer) —
-    // the same `busy` signal that disables send/submit.
+    // Model + effort both restart or race the session, so they are locked while
+    // a turn or session startup is in flight (the same busy signal as Send).
     const settingsLocked = state.busy;
 
     // Until the session's model info arrives (its name + advertised effort menu),
@@ -2236,30 +2269,35 @@
           renderConfigDebugPanel();
         },
       );
-      if (!IS_REMOTE) {
-        const summarizeEnabled = state.readRepliesAloud;
-        const summarizeRow = document.createElement("div");
-        summarizeRow.className = "toolbar-popover-item" +
-          (summarizeEnabled ? "" : " popover-action disabled");
-        summarizeRow.innerHTML =
-          `<span title="Use xAI to make each spoken message brief and speech-friendly before reading it. Adds a billed API call and network delay; falls back to the full text on any failure.">Summarize before speaking</span><span class="popover-switch${state.summarizeRepliesAloud ? " on" : ""}" role="switch" aria-checked="${state.summarizeRepliesAloud}"><span class="popover-switch-knob"></span></span>`;
-        if (summarizeEnabled) {
-          summarizeRow.onclick = (e) => {
-            e.stopPropagation();
+      const summarizeEnabled = IS_REMOTE ? state.remoteTts : state.readRepliesAloud;
+      const summarizeOn = IS_REMOTE
+        ? state.remoteSummarizeRepliesAloud
+        : state.summarizeRepliesAloud;
+      const summarizeRow = document.createElement("div");
+      summarizeRow.className = "toolbar-popover-item" +
+        (summarizeEnabled ? "" : " popover-action disabled");
+      summarizeRow.innerHTML =
+        `<span title="Use xAI to read a brief, speech-friendly summary of each spoken message. Costs an extra xAI call per spoken reply and adds network delay; falls back to the full text on any failure.">Read simplified summaries</span><span class="popover-switch${summarizeOn ? " on" : ""}" role="switch" aria-checked="${summarizeOn}"><span class="popover-switch-knob"></span></span>`;
+      if (summarizeEnabled) {
+        summarizeRow.onclick = (e) => {
+          e.stopPropagation();
+          if (IS_REMOTE) {
+            setRemoteTtsSummaryEnabled(!state.remoteSummarizeRepliesAloud);
+          } else {
             state.summarizeRepliesAloud = !state.summarizeRepliesAloud;
-            speechRequestId += 1;
+            invalidatePendingSpeechSummary();
             vscode.postMessage({
               type: "setSummarizeRepliesAloud",
               value: state.summarizeRepliesAloud,
             });
-            renderConfigDebugPanel();
-          };
-        } else {
-          summarizeRow.setAttribute("aria-disabled", "true");
-          summarizeRow.title = "Turn on Read replies aloud to summarize spoken replies";
-        }
-        gearPopover.appendChild(summarizeRow);
+          }
+          renderConfigDebugPanel();
+        };
+      } else {
+        summarizeRow.setAttribute("aria-disabled", "true");
+        summarizeRow.title = "Turn on Read replies aloud to summarize spoken replies";
       }
+      gearPopover.appendChild(summarizeRow);
     } else {
       addGearInfo("<span>Read replies aloud</span><span class=\"popover-ver\">Not supported</span>");
     }
@@ -2356,20 +2394,23 @@
     for (const [id, meta] of Object.entries(metas)) {
       const el = document.createElement("div");
       const active = id === state.currentModeId;
+      const planUnavailable = id === "plan" && !state.planModeAvailable;
+      const disabled = !!meta.disabled || planUnavailable;
+      const disabledNote = planUnavailable ? state.planModeUnavailableReason : meta.disabledNote;
       el.className = "toolbar-popover-item mode-popover-item" +
         (active ? " active" : "") +
-        (meta.disabled ? " disabled" : "");
+        (disabled ? " disabled" : "");
       el.innerHTML =
         `<span class="mode-item-icon">${meta.icon}</span>` +
         `<span class="mode-item-body">` +
           `<span class="mode-item-label">${escapeHtml(meta.label)}</span>` +
           `<span class="mode-item-desc">${escapeHtml(meta.desc)}</span>` +
-          (meta.disabledNote ? `<span class="mode-item-disabled-note">${escapeHtml(meta.disabledNote)}</span>` : "") +
+          (disabledNote ? `<span class="mode-item-disabled-note">${escapeHtml(disabledNote)}</span>` : "") +
         `</span>` +
         (active ? '<span class="popover-check">✓</span>' : "");
       el.onclick = (e) => {
         e.stopPropagation();
-        if (meta.disabled) return;
+        if (disabled) return;
         vscode.postMessage({ type: "setMode", modeId: id });
         closePopovers();
       };
@@ -2491,27 +2532,37 @@
     return IS_REMOTE && state.reposKnown;
   }
 
+  function repoSwitcherLocked() {
+    return state.repoSwitchPending || state.replaying;
+  }
+
   function applyRepoSwitcherVisibility() {
     const on = repoSwitcherAvailable();
     repoBtn.hidden = !on;
-    if (!on) repoPopover.hidden = true;
+    if (!on || repoSwitcherLocked()) repoPopover.hidden = true;
   }
 
   function renderRepoChip() {
     applyRepoSwitcherVisibility();
     if (!repoSwitcherAvailable()) return;
+    const locked = repoSwitcherLocked();
     const selected = state.repos.find((r) => sameCwd(r.cwd, state.selectedRepoCwd));
     const label = selected?.label || cwdLeaf(state.selectedRepoCwd || state.activeRepoCwd);
     const browsing = !!state.selectedRepoCwd && !!state.activeRepoCwd &&
       !sameCwd(state.selectedRepoCwd, state.activeRepoCwd);
+    repoBtn.disabled = locked;
+    repoBtn.classList.toggle("disabled", locked);
+    repoBtn.setAttribute("aria-disabled", String(locked));
     repoBtn.classList.toggle("browsing", browsing);
     repoBtn.innerHTML =
       `<span class="repo-chip-icon">${selected?.worktreeLabel ? ICON.gitBranch : ICON.folder}</span>` +
       `<span class="repo-chip-label"></span>${ICON.chevronDown}`;
     repoBtn.querySelector(".repo-chip-label").textContent = label;
-    repoBtn.title = browsing
-      ? `Browsing ${state.selectedRepoCwd}; live session is in ${state.activeRepoCwd}`
-      : (state.selectedRepoCwd || "Choose repository");
+    repoBtn.title = locked
+      ? "Loading conversation... repository switching is disabled until it finishes."
+      : browsing
+        ? `Browsing ${state.selectedRepoCwd}; live session is in ${state.activeRepoCwd}`
+        : (state.selectedRepoCwd || "Choose repository");
   }
 
   function renderRepoPopover() {
@@ -2533,7 +2584,7 @@
       const main = document.createElement("button");
       main.type = "button";
       main.className = "repo-row-main";
-      main.disabled = !repo.available;
+      main.disabled = !repo.available || repoSwitcherLocked();
       main.innerHTML = `<span class="repo-row-icon">${repo.worktreeLabel ? ICON.gitBranch : ICON.folder}</span><span class="repo-row-copy"><span class="repo-row-name"></span><span class="repo-row-meta"></span></span>`;
       main.querySelector(".repo-row-name").textContent = repo.label || cwdLeaf(repo.cwd);
       const meta = main.querySelector(".repo-row-meta");
@@ -2542,7 +2593,9 @@
         : "Unavailable";
       main.onclick = (e) => {
         e.stopPropagation();
-        if (!repo.available) return;
+        if (!repo.available || repoSwitcherLocked()) return;
+        state.repoSwitchPending = true;
+        renderRepoChip();
         saveRememberedRemoteSession(null);
         vscode.postMessage({ type: "selectRepo", cwd: repo.cwd });
         closePopovers();
@@ -2554,6 +2607,7 @@
       const pin = document.createElement("button");
       pin.type = "button";
       pin.className = "history-action-btn" + (repo.pinned ? " active" : "");
+      pin.disabled = repoSwitcherLocked();
       pin.innerHTML = ICON.pin;
       pin.title = repo.pinned ? "Unpin repository" : "Pin repository";
       pin.onclick = (e) => {
@@ -2727,8 +2781,8 @@
       } else {
         const name = document.createElement("div");
         name.className = "history-row-name";
-        // Tooltip is the name the USER sees/gave — never the primer-derived
-        // summary (rawSummary), which is an internal title on primed sessions.
+        // Tooltip is the name the USER sees/gave — never a legacy primer-derived
+        // summary (rawSummary), which is internal compatibility data.
         name.title = s.displayName || "";
         // A worktree session gets a branch icon (a TYPE marker in muted gray,
         // off the status-dot palette), not a "(WT)" text prefix like a fork's
@@ -2835,6 +2889,44 @@
     state.welcomeVisible = false;
   }
 
+  /** The welcome panel's status line \u2014 the ONE place a pre-transcript wait is
+   *  announced. Busy states borrow the send button's loader-circle so every
+   *  "working" affordance spins the same way; settled states are plain text.
+   *  `dataset.status` records which busy state is showing, so a later clear can
+   *  tell "the conversation finished loading" from "startup finished" without
+   *  comparing display strings. */
+  function setWelcomeStatus(text, busy) {
+    const ver = $("welcome-version");
+    if (!ver) return;
+    ver.classList.remove("loading-dots");
+    ver.classList.toggle("welcome-status-busy", !!busy);
+    ver.dataset.status = busy ? text : "";
+    if (!busy) {
+      ver.textContent = text;
+      return;
+    }
+    ver.textContent = "";
+    ver.insertAdjacentHTML("beforeend", ICON.spinner);
+    const label = document.createElement("span");
+    label.textContent = text;
+    ver.appendChild(label);
+  }
+
+  function setConversationLoading(active) {
+    if (active) {
+      // Deliberately the only indicator. A second banner above the transcript
+      // used to double it up, and the transcript arrives as one batch anyway \u2014
+      // so the wait that's worth announcing happens while the welcome is still
+      // on screen, and the banner only ever duplicated this line.
+      setWelcomeStatus("Loading conversation", true);
+      return;
+    }
+    const ver = $("welcome-version");
+    if (ver && ver.dataset.status === "Loading conversation") {
+      setWelcomeStatus(state.cliVersion ? `Connected \u00b7 v${state.cliVersion}` : "Connected", false);
+    }
+  }
+
   function resetForNewSession() {
     stopProcessingCue();
     cancelPendingSpeech();
@@ -2857,8 +2949,7 @@
       welcome.hidden = false;
       const onb = $("welcome-onboarding");
       if (onb) onb.innerHTML = "";
-      const ver = $("welcome-version");
-      if (ver) { ver.classList.add("loading-dots"); ver.textContent = "Starting"; }
+      setWelcomeStatus("Starting", true);
     }
     state.welcomeVisible = true;
     state.pendingDiffByToolCallId.clear();
@@ -2886,11 +2977,15 @@
     state.planHistoryQueue = [];
     state.permissionHistoryQueue = [];
     state.userMsgCount = 0;
+    state.interjectionCount = 0;
+    state.historyEventCount = 0;
+    state.lastTurnUsage = null;
+    state.sessionUsage = null;
     state.suppressReplayTurn = false;
     state.skipUserBubble = false;
+    cancelPendingSpeech();
     state.stickToBottom = true; // a fresh/loaded session starts pinned
     updateScrollBtn();
-    hidePlanProcessing();
     hideGrokking();
     hideThinkingIndicator();
     // Busy is per-session UI state — a swap must not leak the previous
@@ -2925,7 +3020,7 @@
     const ver = $("welcome-version");
     if (!onb) return;
     if (mode === "missing-cli") {
-      if (ver) { ver.classList.remove("loading-dots"); ver.textContent = "CLI not installed"; }
+      if (ver) setWelcomeStatus("CLI not installed", false);
       const installCmd = info.platform === "win32"
         ? "irm https://x.ai/cli/install.ps1 | iex"
         : "curl -fsSL https://x.ai/cli/install.sh | bash";
@@ -2940,7 +3035,7 @@
           `<button class="onb-action onb-secondary" type="button" data-act="recheck">Re-check connection</button>` +
         `</div>`;
     } else if (mode === "auth-required") {
-      if (ver) { ver.classList.remove("loading-dots"); ver.textContent = "Authentication required"; }
+      if (ver) setWelcomeStatus("Authentication required", false);
       onb.innerHTML =
         `<div class="onb">` +
           `<p class="onb-heading">Sign in to continue</p>` +
@@ -3003,7 +3098,26 @@
         ? ` (line ${chip.selectionStart})`
         : ` (lines ${chip.selectionStart}-${chip.selectionEnd})`
       : "";
-    tag.innerHTML = icon + `<span>${escapeHtml(name + range)}</span>`;
+    const previewSrc = chip?.previewSrc || (chip?.previewId && state.imagePreviews.get(chip.previewId));
+    const hasPreview = chip?.imageIndex != null && !!previewSrc;
+    if (hasPreview) {
+      const preview = document.createElement("button");
+      preview.type = "button";
+      preview.className = "msg-chip-preview";
+      preview.title = `Preview ${name}`;
+      const img = document.createElement("img");
+      img.src = previewSrc;
+      img.alt = "";
+      preview.appendChild(img);
+      preview.onclick = (e) => {
+        e.stopPropagation();
+        openImagePreview(previewSrc, name, chip?.fullId);
+      };
+      tag.appendChild(preview);
+    }
+    // The icon stands in FOR the picture. With a thumbnail beside it, it is the
+    // same idea said twice — so it appears only when there is nothing to show.
+    tag.insertAdjacentHTML("beforeend", (hasPreview ? "" : icon) + `<span>${escapeHtml(name + range)}</span>`);
     tag.title = (chip?.originRelPath || chip?.path || pathStr) + lineNote;
     return tag;
   }
@@ -3025,7 +3139,7 @@
       el.appendChild(bubble);
       contentParent = bubble;
       // 0-based index among visible user bubbles — host maps this to a rewind
-      // prompt_index (skipping the hidden primer). Set after userMsgCount bump.
+      // prompt_index (skipping a hidden primer in legacy sessions). Set after userMsgCount bump.
       if (state.userMsgCount > 0) {
         el.dataset.userBubbleIndex = String(state.userMsgCount - 1);
       }
@@ -3624,6 +3738,9 @@
       if (e.target.closest(".tool-item-details")) return; // selecting text inside must not collapse
       details.hidden = !details.hidden;
       rowEl.classList.toggle("expanded", !details.hidden); // › ↔ v
+      if (!details.hidden) {
+        details.querySelectorAll(".tool-cmd").forEach((pre) => pre._syncOverflowAffordance?.());
+      }
     });
   }
 
@@ -3651,24 +3768,50 @@
     const pre = document.createElement("pre");
     pre.className = className;
     pre.textContent = preview.text;
+    if (className === "tool-cmd") pre.title = fullText;
     container.appendChild(pre);
-    if (!preview.truncated) return;
-    const label = `View all (${preview.lineCount} lines) →`;
-    const viewAll = IS_REMOTE
-      ? makeInlineExpandToggle(label, "msg-collapse-btn command-view-all", (expanding) => {
-          pre.textContent = expanding ? fullText : preview.text;
-        })
-      : document.createElement("button");
-    if (!IS_REMOTE) {
-      viewAll.type = "button";
-      viewAll.className = "preview-link command-view-all";
-      viewAll.textContent = label;
-      viewAll.onclick = (e) => {
-        e.stopPropagation();
-        vscode.postMessage({ type: "openText", content: fullText, language });
-      };
+    const label = preview.truncated ? `View all (${preview.lineCount} lines) →` : "View all →";
+    let viewAll = null;
+    const ensureViewAll = () => {
+      if (viewAll) return viewAll;
+      viewAll = IS_REMOTE
+        ? makeInlineExpandToggle(label, "msg-collapse-btn command-view-all", (expanding) => {
+            pre.textContent = expanding ? fullText : preview.text;
+            pre.classList.toggle("command-full", expanding);
+          })
+        : document.createElement("button");
+      if (!IS_REMOTE) {
+        viewAll.type = "button";
+        viewAll.className = "preview-link command-view-all";
+        viewAll.textContent = label;
+        viewAll.onclick = (e) => {
+          e.stopPropagation();
+          vscode.postMessage({ type: "openText", content: fullText, language });
+        };
+      }
+      container.appendChild(viewAll);
+      return viewAll;
+    };
+    if (preview.truncated) {
+      ensureViewAll();
+      return;
     }
-    container.appendChild(viewAll);
+    if (className !== "tool-cmd") return;
+
+    const syncOverflowAffordance = () => {
+      const overflowing = pre.clientWidth > 0 && pre.scrollWidth > pre.clientWidth;
+      if (overflowing) ensureViewAll();
+      else if (viewAll && viewAll.getAttribute("aria-expanded") !== "true") {
+        viewAll.remove();
+        viewAll = null;
+      }
+    };
+    pre._syncOverflowAffordance = syncOverflowAffordance;
+    if (typeof ResizeObserver !== "undefined") {
+      const observer = new ResizeObserver(syncOverflowAffordance);
+      observer.observe(pre);
+    }
+    requestAnimationFrame(syncOverflowAffordance);
   }
 
   function attachCommandDetails(item, command, toolCallId) {
@@ -4683,7 +4826,6 @@
 
   function appendThought(text) {
     if (state.suppressReplayTurn) return; // thinking inside the primer turn
-    hidePlanProcessing(); // thought streaming → indicator obsolete
     hideGrokking(); // real content arrived — the Thinking block takes over
     // Traces hidden (the default): stand in with a "Thinking…" row. While
     // replaying a loaded session there's no live reasoning to indicate.
@@ -4730,7 +4872,6 @@
 
   function appendAgent(text) {
     if (state.suppressReplayTurn) return; // grok's response to the primer
-    hidePlanProcessing(); // agent output started — clear the indicator
     hideGrokking(); // real content arrived — the message bubble takes over
     hideThinkingIndicator(); // a real message replaces the "Thinking…" stand-in
     state.activeUserEl = null;
@@ -4767,15 +4908,29 @@
 
   function setRemoteTtsEnabled(enabled) {
     const next = !!enabled;
-    if (state.remoteTts === next) return next;
+    if (state.remoteTts === next && (next || !state.remoteSummarizeRepliesAloud)) return next;
     state.remoteTts = next;
     storeRemotePref(REMOTE_TTS_KEY, state.remoteTts);
-    if (!state.remoteTts && window.speechSynthesis) window.speechSynthesis.cancel();
+    if (!state.remoteTts) {
+      state.remoteSummarizeRepliesAloud = false;
+      storeRemotePref(REMOTE_TTS_SUMMARY_KEY, false);
+      cancelPendingSpeech();
+    }
     window.dispatchEvent(new CustomEvent("grokRemoteTtsChange", {
       detail: { available: ttsAvailable, enabled: state.remoteTts },
     }));
     reportRemotePreferences();
     return state.remoteTts;
+  }
+
+  function setRemoteTtsSummaryEnabled(enabled) {
+    const next = state.remoteTts && !!enabled;
+    if (state.remoteSummarizeRepliesAloud === next) return next;
+    state.remoteSummarizeRepliesAloud = next;
+    storeRemotePref(REMOTE_TTS_SUMMARY_KEY, next);
+    invalidatePendingSpeechSummary();
+    reportRemotePreferences();
+    return next;
   }
 
   function reportRemotePreferences() {
@@ -4784,13 +4939,29 @@
       type: "remotePreferences",
       fontScale: Math.round(state.remoteFontScale * 100),
       readRepliesAloud: state.remoteTts,
+      summarizeRepliesAloud: state.remoteSummarizeRepliesAloud,
       usesTouch: remoteUsesTouchComposer(),
     });
   }
 
-  function cancelPendingSpeech() {
+  function clearPendingSpeechSummary() {
+    if (!pendingSpeechSummary) return;
+    clearTimeout(pendingSpeechSummary.timer);
+    pendingSpeechSummary = null;
+  }
+
+  function invalidatePendingSpeechSummary() {
     speechRequestId += 1;
+    clearPendingSpeechSummary();
+  }
+
+  function cancelPendingSpeech() {
+    invalidatePendingSpeechSummary();
     if (window.speechSynthesis) window.speechSynthesis.cancel();
+  }
+
+  function speakText(text) {
+    window.speechSynthesis.speak(new window.SpeechSynthesisUtterance(text));
   }
 
   function requestSpeech(markdownText) {
@@ -4798,13 +4969,29 @@
     if (!enabled || !ttsAvailable || state.replaying) return;
     const text = spokenTextFromMarkdown(markdownText);
     if (!text) return;
+    clearPendingSpeechSummary();
     const requestId = ++speechRequestId;
     window.speechSynthesis.cancel();
-    if (!IS_REMOTE && state.summarizeRepliesAloud) {
+    const summarize = IS_REMOTE
+      ? state.remoteSummarizeRepliesAloud
+      : state.summarizeRepliesAloud;
+    if (summarize) {
+      const pending = { requestId, text, timer: 0 };
+      pending.timer = setTimeout(() => {
+        if (pendingSpeechSummary !== pending) return;
+        pendingSpeechSummary = null;
+        if (speechRequestId !== requestId) return;
+        const enabledNow = IS_REMOTE ? state.remoteTts : state.readRepliesAloud;
+        const summarizeNow = IS_REMOTE
+          ? state.remoteSummarizeRepliesAloud
+          : state.summarizeRepliesAloud;
+        if (enabledNow && summarizeNow && ttsAvailable) speakText(text);
+      }, SPEECH_SUMMARY_FALLBACK_MS);
+      pendingSpeechSummary = pending;
       vscode.postMessage({ type: "summarizeSpeech", requestId, text });
       return;
     }
-    window.speechSynthesis.speak(new window.SpeechSynthesisUtterance(text));
+    speakText(text);
   }
 
   function speakCompletedTurn() {
@@ -4856,7 +5043,7 @@
 
   // Replayed user prompts (session/load) arrive as user_message_chunk updates.
   // Commit any in-flight agent turn first, then accumulate into one user bubble.
-  function appendUserChunk(text, timestampMs) {
+  function appendUserChunk(text, timestampMs, images) {
     // Replay-only: live user bubbles come from the optimistic `userMessage`
     // post. grok ≥0.2.33 echoes the live prompt back as a user_message_chunk;
     // the host already drops those, but guard here too so a stray live echo
@@ -4914,6 +5101,21 @@
     if (state.skipUserBubble) return; // marker-only verdict: no user bubble
     if (state.suppressReplayTurn) return; // still inside the primer's user message
     state.activeUserRaw += text;
+    const interjection = isInterjectionText(state.activeUserRaw);
+    if (interjection) {
+      const steerEl = state.activeUserEl.closest(".msg");
+      if (steerEl && steerEl.dataset.steer !== "1") {
+        // Classification may need several chunks. Undo the speculative prompt
+        // count once, then advance the independent in-turn coordinate.
+        state.userMsgCount = Math.max(0, state.userMsgCount - 1);
+        state.interjectionCount += 1;
+        steerEl.dataset.steer = "1";
+        refreshUserRewindButtons();
+      }
+    }
+    const displayRaw = interjection
+      ? stripInterjectionEnvelope(state.activeUserRaw)
+      : state.activeUserRaw;
     // The replayed prompt carries the <vscode-context> envelope we sent; strip it
     // back out so the bubble shows the user's own words + filename-only chips (with
     // the full path on hover), matching the live send — not the raw paths inline.
@@ -4923,21 +5125,14 @@
     // the exact leading/trailing shapes we produce, so a look-alike string in the
     // middle of the user's own words stays put. The stripped body is also what
     // the copy button yields: the user's words, not the context plumbing.
-    const parsed = parseAttachmentContext(state.activeUserRaw);
+    const parsed = parseAttachmentContext(displayRaw);
     const selBlocks = parseSelectionBlocks(parsed.body);
     const imageTags = parseImageTags(selBlocks.body);
+    const imagePreviews = new Map(
+      (images || []).map((image) => [image.imageIndex, image]),
+    );
     state.activeUserEl.innerHTML = renderMarkdown(imageTags.body);
     applyAutoDir(state.activeUserEl);
-    // On restore, a steered message comes back wrapped in the CLI's own
-    // interjection envelope. Mark it so it doesn't consume a rewind index — the
-    // live path gets the same mark from `steer` on the userMessage.
-    if (isInterjectionText(state.activeUserRaw)) {
-      const steerEl = state.activeUserEl.closest(".msg");
-      if (steerEl) {
-        steerEl.dataset.steer = "1";
-        refreshUserRewindButtons();
-      }
-    }
     const msgEl = state.activeUserEl.closest(".msg");
     if (msgEl) msgEl._copyText = imageTags.body;
     const chipTags = [
@@ -4945,7 +5140,12 @@
       ...selBlocks.selections.map((s) =>
         makeMsgChipTag(s.path, { selectionStart: s.start, selectionEnd: s.end })),
       ...imageTags.images.map((im) =>
-        makeMsgChipTag(`Image #${im.index}`, { imageIndex: im.index, path: im.path })),
+        makeMsgChipTag(`Image #${im.index}`, {
+          imageIndex: im.index,
+          path: im.path || imagePreviews.get(im.index)?.path,
+          previewSrc: imagePreviews.get(im.index)?.previewSrc,
+          fullId: imagePreviews.get(im.index)?.fullId,
+        })),
     ];
     if (chipTags.length) {
       const chipsRow = document.createElement("div");
@@ -4959,10 +5159,43 @@
   // Render and dequeue every saved plan whose `afterUserMessage` <= cutoff.
   // Plans without a saved position never drain here — they fall out at the end
   // of replay when we flush the rest of the queue.
+  function normalizePlanHistory(plans) {
+    let promptPosition;
+    let promptOrdinal = 0;
+    let inferredInterjections = 0;
+    return (plans || []).map((plan) => {
+      if (typeof plan.afterUserMessage !== "number") return plan;
+      if (plan.afterUserMessage !== promptPosition) {
+        if (promptPosition !== undefined) {
+          inferredInterjections += Math.max(0, promptOrdinal - 1);
+        }
+        promptPosition = plan.afterUserMessage;
+        promptOrdinal = 0;
+      }
+      if (typeof plan.afterInterjection === "number") {
+        inferredInterjections = Math.max(inferredInterjections, plan.afterInterjection);
+        promptOrdinal += 1;
+        return plan;
+      }
+      // Old entries retain chronological array order. Use it as the best
+      // possible in-prompt ordinal instead of bunching equal coordinates.
+      const afterInterjection = inferredInterjections + promptOrdinal;
+      promptOrdinal += 1;
+      return { ...plan, afterInterjection };
+    });
+  }
+
   function drainPlanHistory(cutoff) {
     if (!state.planHistoryQueue.length) return;
     state.planHistoryQueue = state.planHistoryQueue.filter((p) => {
-      if (typeof p.afterUserMessage === "number" && p.afterUserMessage <= cutoff) {
+      const reached = typeof p.afterUserMessage === "number" && (
+        p.afterUserMessage < cutoff ||
+        (p.afterUserMessage === cutoff && (
+          typeof p.afterInterjection !== "number" ||
+          p.afterInterjection <= state.interjectionCount
+        ))
+      );
+      if (reached) {
         addPlanHistoryCard(p.text, p.verdict, p.planPath, p.planName);
         return false;
       }
@@ -5024,35 +5257,13 @@
     state.permissionHistoryQueue = [];
   }
 
-  function showPlanProcessing() {
-    hidePlanProcessing(); // dedupe
-    hideGrokking(); // one waiting indicator at a time
-    hideThinkingIndicator();
-    clearWelcome();
-    const el = document.createElement("div");
-    el.className = "plan-processing";
-    el.innerHTML = '<span class="plan-processing-dots"><span></span><span></span><span></span></span>';
-    el.setAttribute("aria-label", "Grok is processing");
-    messagesEl.appendChild(el);
-    state.planProcessingEl = el;
-    scrollToBottom();
-  }
-
-  function hidePlanProcessing() {
-    if (state.planProcessingEl && state.planProcessingEl.parentElement) {
-      state.planProcessingEl.parentElement.removeChild(state.planProcessingEl);
-    }
-    state.planProcessingEl = null;
-  }
-
   // "Grokking…" — the generic waiting indicator shown on every user-initiated
   // turn from agentStart until grok produces its first content (thought /
   // message / tool / card), which removes it and renders in its place. Mirrors
   // the Thinking header's look (loading-dots ellipsis, same muted font) without
-  // the chevron, and is not expandable. Mutually exclusive with planProcessing.
+  // the chevron, and is not expandable.
   function showGrokking() {
     hideGrokking(); // dedupe
-    hidePlanProcessing(); // one waiting indicator at a time
     hideThinkingIndicator();
     clearWelcome();
     const el = document.createElement("div");
@@ -5084,7 +5295,6 @@
     if (state.thinkingIndicatorEl) return; // already up — keep it stable
     if (state.activeToolGroupEl) return; // a running tool already indicates work
     hideGrokking();
-    hidePlanProcessing();
     clearWelcome();
     const el = document.createElement("div");
     el.className = "thinking-indicator";
@@ -5119,7 +5329,6 @@
     return !!(
       state.grokkingEl ||
       state.thinkingIndicatorEl ||
-      state.planProcessingEl ||
       state.activeToolGroupEl ||
       (state.activeAgentEl && (state.activeAgentRaw || "").trim()) ||
       (state.showThinking && state.activeThoughtEl) ||
@@ -5177,6 +5386,25 @@
     lastScrollportHeight = h;
     if (state.stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
   }).observe(messagesEl);
+
+  // The scrollport's own border-box does not resize when content inside an
+  // expanded tool detail grows, so ResizeObserver above cannot see that case.
+  // Re-follow after subtree layout changes only when the reader was already
+  // pinned; a deliberate scroll-up has cleared stickToBottom and is untouched.
+  let contentFollowFrame = 0;
+  new MutationObserver(() => {
+    if (!state.stickToBottom || contentFollowFrame) return;
+    contentFollowFrame = requestAnimationFrame(() => {
+      contentFollowFrame = 0;
+      if (state.stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+  }).observe(messagesEl, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ["hidden", "class", "style"],
+  });
 
   // While a click-triggered smooth scroll is animating, the intermediate scroll
   // events would briefly re-show the button; suppress recompute until we land.
@@ -5281,6 +5509,27 @@
     wirePermissionKeys(actions, buttons);
     el.appendChild(actions);
     return { buttons, defaultIndex };
+  }
+
+  // A single replay-stable coordinate shared by plan cards, permission cards,
+  // and usage records. Drain before advancing so a verdict that released the
+  // agent appears immediately before the first implementation update.
+  function advanceHistoryEvent() {
+    state.planHistoryQueue = state.planHistoryQueue.filter((p) => {
+      if (typeof p.afterHistoryEvent === "number" && p.afterHistoryEvent <= state.historyEventCount) {
+        addPlanHistoryCard(p.text, p.verdict, p.planPath, p.planName);
+        return false;
+      }
+      return true;
+    });
+    state.permissionHistoryQueue = state.permissionHistoryQueue.filter((p) => {
+      if (!p.toolCallId && typeof p.afterHistoryEvent === "number" && p.afterHistoryEvent <= state.historyEventCount) {
+        addRestoredPermissionCard(p.title, p.outcome);
+        return false;
+      }
+      return true;
+    });
+    state.historyEventCount += 1;
   }
 
   function updatePermissionOptions(requestId, options) {
@@ -5779,8 +6028,8 @@
   // label. A resolved plan drops its inline text entirely — the plan-file
   // link IS the plan (opens as an editor tab); the Show/Hide toggle survives
   // only as the no-file fallback so the text stays reachable. Shared by the
-  // live button click and the buffered `planResolved` replay (re-focus), so a
-  // resolved card can never come back actionable.
+  // live click and buffered `planResolved` replay (re-focus), so a resolved
+  // card can never come back actionable.
   function resolvePlanCardEl(el, verdict) {
     el.classList.add("resolved");
     const actions = el.querySelector(".card-actions");
@@ -5856,7 +6105,6 @@
           verdict,
           ...(comment ? { comment } : {}),
         });
-        // (The comment, if any, lands as its own user bubble below.)
         resolvePlanCardEl(el, verdict);
       };
       return b;
@@ -5875,6 +6123,9 @@
   // and the verdict the user gave it (persisted in globalState).
   function addPlanHistoryCard(text, verdict, planPath, planName) {
     clearWelcome();
+    // A native verdict can sit inside one agent turn. Finalize the plan-drafting
+    // bubble so the implementation chunk after this card starts a new bubble.
+    commitAgentTurn();
     const el = document.createElement("div");
     el.className = "card plan plan-history";
     const title = document.createElement("div");
@@ -5922,9 +6173,102 @@
 
   // ---------- chips ----------
 
+  /** Toggle the "rendering the full size" disc over the open preview.
+   *  The timeout is not decoration: an unrecognised handle is answered with
+   *  SILENCE on purpose, so that probing reveals nothing about what is on disk —
+   *  which means a spinner waiting on one would turn forever. */
+  function setImagePreviewLoading(active) {
+    if (state.imageFullTimer) {
+      clearTimeout(state.imageFullTimer);
+      state.imageFullTimer = null;
+    }
+    const spinner = document.querySelector(".image-preview-spinner");
+    if (spinner) spinner.hidden = !active;
+    if (!active) return;
+    state.imageFullTimer = setTimeout(() => {
+      const late = document.querySelector(".image-preview-spinner");
+      if (late) late.hidden = true;
+      state.pendingImageFullId = null;
+      state.imageFullTimer = null;
+    }, 20000);
+  }
+
+  function openImagePreview(src, label, fullId) {
+    if (!src) return;
+    let overlay = document.querySelector(".image-preview-overlay");
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.className = "image-preview-overlay";
+      overlay.hidden = true;
+      overlay.innerHTML = `<button type="button" class="image-preview-close" aria-label="Close image preview">&times;</button><img>`
+        + `<div class="image-preview-spinner" role="status" aria-label="Loading full-size image" hidden>${ICON.spinner}</div>`;
+      const close = () => {
+        overlay.hidden = true;
+        // Whatever was in flight is for a picture nobody is looking at now.
+        setImagePreviewLoading(false);
+        state.pendingImageFullId = null;
+      };
+      overlay.onclick = (e) => { if (e.target === overlay) close(); };
+      overlay.querySelector(".image-preview-close").onclick = close;
+      document.body.appendChild(overlay);
+    }
+    const img = overlay.querySelector("img");
+    img.src = src;
+    img.alt = label || "Attached image";
+    overlay.hidden = false;
+    overlay.querySelector(".image-preview-close").focus();
+
+    // A remote only ever holds a 320px thumbnail, so enlarging it shows a blurry
+    // copy of what was already on screen. Ask the host for a real render and
+    // swap it in when it lands — the thumbnail stays up meanwhile, so a slow or
+    // unanswered request degrades to exactly the old behaviour.
+    state.pendingImageFullId = null;
+    setImagePreviewLoading(false);
+    if (IS_REMOTE && fullId) {
+      state.pendingImageFullId = fullId;
+      setImagePreviewLoading(true);
+      vscode.postMessage({ type: "requestImageFull", fullId });
+    }
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    const overlay = document.querySelector(".image-preview-overlay");
+    if (overlay && !overlay.hidden) overlay.hidden = true;
+  });
+
+  function previewCacheForCurrentSession() {
+    return state.imagePreviews;
+  }
+
+  function rememberImagePreview(previewId, previewSrc) {
+    if (typeof previewId !== "string" || typeof previewSrc !== "string") return false;
+    const previews = previewCacheForCurrentSession();
+    previews.set(previewId, previewSrc);
+    while (previews.size > 24) {
+      const oldest = previews.keys().next().value;
+      if (oldest === undefined) break;
+      previews.delete(oldest);
+    }
+    return true;
+  }
+
+  if (IS_REMOTE) {
+    // The relay registers its decoded/uploaded preview before sending the host
+    // frame. Generate the id here so it uses the same opaque-token contract as
+    // the rest of the remote UI, while keeping imagePreviews private to chat.js.
+    window.grokRegisterRemoteImagePreview = (previewSrc) => {
+      if (typeof previewSrc !== "string" || !previewSrc.startsWith("data:image/")) return null;
+      const previewId = newRemoteTabToken();
+      if (!previewId || !/^[A-Za-z0-9_-]{20,128}$/.test(previewId)) return null;
+      return rememberImagePreview(previewId, previewSrc) ? previewId : null;
+    };
+  }
+
   function renderChips() {
     chipsEl.innerHTML = "";
     attachmentsEl.innerHTML = "";
+    const imagePreviews = previewCacheForCurrentSession();
     for (const chip of state.chips) {
       // Split on both separators — a file outside the workspace has an absolute
       // relPath (Windows backslashes), so split("/") alone would show the whole
@@ -5956,7 +6300,21 @@
         // For a disk-imported image the interesting path is the ORIGINAL file,
         // not the staged copy the chip's path points at.
         el.title = (chip.originRelPath || chip.path) + rangeTitle;
-        el.innerHTML = chip.imageIndex != null ? ICON.image : ICON.file;
+        const previewSrc = chip.previewSrc || (chip.previewId && imagePreviews.get(chip.previewId));
+        if (chip.imageIndex != null && previewSrc) {
+          const preview = document.createElement("button");
+          preview.type = "button";
+          preview.className = "attachment-preview";
+          preview.title = `Preview ${label}`;
+          const img = document.createElement("img");
+          img.src = previewSrc;
+          img.alt = "";
+          preview.appendChild(img);
+          preview.onclick = () => openImagePreview(previewSrc, label, chip.fullId);
+          el.appendChild(preview);
+        } else {
+          el.innerHTML = chip.imageIndex != null ? ICON.image : ICON.file;
+        }
         const span = document.createElement("span");
         span.textContent = label;
         el.appendChild(span);
@@ -5965,7 +6323,11 @@
         rm.className = "attachment-remove";
         rm.title = "Remove";
         rm.textContent = "×";
-        rm.onclick = () => vscode.postMessage({ type: "removeChip", id: chip.id });
+        rm.onclick = (e) => {
+          e.stopPropagation();
+          if (chip.previewId) imagePreviews.delete(chip.previewId);
+          vscode.postMessage({ type: "removeChip", id: chip.id });
+        };
         el.appendChild(rm);
         attachmentsEl.appendChild(el);
         continue;
@@ -6129,7 +6491,11 @@
     // locked, where a setMode would throw "no session"; that flag always clears.
     modeBtn.disabled = state.busyLocked;
     modeBtn.classList.toggle("disabled", state.busyLocked);
-    modeBtn.title = state.busyLocked ? "Mode — available once the session is ready" : "Pick mode";
+    modeBtn.title = state.busyLocked
+      ? "Mode — available once the session is ready"
+      : state.planModeAvailable
+        ? "Pick mode"
+        : `Pick mode — ${state.planModeUnavailableReason}`;
     updateSandboxBtn();
     if (!state.busy) {
       sendBtn.innerHTML = ICON.arrowUp;
@@ -6158,6 +6524,7 @@
   function queueFromComposer() {
     const t = input.value.trim();
     if (!t) return false;
+    stopVoiceForManualSend();
     queueOutgoing(t);
     input.value = "";
     renderInputHighlight(); // also flips the busy button back to Stop (empty composer)
@@ -6242,6 +6609,7 @@
     // Sendable = typed text or any visible chip (file or image alike — image
     // chips render as remove-only attachment rows, so they're never hidden).
     if (!text && state.chips.every((c) => c.hidden)) return;
+    stopVoiceForManualSend();
     state.busy = true;
     updateSendButton();
     state.activeAgentEl = null;
@@ -6325,13 +6693,15 @@
       return;
     }
     if (state.mic === "idle") {
+      // The host is the authority on whether voice is configured, but the
+      // anchors must be captured before every start request it receives.
+      captureVoiceInsertion();
+      state.voiceLive = false;
+      state.voiceDiscarded = false;
       // Skip the optimistic "listening" flash when we know no key is set — the
       // host will pop the setup guidance instead of recording. Still send
       // voiceStart so the host (the authority on the key) makes the call.
       if (state.voiceConfigured) {
-        // Remember what's already typed; live partials replace only the tail.
-        state.voiceBase = input.value;
-        state.voiceLive = false;
         setMic("start");
       }
       vscode.postMessage({ type: "voiceStart" });
@@ -6424,7 +6794,9 @@
     if (!state.voiceConfigured || remoteMic || remoteMicStart || state.mic !== "idle") return;
     const attempt = { cancelled: false };
     remoteMicStart = attempt;
-    state.voiceBase = input.value;
+    captureVoiceInsertion();
+    state.voiceLive = false;
+    state.voiceDiscarded = false;
     setMic("start");
     let stream;
     let context;
@@ -6497,6 +6869,25 @@
     }
   }
 
+  // Manual Send/Queue means "send exactly what is visible now". It cancels
+  // capture and blocks in-flight voice results from repopulating the cleared
+  // composer. The mic button's stop path deliberately does not use this.
+  function stopVoiceForManualSend() {
+    if (state.mic === "idle") return;
+    state.mic = "idle";
+    clearVoiceInsertion();
+    state.voiceLive = false;
+    state.voiceDiscarded = true;
+    if (IS_REMOTE) {
+      if (remoteMicStart) remoteMicStart.cancelled = true;
+      if (remoteMic) stopBrowserMic(true);
+      else if (remoteMicStart) remoteMicStart = null;
+    } else {
+      vscode.postMessage({ type: "voiceStop", discard: true });
+    }
+    renderMic();
+  }
+
   function finishBrowserMicStop(mic) {
     if (remoteMic !== mic) return;
     if (mic.flushTimer) clearTimeout(mic.flushTimer);
@@ -6538,13 +6929,48 @@
     renderInputHighlight();
   }
 
-  // base + live transcript, with a separating space unless base already ends in
-  // whitespace (or the tail is empty). Used for streaming partials/final.
-  function composeVoiceTail(base, text) {
+  function captureVoiceInsertion() {
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? start;
+    state.voiceBefore = input.value.slice(0, start);
+    state.voiceAfter = input.value.slice(end);
+    state.voiceInsertionActive = true;
+  }
+
+  function clearVoiceInsertion() {
+    const wasActive = state.voiceInsertionActive;
+    state.voiceBefore = "";
+    state.voiceAfter = "";
+    state.voiceInsertionActive = false;
+    // Repaint: dictation is over, so the words stop being provisional and lose
+    // their tint. Callers finalise by rendering FIRST and clearing after, so
+    // without this the mark survives until the next keystroke.
+    if (wasActive && inputHighlight) renderInputHighlight();
+  }
+
+  // Insert between the text surrounding the selection captured at start. The
+  // caret stays just after the dictated text, before the preserved suffix.
+  function composeVoiceInsertion(before, text, after) {
     const t = text || "";
-    if (!base) return t;
-    if (!t || /\s$/.test(base)) return base + t;
-    return base + " " + t;
+    if (!t) return { value: before + after, caret: before.length };
+    const left = before && !/\s$/.test(before) && !/^\s/.test(t) ? " " : "";
+    const right = after && !/\s$/.test(t) && !/^\s/.test(after) &&
+      !/^[.,!?;:)\]}]/.test(after) ? " " : "";
+    return {
+      value: before + left + t + right + after,
+      caret: before.length + left.length + t.length,
+    };
+  }
+
+  function renderVoiceInsertion(text, focus = false) {
+    if (!state.voiceInsertionActive) captureVoiceInsertion();
+    const result = composeVoiceInsertion(state.voiceBefore, text, state.voiceAfter);
+    input.value = result.value;
+    input.setSelectionRange(result.caret, result.caret);
+    if (focus) input.focus();
+    updateSlash();
+    updateMention();
+    renderInputHighlight();
   }
 
   // Mirror the composer text onto the backdrop, wrapping a trailing send command
@@ -6574,13 +7000,36 @@
     autosizeInput();
     if (!inputHighlight) return;
     const text = input.value;
+
+    // Two things get marked, and they are not the same kind of thing. The words
+    // being dictated are PROVISIONAL — each partial replaces them — so they take
+    // a tint that says "this part is still moving". A trailing send phrase is a
+    // COMMAND about to fire, so it takes solid fill: louder than the text beside
+    // it, because acting on it is irreversible.
     const range = trailingSendPhrase(text, state.voiceSendPhrase);
-    if (!range) {
+    const cmdStart = range ? range.index : text.length;
+    // The dictated span lies between the anchors captured at mic start. Clamped,
+    // because the composer stays editable while dictation runs.
+    const liveStart = state.voiceInsertionActive
+      ? Math.min(state.voiceBefore.length, text.length)
+      : text.length;
+    const liveEnd = state.voiceInsertionActive
+      ? Math.max(liveStart, text.length - state.voiceAfter.length)
+      : text.length;
+    // The command wins where they overlap: it always sits at the tail, and the
+    // dictation that produced it must not out-shout it.
+    const liveEndVisible = Math.min(liveEnd, cmdStart);
+
+    if (!range && liveStart >= liveEnd) {
       inputHighlight.textContent = "";
     } else {
-      const before = text.slice(0, range.index);
-      const cmd = text.slice(range.index, range.index + range.length);
-      inputHighlight.innerHTML = escapeHtml(before) + '<span class="cmd-token">' + escapeHtml(cmd) + "</span>";
+      const span = (cls, s) => (s ? '<span class="' + cls + '">' + escapeHtml(s) + "</span>" : "");
+      inputHighlight.innerHTML =
+        escapeHtml(text.slice(0, liveStart)) +
+        span("voice-token", text.slice(liveStart, liveEndVisible)) +
+        escapeHtml(text.slice(Math.max(liveStart, liveEndVisible), cmdStart)) +
+        span("cmd-token", range ? text.slice(range.index, range.index + range.length) : "") +
+        escapeHtml(range ? text.slice(range.index + range.length) : "");
     }
     inputHighlight.scrollTop = input.scrollTop;
     inputHighlight.scrollLeft = input.scrollLeft;
@@ -6759,8 +7208,7 @@
     "subagentUpdate",
   ]);
 
-  window.addEventListener("message", (e) => {
-    const msg = e.data;
+  function handleHostMessage(msg) {
     switch (msg.type) {
       case "initialState":
         state.useCtrlEnter = msg.useCtrlEnter;
@@ -6784,6 +7232,13 @@
         }
         applyThinkingVisibility();
         updateSandboxBtn();
+        break;
+      case "planModeAvailability":
+        state.planModeAvailable = msg.available !== false;
+        state.planModeUnavailableReason = state.planModeAvailable
+          ? ""
+          : String(msg.reason || "Plan mode is unavailable.");
+        updateSendButton();
         break;
       case "remoteStatus":
         state.remoteLinked = !!msg.linked;
@@ -6833,20 +7288,24 @@
         if (!IS_REMOTE && !state.readRepliesAloud && msg.value) {
           vscode.postMessage({ type: "setSummarizeRepliesAloud", value: false });
         }
-        speechRequestId += 1;
+        invalidatePendingSpeechSummary();
         if (state.gearView === "config") renderConfigDebugPanel();
         break;
-      case "speechSummary":
+      case "speechSummary": {
+        const pending = pendingSpeechSummary;
         if (
-          !IS_REMOTE &&
+          pending &&
+          pending.requestId === msg.requestId &&
           msg.requestId === speechRequestId &&
-          state.readRepliesAloud &&
-          ttsAvailable &&
-          msg.text
+          (IS_REMOTE ? state.remoteTts : state.readRepliesAloud) &&
+          (IS_REMOTE ? state.remoteSummarizeRepliesAloud : state.summarizeRepliesAloud) &&
+          ttsAvailable
         ) {
-          window.speechSynthesis.speak(new window.SpeechSynthesisUtterance(msg.text));
+          clearPendingSpeechSummary();
+          speakText(msg.text || pending.text);
         }
         break;
+      }
       case "showThinking":
         // Live toggle (grok.showThinking). Initial value also arrives via
         // initialState + is baked into the <body class> by the host to avoid a flash.
@@ -6911,9 +7370,14 @@
         state.activeThoughtEl = null;
         state.activeToolGroupEl = null;
         state.turnAgentActionsEl = null;
+        // The host has just rebuilt the aggregate from the surviving ledger.
+        // No completed-turn figure survives a rewind; when the whole transcript
+        // is gone, neither does the session aggregate.
+        state.lastTurnUsage = null;
+        if (msg.surviving === 0) state.sessionUsage = null;
+        if (!contextPopover.hidden) openContextPopover();
         hideGrokking();
         hideThinkingIndicator();
-        hidePlanProcessing();
         // The newest surviving agent message ends a finished turn, so its
         // copy/timestamp footer belongs visible.
         const agents = messagesEl.querySelectorAll(".msg.agent .msg-actions");
@@ -6953,24 +7417,20 @@
         if (!gearPopover.hidden && state.gearView === "about") renderAboutPanel(false);
         break;
       case "initialized": {
-        // The ACP handshake is done, but grok isn't ready for the user until the
-        // hidden primer turn lands. Stash the version and keep showing "starting…";
-        // the line flips to "connected · v…" only when the spinner hides (the
-        // setBusy:false at the end of priming). See the setBusy handler.
+        // The ACP handshake is done, but session/new or session/load may still be
+        // running. Keep showing Starting until the startup lock clears.
         state.cliVersion = msg.info.version || "";
         state.startingPhase = true;
-        const verEl = $("welcome-version");
-        if (verEl) { verEl.classList.add("loading-dots"); verEl.textContent = "Starting"; }
+        setWelcomeStatus("Starting", true);
         const onb = $("welcome-onboarding");
         if (onb) onb.innerHTML = "";
         break;
       }
       case "cliUpdating": {
         // One-time hint while the silent `grok update` runs before the session
-        // spawns; overwritten by "starting…" once grok connects, then
-        // "connected · v<new version>" once the primer finishes.
-        const verEl = $("welcome-version");
-        if (verEl) { verEl.classList.add("loading-dots"); verEl.textContent = "Updating Grok Build CLI"; }
+        // spawns; overwritten by Starting once grok connects, then Connected
+        // once session startup finishes.
+        setWelcomeStatus("Updating Grok Build CLI", true);
         break;
       }
       case "session": {
@@ -7027,6 +7487,7 @@
       case "voiceState":
         // Host confirms a transition (e.g. recording actually started). Only
         // accept the known states; ignore anything unexpected.
+        if (state.voiceDiscarded && msg.status !== "idle") break;
         if (msg.status === "listening" || msg.status === "transcribing") {
           state.mic = msg.status;
           if (IS_REMOTE && msg.status === "listening" && remoteMic && !remoteMic.ready) {
@@ -7041,6 +7502,7 @@
           // live flag and any queued messages too, not just the button.
           state.mic = "idle";
           state.voiceLive = false;
+          clearVoiceInsertion();
           if (IS_REMOTE) cleanupRemoteMic();
           renderMic();
         }
@@ -7052,22 +7514,29 @@
         renderInputHighlight();
         break;
       case "voicePartial":
-        // Live streaming update: replace the tail after the pre-dictation base.
+        if (state.voiceDiscarded) break;
+        // Live streaming update: replace only the dictated text at the captured
+        // insertion point. Passive remote tabs do not own the capture.
         // Same-repo passive tabs receive the shared partial too, but their
         // independently typed composer must remain untouched.
         if (!IS_REMOTE || remoteMic) {
           state.voiceLive = true;
-          input.value = composeVoiceTail(state.voiceBase, msg.text || "");
-          renderInputHighlight();
+          renderVoiceInsertion(msg.text || "");
         }
         break;
       case "voiceSubmit": {
+        if (state.voiceDiscarded) break;
         // The webview is the submission boundary for local and remote voice.
         // In AFK Pilot this makes the spoken prompt cross the relay as the same
         // send/queueSend frame as typed input, so relay metering and busy-turn
         // queueing apply before the host can prompt the agent.
-        const t = composeVoiceTail(state.voiceBase, msg.text || "").trim();
-        state.voiceBase = "";
+        const composed = state.voiceInsertionActive
+          ? composeVoiceInsertion(state.voiceBefore, msg.text || "", state.voiceAfter).value
+          : (msg.text || "");
+        const t = composed.trim();
+        state.voiceBefore = "";
+        state.voiceAfter = "";
+        state.voiceInsertionActive = true;
         state.voiceLive = false;
         input.value = "";
         renderInputHighlight();
@@ -7078,17 +7547,16 @@
         break;
       }
       case "voiceTranscript":
-        // Final result. Streaming replaces the live tail; batch appends.
-        if (state.voiceLive) {
-          input.value = composeVoiceTail(state.voiceBase, (msg.text || "").trim());
-          input.focus();
-          updateSlash();
-          updateMention();
-          renderInputHighlight();
+        if (state.voiceDiscarded) break;
+        // Final result. Streaming and started dictation replace the captured
+        // insertion; unsolicited transcripts retain append behavior.
+        if (state.voiceLive || state.voiceInsertionActive) {
+          renderVoiceInsertion((msg.text || "").trim(), true);
         } else {
           insertTranscript(msg.text);
         }
         state.voiceLive = false;
+        clearVoiceInsertion();
         if (IS_REMOTE) cleanupRemoteMic();
         setMic("transcript");
         // "grok send" detected: submit hands-free — but only when idle, so it
@@ -7098,6 +7566,7 @@
       case "voiceError":
         // Setup/record/transcribe failed (the host already showed the reason).
         state.voiceLive = false;
+        clearVoiceInsertion();
         if (IS_REMOTE) cleanupRemoteMic();
         setMic("error");
         break;
@@ -7144,23 +7613,22 @@
           state.rejectedSubmissionText = "";
           renderQueuedBlocks();
         }
-        // Live send (or immediate verdict-feedback bubble): render and bump the
-        // counter so any plan history queued for this position drains first.
-        drainPlanHistory(state.userMsgCount);
-        drainPermissionHistory(state.userMsgCount);
-        state.userMsgCount += 1;
+        // A steer/interjection is part of the already-running turn: it renders
+        // as a bubble but never advances the prompt counter or drains cards at
+        // a new prompt boundary. Real sends do both.
+        if (msg.steer) {
+          drainPlanHistory(state.userMsgCount);
+          state.interjectionCount += 1;
+        } else {
+          drainPlanHistory(state.userMsgCount);
+          drainPermissionHistory(state.userMsgCount);
+          state.userMsgCount += 1;
+        }
         addMessage("user", msg.text, msg.chips || [], { steer: msg.steer });
         forceScrollToBottom(); // jump back to the bottom on the user's own send (#16)
-        // If the indicator is showing and a NEW (live-send) user message comes
-        // in, hide it. (When the host posts a userMessage as part of the verdict
-        // flow, it then immediately posts planProcessing, which re-shows it
-        // after we hide here — the net effect is correct: indicator below.)
-        hidePlanProcessing();
         break;
       case "agentStart":
-        // A user-initiated turn just began (live send, or a plan-verdict
-        // follow-up). Show "Grokking…" until the first real content replaces it.
-        // The silent primer never emits agentStart, so it never shows here.
+        // A user-initiated turn began. Show Grokking until content replaces it.
         state.turnAgentActionsEl = null; // new turn → previous turn keeps its footer
         state.ttsTurnText = "";
         showGrokking();
@@ -7177,21 +7645,38 @@
         updateSendButton();
         break;
       case "thoughtChunk":
+        advanceHistoryEvent();
         appendThought(msg.text);
         break;
       case "messageChunk":
+        advanceHistoryEvent();
         appendAgent(msg.text);
         break;
       case "media":
         addGeneratedMedia(msg);
         break;
       case "userMessageChunk":
-        appendUserChunk(msg.text, msg.timestampMs);
+        appendUserChunk(msg.text, msg.timestampMs, msg.images);
         break;
+      case "imageFull": {
+        // Ignore an answer for a picture the overlay has moved on from, so a
+        // slow reply cannot replace whatever the user is looking at now.
+        if (state.pendingImageFullId !== msg.fullId) break;
+        const overlay = document.querySelector(".image-preview-overlay");
+        // A missing src means the source is gone (swept, or deleted). Stop the
+        // spinner either way — the thumbnail already on screen is the answer.
+        if (msg.src && overlay && !overlay.hidden) overlay.querySelector("img").src = msg.src;
+        setImagePreviewLoading(false);
+        state.pendingImageFullId = null;
+        break;
+      }
       case "historyReplay":
         if (msg.active) {
           if (state.replayDepth === 0) {
             state.suppressReplayTurn = false; // fresh outer replay starts unsuppressed
+            state.repoSwitchPending = true;
+            setConversationLoading(true);
+            renderRepoChip();
           }
           state.replayDepth += 1;
           state.replaying = true;
@@ -7202,6 +7687,9 @@
           state.replayDepth -= 1;
           if (state.replayDepth > 0) break;
           state.replaying = false;
+          state.repoSwitchPending = false;
+          setConversationLoading(false);
+          renderRepoChip();
           // A remote snapshot can end while its latest turn is still running.
           // Seed the already-rendered prefix only in that case, so the eventual
           // live agentEnd speaks the complete reply. Finished buffered turns
@@ -7226,6 +7714,9 @@
           revealTurnFooter();
         }
         break;
+      case "historyBatch":
+        for (const nested of msg.messages || []) handleHostMessage(nested);
+        break;
       case "permissionHistoryQueue":
         // Answered permission cards from the resumed session, interleaved inline
         // exactly like the plan queue. Does NOT reset userMsgCount — planHistoryQueue
@@ -7235,13 +7726,13 @@
       case "planHistoryQueue":
         // Sent by the host right before replay starts. Drives inline placement
         // of historical plan cards from appendUserChunk / live userMessage.
-        state.planHistoryQueue = (msg.plans || []).slice();
+        state.planHistoryQueue = normalizePlanHistory(msg.plans);
         state.userMsgCount = 0;
-        break;
-      case "planProcessing":
-        showPlanProcessing();
+        state.interjectionCount = 0;
+        state.historyEventCount = 0;
         break;
       case "toolCall":
+        advanceHistoryEvent();
         if (state.suppressReplayTurn) break; // tool calls inside the primer turn (unlikely but defensive)
         if (isQuestionTool(msg.call)) {
           // No generic tool chip — the question card stands in for it.
@@ -7278,6 +7769,7 @@
         renderRestoredPermissionForTool(msg.call.toolCallId, msg.call.title);
         break;
       case "toolCallUpdate": {
+        advanceHistoryEvent();
         if (state.suppressReplayTurn) break;
         // Resume: anchor a restored permission card here — the update carries the
         // tool's real title (the tool_call is often a generic "Shell"/"Grep"), so
@@ -7470,16 +7962,12 @@
         break;
       case "promptComplete":
         // Finalize the Thinking block and update the token donut — but DO NOT
-        // clear busy here. agentEnd is now the single authoritative "user can
-        // send again" signal, so that the verdict → afterTurn flow can keep
-        // busy=true across two consecutive client.prompt() calls (the original
-        // turn ends emitting promptComplete; afterTurn's follow-up turn then
-        // runs and emits its own agentEnd at the end, which clears busy).
+        // clear busy here. agentEnd is the authoritative "user can send again"
+        // signal for the host-owned prompt lifecycle.
         commitAgentTurn();
         // Deliberately NOT revealTurnFooter(): promptComplete ends one
         // client.prompt(), not necessarily the TURN. More tool calls and text
-        // routinely follow (and a plan verdict runs a second prompt entirely),
-        // so revealing here put a copy/timestamp footer mid-conversation that
+        // routinely follow, so revealing here put a footer mid-conversation that
         // then had content rendered below it — a footer that flickers in and
         // leaves a gap. agentEnd/agentError are the authoritative turn end and
         // already reveal it; the same signal that clears busy should be the one
@@ -7544,7 +8032,6 @@
       }
       case "agentReset": {
         stopProcessingCue();
-        hidePlanProcessing(); // turn is being reset, indicator no longer applies
         hideGrokking();
         hideThinkingIndicator();
         // Drop the in-flight agent bubble entirely. Used when the host wants to
@@ -7569,7 +8056,6 @@
         stopProcessingCue();
         hideGrokking(); // turn ended (possibly before any content)
         hideThinkingIndicator();
-        hidePlanProcessing();
         revealTurnFooter();
         addError(msg.text);
         state.busy = false;
@@ -7585,7 +8071,6 @@
         // A turn that ends with NO content (grok's [Plan cancelled] ack can be
         // empty) would otherwise orphan the dots forever — content-based
         // clearing never fires.
-        hidePlanProcessing();
         revealTurnFooter();
         state.busy = false;
         updateSendButton();
@@ -7595,7 +8080,6 @@
       case "exit":
         stopProcessingCue();
         hideGrokking();
-        hidePlanProcessing();
         addError(`Grok exited (code ${msg.code}). Send a message to restart this session, or start a new one.`);
         state.busy = false;
         state.busyLocked = false; // a dead process ends any startup lock too
@@ -7659,21 +8143,18 @@
         // CLI work.
         state.busy = !!msg.value;
         state.busyLocked = !!msg.locked;
+        if (!state.busy && !state.replaying) {
+          state.repoSwitchPending = false;
+          renderRepoChip();
+        }
         updateSendButton();
         if (!state.busy) {
-          // (Anything type-ahead-queued during the startup window is flushed by
-          // the HOST once the primer acks — nothing to do here.)
-          // Priming just finished: the first hidden message was sent and processed,
-          // so grok is finally ready. Reveal the version now — not at "initialized",
-          // which fires while the primer is still in flight (spinner still up).
+          // Anything typed during startup is flushed by the host. Reveal the
+          // version only now; initialized fires before session startup finishes.
           if (state.startingPhase) {
             state.startingPhase = false;
-            const verEl = $("welcome-version");
-            if (verEl) {
-              const ver = state.cliVersion ? ` · v${state.cliVersion}` : "";
-              verEl.classList.remove("loading-dots"); // settled — no animated dots
-              verEl.textContent = `Connected${ver}`;
-            }
+            const ver = state.cliVersion ? ` · v${state.cliVersion}` : "";
+            setWelcomeStatus(`Connected${ver}`, false); // settled — no spinner
           }
         }
         // Refresh the gear popover's model/effort lock state if it's open.
@@ -7699,6 +8180,11 @@
         showOnboarding(msg.state, { platform: msg.platform });
         break;
       case "error":
+        if (state.repoSwitchPending) {
+          state.repoSwitchPending = false;
+          setConversationLoading(false);
+          renderRepoChip();
+        }
         if (state.queuedSubmissionPending && isRelaySendRejection(msg.text)) {
           state.queuedSubmissionPending = false;
           state.queuedSubmissionRejected = true;
@@ -7761,9 +8247,20 @@
           if (state.activeSessionId) {
             const activeEntry = entries.find((entry) => entry.id === state.activeSessionId)
               || state.sessions.find((entry) => entry.id === state.activeSessionId);
+            // repoCwd must name the repo this SESSION lives in, not the one the
+            // list happens to be showing. Those diverge whenever you browse
+            // another repo's history (the chip literally says "Browsing X; live
+            // session is in Y"), and remembering the browsed one pairs a repo
+            // with a session that does not belong to it. On the next reconnect
+            // restoreRememberedRemoteSession then issues two contradictory
+            // commands — selectRepo(X) followed by resumeSession(a session in
+            // Y) — and the host obeys both in order. That is the A→B→A→B
+            // bouncing: the second command lands after the first has finished
+            // loading, and whichever repo you end on gets remembered, so the
+            // next reconnect can flip you straight back.
             saveRememberedRemoteSession({
               id: state.activeSessionId,
-              repoCwd: state.selectedRepoCwd || state.cwd || "",
+              repoCwd: state.activeRepoCwd || state.selectedRepoCwd || state.cwd || "",
               cwd: activeEntry?.cwd || state.activeRepoCwd || state.cwd || "",
             });
           } else saveRememberedRemoteSession(null);
@@ -7816,7 +8313,9 @@
       // freshly streamed content.
       if (state.sendQueue.length && state.queuedWrapEl) messagesEl.appendChild(state.queuedWrapEl);
     }
-  });
+  }
+
+  window.addEventListener("message", (e) => handleHostMessage(e.data));
 
   // ---------- wire ----------
 
@@ -7846,7 +8345,11 @@
   if (welcomeAboutLink) welcomeAboutLink.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openAboutPanel(); };
   addBtn.onclick = (e) => { e.stopPropagation(); openAddPopover(); };
   historyBtn.onclick = (e) => { e.stopPropagation(); openHistoryPopover(); };
-  repoBtn.onclick = (e) => { e.stopPropagation(); openRepoPopover(); };
+  repoBtn.onclick = (e) => {
+    e.stopPropagation();
+    if (repoSwitcherLocked()) return;
+    openRepoPopover();
+  };
   // Hidden from the first paint: the chip has nothing to say until a `repos`
   // frame arrives, and in VS Code it never appears at all.
   applyRepoSwitcherVisibility();
@@ -8027,7 +8530,11 @@
       reader.onload = () => {
         const dataUrl = String(reader.result || "");
         const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
-        if (m) vscode.postMessage({ type: "pasteImage", mimeType: m[1], data: m[2] });
+        if (m) {
+          const previewId = newRemoteTabToken();
+          rememberImagePreview(previewId, dataUrl);
+          vscode.postMessage({ type: "pasteImage", mimeType: m[1], data: m[2], previewId });
+        }
         settle();
       };
       reader.readAsDataURL(blob);
