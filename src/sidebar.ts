@@ -7,11 +7,14 @@ import {
   Session,
   SessionStatus,
   beginQueuedSendCommit,
+  beginTurn,
   createPendingPermission,
+  endTurn,
   finishQueuedSendCommit,
   pendingPermissionOptions,
   preferredPermissionAllowOption,
   sessionUiSnapshot,
+  turnIsInFlight,
 } from "./session";
 import { buildReapCandidates, selectReapable, computeDot, Dot } from "./session-pool";
 import { resolveVoiceKey, extractGrokAuthKey, parseVoiceCommand, buildSttKeyterms, voiceSettingForRepo, DEFAULT_SEND_PHRASE, MAX_RECORDING_SECONDS } from "./voice";
@@ -114,7 +117,7 @@ import { MAX_DIFF_EXPAND_BYTES, expandDiffToWholeFile } from "./diff-view";
 import { permissionAnswerAllowed, permissionOptionsForPlan, pickRejectOption, shouldRejectPermission } from "./plan-gate";
 import { appendPlanEntry, planRestoreSource, truncateResolvedAfter, countsAsUserBubble, decideRestoreState, isInterjectionText } from "./plan-restore";
 import { planReviewFileName, sanitizePlanReviewFilePart } from "./plan-review";
-import { isPrimerText, isPrimerSummary } from "./grok-primer";
+import { isPrimerText } from "./grok-primer";
 import { HOST_CAPABILITIES, HostMsg, WebviewMsg } from "./protocol";
 import { RemoteUplink } from "./remote-uplink";
 import { RemoteClientState, serializesRemoteSessionTransition } from "./remote-client-state";
@@ -128,16 +131,18 @@ import { historyImagePreviews } from "./image-history";
 import {
   SessionListEntry,
   SessionMetaOverrides,
+  RepoArchives,
   RepoPins,
   carrySessionName,
   clearSessions,
+  cliSessionTitle,
   defaultFs,
   deleteSessionDir,
   discoverRepos,
   fallbackName,
   forkDisplayName,
   indexSessions,
-  isEmptyPrimerSession,
+  isEmptySession,
   isPathInside,
   mostRecentSession,
   normalizeRepoPath,
@@ -195,6 +200,11 @@ const SANDBOX_PROFILE_WORKSPACE_FALLBACK_KEY = "grok.sandboxProfileWorkspaceFall
  * authoritative as soon as the host registers it (normally after reload). */
 const SUMMARIZE_REPLIES_ALOUD_FALLBACK_KEY = "grok.summarizeRepliesAloudFallback";
 const REPO_PINS_KEY = "grok.repoPins";
+/** globalState key for the remote rail's Archived section. Stored on the host so
+ *  the choice follows you to a phone and survives a cleared browser — archiving
+ *  is curation of your projects, not a preference about one sidebar. Read by the
+ *  browser client only; the VS Code repo picker ignores it entirely. */
+const REPO_ARCHIVES_KEY = "grok.repoArchives";
 /** globalState key for the anonymous per-install telemetry GUID (survives updates). */
 const INSTALL_ID_KEY = "grok.installId";
 /** globalState key for the eye-off choice on the active-editor context chip.
@@ -251,6 +261,15 @@ interface CliCompatibilityResult {
 
 // History pagination: rows fetched per "page" (initial open + each load-more / search page).
 const SESSION_PAGE_SIZE = 100;
+
+/** Rows a `listRepoSessions` preview returns when the client names no limit —
+ *  the projects rail shows a few per repo and links out for the rest. */
+const REPO_PREVIEW_SIZE = 3;
+
+/** How long a cancelled turn may go unanswered before the host settles it
+ *  itself. Generous: an honoured cancel comes back well inside a second, so this
+ *  only ever fires when the turn was going to wedge anyway. */
+const CANCEL_SETTLE_GRACE_MS = 10_000;
 
 // Records the extension version at the last silent CLI-update check. A fresh
 // install establishes the baseline; a later extension upgrade updates once.
@@ -337,12 +356,20 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   private static readonly IDLE_TTL_MS = 60 * 60 * 1000; // 1h
   private static readonly REAP_INTERVAL_MS = 5 * 60 * 1000; // sweep every 5 min
   private static readonly STAGING_ORPHAN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-  // The legacy empty-primer sweep only scans the newest N by mtime, keeping its
-  // one-shot compatibility scan bounded on a large store.
+  // The empty-session sweep only scans the newest N by mtime, keeping it bounded
+  // on a large store.
   private static readonly SWEEP_SCAN_LIMIT = 300;
+  // …and leaves recent ones alone entirely. Parking is what removes the empty
+  // session you just walked away from; the sweep exists for the ones nothing was
+  // there to park, and those are never minutes old. A session grok registered
+  // recently may not have written its history yet, and — the case this is really
+  // sized for — may be open in ANOTHER VS Code window, whose live processes this
+  // one cannot see. That window's session would be empty (nothing else is ever
+  // swept) and grok re-persists it on its next turn, so the cost is bounded; the
+  // delay is what keeps it from being routine. Costs nothing in return: an orphan
+  // is stamped when its window opened, so by the next activation it is already old.
+  private static readonly SWEEP_MIN_AGE_MS = 30 * 60 * 1000;
   private reaper?: ReturnType<typeof setInterval>;
-  /** Guards {@link sweepEmptyPrimerSessions} to one run per activation. */
-  private sweptEmptySessions = false;
   private oauthShadowWarningShown = false;
   private output: vscode.OutputChannel;
   private get chips(): FileChip[] { return this.focused.chips; }
@@ -1307,7 +1334,13 @@ See design doc for the full state machine diagram.`;
       // This CLI's verdict behavior is not trusted, so there is no safe native
       // continuation to preserve. Cancel it and wait for client.prompt() to
       // settle; a set_mode acknowledgement alone cannot authorize writes.
+      const cancelled = session.turnToken;
       void client.cancel("unavailable Plan recovery");
+      // "Wait for client.prompt() to settle" is the assumption that wedged
+      // sessions in the first place — a cancel is a request, not an outcome.
+      // This path cancels a CLI already known to be misbehaving, so it is the
+      // LAST one that should be trusted to answer. Same recovery as a user Stop.
+      if (cancelled) this.armCancelRecovery(session, cancelled);
     }
     this.emit(session, {
       type: "planNotice",
@@ -2242,8 +2275,11 @@ See design doc for the full state machine diagram.`;
       for (const s of [...this.pool]) {
         if (s.worktree && pathsEqual(s.worktree.path, wt.path)) {
           for (const holder of this.remoteClients.clientsForActiveValue(s)) strandedHolders.add(holder);
-          s.client?.dispose();
-          s.client = undefined;
+          // Detach, don't hand-roll: this used to drop the client without ending
+          // the turn, so a cancel recovery armed before the removal still held a
+          // live token and a matching generation and would respawn the session
+          // against a checkout that no longer exists.
+          this.detachClient(s)?.dispose();
           if (s !== this.focused) this.pool.delete(s);
         }
       }
@@ -2347,6 +2383,7 @@ See design doc for the full state machine diagram.`;
       fs: defaultFs,
       grokHome: resolveGrokHome(process.env),
       pins,
+      archives: this.context.globalState.get<RepoArchives>(REPO_ARCHIVES_KEY, {}),
       tmpDir: os.tmpdir(),
       // The primary workspace is already the extension's local execution scope;
       // keep it as the one trusted return target before its first catalog lands.
@@ -2459,6 +2496,35 @@ See design doc for the full state machine diagram.`;
     });
   }
 
+  /** Answer `listRepoSessions`: the newest few sessions for ONE repo, without
+   *  making it the client's selection. `cwd` is matched against the catalog the
+   *  client was already sent — an unknown or unavailable path is dropped in
+   *  silence rather than answered, so a remote can never turn this into a probe
+   *  for which arbitrary paths exist on the host. */
+  private sendRepoSessionsPreview(clientId: string, cwd: string, limit?: number): void {
+    const hit = this.repoCatalog().find((r) => pathsEqual(r.cwd, cwd));
+    if (!hit || !hit.available) return;
+    // Clamp: the rail wants a handful, and an unbounded limit would make every
+    // repo row a full history read.
+    const size = Math.max(1, Math.min(20, Math.trunc(Number(limit)) || REPO_PREVIEW_SIZE));
+    const list = this.buildSessionsList(
+      hit.cwd,
+      { offset: 0, limit: size },
+      this.remoteActiveSessionId(clientId),
+    );
+    if (list.type !== "sessions") return;
+    this.sendRemoteClient(clientId, {
+      type: "repoSessions",
+      // The host's own spelling, not the one the client sent — the rail keys its
+      // rows on this, and echoing an arbitrary casing would split one repo into
+      // two rail entries.
+      cwd: hit.cwd,
+      entries: list.entries,
+      dots: list.dots,
+      total: list.total,
+    });
+  }
+
   private selectRepo(cwd: string): void {
     const hit = this.repoCatalog().find((r) => pathsEqual(r.cwd, cwd));
     if (!hit || !hit.available) return;
@@ -2513,6 +2579,131 @@ See design doc for the full state machine diagram.`;
     else delete next[key];
     await this.context.globalState.update(REPO_PINS_KEY, next);
     this.postRepoCatalog();
+  }
+
+  /** Record where a project belongs in the remote rail. Both answers are stored,
+   *  including "not archived" — that one exists to hold a long-idle project in
+   *  view against the rail's own age rule, so forgetting it is not the same as
+   *  storing it (see RepoArchiveChoice). Nothing here changes what VS Code
+   *  shows; the catalog reports the choice and the browser client acts on it. */
+  private async setRepoArchived(cwd: string, archived: boolean): Promise<void> {
+    const hit = this.repoCatalog().find((r) => pathsEqual(r.cwd, cwd));
+    if (!hit) return;
+    const archives = this.context.globalState.get<RepoArchives>(REPO_ARCHIVES_KEY, {});
+    const key = normalizeRepoPath(hit.cwd);
+    await this.context.globalState.update(REPO_ARCHIVES_KEY, {
+      ...archives,
+      [key]: { cwd: hit.cwd, at: Date.now(), archived },
+    });
+    this.postRepoCatalog();
+  }
+
+  /** Pin/unpin one conversation. Stored on the session's own override entry, so
+   *  it survives a rename and travels with nothing else — `pinnedCwd` is kept
+   *  alongside because the Pinned group spans repos and has to know where to
+   *  read each session from without scanning every checkout. */
+  private async toggleSessionPin(id: string, cwd: string | undefined, pinned: boolean): Promise<void> {
+    if (!id) return;
+    await this.updateSessionMeta((overrides) => {
+      const existing = overrides[id];
+      // Resolve the home repo once, at pin time: the client sends the row's own
+      // cwd (already gated against the catalog), and falling back to whatever
+      // repo happens to be selected would file the pin under the wrong project.
+      const home = cwd || existing?.pinnedCwd || this.sessionCache.get(id)?.entry.cwd;
+      if (pinned && !home) return null; // nothing to write
+      const next: SessionMetaOverrides = { ...overrides };
+      const entry = { ...(existing ?? {}) };
+      if (pinned) {
+        entry.pinnedAt = Date.now();
+        entry.pinnedCwd = home;
+      } else {
+        delete entry.pinnedAt;
+        delete entry.pinnedCwd;
+      }
+      // An override that now carries nothing is noise in globalState — drop it
+      // rather than accumulating empty objects for every session ever unpinned.
+      if (Object.keys(entry).length === 0) delete next[id];
+      else next[id] = entry;
+      return next;
+    });
+    // The pin lives in globalState, not in the session's summary.json, so the
+    // file's mtime does not move and the entry cache would keep serving a row
+    // with the OLD pin state — the pin control would then still say "Pin" right
+    // after pinning, and clicking it would pin again instead of unpinning. Same
+    // reason `customName` invalidates here: an override changes the entry
+    // without touching disk.
+    this.sessionCache.delete(id);
+    this.postSessionsList(); // fans out the pinned refresh too
+  }
+
+  /** Read-modify-write on the session-meta map, serialised.
+   *
+   *  Every writer of this map reads the whole object, edits a copy and writes it
+   *  back. The read is synchronous but the write awaits, so two updates started
+   *  in the same tick both read the OLD map and the second silently discards the
+   *  first — pin A then immediately pin B, and only B survives. Remote messages
+   *  are not serialised, so "the same tick" is an ordinary double click.
+   *
+   *  Chaining every call through one promise makes the read-modify-write atomic
+   *  with respect to other users of this helper. It is the mechanism the older
+   *  writers should migrate onto (ROADMAP § Concurrent writes); until they do,
+   *  a pin can still lose a race against a rename, which is far rarer than two
+   *  pins in a row. Returning null from the mutator means "nothing to write". */
+  private sessionMetaWrites: Promise<void> = Promise.resolve();
+  private updateSessionMeta(
+    mutate: (current: SessionMetaOverrides) => SessionMetaOverrides | null,
+  ): Promise<void> {
+    const run = this.sessionMetaWrites.then(async () => {
+      const current = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+      const next = mutate(current);
+      if (next) await this.context.globalState.update(SESSION_META_KEY, next);
+    });
+    // Keep the chain alive even if one link throws, or every later write dies.
+    this.sessionMetaWrites = run.catch(() => {});
+    return run;
+  }
+
+  /** Every pinned conversation across every repo, newest pin first. Reads are
+   *  grouped by the stored home cwd so this costs one index scan per repo that
+   *  actually holds a pin — not one per repo in the catalog. */
+  private buildPinnedSessions(): { entries: SessionListEntry[]; dots: Record<string, Dot> } {
+    const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const grokHome = resolveGrokHome(process.env);
+    const log = (m: string) => this.output.appendLine(m);
+    const byCwd = new Map<string, { cwd: string; ids: string[] }>();
+    for (const [id, o] of Object.entries(overrides)) {
+      if (typeof o?.pinnedAt !== "number" || !o.pinnedCwd) continue;
+      const key = normalizeFsPath(o.pinnedCwd);
+      const bucket = byCwd.get(key) ?? { cwd: o.pinnedCwd, ids: [] };
+      bucket.ids.push(id);
+      byCwd.set(key, bucket);
+    }
+    const entries: SessionListEntry[] = [];
+    for (const { cwd, ids } of byCwd.values()) {
+      const index = indexSessions({ fs: defaultFs, grokHome, cwd, log });
+      const wanted = new Set(ids);
+      const present = index.filter((e) => wanted.has(e.id));
+      if (!present.length) continue;
+      const mtimeById = new Map(present.map((e) => [e.id, e.mtimeMs]));
+      // One repo per pass, so every id in it reads from that same checkout.
+      const cwdById = new Map(present.map((e) => [e.id, cwd]));
+      entries.push(...this.readEntriesCachedMulti(
+        present.map((e) => e.id), mtimeById, cwdById, overrides, grokHome, log,
+      ));
+    }
+    // Newest pin on top — the same rule the repo rows use, and the one that
+    // matches "I just pinned this, where did it go".
+    entries.sort((a, b) => (b.pinnedAt ?? 0) - (a.pinnedAt ?? 0));
+    const dots: Record<string, Dot> = {};
+    for (const e of entries) dots[e.id] = this.dotForId(e.id);
+    return { entries, dots };
+  }
+
+  private postPinnedSessions(clientId?: string): void {
+    if (!clientId && !this.remoteClients.clients().length) return;
+    const msg: HostMsg = { type: "pinnedSessions", ...this.buildPinnedSessions() };
+    if (clientId) this.sendRemoteClient(clientId, msg);
+    else for (const id of this.remoteClients.clients()) this.sendRemoteClient(id, msg);
   }
 
   private annotateWorktreeLabels(
@@ -3113,6 +3304,14 @@ See design doc for the full state machine diagram.`;
     }
     session.buffer = [];
     session.status = "idle";
+    // The replacement session has no turn, whatever the old one was doing. This
+    // matters most in the case the token exists for: a `prompt()` that never
+    // settles never runs its `finally`, so the token outlives the client that
+    // owned it — and resetting only `status` (which is all this used to have to
+    // do) would leave the fresh session reporting a turn in flight and diverting
+    // every send into the queue. A restart has always been the cure for a wedged
+    // session; it stays the cure.
+    session.turnToken = undefined;
     // Stop any in-progress voice capture so listening never carries across a
     // new/resumed/restarted session (covers New Session, history resume, and
     // model/effort restarts — all of which route through here).
@@ -3755,8 +3954,11 @@ See design doc for the full state machine diagram.`;
       // bail): `handleSend`/`ensureClient` prefer `session.client`, so leaving
       // it set routed every post-crash send into a dead pipe instead of
       // respawning.
-      session.gen++;
-      session.client = undefined;
+      // Ends the turn too: a process that dies mid-turn may never settle its
+      // `prompt()`, and the send path tests for a turn in flight BEFORE it
+      // respawns — so the next send would be diverted into a queue this handler
+      // has just emptied. The turn died with the process.
+      this.detachClient(session);
       void client.dispose();
     });
     client.on("stderr", (text: string) => this.output.append(text));
@@ -4093,9 +4295,12 @@ See design doc for the full state machine diagram.`;
         if (origin === "remote" && clientId) await this.newRemoteSession(clientId);
         else await this.newFocusedSession(origin);
         break;
-      case "cancel":
+      case "cancel": {
+        const cancelled = session.turnToken;
         await session.client?.cancel("user Stop click");
+        if (cancelled) this.armCancelRecovery(session, cancelled);
         break;
+      }
       case "queueSend": {
         // Host-owned per-session queue (#37): the webview renders a mirror from
         // the queuedSends snapshots, so queued messages survive focus switches
@@ -4528,9 +4733,29 @@ See design doc for the full state machine diagram.`;
           this.postSessionsList({ offset: msg.offset, limit: msg.limit, query: msg.query });
         }
         break;
+      case "listRepoSessions":
+        // Preview rows for a repo WITHOUT selecting it (the projects rail).
+        // Remote-only: the VS Code webview has no rail and is locked to its own
+        // workspace, so answering it locally would be the one path that hands
+        // the local view another repo's history.
+        if (origin === "remote" && clientId) {
+          this.sendRepoSessionsPreview(clientId, msg.cwd, msg.limit);
+        }
+        break;
+      case "toggleSessionPin":
+        // Rail-only affordance, so remote-only: the VS Code history popover
+        // offers no pin, and answering it locally would write state no local
+        // surface can show or undo.
+        if (origin === "remote" && clientId) {
+          await this.toggleSessionPin(msg.id, msg.cwd, msg.pinned);
+        }
+        break;
       case "selectRepo":
         if (origin === "remote" && clientId) this.selectRemoteRepo(clientId, msg.cwd);
         else this.selectRepo(msg.cwd);
+        break;
+      case "setRepoArchived":
+        await this.setRepoArchived(msg.cwd, msg.archived);
         break;
       case "toggleRepoPin":
         await this.toggleRepoPin(msg.cwd, msg.pinned);
@@ -4542,10 +4767,10 @@ See design doc for the full state machine diagram.`;
         else await this.openSession(msg.id, msg.cwd);
         break;
        case "renameSession":
-          this.renameSession(msg.id, msg.name, origin, clientId);
+          this.renameSession(msg.id, msg.name, origin, clientId, msg.cwd);
           break;
       case "deleteSession":
-        await this.deleteSession(msg.id, msg.name, origin, clientId);
+        await this.deleteSession(msg.id, msg.name, origin, clientId, msg.cwd);
         break;
       case "clearAllSessions":
         await this.clearAllSessions(msg.cwd, origin, clientId);
@@ -4669,6 +4894,13 @@ See design doc for the full state machine diagram.`;
     const local = this.buildSessionsList(localCwd, opts);
     this.postLocal(local);
     if (opts) return;
+    // Pins ride along with every catalog mutation rather than being refreshed at
+    // each site that can invalidate one. Deleting a session, clearing a repo and
+    // removing a worktree all land here; hanging the pinned refresh off the same
+    // funnel fixes the whole class instead of the three cases we happened to
+    // think of. Cheap when nothing is pinned — the scan is over an in-memory map
+    // and reads no disk until a pin actually exists.
+    this.postPinnedSessions();
     for (const clientId of this.remoteClients.clients()) {
       const cwd = this.remoteClients.cwd(clientId);
       const activeId = this.remoteActiveSessionId(clientId);
@@ -4822,33 +5054,34 @@ See design doc for the full state machine diagram.`;
   /** The name this session shows in the history list — what the user actually
    *  reads, which is what a fork should be named after (#48).
    *
-   *  Precedence mirrors the list itself: the rename/auto-generated `customName`
-   *  first (that IS the row's label for any session that has one), then grok's
-   *  own `session_summary` from disk, then the first user message.
+   *  Precedence mirrors the list itself: the user's `customName` first (that IS
+   *  the row's label for any session that has one), then grok's own title, then
+   *  the first user message.
    *
-   *  The one deliberate departure: a **legacy primer-derived** summary is
-   *  skipped. Older builds sent the primer as message #1, so inheriting that
-   *  invisible internal title into a fork would propagate it forever.
-   *  `isPrimerSummary` rejects it and we fall through to something real. */
+   *  The one deliberate departure: a **legacy primer-derived** title is skipped.
+   *  Older builds sent the primer as message #1, so inheriting that invisible
+   *  internal title into a fork would propagate it forever. `cliSessionTitle`
+   *  rejects it and we fall through to something real. */
   private sessionDisplayName(session: Session): string {
     const id = session.activeSessionId;
     if (!id) return "";
-    const custom = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]?.customName?.trim();
+    const override = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id];
+    const custom = override?.customName?.trim();
     if (custom) return custom;
     try {
       const cwd = this.sessionCwd(session);
-      const raw = fs.readFileSync(
+      const raw = JSON.parse(fs.readFileSync(
         path.join(sessionsDirFor(resolveGrokHome(process.env), cwd), id, "summary.json"),
         "utf8",
-      );
-      const summary = (JSON.parse(raw)?.session_summary as string | undefined)?.trim();
-      if (summary && !isPrimerSummary(summary)) return fallbackName(summary, Date.now());
+      ));
+      const title = cliSessionTitle(raw?.session_summary, raw?.generated_title);
+      if (title) return fallbackName(title, Date.now());
     } catch {
       // No summary yet (grok flushes it at turn end) — fall through.
     }
     // Same last resort the history list uses ("Untitled (<date>)"), so a fork of
     // a nameless session reads like a row rather than a bare "(Fork)".
-    const first = (session.firstUserMessageForTitle || "").trim();
+    const first = (session.firstUserMessageForTitle || "").trim() || (override?.autoName || "").trim();
     return fallbackName(first, Date.now());
   }
 
@@ -4860,7 +5093,10 @@ See design doc for the full state machine diagram.`;
   ): SessionListEntry {
     const now = Date.now();
     const customName = overrides[id]?.customName?.trim() || undefined;
-    const firstMsg = (session.firstUserMessageForTitle || "").trim();
+    // No summary.json to read yet, so grok has no title for this one — the best
+    // we have is the opening message, live or as the stored `autoName`.
+    const firstMsg = (session.firstUserMessageForTitle || "").trim()
+      || (overrides[id]?.autoName || "").trim();
     const displayName = customName || (firstMsg ? fallbackName(firstMsg, now) : "New session");
     const ts = session.lastActiveAt || now;
     return {
@@ -4932,17 +5168,60 @@ See design doc for the full state machine diagram.`;
     return ids.map((id) => this.sessionCache.get(id)?.entry).filter((e): e is SessionListEntry => !!e);
   }
 
-  private remoteAuthorizedSessionCwd(
+  /** Which repo a remote request may act in. The client's selection by default;
+   *  a NAMED repo when it asks for one and that repo is in the host's own
+   *  catalog. Matching the catalog is the whole boundary — the path is never
+   *  trusted as given, so a remote can only ever reach projects this host has
+   *  already discovered and told it about.
+   *
+   *  Widened from selection-only deliberately: the rail lists every project, and
+   *  refusing to rename a row it just drew is a broken affordance, not a guard.
+   *  It was never much of a guard either — a remote can select any catalog repo
+   *  and then act, so the selection only ever added a step to the same reach. */
+  private remoteRepoScope(clientId: string, requestedCwd?: string): string | undefined {
+    if (requestedCwd) {
+      const hit = this.repoCatalog().find((r) => pathsEqual(r.cwd, requestedCwd));
+      // The host's own spelling, never the client's.
+      if (hit?.available) return hit.cwd;
+      return undefined;
+    }
+    return this.remoteClients.cwd(clientId);
+  }
+
+  /** The catalog repo that owns a session cwd — the checkout itself, or the parent
+   *  of one of its worktrees. A rail row for a worktree session names the WORKTREE
+   *  as its cwd, because that is where its transcript lives, and a worktree is
+   *  deliberately not a catalog row (see sessionCwdsForRepo) — so scoping by
+   *  catalog alone refused every action on one. The catalog is still the whole
+   *  boundary: the parent has to be a repo this host discovered for itself. */
+  private repoOwningSessionCwd(cwd: string, overrides: SessionMetaOverrides): string | undefined {
+    return this.repoCatalog().find(
+      (r) => r.available && this.sessionCwdsForRepo(r.cwd, overrides).some((c) => pathsEqual(c, cwd)),
+    )?.cwd;
+  }
+
+  /** Where a remote's rename/delete may land, or why it may not.
+   *
+   *  "gone" is not a permission answer: the project IS in scope, the conversation
+   *  simply is not in it any more. That is exactly what a rail row left over from
+   *  a clear-all looks like, and answering it with "wrong repository" sent people
+   *  hunting a permissions bug that was really a stale list. */
+  private remoteSessionTarget(
     clientId: string,
     id: string,
     overrides: SessionMetaOverrides,
-  ): string | undefined {
-    const selectedCwd = this.remoteClients.cwd(clientId);
+    requestedCwd?: string,
+  ): { cwd: string; reason?: undefined } | { cwd?: undefined; reason: "scope" | "gone"; repoCwd?: string } {
+    // A named repo the catalog does not know is a refusal, not a fallback to the
+    // selected one — otherwise a bad cwd would quietly act somewhere else.
+    const selectedCwd = this.remoteRepoScope(clientId, requestedCwd)
+      ?? (requestedCwd ? this.repoOwningSessionCwd(requestedCwd, overrides) : undefined);
+    if (!selectedCwd) return { reason: "scope" };
     const allowedCwds = this.sessionCwdsForRepo(selectedCwd, overrides);
     const live = [...this.pool].find((session) => session.activeSessionId === id);
     if (live) {
       const cwd = this.sessionCwd(live);
-      if (sessionCwdBelongsToRepo(cwd, allowedCwds, pathsEqual)) return cwd;
+      if (sessionCwdBelongsToRepo(cwd, allowedCwds, pathsEqual)) return { cwd };
     }
 
     const candidates = [...new Set([
@@ -4953,17 +5232,35 @@ See design doc for the full state machine diagram.`;
       !!cwd && sessionCwdBelongsToRepo(cwd, allowedCwds, pathsEqual)
     ))];
     const grokHome = resolveGrokHome(process.env);
-    return candidates.find((cwd) =>
+    const found = candidates.find((cwd) =>
       indexSessions({ fs: defaultFs, grokHome, cwd })
         .some((entry) => entry.id === id)
     );
+    return found ? { cwd: found } : { reason: "gone", repoCwd: selectedCwd };
   }
 
-  private reportUnauthorizedSessionTarget(clientId: string, action: "rename" | "delete", id: string): void {
-    this.output.appendLine(`[remote] refused ${action}Session for ${id} (session is outside selected repo)`);
+  private reportUnauthorizedSessionTarget(
+    clientId: string,
+    action: "rename" | "delete",
+    id: string,
+    miss: { reason: "scope" | "gone"; repoCwd?: string },
+  ): void {
+    if (miss.reason === "gone") {
+      this.output.appendLine(`[remote] dropped ${action}Session for ${id} (no longer in ${miss.repoCwd})`);
+      // Refresh what the client is looking at rather than argue with it: the row
+      // it acted on is stale, so the honest repair is to make the row disappear.
+      this.postSessionsList();
+      this.refreshRemoteRepoPreview(clientId, miss.repoCwd);
+      this.sendRemoteClient(clientId, {
+        type: "error",
+        text: "That conversation is no longer in this project. The list has been refreshed.",
+      });
+      return;
+    }
+    this.output.appendLine(`[remote] refused ${action}Session for ${id} (session is outside every known project)`);
     this.sendRemoteClient(clientId, {
       type: "error",
-      text: `Could not ${action} this conversation because it does not belong to this tab's selected repository.`,
+      text: `Could not ${action} this conversation because it does not belong to a project this computer knows about.`,
     });
   }
 
@@ -4972,12 +5269,17 @@ See design doc for the full state machine diagram.`;
     name: string,
     origin: MsgOrigin,
     clientId?: string,
+    requestedCwd?: string,
   ): void {
     const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
-    if (origin === "remote" && clientId && !this.remoteAuthorizedSessionCwd(clientId, id, overrides)) {
-      this.reportUnauthorizedSessionTarget(clientId, "rename", id);
+    const target = origin === "remote" && clientId
+      ? this.remoteSessionTarget(clientId, id, overrides, requestedCwd)
+      : undefined;
+    if (target?.reason && clientId) {
+      this.reportUnauthorizedSessionTarget(clientId, "rename", id, target);
       return;
     }
+    const authorizedCwd = target?.cwd;
     const trimmed = (name || "").trim();
     const next: SessionMetaOverrides = { ...overrides };
     if (!trimmed) {
@@ -4995,6 +5297,29 @@ See design doc for the full state machine diagram.`;
     // otherwise keep serving the old name. Drop it so the next read rebuilds the entry.
     this.sessionCache.delete(id);
     this.postSessionsList();
+    this.refreshRemoteRepoPreview(clientId, authorizedCwd);
+  }
+
+  /** Re-push one repo's preview after acting on a session inside it. `postSessionsList`
+   *  only refreshes the repo the client has SELECTED, so a rename or delete in any
+   *  other project would leave the rail showing the old row until something else
+   *  happened to refetch it. */
+  private refreshRemoteRepoPreview(clientId?: string, cwd?: string): void {
+    if (!clientId || !cwd) return;
+    // Resolve to the PROJECT, not the session's own directory. A worktree
+    // conversation lives in a worktree, which is deliberately not a catalog row
+    // — so a preview addressed to it lands under a key no project matches, and
+    // the parent project quietly keeps showing the row that was just renamed or
+    // deleted. Every caller here passes a session cwd, so the resolution belongs
+    // at this seam rather than in each of them.
+    const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const repoCwd = this.repoCatalog().find((r) => pathsEqual(r.cwd, cwd))?.cwd
+      ?? this.repoOwningSessionCwd(cwd, overrides);
+    if (!repoCwd) return;
+    if (pathsEqual(repoCwd, this.remoteClients.cwd(clientId))) return;
+    // The rail's expanded cap — matches what its own probe asks for, so a
+    // refresh never returns fewer rows than the client already had.
+    this.sendRepoSessionsPreview(clientId, repoCwd, 20);
   }
 
   // No native confirm here: the webview shows its own confirm dialog before
@@ -5056,23 +5381,37 @@ See design doc for the full state machine diagram.`;
     _name: string | undefined,
     origin: MsgOrigin,
     clientId?: string,
+    requestedCwd?: string,
   ): Promise<void> {
     const overridesNow = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
-    const authorizedRemoteCwd = origin === "remote" && clientId
-      ? this.remoteAuthorizedSessionCwd(clientId, id, overridesNow)
+    const target = origin === "remote" && clientId
+      ? this.remoteSessionTarget(clientId, id, overridesNow, requestedCwd)
       : undefined;
-    if (origin === "remote" && clientId && !authorizedRemoteCwd) {
-      this.reportUnauthorizedSessionTarget(clientId, "delete", id);
+    if (target?.reason && clientId) {
+      this.reportUnauthorizedSessionTarget(clientId, "delete", id, target);
       return;
     }
+    const authorizedRemoteCwd = target?.cwd;
     if (this.isSessionLoadReserved(id)) {
       this.output.appendLine(`[sessions] refused delete of reserved session ${id}`);
       this.reportProtectedSession(origin, clientId, "delete");
       return;
     }
-    const liveForCwd = [...this.pool].find((s) => s.activeSessionId === id);
-    if (liveForCwd && this.sessionHasLiveOwner(liveForCwd)) {
-      this.output.appendLine(`[sessions] refused delete of owned live session ${id}`);
+    const live = [...this.pool].find((s) => s.activeSessionId === id);
+    // Deleting the conversation you are READING is allowed. The guard exists to
+    // stop one surface pulling a conversation out from under another, not to
+    // protect you from your own delete — and having the same conversation open
+    // at the desk AND in the browser is an ordinary way to work, so either side
+    // may delete it and every side lands somewhere sensible. What stays refused
+    // is deleting a live conversation you are NOT the one looking at.
+    const watchers = live ? this.remoteClients.clientsForActiveValue(live) : [];
+    const requesterWatches = !!live && (
+      origin === "remote" && clientId
+        ? watchers.includes(clientId)
+        : live === this.focused
+    );
+    if (live && this.sessionHasLiveOwner(live) && !requesterWatches) {
+      this.output.appendLine(`[sessions] refused delete of live session ${id} owned elsewhere`);
       this.reportProtectedSession(origin, clientId, "delete");
       return;
     }
@@ -5081,10 +5420,18 @@ See design doc for the full state machine diagram.`;
     // some remote client happens to have selected.
     const cwd =
       authorizedRemoteCwd ||
-      liveForCwd?.cwd ||
+      live?.cwd ||
       overridesNow[id]?.worktreePath ||
       this.sessionCache.get(id)?.entry.cwd ||
       this.historyCwdFor(origin);
+    // Tear the CLI down BEFORE touching the disk, not after. The live process
+    // owns this conversation and re-persists it: delete the directory first and
+    // it simply comes back, which is why deleting the open conversation used to
+    // be refused outright rather than merely awkward. `disposeSession` ends the
+    // turn, drops the client and disposes it, so by the time the files go there
+    // is nothing left that could write them again.
+    const wasFocused = !!live && live === this.focused;
+    if (live) this.disposeSession(live);
     try {
       deleteSessionDir({
         fs: defaultFs,
@@ -5104,18 +5451,18 @@ See design doc for the full state machine diagram.`;
       delete next[id];
       void this.context.globalState.update(SESSION_META_KEY, next);
     }
-    // Tear down the live process if this session is in the pool (focused or
-    // backgrounded), then re-home focus if we just killed the visible one.
-    const live = [...this.pool].find((s) => s.activeSessionId === id);
-    if (live) {
-      const wasFocused = live === this.focused;
-      this.disposeSession(live);
-      if (wasFocused) {
-        this.focused = this.newLocalSession();
-        await this.startSession();
-      }
+    // Everyone who was reading it needs somewhere to be. `newRemoteSession`
+    // starts in that tab's OWN repo, which is the repo of the conversation just
+    // deleted — you were sitting in it. The catalog goes out once at the end
+    // rather than once per watcher.
+    if (wasFocused) {
+      this.focused = this.newLocalSession();
+      await this.startSession();
     }
+    for (const watcher of watchers) await this.newRemoteSession(watcher, false);
+    if (watchers.length) this.postRepoCatalog();
     this.postSessionsList();
+    this.refreshRemoteRepoPreview(clientId, authorizedRemoteCwd);
   }
 
   /** Delete every inactive session in the requested repo's history. Every session
@@ -5127,11 +5474,14 @@ See design doc for the full state machine diagram.`;
     origin: MsgOrigin,
     clientId?: string,
   ): Promise<void> {
+    // Any project in the host's own catalog, not just the selected one — the rail
+    // offers this per project, and the catalog is the boundary (see
+    // remoteRepoScope). A path the host has never discovered still gets nothing.
     const selectedCwd = origin === "remote" && clientId
-      ? this.remoteClients.cwd(clientId)
+      ? this.remoteRepoScope(clientId, requestedCwd)
       : requestedCwd;
-    if (origin === "remote" && !pathsEqual(requestedCwd, selectedCwd)) {
-      this.output.appendLine("[remote] dropped clearAllSessions (cwd does not match selected repo)");
+    if (!selectedCwd) {
+      this.output.appendLine("[remote] dropped clearAllSessions (cwd is not a known repository)");
       return;
     }
     const repo = this.repoCatalog().find((r) => pathsEqual(r.cwd, selectedCwd));
@@ -5162,13 +5512,20 @@ See design doc for the full state machine diagram.`;
       (entry) => protectedIds.has(entry.id) && entry.id !== requesterId,
     );
     const clearableCount = repoEntries.filter((entry) => !protectedIds.has(entry.id)).length;
+    // A notice is a line in the transcript, and a transcript belongs to ONE
+    // project — so a remark about a project you are not talking in lands in the
+    // wrong conversation. Where the rail is the thing that asked, the refreshed
+    // rail is the answer: the project shows itself empty, in its own place.
+    const clientCwd = origin === "remote" && clientId ? this.remoteClients.cwd(clientId) : undefined;
+    const inThisConversation = origin !== "remote" || (!!clientCwd && pathsEqual(cwd, clientCwd));
     if (clearableCount === 0) {
       if (keptForAnotherOwner) this.reportProtectedSession(origin, clientId, "clear");
-      else this.reportRequester(
+      else if (inThisConversation) this.reportRequester(
         origin === "remote" && clientId ? this.captureRemoteRequester(clientId) : undefined,
         "info",
         "No history to clear.",
       );
+      this.refreshRemoteRepoPreview(clientId, cwd);
       return;
     }
     // Confirm lives in the webview (custom dialog) — see deleteSession.
@@ -5220,6 +5577,11 @@ See design doc for the full state machine diagram.`;
       await this.startSession();
     }
     this.postSessionsList();
+    // `postSessionsList` only refreshes the project the client has SELECTED, so
+    // clearing any other one left the rail showing every row it had just deleted
+    // — no confirmation, and a later delete on one of those ghosts failed with a
+    // permissions error that was really "this is not there any more".
+    this.refreshRemoteRepoPreview(clientId, cwd);
     if (keptForAnotherOwner) this.reportProtectedSession(origin, clientId, "clear");
   }
 
@@ -6567,8 +6929,77 @@ See design doc for the full state machine diagram.`;
 
   /** A prompt is running or pending user action — a new prompt now would
    *  cancel it (a second `session/prompt` kills the in-flight turn). */
+  /** Whether a prompt is genuinely running. This used to read `status`, which
+   *  cannot tell "working" from "was working and never settled" — see
+   *  Session.turnToken for the wedge that cost. */
   private turnInFlight(session: Session): boolean {
-    return session.status === "working" || session.status === "needs-you";
+    return turnIsInFlight(session);
+  }
+
+  /** A cancel is a request, not an outcome: `client.prompt()` settling is the ONLY
+   *  thing that ends a turn, so a cancel the CLI never answers leaves the session
+   *  pinned mid-turn and every later send diverted into the queue — permanently,
+   *  with nothing on disk to show for it.
+   *
+   *  Recovery RESTARTS the process rather than declaring the turn over locally.
+   *  Declaring it over is not enough and is worse than doing nothing: the client
+   *  is still live and its handlers are fenced only by `gen`, so a cancel that
+   *  eventually produces chunks, a permission request or a completion would pour
+   *  them into whatever turn is current by then — and flushing the queue would
+   *  put a second prompt on a client that may still be running the first.
+   *  `startSession` is the fence this codebase already has: it bumps `gen` (so
+   *  every event from the old client is ignored), disposes it, clears the turn
+   *  token, and resumes this same conversation from disk so nothing is lost.
+   *
+   *  A CLI that has ignored a stop request for ten seconds is wedged; replacing
+   *  the process is the honest reading of what the user asked for. */
+  private armCancelRecovery(session: Session, token: object): void {
+    const gen = session.gen;
+    setTimeout(() => {
+      if (gen !== session.gen) return; // already restarted or replaced
+      if (session.turnToken !== token) return; // the cancel was honoured
+      void this.recoverUnansweredCancel(session, token);
+    }, CANCEL_SETTLE_GRACE_MS);
+  }
+
+  private async recoverUnansweredCancel(session: Session, token: object): Promise<void> {
+    // Nothing to recover if the client is already gone — something else tore it
+    // down (a crash, a removed worktree), and respawning here would resurrect a
+    // session that was deliberately ended, possibly against a cwd that no longer
+    // exists. Belt to the generation check: whoever disposes a client is
+    // expected to invalidate the turn, and this survives one that forgets.
+    if (!session.client) {
+      endTurn(session, token);
+      return;
+    }
+    this.output.appendLine("[turn] cancel went unanswered; restarting this session's CLI");
+    // Said BEFORE the restart, deliberately. startSession unlocks the composer
+    // and flushes any queued sends itself, so a notice emitted afterwards could
+    // land behind that queued turn's userMessage/agentStart — reading as if the
+    // new turn had failed, and clearing the busy state of a turn that had only
+    // just begun. Live-only as a consequence (the restart clears the buffer);
+    // the conversation itself is reloaded from disk intact.
+    this.emit(session, {
+      type: "agentError",
+      text: "Stopped. The agent didn't answer the stop request, so its process is being restarted. This conversation is intact.",
+    });
+    const client = await this.startSession(session.activeSessionId, session);
+    // Another restart can overtake this one while it is starting. Then the
+    // session belongs to that one, and nothing here has anything to say about
+    // it — least of all an error.
+    if (session.client && session.client !== client) return;
+    if (!session.client) {
+      // startSession clears the token on its way through, but it can fail before
+      // reaching that; either way this session must not be left pinned mid-turn.
+      endTurn(session, token);
+      this.emit(session, {
+        type: "agentError",
+        text: "The agent's process couldn't be restarted. Send again to start it.",
+      });
+      this.setStatus(session, "error");
+    }
+    // A successful restart has already cleared the token, unlocked the composer
+    // and flushed anything queued. There is nothing left to do here.
   }
 
   /** A send that raced into a running turn (desk↔remote co-attach: the other
@@ -6754,6 +7185,9 @@ See design doc for the full state machine diagram.`;
     session.inUserMessage = false; // live send isn't part of the streamed-chunk count path
     this.emit(session, { type: "userMessage", text, chips: sentChips, submissionId });
     this.emit(session, { type: "agentStart" });
+    // The token, not the status, is what says a turn is running from here on —
+    // and only whoever holds it may end this one.
+    const turn = beginTurn(session);
     this.setStatus(session, "working");
 
     try {
@@ -6764,6 +7198,9 @@ See design doc for the full state machine diagram.`;
       }
       const meta = await client.prompt(promptBlocks);
       if (gen !== session.gen) return; // session was switched mid-turn
+      // A cancel recovery may have settled this turn already; a second agentEnd
+      // would end a turn that is no longer ours.
+      if (!endTurn(session, turn)) return;
       if (slashCommand === "compact") {
         // A native /compact streams no agent content (research/compact.md), so
         // the turn would end with a blank bubble and no sign it worked. Paint a
@@ -6780,6 +7217,10 @@ See design doc for the full state machine diagram.`;
       this.maybeGenerateTitle(session);
     } catch (err) {
       if (gen !== session.gen) return; // prompt rejected because we disposed the old client — don't leak the error into the new session
+      // Same rule as the success path: if a cancel recovery already ended this
+      // turn, the failure it eventually reported is not ours to announce.
+      // Checked BEFORE the auth resend, which starts a turn of its own.
+      if (!endTurn(session, turn)) return;
       const e = err as any;
       // A rate/usage-limit failure (ACP -32003, or limit phrasing) is not a
       // credential problem: skip the auth recovery — its retry would end on
@@ -6800,6 +7241,12 @@ See design doc for the full state machine diagram.`;
       this.emit(session, { type: "agentError", text: promptErrorText(e) });
       this.setStatus(session, "error");
     } finally {
+      // Belt to the braces above: however this turn left — an early return on a
+      // switched session, a throw nobody caught — it must not stay in flight, or
+      // every later send in this session is diverted into the queue. A no-op
+      // when the turn was already settled, or when the auth resend has since
+      // started one of its own.
+      endTurn(session, turn);
       // The turn is fully over — fire anything queued during it (#37).
       if (gen === session.gen) {
         this.settleUnavailablePlanTurn(session, client, gen);
@@ -6850,16 +7297,21 @@ See design doc for the full state machine diagram.`;
     session.userMessageCount += 1;
     this.emit(session, { type: "userMessage", text: displayText, chips });
     this.emit(session, { type: "agentStart" });
+    // The resend is a turn in its own right — it gets its own token, and the
+    // outer turn's `finally` can no longer end it (the tokens differ).
+    const turn = beginTurn(session);
     this.setStatus(session, "working");
     try {
       const meta = await client.prompt(promptBlocks);
       if (gen !== session.gen) return true;
+      if (!endTurn(session, turn)) return true;
       this.emit(session, { type: "agentEnd", meta });
       this.setStatus(session, "done");
       session.authRecoveryTried = false; // recovered — re-arm for a future expiry
       this.maybeGenerateTitle(session);
     } catch (err2) {
       if (gen !== session.gen) return true;
+      if (!endTurn(session, turn)) return true;
       const e2 = err2 as any;
       // The resend ran into a usage limit — that's the real story, not auth
       // (#57): a fresh process with a fresh token hit the same wall.
@@ -6887,26 +7339,42 @@ See design doc for the full state machine diagram.`;
         this.emit(session, { type: "agentError", text: promptErrorText(e2) });
         this.setStatus(session, "error");
       }
+    } finally {
+      // Same belt as the ordinary send path: a resend that leaves any other way
+      // must not leave the session pinned mid-turn.
+      endTurn(session, turn);
     }
     return true;
   }
 
+  /** Give a session a readable name from its opening prompt, as `autoName` — never
+   *  as `customName`. The distinction is the whole of #96: written as a rename, our
+   *  guess outranked grok's own `session_summary` forever, so every unrenamed row
+   *  stayed a truncated first sentence while the CLI had a real topic for it.
+   *  `buildEntry` now ranks this below the CLI title, which means it shows only
+   *  until grok writes one — usually the same turn.
+   *
+   *  Sessions named before this change keep the name they have: an auto title
+   *  already written into `customName` is indistinguishable from a rename, and
+   *  guessing wrong there would silently discard names people typed. */
   private maybeGenerateTitle(session: Session): void {
     if (session.titleGenerated) return;
     const sid = session.client?.sessionId ?? session.activeSessionId;
     const first = session.firstUserMessageForTitle;
     if (!sid || !first) return;
     session.titleGenerated = true;
-    const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
-    if (overrides[sid]?.customName) return;
     const cleaned = first.replace(/\s+/g, " ").trim();
     if (!cleaned) return;
     const title = cleaned.length > 50 ? cleaned.slice(0, 47) + "…" : cleaned;
-    const next: SessionMetaOverrides = {
-      ...overrides,
-      [sid]: { ...(overrides[sid] ?? {}), customName: title },
-    };
-    void this.context.globalState.update(SESSION_META_KEY, next);
+    void this.updateSessionMeta((current) => {
+      const entry = current[sid];
+      if (entry?.customName || entry?.autoName) return null;
+      return { ...current, [sid]: { ...(entry ?? {}), autoName: title } };
+    });
+    // An override changes the row without touching summary.json's mtime, so the
+    // mtime-keyed cache would keep serving the un-named entry (same reason rename
+    // and pin invalidate here).
+    this.sessionCache.delete(sid);
   }
 
   private buildInitialStateMsg(): HostMsg {
@@ -6943,10 +7411,11 @@ See design doc for the full state machine diagram.`;
     this.postModePolicy();
     this.postSandboxState();
     void this.postRemoteStatus();
-    // Sweep legacy empty-primer sessions once the first session is live (so the
-    // newly-focused session is excluded from the sweep).
+    // Sweep abandoned empty sessions once the first session is live (so the
+    // newly-focused session is excluded from the sweep). This is the run that
+    // collects what the last window left behind when it closed without a prompt.
     void this.startSession().then(() => {
-      this.sweepEmptyPrimerSessions();
+      this.sweepEmptySessions();
     });
   }
 
@@ -7155,6 +7624,7 @@ See design doc for the full state machine diagram.`;
     hasLiveSession(id: string): boolean;
     remoteClientLeft(clientId: string): void;
     remoteClientRoster(clientIds: string[]): void;
+    sweepEmptySessions(cwd: string): void;
     workspaceRoot(): string;
   } {
     return {
@@ -7368,6 +7838,7 @@ See design doc for the full state machine diagram.`;
       ),
       remoteClientLeft: (clientId) => this.releaseRemoteClient(clientId),
       remoteClientRoster: (clientIds) => this.retainRemoteClients(clientIds),
+      sweepEmptySessions: (cwd) => this.sweepEmptySessions(cwd),
       workspaceRoot: () => this.workspaceRoot(),
     };
   }
@@ -7658,51 +8129,101 @@ See design doc for the full state machine diagram.`;
     this.sessionCache.delete(id);
   }
 
-  /** One-shot cleanup (per activation) of empty, primer-only sessions left on disk by
-   *  earlier runs — the "extra sessions I didn't create" of #24. Scans the newest
-   *  slice by mtime (bounded, so it stays cheap on a large store), confirms each
-   *  candidate is genuinely primer-only by reading its chat history, and deletes it.
-   *  Never touches a live session, a renamed one, or a session that isn't ours. */
-  private sweepEmptyPrimerSessions(): void {
-    if (this.sweptEmptySessions) return;
-    this.sweptEmptySessions = true;
-    const cwd = this.workspaceRoot();
+  /** Every session id in a repo that has been PROVEN to hold real work, for this
+   *  activation. The sweep runs on every new/opened session, and without this each
+   *  run would re-read every `summary.json` under the repo; with it, a repeat run
+   *  reads only directories it has never classified. Safe to keep forever: a
+   *  session that has a real user turn never becomes empty again. Keyed by
+   *  {@link normalizeRepoPath}. */
+  private readonly provenNonEmpty = new Map<string, Set<string>>();
+
+  /** Delete every empty session directory in `cwd` — one that grok registered but
+   *  no conversation ever reached. `parkFocused` handles the session you walk away
+   *  from inside a running window; this handles the ones nothing was there to park:
+   *  a window closed without a prompt, a crashed host, a remote tab that vanished.
+   *  With the primer retired (v2.2.0) nothing removed those at all and they
+   *  collected as unloadable "Untitled" rows — a session directory holding only
+   *  `summary.json` is not loadable by the CLI (#97).
+   *
+   *  Runs on activation and after every new/opened session, so at most one empty
+   *  session — the live one you are looking at — survives in the repo you are
+   *  working in. Scans the newest slice by mtime so it stays bounded on a large
+   *  store, and reads content only for directories it has not already cleared.
+   *  Never touches a live session, one being loaded right now, one younger than
+   *  {@link SWEEP_MIN_AGE_MS}, a renamed or pinned one, a worktree session, or a
+   *  subagent's transcript. Best-effort throughout: a locked directory is logged
+   *  and skipped. */
+  private sweepEmptySessions(cwd: string = this.workspaceRoot()): void {
+    if (!cwd) return;
     const grokHome = resolveGrokHome(process.env);
     const log = (m: string) => this.output.appendLine(m);
     const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    // A session with a live process re-persists itself the moment it is touched,
+    // so deleting one is at best pointless and at worst races the CLI. The same
+    // goes for a load already in flight: its directory is about to be handed to a
+    // process that has not started yet, and it has no pool entry to protect it.
     const liveIds = new Set<string>();
     for (const s of this.pool) if (s.activeSessionId) liveIds.add(s.activeSessionId);
     if (this.focused.activeSessionId) liveIds.add(this.focused.activeSessionId);
+    for (const clientId of this.remoteClients.clients()) {
+      const id = this.remoteClients.active(clientId)?.activeSessionId;
+      if (id) liveIds.add(id);
+    }
+    for (const id of this.sessionLoadReservations.keys()) liveIds.add(id);
 
+    const repoKey = normalizeRepoPath(cwd);
+    let proven = this.provenNonEmpty.get(repoKey);
+    if (!proven) {
+      proven = new Set<string>();
+      this.provenNonEmpty.set(repoKey, proven);
+    }
     const sessDir = sessionsDirFor(grokHome, cwd);
     const index = indexSessions({ fs: defaultFs, grokHome, cwd, log });
     const removed: string[] = [];
-    for (const { id } of index.slice(0, GrokSidebar.SWEEP_SCAN_LIMIT)) {
-      if (liveIds.has(id) || overrides[id]?.customName?.trim()) continue;
+    const now = Date.now();
+    for (const { id, mtimeMs } of index.slice(0, GrokSidebar.SWEEP_SCAN_LIMIT)) {
+      if (liveIds.has(id) || proven.has(id)) continue;
+      // The index is already sorted newest-first, so this could break — but a
+      // clock skew or a touched file would then silently end the scan early.
+      if (now - mtimeMs < GrokSidebar.SWEEP_MIN_AGE_MS) continue;
       let raw: any;
       try {
         raw = JSON.parse(defaultFs.readFileSync(path.join(sessDir, id, "summary.json"), "utf8"));
       } catch {
         continue;
       }
-      const numMessages = typeof raw?.num_messages === "number" ? raw.num_messages : 0;
-      // Read the chat history and let the content check decide — do NOT skip on a high
-      // num_messages. A primer-only session whose agentic primer turn ballooned past
-      // the gate (e.g. 74 messages, zero real queries) would otherwise survive forever.
-      // Real sessions are already cheaply skipped above via their customName override.
+      // Read the chat history and let the content check decide — do NOT skip on a
+      // high num_messages. A primer-only session whose agentic primer turn ballooned
+      // past the gate (e.g. 74 messages, zero real queries) would otherwise survive
+      // forever. A history file that is present but unreadable is not evidence of
+      // anything, so it is reported as such rather than as "no history".
       let chatHistory: string | undefined;
+      let historyUnreadable = false;
+      const historyPath = path.join(sessDir, id, "chat_history.jsonl");
       try {
-        chatHistory = defaultFs.readFileSync(path.join(sessDir, id, "chat_history.jsonl"), "utf8");
+        chatHistory = defaultFs.readFileSync(historyPath, "utf8");
       } catch {
-        chatHistory = undefined;
+        historyUnreadable = defaultFs.existsSync(historyPath);
       }
-      const empty = isEmptyPrimerSession({
-        numMessages,
+      const override = overrides[id];
+      const empty = isEmptySession({
+        customName: override?.customName,
+        pinnedAt: override?.pinnedAt,
+        worktreePath: override?.worktreePath,
+        kind: typeof raw?.session_kind === "string" ? raw.session_kind : undefined,
+        numMessages: typeof raw?.num_messages === "number" ? raw.num_messages : 0,
         summary: typeof raw?.session_summary === "string" ? raw.session_summary : "",
         generatedTitle: typeof raw?.generated_title === "string" ? raw.generated_title : "",
         chatHistory,
+        historyUnreadable,
       });
-      if (!empty) continue;
+      if (!empty) {
+        // Cache only a verdict reached from evidence. A locked file makes this
+        // "not empty" too, and caching THAT would retire the session from every
+        // later sweep this activation — the lock clears, the orphan stays forever.
+        if (!historyUnreadable) proven.add(id);
+        continue;
+      }
       try {
         deleteSessionDir({ fs: defaultFs, grokHome, cwd, id });
         removed.push(id);
@@ -7718,9 +8239,30 @@ See design doc for the full state machine diagram.`;
         this.sessionCache.delete(id);
       }
       void this.context.globalState.update(SESSION_META_KEY, next);
-      log(`[sessions] swept ${removed.length} empty primer session(s) from history`);
+      log(`[sessions] swept ${removed.length} empty session(s) from history`);
       this.postSessionsList();
     }
+  }
+
+  /** Detach a session from its live client: bump the generation so every handler
+   *  and await bound to that client bails, drop the reference, and END ITS TURN.
+   *
+   *  The turn is the part that is easy to forget and expensive to miss. A client
+   *  that goes away without settling its `prompt()` leaves the turn in flight
+   *  with nothing left to end it, and the send path tests that BEFORE it
+   *  respawns — so the next send is diverted into a queue that can never flush,
+   *  and the session is dead to its user until the window is reloaded. Four
+   *  teardown paths made that same mistake independently, which is why this is
+   *  one function rather than four careful call sites.
+   *
+   *  Returns the detached client so the caller can dispose it as it needs —
+   *  fire-and-forget, or awaited. */
+  private detachClient(session: Session): AcpClient | undefined {
+    const client = session.client;
+    session.gen++;
+    session.client = undefined;
+    session.turnToken = undefined;
+    return client;
   }
 
   /** Tear down one session's live process and drop it from the pool. Bumps its
@@ -7729,9 +8271,7 @@ See design doc for the full state machine diagram.`;
    *  green; an idle/read one goes gray. */
   private disposeSession(session: Session): void {
     const id = session.activeSessionId;
-    session.gen++;
-    session.client?.dispose();
-    session.client = undefined;
+    this.detachClient(session)?.dispose();
     this.pool.delete(session);
     this.remoteClients.deleteActiveValue(session);
     if (id) this.post({ type: "sessionDot", id, dot: this.dotForId(id) });
@@ -7935,9 +8475,8 @@ See design doc for the full state machine diagram.`;
   private disposePool(): Promise<void> {
     const closing: Promise<void>[] = [];
     for (const s of this.pool) {
-      s.gen++;
-      if (s.client) closing.push(s.client.dispose());
-      s.client = undefined;
+      const client = this.detachClient(s);
+      if (client) closing.push(client.dispose());
     }
     this.pool.clear();
     return Promise.all(closing).then(() => undefined);
@@ -7962,6 +8501,7 @@ See design doc for the full state machine diagram.`;
     this.emit(this.focused, { type: "clearMessages" });
     await this.startSession();
     await this.persistWorktreeBinding(this.focused);
+    this.sweepEmptySessions(this.sessionCwd(this.focused));
     this.postRepoCatalog();
   }
 
@@ -7988,6 +8528,7 @@ See design doc for the full state machine diagram.`;
     this.emit(session, { type: "clearMessages" });
     await this.startSession(undefined, session);
     await this.persistWorktreeBinding(session);
+    this.sweepEmptySessions(this.sessionCwd(session));
     if (notifyCatalog) this.postRepoCatalog();
     this.sendRemoteSessionList(session, ownerTabToken);
   }
@@ -8030,6 +8571,35 @@ See design doc for the full state machine diagram.`;
     } finally {
       this.releaseSessionLoad(id, claim.reservation, failure);
     }
+    const opened = this.remoteClients.active(clientId);
+    if (opened) this.sweepEmptySessions(this.sessionCwd(opened));
+  }
+
+  /** The repo scope a remote `resumeSession` should run under. Normally the tab's
+   *  own selection; when the named session cwd belongs to a different catalog
+   *  repo, the tab is moved there first and told about it. Returns the scope to
+   *  use. A cwd owned by no catalog repo leaves the selection untouched, so the
+   *  caller's existing "not found in selected repo" refusal still fires. */
+  private adoptRepoForRemoteSession(
+    clientId: string,
+    sessionCwd: string | undefined,
+    overrides: SessionMetaOverrides,
+  ): string {
+    const selectedCwd = this.remoteClients.cwd(clientId);
+    if (!sessionCwd) return selectedCwd;
+    if (sessionCwdBelongsToRepo(sessionCwd, this.sessionCwdsForRepo(selectedCwd, overrides), pathsEqual)) {
+      return selectedCwd;
+    }
+    const owner = this.repoCatalog().find((repo) =>
+      repo.available &&
+      sessionCwdBelongsToRepo(sessionCwd, this.sessionCwdsForRepo(repo.cwd, overrides), pathsEqual),
+    );
+    if (!owner) return selectedCwd;
+    if (this.remoteVoice.has(clientId)) void this.handleRemoteVoiceStop(clientId, true);
+    this.parkRemoteSession(clientId);
+    this.remoteClients.select(clientId, owner.cwd);
+    this.sendRemoteRepoCatalog(clientId);
+    return owner.cwd;
   }
 
   private async openRemoteSessionReserved(
@@ -8039,8 +8609,20 @@ See design doc for the full state machine diagram.`;
     sessionCwd?: string,
     notifyCatalog = true,
   ): Promise<void> {
-    const selectedCwd = this.remoteClients.cwd(clientId);
     const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    // A remote may name a session that lives in a DIFFERENT repo of the catalog
+    // it was shown — the projects rail lists every repo's sessions at once, so
+    // "open that conversation over there" is now an ordinary click. Move the
+    // tab's selection to the owning repo as part of THIS operation instead of
+    // refusing it.
+    //
+    // Deliberately not two messages: `selectRepo` opens that repo's newest
+    // session on its own, so a client that switched and then resumed would race
+    // its own switch and load a session the user did not pick. The isolation
+    // this replaces is unchanged in substance — the cwd must still belong to a
+    // repo in the catalog (`remoteTargetableCwd` already gated it inbound), and
+    // a cwd owned by no catalog repo still falls through to the refusal below.
+    const selectedCwd = this.adoptRepoForRemoteSession(clientId, sessionCwd, overrides);
     const allowedCwds = this.sessionCwdsForRepo(selectedCwd, overrides);
     const conflictingOwner = this.remoteClients.clients().find((ownerId) =>
       ownerId !== clientId && this.remoteClients.active(ownerId)?.activeSessionId === id
@@ -8176,6 +8758,10 @@ See design doc for the full state machine diagram.`;
     } finally {
       this.releaseSessionLoad(id, claim.reservation, failure);
     }
+    // Opening a conversation is the other moment the user is looking straight at
+    // this repo's history — and the moment the session they just left became
+    // abandonable. Only on success: a load that threw has told us nothing.
+    this.sweepEmptySessions(this.sessionCwd(this.focused));
   }
 
   private async openSessionReserved(id: string, sessionCwd?: string): Promise<void> {
@@ -8772,6 +9358,10 @@ See design doc for the full state machine diagram.`;
       activeCwd: this.sessionCwd(session),
     });
     snap.push(this.buildSessionsList(cwd, undefined, this.remoteActiveSessionId(clientId)));
+    // Pins belong in the snapshot, not behind a `ready` handler: `ready` from a
+    // remote is answered HERE and never reaches onMessage's switch, so anything
+    // pushed from there would simply never arrive on a fresh tab or a reconnect.
+    snap.push({ type: "pinnedSessions", ...this.buildPinnedSessions() });
     const out: HostMsg[] = [];
     for (const m of snap) {
       const t = transformHostMsgForRemote(m, this.remoteMediaDeps);

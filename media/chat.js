@@ -392,6 +392,47 @@
     repoSwitchPending: false,
     selectedRepoCwd: "",
     activeRepoCwd: "",
+    // Projects rail (browser client only). `repoPreviews` caches one page of
+    // rows per NON-selected repo — the selected one always reads the live
+    // `sessions` list instead. `repoPreviewsSupported` latches on the first
+    // `repoSessions` frame: until a host has answered once, the rail probes with
+    // a single request rather than one per repo, so an older host that ignores
+    // the message costs one dead frame instead of a fan-out on every catalog push.
+    // Pinned conversations across every repo — the rail's Pinned group. Host
+    // pushes it; the client never has to ask, and an older host simply never
+    // sends it, leaving the group absent rather than empty.
+    pinnedSessions: [],
+    // Capability latch: the host announces per-session pinning by sending the
+    // frame at all — even empty. Without this the pin renders against a host
+    // that drops `toggleSessionPin`, which is a control that looks broken
+    // rather than absent (the same trap the repo chip avoids).
+    pinnedSessionsKnown: false,
+    repoPreviews: {},
+    repoPreviewsAsked: {},
+    repoPreviewsSupported: false,
+    // Latched when the probe goes unanswered past its deadline — the only way to
+    // learn that a host predates the frame, since silence is all it can offer.
+    repoPreviewsUnsupported: false,
+    // What the connected host says it can do (initialState.capabilities). Empty
+    // until it says, so a control that needs one is withheld rather than offered
+    // and then refused.
+    hostCaps: {},
+    railCollapsed: {},
+    railExpanded: {},
+    // Whether the Archived section is open. Closed by default and remembered
+    // per device, like the project folds.
+    railArchiveOpen: false,
+    // True between a catalog naming a new selected repo and the session list for
+    // that repo arriving — the window in which `state.sessions` still describes
+    // the repo we just left.
+    railSessionsStale: false,
+    // The selected repo's newest sessions AS THE RAIL SEES THEM — fed only by
+    // unfiltered first pages, so an open history search never reshapes the rail.
+    railSelectedRows: [],
+    // Whether that list has ever arrived. An empty holder is otherwise
+    // indistinguishable from a project that genuinely has no conversations, and
+    // the two answer "when was this last worked in" very differently.
+    railSelectedRowsKnown: false,
     activeSessionId: null,
     // Dashboard dot per grok-session id (id → "working"|"needs-you"|"unread"|
     // "error"|"none"). The host computes the value (live status + persisted unread
@@ -579,6 +620,8 @@
     check: `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`,
     chevronRight: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`,
     chevronDown: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>`,
+    ellipsis: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>`,
+    search: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>`,
     clock: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`,
     plus: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>`,
     x: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
@@ -588,6 +631,8 @@
     pencil: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></svg>`,
     folder: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h5l2 3h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/></svg>`,
     pin: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="m5 17 2-7V5l-2-2h14l-2 2v5l2 7Z"/></svg>`,
+    archive: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg>`,
+    archiveRestore: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h4"/><path d="M20 8v11a2 2 0 0 1-2 2h-4"/><path d="m9 15 3-3 3 3"/><path d="M12 12v9"/></svg>`,
     mic: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>`,
     cornerDownRight: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 10 20 15 15 20"/><path d="M4 4v7a4 4 0 0 0 4 4h12"/></svg>`,
     gitBranch: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>`,
@@ -1807,6 +1852,64 @@
     });
   }
 
+  /** uiConfirm with a single text field. Resolves to the string, or null on
+   *  cancel — an empty string is a real answer the caller may want to reject on
+   *  its own terms, so it is never conflated with "dismissed". */
+  function uiPrompt(opts) {
+    return new Promise((resolve) => {
+      const overlay = document.createElement("div");
+      overlay.className = "confirm-overlay";
+      const panel = document.createElement("div");
+      panel.className = "confirm-panel";
+      const title = document.createElement("div");
+      title.className = "confirm-title";
+      title.textContent = opts.title;
+      panel.appendChild(title);
+
+      const field = document.createElement("input");
+      field.type = "text";
+      field.className = "confirm-input";
+      field.value = opts.value || "";
+      if (opts.placeholder) field.placeholder = opts.placeholder;
+      panel.appendChild(field);
+
+      const actions = document.createElement("div");
+      actions.className = "confirm-actions";
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "confirm-btn";
+      cancelBtn.textContent = "Cancel";
+      const okBtn = document.createElement("button");
+      okBtn.type = "button";
+      okBtn.className = "confirm-btn confirm-primary";
+      okBtn.textContent = opts.confirmLabel || "OK";
+      const done = (v) => {
+        document.removeEventListener("keydown", onKey, true);
+        overlay.remove();
+        resolve(v);
+      };
+      const onKey = (e) => {
+        if (e.key === "Escape") { e.stopPropagation(); done(null); }
+      };
+      document.addEventListener("keydown", onKey, true);
+      field.onkeydown = (e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") { e.preventDefault(); done(field.value); }
+        if (e.key === "Escape") done(null);
+      };
+      cancelBtn.onclick = (e) => { e.stopPropagation(); done(null); };
+      okBtn.onclick = (e) => { e.stopPropagation(); done(field.value); };
+      overlay.onclick = (e) => { if (e.target === overlay) { e.stopPropagation(); done(null); } };
+      actions.appendChild(cancelBtn);
+      actions.appendChild(okBtn);
+      panel.appendChild(actions);
+      overlay.appendChild(panel);
+      document.body.appendChild(overlay);
+      field.focus();
+      field.select();
+    });
+  }
+
   function showRemoteExplainer() {
     const overlay = document.createElement("div");
     overlay.className = "confirm-overlay remote-explainer-overlay";
@@ -2506,13 +2609,36 @@
 
   // Cheap incremental update for a single dot when a `sessionDot` arrives while the
   // popover is open — no full re-render.
-  function patchSessionDot(id) {
+  // `root` defaults to the popover. The projects rail carries the same
+  // `data-session-dot` attribute, and one id can be on screen in both at once,
+  // so callers patch each surface they have rather than assuming one home.
+  function patchSessionDot(id, root) {
+    const host = root || historyPopover;
+    if (!host) return;
     const sel = "[data-session-dot=\"" + (window.CSS && CSS.escape ? CSS.escape(id) : id) + "\"]";
-    const dot = historyPopover.querySelector(sel);
-    if (dot) applySessionDot(dot, state.dots[id]);
+    for (const dot of host.querySelectorAll(sel)) applySessionDot(dot, state.dots[id]);
   }
 
-  const cwdKey = (cwd) => String(cwd || "").replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
+  // Repo identity, mirroring the host's own `normalizeRepoPath`: trailing
+  // separators and slash direction never matter, but **case only folds on
+  // Windows**. Folding it everywhere merged `/work/Foo` and `/work/foo` — two
+  // genuinely different checkouts on Linux/macOS — into one identity, which the
+  // projects rail turns into one project rendering the other's conversations and
+  // a click acting on the wrong checkout. The host runs this same rule off
+  // `process.platform`; a browser has no such thing, so infer it from the shape
+  // of the path the host sent (drive letter, or backslashes).
+  // Split on the ONE shape that is unambiguous: a repo cwd is always absolute
+  // (the host only catalogues absolute paths), and an absolute path starting
+  // with "/" is POSIX. There, case is significant AND a backslash is an ordinary
+  // filename character — so neither may be normalised away. Everything else is a
+  // Windows spelling (drive letter or UNC), where both fold. Testing for
+  // backslashes instead would mis-read a legitimate POSIX directory such as
+  // `/srv/Foo\bar` as a Windows path.
+  const cwdKey = (cwd) => {
+    const raw = String(cwd || "");
+    if (raw.charAt(0) === "/") return raw.replace(/\/+$/, "");
+    return raw.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
+  };
   const sameCwd = (a, b) => cwdKey(a) === cwdKey(b);
   const cwdLeaf = (cwd) => {
     const parts = String(cwd || "").replace(/[\\/]+$/, "").split(/[\\/]+/).filter(Boolean);
@@ -2544,6 +2670,8 @@
 
   function renderRepoChip() {
     applyRepoSwitcherVisibility();
+    // The conversation header names the repo too, and a switch changes it.
+    renderSessionHead();
     if (!repoSwitcherAvailable()) return;
     const locked = repoSwitcherLocked();
     const selected = state.repos.find((r) => sameCwd(r.cwd, state.selectedRepoCwd));
@@ -2844,23 +2972,26 @@
         };
       }
       actions.appendChild(renameBtn);
-      // No delete for the active session: it's the live conversation and the CLI
-      // re-persists it, so a delete wouldn't stick. Rename is still fine.
-      if (!active) {
-        const delBtn = document.createElement("button");
-        delBtn.className = "history-action-btn history-action-danger";
-        delBtn.innerHTML = ICON.trash;
-        delBtn.title = "Delete";
-        delBtn.onclick = (e) => {
-          e.stopPropagation();
-          uiConfirm({
-            title: s.displayName ? `Delete "${s.displayName}"?` : "Delete this session?",
-            body: "This cannot be undone.",
-            confirmLabel: "Delete",
-            danger: true,
-          }).then((ok) => { if (ok) vscode.postMessage({ type: "deleteSession", id: s.id, name: s.displayName }); });
-        };
-        actions.appendChild(delBtn);
+      // The open conversation is deletable here too, where the host can do it:
+      // it disposes the CLI before touching the disk — which is what used to
+      // make the delete "not stick" — and then starts a fresh conversation in
+      // the same project. Against a host that cannot, the button stays away
+      // rather than posting a message that comes back refused.
+      if (!active || canDeleteActiveSession()) {
+      const delBtn = document.createElement("button");
+      delBtn.className = "history-action-btn history-action-danger";
+      delBtn.innerHTML = ICON.trash;
+      delBtn.title = "Delete";
+      delBtn.onclick = (e) => {
+        e.stopPropagation();
+        uiConfirm({
+          title: s.displayName ? `Delete "${s.displayName}"?` : "Delete this session?",
+          body: deleteSessionWarning(active),
+          confirmLabel: "Delete",
+          danger: true,
+        }).then((ok) => { if (ok) vscode.postMessage({ type: "deleteSession", id: s.id, name: s.displayName }); });
+      };
+      actions.appendChild(delBtn);
       }
       row.appendChild(actions);
 
@@ -2875,9 +3006,1086 @@
     state.sessionLoading = false;
     state.sessionHasMore = false;
     renderHistoryList();
-    positionDropdownPopover(historyPopover, historyBtn);
+    // Where the rail exists the app-wide bar is gone, so `historyBtn` has no box
+    // to hang a dropdown off — the conversation header carries its own History
+    // icon and that is the anchor. The browser page reparents the popover to
+    // match.
+    positionDropdownPopover(historyPopover, railHistoryAnchor() || historyBtn);
     historyPopover.hidden = false;
     requestSessions(0);
+  }
+
+  function railHistoryAnchor() {
+    if (!IS_REMOTE || !document.body.classList.contains("has-rail")) return null;
+    return document.getElementById("session-history") || document.getElementById("session-head-main");
+  }
+
+  // ---------- projects rail ----------
+  //
+  // A persistent left rail: every repo with Grok history, each showing its
+  // newest few sessions. It exists ONLY in the browser client — `#projects-rail`
+  // is part of the relay's own page, so in the VS Code webview every function
+  // here finds no mount and returns. That element lookup is the entire gate;
+  // there is no second copy of this UI to keep in sync, and VS Code (where the
+  // window already IS the repo) renders nothing new.
+  //
+  // Rows for a repo the client is NOT currently in arrive on `repoSessions`, a
+  // frame older hosts never send. When it never arrives the rail still works:
+  // the selected repo's rows come from the ordinary `sessions` frame and the
+  // other repos simply stay empty until you open them. Capability detection,
+  // never a version check — same rule as the repo chip above.
+
+  const RAIL_PREVIEW = 3;      // rows per repo before "Show all"
+  const RAIL_EXPANDED = 20;    // rows after it — the rail is a jump list, not history
+
+  // A project nobody has touched in a month is not one you are choosing between
+  // today, so it drops to Archived on its own — the list stays a list of what you
+  // are working on without anyone having to tidy it.
+  const RAIL_ARCHIVE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
+  // …but never so far that Projects empties out. See railSections.
+  const RAIL_ALWAYS_VISIBLE = 3;
+
+  // Generous: the host answers by scanning the session store on disk, and a slow
+  // first read must not be mistaken for an extension that cannot answer at all.
+  const RAIL_PROBE_TIMEOUT_MS = 8000;
+
+  let railEl = null;
+  let railResolved = false;
+  let railProbeTimer = null;
+
+  /** The list body. The browser page wraps the rail in fixed chrome (brand,
+   *  search, account) and gives the scrolling middle its own element, so the
+   *  only thing this file may empty is that middle — clearing the whole aside
+   *  would take the chrome with it on every render. Falls back to the aside so
+   *  a page without the wrapper still works. */
+  function rail() {
+    if (!railResolved) {
+      railResolved = true;
+      railEl = IS_REMOTE
+        ? document.getElementById("rail-scroll") || document.getElementById("projects-rail")
+        : null;
+      // Once, before anything reads the fold state — renderRail() resolves the
+      // mount before it renders a row, so this always lands first.
+      if (railEl) loadRailShape();
+    }
+    return railEl;
+  }
+
+  /** The whole panel, chrome included — what gets hidden, and what the drawer
+   *  slides. `rail()` is only its scrolling middle. */
+  function railPanel() {
+    return IS_REMOTE ? document.getElementById("projects-rail") : null;
+  }
+
+  /** Live filter over what the rail already holds: repo labels and the session
+   *  rows already fetched. Deliberately NOT a host search — the host searches one
+   *  repo at a time, so a cross-repo query would be one round-trip per project.
+   *  History remains the place that reaches everything. */
+  function railFilterText() {
+    const input = document.getElementById("rail-search");
+    return input ? input.value.trim().toLowerCase() : "";
+  }
+
+  function railMatches(text) {
+    const q = railFilterText();
+    if (!q) return true;
+    return String(text || "").toLowerCase().includes(q);
+  }
+
+  function wireRailSearch() {
+    const input = document.getElementById("rail-search");
+    if (!input || input.dataset.railWired) return;
+    input.dataset.railWired = "1";
+    input.oninput = () => renderRail();
+    input.onkeydown = (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape" && input.value) { input.value = ""; renderRail(); }
+    };
+  }
+
+  // ---------- rail overflow menus ----------
+  //
+  // Anchored to the button but parented to <body> and position:fixed, because
+  // the rail is an `overflow: hidden auto` scroller: a menu positioned inside it
+  // would be clipped by the very rows it belongs to.
+  let railMenuEl = null;
+
+  function closeRailMenu() {
+    if (railMenuEl) { railMenuEl.remove(); railMenuEl = null; }
+  }
+
+  /** items: [{ label, icon, danger, disabled, onSelect }] — a `null` entry is a
+   *  separator, which is how the destructive tail is kept away from the thumb. */
+  function openRailMenu(anchor, items) {
+    const wasMine = railMenuEl && railMenuEl.dataset.anchorId === anchor.dataset.railMenuId;
+    closeRailMenu();
+    if (wasMine) return;
+    if (!anchor.dataset.railMenuId) anchor.dataset.railMenuId = String(++openRailMenu.seq);
+
+    const menu = document.createElement("div");
+    menu.className = "rail-menu";
+    menu.dataset.anchorId = anchor.dataset.railMenuId;
+    menu.setAttribute("role", "menu");
+    for (const item of items) {
+      if (!item) {
+        const sep = document.createElement("div");
+        sep.className = "rail-menu-sep";
+        menu.appendChild(sep);
+        continue;
+      }
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "rail-menu-item" + (item.danger ? " danger" : "");
+      btn.setAttribute("role", "menuitem");
+      btn.disabled = !!item.disabled;
+      if (item.title) btn.title = item.title;
+      btn.innerHTML = `<span class="rail-menu-icon">${item.icon || ""}</span><span></span>`;
+      btn.lastChild.textContent = item.label;
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        closeRailMenu();
+        item.onSelect();
+      };
+      menu.appendChild(btn);
+    }
+    document.body.appendChild(menu);
+    railMenuEl = menu;
+
+    // Flip up / pull left rather than run off the viewport — the rail sits at the
+    // left edge on desktop and the drawer covers the screen on a phone.
+    const box = anchor.getBoundingClientRect();
+    const size = menu.getBoundingClientRect();
+    const gap = 4;
+    let top = box.bottom + gap;
+    if (top + size.height > window.innerHeight - 8) top = Math.max(8, box.top - size.height - gap);
+    let left = box.right - size.width;
+    left = Math.max(8, Math.min(left, window.innerWidth - size.width - 8));
+    menu.style.top = `${Math.round(top)}px`;
+    menu.style.left = `${Math.round(left)}px`;
+    const first = menu.querySelector(".rail-menu-item:not(:disabled)");
+    if (first) first.focus();
+  }
+  openRailMenu.seq = 0;
+
+  if (IS_REMOTE) {
+    document.addEventListener("click", (e) => {
+      if (railMenuEl && !railMenuEl.contains(e.target)) closeRailMenu();
+    }, true);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeRailMenu();
+    });
+    window.addEventListener("resize", closeRailMenu);
+  }
+
+  /** The ⋯ button itself — same shape for a project row, a conversation row and
+   *  the conversation header, so one class carries all three. */
+  function railMenuButton(label, items) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "rail-action-btn rail-menu-btn";
+    btn.innerHTML = ICON.ellipsis;
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    btn.setAttribute("aria-haspopup", "menu");
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      openRailMenu(btn, typeof items === "function" ? items() : items);
+    };
+    btn.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") e.stopPropagation(); };
+    return btn;
+  }
+
+  // ---------- remembered rail shape ----------
+  //
+  // Which projects are folded, and which have been expanded past their preview,
+  // are answers to "how do I like my sidebar", not facts about the session — so
+  // they outlive the tab. Kept in localStorage rather than the host: this is the
+  // BROWSER's view of a catalog it merely reads, and two tabs on two machines
+  // are entitled to different shapes. Keyed by device so a second device's rail
+  // does not inherit the first one's folds.
+  const RAIL_SHAPE_KEY = "grok.remote.railShape";
+
+  function railShapeKey() {
+    try {
+      return RAIL_SHAPE_KEY + ":" + (new URLSearchParams(location.search).get("device") || "default");
+    } catch (_) {
+      return RAIL_SHAPE_KEY + ":default";
+    }
+  }
+
+  function loadRailShape() {
+    if (!IS_REMOTE) return;
+    try {
+      const raw = localStorage.getItem(railShapeKey());
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      // Shapes only — anything else in there is a corrupted or foreign write and
+      // is better ignored than trusted into the render path.
+      if (saved && typeof saved === "object") {
+        if (saved.collapsed && typeof saved.collapsed === "object") state.railCollapsed = saved.collapsed;
+        if (saved.expanded && typeof saved.expanded === "object") state.railExpanded = saved.expanded;
+        // Whether Archived is open is the same kind of answer, so it keeps the
+        // same company. Default closed: the section exists to be out of the way.
+        if (saved.archiveOpen === true) state.railArchiveOpen = true;
+      }
+    } catch (_) { /* private mode, or a value we did not write */ }
+  }
+
+  function saveRailShape() {
+    if (!IS_REMOTE) return;
+    try {
+      localStorage.setItem(railShapeKey(), JSON.stringify({
+        collapsed: state.railCollapsed,
+        expanded: state.railExpanded,
+        archiveOpen: !!state.railArchiveOpen,
+      }));
+    } catch (_) { /* private mode, or quota */ }
+  }
+
+
+  /** Repos in rail order: the one holding the most recent CONVERSATION, first.
+   *  The rail deliberately ignores repo pins, which the VS Code repo picker still
+   *  offers — a pin only earns its complexity where recency is a poor answer, and
+   *  for projects it never is: the one you touched last is the one you want.
+   *  Conversations are different, and keep their pins. */
+  function railRepos() {
+    return state.repos.slice().sort((a, b) =>
+      // Ties break on the NAME, never on the catalog's own stamp: that stamp is
+      // the session directory's mtime, which clearing a project's history
+      // touches — so using it here would put the just-emptied project above its
+      // equally-empty neighbours, which is the bug this ordering exists to fix,
+      // in miniature.
+      railRepoActivity(b) - railRepoActivity(a) ||
+      String(a.label || a.cwd || "").localeCompare(String(b.label || b.cwd || "")));
+  }
+
+  /** When this project was last worked in, read from its conversations.
+   *
+   *  Deliberately NOT the catalog's own `updatedAt`, which is the mtime of the
+   *  project's session DIRECTORY: emptying a project writes to that directory, so
+   *  clearing a project's history shot it straight to the top of the rail — the
+   *  one project that demonstrably had no recent activity, presented as the most
+   *  recent. Last activity means the last conversation, and a project with none
+   *  has none. Falls back to the catalog stamp only while the rows are still
+   *  loading, where a settling guess beats an arbitrary order. */
+  /** Projects split into the two sections the rail shows them in.
+   *
+   *  Archiving is derived, never a stored section: one timestamped choice per
+   *  project plus an age rule, both read against the project's newest
+   *  conversation. That is what makes "working in an archived project brings it
+   *  back" need no bookkeeping at all — activity newer than the choice simply
+   *  outranks it, and there is no flag left behind to go stale. */
+  function railSections() {
+    const ordered = railRepos();
+    const now = Date.now();
+    // The floor, and it is a REQUIREMENT rather than a rounding error: however
+    // quiet things have been, the newest few projects stay in view. Coming back
+    // from three weeks away would otherwise archive every project at once and
+    // leave a rail that reads as broken. So yes, three projects can sit in
+    // Projects with nothing recent in them — deliberately. It holds back the AGE
+    // rule only; an explicit Archive still takes effect immediately, or the
+    // control would silently do nothing on the projects you use most.
+    const floorKeys = new Set(
+      ordered
+        .filter((r) => !sameCwd(r.cwd, state.selectedRepoCwd))
+        .slice(0, RAIL_ALWAYS_VISIBLE)
+        .map((r) => cwdKey(r.cwd)),
+    );
+    const active = [];
+    const archived = [];
+    for (const repo of ordered) (railRepoArchived(repo, floorKeys, now) ? archived : active).push(repo);
+    return { active, archived };
+  }
+
+  function railRepoArchived(repo, floorKeys, now) {
+    // Never the project you are reading. Archiving it is still recorded — it
+    // drops out of sight the moment you work somewhere else — but a rail that
+    // files the open conversation under "Archived" is describing the screen
+    // wrongly.
+    if (sameCwd(repo.cwd, state.selectedRepoCwd)) return false;
+    const known = railKnownRows(repo);
+    const at = railRepoActivity(repo);
+    // Your own last word, in force until the project is worked in again — and
+    // without the project's own rows there is nothing that could have overruled
+    // it, so it stands as given rather than being tested against a guess.
+    if (repo.archivedAt > 0 && (!known || repo.archivedAt >= at)) return !!repo.archived;
+    // The age rule NEVER runs on a guess. Without the project's conversations we
+    // do not know when it was last worked in: `repo.updatedAt` is the session
+    // DIRECTORY's mtime, and that does not move when you continue an existing
+    // conversation — only when one is added or removed. Against an extension too
+    // old to list another project's sessions that stamp is all there is, and
+    // trusting it files a project you use every day under Archived. Better to
+    // leave every project in view than to hide the wrong one silently.
+    if (!known) return false;
+    if (floorKeys.has(cwdKey(repo.cwd))) return false;
+    // No conversations at all — nothing to have been recent.
+    return at > 0 ? now - at > RAIL_ARCHIVE_AFTER_MS : true;
+  }
+
+  /** Whether the live conversation is one of THIS project's.
+   *
+   *  `activeRepoCwd` is the live session's own cwd, and for a worktree session
+   *  that is the worktree — a directory that is deliberately not a catalog row.
+   *  So the parent project has to recognise its own conversation by the rows it
+   *  actually draws, or the project holding the conversation you are reading
+   *  claims to hold nothing. */
+  function railRepoOwnsActive(repo, row) {
+    if (!state.activeSessionId) return false;
+    if (sameCwd(repo.cwd, state.activeRepoCwd)) return true;
+    if (row) return sameCwd(row.cwd, state.activeRepoCwd);
+    const rows = railRowsFor(repo);
+    return !!rows && rows.entries.some(
+      (s) => s.id === state.activeSessionId && sameCwd(s.cwd, state.activeRepoCwd),
+    );
+  }
+
+  /** Whether the host can record an archive choice. `archived` rides on every
+   *  catalog row from a host that knows about it, empty or not, so its presence
+   *  is the capability — a version number would be the wrong question, and an
+   *  absent field cannot be told from "nothing archived yet". */
+  function railArchiveSupported() {
+    return state.repos.some((r) => typeof r.archived === "boolean");
+  }
+
+  /** Rows we can draw conclusions FROM, as opposed to rows we merely have none
+   *  of yet. The selected project's holder starts empty and stays empty until
+   *  its first list arrives, so an empty one proves nothing about the project —
+   *  and every question the rail asks of it ("when was this last worked in",
+   *  "is there anything here to clear") gets the wrong answer from that. One
+   *  gate, because two of them drifted apart the first time. */
+  function railKnownRows(repo) {
+    const rows = railRowsFor(repo);
+    if (!rows) return null;
+    if (!rows.entries.length && rows.entries === state.railSelectedRows && !state.railSelectedRowsKnown) {
+      return null;
+    }
+    return rows;
+  }
+
+  function railRepoActivity(repo) {
+    const rows = railKnownRows(repo);
+    if (!rows) return repo.updatedAt || 0;
+    let newest = 0;
+    for (const s of rows.entries) {
+      const at = Number(s.updatedAt) || 0;
+      if (at > newest) newest = at;
+    }
+    return newest;
+  }
+
+  /** Preview rows for a repo. The SELECTED repo reads the live `sessions` list
+   *  rather than its cached preview: that list is the one the host keeps pushing
+   *  on every rename/delete/new-session, so the repo you are working in stays
+   *  correct without the rail asking for anything. */
+  function railRowsFor(repo) {
+    if (sameCwd(repo.cwd, state.selectedRepoCwd)) {
+      // Deliberately NOT `state.sessions`: that list follows the history
+      // popover's search, and it also still describes the PREVIOUS repo in the
+      // beat between the catalog naming a new one and its list arriving —
+      // rendering it then is cross-repo bleed, not a cosmetic lag. This holder
+      // is written only by unfiltered first pages, so it always means "this
+      // repo's newest conversations".
+      // Mid-switch the holder still describes the repo we left, so fall back to
+      // what we already know about THIS repo — the preview fetched while it was
+      // a sibling. Blanking the section instead would throw away rows we hold
+      // and make a switch look like a load; the controls are disabled during the
+      // switch anyway, so showing them costs nothing and keeps the conversation
+      // you just clicked on screen.
+      if (state.railSessionsStale) {
+        const known = state.repoPreviews[cwdKey(repo.cwd)];
+        return known ? { entries: known.entries, total: known.total } : null;
+      }
+      return { entries: state.railSelectedRows, total: state.railSelectedRows.length };
+    }
+    const cached = state.repoPreviews[cwdKey(repo.cwd)];
+    return cached ? { entries: cached.entries, total: cached.total } : null;
+  }
+
+  /** Ask the host for previews of the repos we have no rows for. Skipped
+   *  entirely until the host proves it answers — one probe for the first repo,
+   *  and the rest only once a `repoSessions` frame has come back. Without this
+   *  an old host would be sent one dead request per repo on every catalog push. */
+  function requestRailPreviews() {
+    if (!rail() || !state.reposKnown) return;
+    const wanted = railRepos().filter(
+      (r) => r.available && !sameCwd(r.cwd, state.selectedRepoCwd) && !state.repoPreviews[cwdKey(r.cwd)],
+    );
+    if (!wanted.length) return;
+    const ask = state.repoPreviewsSupported ? wanted : wanted.slice(0, 1);
+    for (const r of ask) {
+      const key = cwdKey(r.cwd);
+      if (state.repoPreviewsAsked[key]) continue;
+      state.repoPreviewsAsked[key] = true;
+      vscode.postMessage({ type: "listRepoSessions", cwd: r.cwd, limit: RAIL_EXPANDED });
+      armRailProbeDeadline();
+    }
+  }
+
+  /** A host that predates `listRepoSessions` answers with silence, so the only
+   *  way to tell "still reading the session store" from "will never reply" is a
+   *  deadline. Armed once, on the first probe; cancelled by the first answer. */
+  function armRailProbeDeadline() {
+    if (railProbeTimer || state.repoPreviewsSupported || state.repoPreviewsUnsupported) return;
+    const ms = Number(window.__grokRailProbeTimeoutMs) > 0
+      ? Number(window.__grokRailProbeTimeoutMs)
+      : RAIL_PROBE_TIMEOUT_MS;
+    railProbeTimer = setTimeout(() => {
+      railProbeTimer = null;
+      if (state.repoPreviewsSupported) return;
+      state.repoPreviewsUnsupported = true;
+      renderRail();
+    }, ms);
+  }
+
+  function renderRail() {
+    const root = rail();
+    if (!root) return;
+    // The rail is the repo switcher in another shape: it appears under exactly
+    // the same condition, so a host that never sends `repos` gets the plain
+    // single-column chat instead of an empty sidebar.
+    const on = repoSwitcherAvailable() && state.repos.length > 0;
+    const panel = railPanel();
+    if (panel) panel.hidden = !on;
+    root.hidden = !on;
+    document.body.classList.toggle("has-rail", on);
+    if (!on) { renderSessionHead(); return; }
+    wireRailSearch();
+    closeRailMenu();
+
+    root.innerHTML = "";
+    const q = railFilterText();
+    let shownAnything = false;
+
+    // Pinned sits ABOVE Projects and spans every repo: a pin is only worth
+    // anything if it lifts a conversation OUT of the project you would otherwise
+    // have to open first. Rows name their repo, because out here that is the
+    // only thing telling two similarly-named conversations apart.
+    const pinned = state.pinnedSessions.filter(
+      (s) => railMatches(s.displayName) || railMatches(railRepoLabelFor(s.cwd)),
+    );
+    if (pinned.length) {
+      const pinHead = document.createElement("div");
+      pinHead.className = "rail-head";
+      pinHead.innerHTML = `<span class="rail-head-title">Pinned</span>`;
+      root.appendChild(pinHead);
+
+      const pinList = document.createElement("div");
+      pinList.className = "rail-list rail-pinned";
+      for (const s of pinned) {
+        pinList.appendChild(renderRailSessionRow(s, { cwd: s.cwd, available: true }, { showRepo: true }));
+      }
+      root.appendChild(pinList);
+      shownAnything = true;
+    }
+
+    // While filtering, a project earns its place either by its own name (then it
+    // shows all its rows) or by holding a matching conversation (then it shows
+    // only those). Projects that do neither are dropped rather than left as empty
+    // headings — a filtered list that still lists everything is not a filter.
+    const sections = railSections();
+    const repos = sections.active.filter((repo) => !q || railRepoHasMatch(repo));
+    if (repos.length) {
+      const head = document.createElement("div");
+      head.className = "rail-head";
+      head.innerHTML = `<span class="rail-head-title">Projects</span>`;
+      root.appendChild(head);
+
+      const list = document.createElement("div");
+      list.className = "rail-list";
+      root.appendChild(list);
+
+      for (const repo of repos) list.appendChild(renderRailRepo(repo, false));
+      shownAnything = true;
+    }
+
+    // Archived: everything you put away, plus everything that went quiet for a
+    // month. Folded by default — the whole point is that it is out of the way —
+    // but a search reaches inside, because a query answered with "No matches."
+    // while the project sits collapsed two inches below is simply wrong.
+    const archived = sections.archived.filter((repo) => !q || railRepoHasMatch(repo));
+    if (archived.length) {
+      const open = q ? true : !!state.railArchiveOpen;
+      root.appendChild(railArchiveHead(archived.length, open, !!q));
+      if (open) {
+        const list = document.createElement("div");
+        list.className = "rail-list";
+        for (const repo of archived) list.appendChild(renderRailRepo(repo, true));
+        root.appendChild(list);
+      }
+      shownAnything = true;
+    }
+
+    if (!shownAnything) root.appendChild(railNote(q ? "No matches." : "No projects yet"));
+    renderSessionHead();
+  }
+
+  /** The Archived heading, which is also its own disclosure control. A count
+   *  rather than a bare label: folded away, the number is the only thing saying
+   *  whether there is anything down there worth opening. */
+  function railArchiveHead(count, open, forcedOpenBySearch) {
+    const head = document.createElement("div");
+    head.className = "rail-head rail-head-fold";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "rail-head-btn";
+    btn.setAttribute("aria-expanded", String(open));
+    btn.innerHTML =
+      `<span class="rail-head-twisty">${open ? ICON.chevronDown : ICON.chevronRight}</span>` +
+      `<span class="rail-head-title">Archived</span>` +
+      `<span class="rail-head-count"></span>`;
+    btn.querySelector(".rail-head-count").textContent = String(count);
+    // While a search is holding it open, the button would otherwise appear to do
+    // nothing — the next render forces it back open. Say so instead.
+    btn.disabled = forcedOpenBySearch;
+    btn.title = forcedOpenBySearch
+      ? "Open while your search matches an archived project"
+      : (open ? "Hide archived projects" : "Show archived projects");
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      if (state.railArchiveOpen) delete state.railArchiveOpen;
+      else state.railArchiveOpen = true;
+      saveRailShape();
+      renderRail();
+    };
+    head.appendChild(btn);
+    return head;
+  }
+
+  /** The catalog's label for a cwd — repos that share a leaf name are only
+   *  distinguishable there. Falls back to the leaf for a worktree, whose cwd is a
+   *  subdirectory and so names no catalog row. */
+  function railRepoLabelFor(cwd) {
+    const home = state.repos.find((r) => sameCwd(r.cwd, cwd));
+    return home?.label || cwdLeaf(cwd);
+  }
+
+  function railRepoHasMatch(repo) {
+    if (railMatches(repo.label || cwdLeaf(repo.cwd))) return true;
+    const rows = railRowsFor(repo);
+    return !!rows && rows.entries.some((s) => railMatches(s.displayName));
+  }
+
+  // ---------- the conversation header ----------
+  //
+  // Where the rail exists, the app-wide toolbar does not: the controls that
+  // belong to a PROJECT moved into the rail, and what is left belongs to the
+  // conversation you are reading, so it lives with the conversation. On a phone
+  // this same header also carries the drawer handle and New, which is why it is
+  // one component and not two.
+
+  /** The active session's record, wherever we happen to hold it. `railSelectedRows`
+   *  first: it is the only list guaranteed to be an unfiltered page of the repo
+   *  currently selected, where `state.sessions` follows the history search box. */
+  function activeSessionRecord() {
+    const id = state.activeSessionId;
+    if (!id) return null;
+    const lists = [state.railSelectedRows, state.sessions, state.pinnedSessions];
+    for (const list of lists) {
+      if (!Array.isArray(list)) continue;
+      const hit = list.find((s) => s && s.id === id);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  function renderSessionHead() {
+    if (!IS_REMOTE) return;
+    const head = document.getElementById("session-head");
+    if (!head) return;
+    const titleEl = document.getElementById("session-head-title");
+    const subEl = document.getElementById("session-head-sub");
+    const menuSlot = document.getElementById("session-head-actions");
+    if (!titleEl || !subEl || !menuSlot) return;
+
+    const record = activeSessionRecord();
+    // A brand-new conversation has no stored name until its first turn is
+    // summarised, so say what it is rather than showing an empty bar.
+    let name = record?.displayName || "New session";
+    if (record?.worktreeLabel && name.startsWith("(WT)")) name = name.slice(4).trim() || "Worktree";
+    titleEl.textContent = name;
+
+    const cwd = record?.cwd || state.selectedRepoCwd;
+    subEl.textContent = cwd ? railRepoLabelFor(cwd) : "";
+    subEl.hidden = !cwd;
+    head.title = cwd || "";
+
+    menuSlot.innerHTML = "";
+    if (record) {
+      const repo = state.repos.find((r) => sameCwd(r.cwd, cwd)) || { cwd, available: true };
+      const active = record.id === state.activeSessionId && sameCwd(cwd, state.activeRepoCwd);
+      menuSlot.appendChild(railMenuButton("Session actions", () => railSessionMenuItems(record, repo, active)));
+    }
+
+    // The title is a label. It says where you are; it does not also secretly open
+    // something. History and New are their own icons, in the order the VS Code
+    // top bar has always used them — the same two controls in the same two
+    // places, so the browser is not a second thing to learn.
+    const history = document.getElementById("session-history");
+    if (history && !history.dataset.railWired) {
+      history.dataset.railWired = "1";
+      history.innerHTML = ICON.clock;
+      history.onclick = (e) => { e.stopPropagation(); openHistoryPopover(); };
+    }
+    const add = document.getElementById("session-new");
+    if (add && !add.dataset.railWired) {
+      add.dataset.railWired = "1";
+      add.innerHTML = ICON.squarePen;
+      add.onclick = (e) => {
+        e.stopPropagation();
+        closePopovers();
+        vscode.postMessage({ type: "newSession" });
+      };
+    }
+  }
+
+  function renderRailRepo(repo, inArchive) {
+    const key = cwdKey(repo.cwd);
+    const selected = sameCwd(repo.cwd, state.selectedRepoCwd);
+    // The project holding the live conversation stays open. A fold is a
+    // preference you set at some earlier moment, and the one thing it must never
+    // do is hide where you are NOW — which is exactly what happened when you
+    // folded a project and later opened one of its conversations from elsewhere.
+    // Only in Projects: down in Archived the section is already closed, so
+    // holding one project open inside it would be noise.
+    const holdsLive = !inArchive && railRepoOwnsActive(repo);
+    const collapsed = !holdsLive && !!state.railCollapsed[key];
+
+    // No marker for the selected or the live project. The conversation you are
+    // reading is highlighted where it sits, which says which project you are in
+    // without a second, competing mark — and the header names it outright.
+    const sec = document.createElement("section");
+    sec.className = "rail-repo" +
+      (repo.available ? "" : " unavailable") +
+      (collapsed ? " collapsed" : "");
+
+    const head = document.createElement("div");
+    head.className = "rail-repo-head";
+    head.title = repo.cwd;
+
+    // Collapse is its own control, so clicking the NAME can mean "work here"
+    // without also folding the rows away.
+    const twisty = document.createElement("button");
+    twisty.type = "button";
+    twisty.className = "rail-twisty";
+    twisty.innerHTML = collapsed ? ICON.chevronRight : ICON.chevronDown;
+    twisty.disabled = holdsLive;
+    twisty.title = holdsLive
+      ? "The open conversation is in this project"
+      : (collapsed ? "Expand" : "Collapse");
+    twisty.setAttribute("aria-expanded", String(!collapsed));
+    twisty.onclick = (e) => {
+      e.stopPropagation();
+      if (holdsLive) return;
+      if (collapsed) delete state.railCollapsed[key];
+      else state.railCollapsed[key] = true;
+      saveRailShape();
+      renderRail();
+    };
+    head.appendChild(twisty);
+
+    const name = document.createElement("button");
+    name.type = "button";
+    name.className = "rail-repo-name";
+    name.disabled = !repo.available || repoSwitcherLocked();
+    name.innerHTML =
+      `<span class="rail-repo-icon">${repo.worktreeLabel ? ICON.gitBranch : ICON.folder}</span>` +
+      `<span class="rail-repo-label"></span>`;
+    name.querySelector(".rail-repo-label").textContent = repo.label || cwdLeaf(repo.cwd);
+    name.onclick = () => {
+      if (!repo.available || repoSwitcherLocked() || selected) return;
+      selectRailRepo(repo);
+    };
+    head.appendChild(name);
+
+
+    const actions = document.createElement("div");
+    actions.className = "rail-repo-actions";
+
+    // New session in ANY project, selected or not. The host only ever creates in
+    // the repo it currently has selected, so for another one this is really
+    // "switch there, then start fresh" — a two-step intent the page has to own,
+    // because the browser client arms its own "open this repo's newest session"
+    // bridge on every outbound `selectRepo` and would otherwise land the tab on
+    // an existing conversation. `__grokRailNewIntent` tells that bridge which
+    // intent this particular switch carries. The title says so out loud: this
+    // button moves the whole tab, and that should never be a surprise.
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "rail-action-btn";
+    add.innerHTML = ICON.plus;
+    add.title = selected ? "New session here" : "Switch to this project and start a new session";
+    add.disabled = !repo.available || repoSwitcherLocked();
+    add.onclick = (e) => {
+      e.stopPropagation();
+      if (!repo.available || repoSwitcherLocked()) return;
+      if (selected) { vscode.postMessage({ type: "newSession" }); return; }
+      window.__grokRailNewIntent = repo.cwd;
+      selectRailRepo(repo);
+    };
+    actions.appendChild(add);
+
+    // Projects sort by recency and nothing else, so there is no pin here — the
+    // menu carries only the destructive act, which is precisely what a menu is
+    // for. (The VS Code repo picker keeps its own repo pins; the rail ignores
+    // them.)
+    //
+    // A project we have loaded and found empty offers nothing to clear, so the
+    // item says so on its face instead of taking the click and answering with a
+    // notice in whatever conversation happens to be open. Only a LOADED preview
+    // counts: "no rows yet" is not "no rows".
+    const loaded = railKnownRows(repo);
+    const knownEmpty = !!loaded && loaded.entries.length === 0;
+    // Clearing a project the host has NOT selected is a repo-addressed act, and
+    // an extension that predates that simply drops the message — no error, no
+    // deletion, nothing. A control that fails in silence is worse than one that
+    // isn't offered, so it waits for proof: a host that has answered
+    // `listRepoSessions` is a host that reads the cwd on these messages, and one
+    // that has not cannot draw another project's rows either. The SELECTED
+    // project is never gated — clearing where you already are has always worked.
+    const reachable = selected || state.repoPreviewsSupported;
+    actions.appendChild(railMenuButton("Project actions", () => [
+      // First, because it is the everyday one: putting a project away is
+      // housekeeping, and it has to be reachable without passing the delete.
+      // The verb follows the section this row is drawn in rather than the stored
+      // flag — a project the age rule archived has no stored flag, and offering
+      // "Archive" on a row that is already under Archived would be nonsense.
+      // Hidden entirely against a host too old to record the choice: a control
+      // that silently does nothing is worse than one that isn't there.
+      ...(railArchiveSupported() ? [{
+        label: inArchive ? "Move to Projects" : "Archive project",
+        icon: inArchive ? ICON.archiveRestore : ICON.archive,
+        title: inArchive
+          ? "Show this project under Projects again"
+          : "Move this project out of the way. Its conversations stay, and working here brings it back.",
+        onSelect: () => vscode.postMessage({
+          type: "setRepoArchived",
+          cwd: repo.cwd,
+          archived: !inArchive,
+        }),
+      }, null] : []),
+      {
+        label: "Clear all history",
+        icon: ICON.trash,
+        danger: true,
+        disabled: !repo.available || knownEmpty || !reachable,
+        title: !reachable
+          ? "Update the Grok extension on your computer to clear another project's history from here"
+          : knownEmpty
+            ? "This project has no history"
+            : "Delete all sessions in this repository's history",
+        onSelect: () => {
+          const repoLabel = repo.label || cwdLeaf(repo.cwd);
+          uiConfirm({
+            title: `Clear history for “${repoLabel}”?`,
+            body: `Deletes every session for:\n${repo.cwd}\n\nThe current session is kept. This cannot be undone.`,
+            confirmLabel: "Delete All",
+            danger: true,
+          }).then((ok) => {
+            // `clearAllSessions` is repo-addressed, so this works on a project
+            // the host does not currently have selected — no switch needed.
+            if (ok) vscode.postMessage({ type: "clearAllSessions", cwd: repo.cwd });
+          });
+        },
+      },
+    ]));
+
+    head.appendChild(actions);
+    sec.appendChild(head);
+
+    if (!collapsed) sec.appendChild(renderRailSessions(repo, key));
+    return sec;
+  }
+
+  function renderRailSessions(repo, key) {
+    const body = document.createElement("div");
+    body.className = "rail-sessions";
+
+    if (!repo.available) {
+      body.appendChild(railNote("Unavailable"));
+      return body;
+    }
+
+    const rows = railRowsFor(repo);
+    if (!rows) {
+      // No rows yet. Two very different reasons, and saying "Loading…" for both
+      // is the wrong answer: a host too old to answer `listRepoSessions` will
+      // NEVER answer, and the probe is sent for one repo only — so every other
+      // repo would sit on a spinner forever with nothing coming.
+      if (state.repoPreviewsUnsupported) {
+        const note = railNote("Update the extension to preview");
+        note.title =
+          "The Grok extension on your computer is older than this page, so it can't " +
+          "list another project's sessions without switching to it. Click the project " +
+          "name to open it, or update the extension.";
+        body.appendChild(note);
+      } else {
+        body.appendChild(railNote("Loading…"));
+      }
+      return body;
+    }
+
+    // A search answers itself: showing three of five matches behind a "Show 2
+    // more" would hide the very rows the query asked for. Matching by project
+    // name instead means the whole project matched, so its list stays as it was.
+    const q = railFilterText();
+    const nameMatched = !q || railMatches(repo.label || cwdLeaf(repo.cwd));
+    if (q && !nameMatched) {
+      const hits = rows.entries.filter((s) => railMatches(s.displayName)).slice(0, RAIL_EXPANDED);
+      for (const s of hits) body.appendChild(renderRailSessionRow(s, repo));
+      return body;
+    }
+
+    const visible = state.railExpanded[key] ? RAIL_EXPANDED : RAIL_PREVIEW;
+    const shown = rows.entries.slice(0, visible);
+    if (!shown.length) {
+      body.appendChild(railNote("No sessions yet"));
+      return body;
+    }
+    for (const s of shown) body.appendChild(renderRailSessionRow(s, repo));
+
+    // What expanding ACTUALLY reveals, which is two caps deep:
+    //   - never the host's `total` (it counts index slots, including subagent
+    //     sessions the list hides, so it promises rows that do not exist), and
+    //   - never the full loaded list either, because expanding stops at
+    //     RAIL_EXPANDED. A repo with 28 loaded sessions offered "Show 25 more"
+    //     and then revealed 17, stranding the last 8 behind no control at all.
+    // The rail is a jump list; history remains the place that holds everything.
+    const reachable = Math.min(rows.entries.length, RAIL_EXPANDED);
+    const hidden = Math.max(0, reachable - shown.length);
+    if (hidden > 0 && !state.railExpanded[key]) {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "rail-more";
+      more.textContent = `Show ${hidden} more`;
+      more.onclick = (e) => {
+        e.stopPropagation();
+        state.railExpanded[key] = true;
+        saveRailShape();
+        renderRail();
+      };
+      body.appendChild(more);
+    } else if (state.railExpanded[key] && rows.entries.length > RAIL_PREVIEW) {
+      const less = document.createElement("button");
+      less.type = "button";
+      less.className = "rail-more";
+      less.textContent = "Show less";
+      less.onclick = (e) => {
+        e.stopPropagation();
+        delete state.railExpanded[key];
+        saveRailShape();
+        renderRail();
+      };
+      body.appendChild(less);
+    }
+    return body;
+  }
+
+  function renderRailSessionRow(s, repo, opts) {
+    const row = document.createElement("div");
+    const active = s.id === state.activeSessionId && railRepoOwnsActive(repo, s);
+    row.className = "rail-session" + (active ? " active" : "");
+    row.title = s.displayName || "";
+    // The row is the primary control, so it has to behave like one: reachable by
+    // Tab and openable with Enter/Space. The repo names and pin buttons around it
+    // are real <button>s; without this the conversations themselves — the whole
+    // point of the rail — were the only thing a keyboard could not reach.
+    row.setAttribute("role", "button");
+    row.tabIndex = 0;
+    if (active) row.setAttribute("aria-current", "true");
+    row.onkeydown = (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      // Only when the ROW itself has focus. The pin button lives inside it and
+      // is a real <button>, so pressing Enter there already activates the pin —
+      // letting the key bubble on to here would also open the conversation, and
+      // opening one in another project moves the whole tab.
+      if (e.target !== row) return;
+      e.preventDefault(); // Space would scroll the rail
+      row.click();
+    };
+
+    const dot = document.createElement("span");
+    // Same attribute the history popover uses, so `sessionDot` patches both
+    // surfaces at once without the rail subscribing to anything of its own.
+    dot.setAttribute("data-session-dot", s.id);
+    applySessionDot(dot, state.dots[s.id]);
+    row.appendChild(dot);
+
+    const label = document.createElement("span");
+    label.className = "rail-session-name";
+    if (s.worktreeLabel) {
+      const branch = document.createElement("span");
+      branch.className = "rail-session-branch";
+      branch.innerHTML = ICON.gitBranch;
+      branch.title = "Worktree: " + s.worktreeLabel;
+      row.appendChild(branch);
+    }
+    let name = s.displayName || "Untitled";
+    if (s.worktreeLabel && name.startsWith("(WT)")) name = name.slice(4).trim() || "Worktree";
+    label.textContent = name;
+    row.appendChild(label);
+
+    // In the Pinned group a row has left its project behind, so it has to say
+    // which one it came from — two conversations called "Untitled" are otherwise
+    // indistinguishable, and opening the wrong one moves the whole tab.
+    if (opts && opts.showRepo) {
+      const where = document.createElement("span");
+      where.className = "rail-session-repo";
+      // Prefer the catalog's label: the host disambiguates repos that share a
+      // leaf name (two checkouts both called "project" become distinguishable
+      // there). Falling back to the leaf covers a worktree session, whose cwd is
+      // a subdirectory and so names no catalog row.
+      const home = state.repos.find((r) => sameCwd(r.cwd, s.cwd));
+      where.textContent = home?.label || cwdLeaf(s.cwd);
+      where.title = s.cwd || "";
+      row.appendChild(where);
+    }
+
+    // No pin mark. The Pinned section at the top of the rail already says which
+    // conversations are pinned — more plainly than a glyph could — and repeating
+    // it on the copy inside the project is a second answer to a question already
+    // answered. The menu still says Unpin wherever you open it.
+    if (typeof s.pinnedAt === "number") row.classList.add("pinned");
+
+    const actions = document.createElement("div");
+    actions.className = "rail-session-actions";
+    actions.appendChild(railMenuButton("Session actions", () => railSessionMenuItems(s, repo, active)));
+    row.appendChild(actions);
+    row.onclick = railSessionOpener(s, repo, active);
+    return row;
+  }
+
+  /** Shared by a rail row and the conversation header, so the same session
+   *  offers the same actions wherever you reach it. */
+  function railSessionMenuItems(s, repo, active) {
+    const cwd = s.cwd || repo.cwd;
+    const isPinned = typeof s.pinnedAt === "number";
+    const items = [
+      {
+        label: "Rename",
+        icon: ICON.pencil,
+        onSelect: () => railRenameSession(s, cwd),
+      },
+    ];
+    // Capability, never a version: a host that has never sent `pinnedSessions`
+    // will silently drop `toggleSessionPin`, so offering the control there gives
+    // a control that does nothing — worse than not having one. The frame arrives
+    // in every remote snapshot, empty included, so a capable host always says so.
+    if (state.pinnedSessionsKnown) {
+      items.push({
+        label: isPinned ? "Unpin conversation" : "Pin conversation",
+        icon: ICON.pin,
+        onSelect: () => vscode.postMessage({
+          type: "toggleSessionPin",
+          id: s.id,
+          // The row's own cwd, so the host files the pin under the repo this
+          // conversation actually lives in rather than the one we are viewing.
+          cwd,
+          pinned: !isPinned,
+        }),
+      });
+    }
+    // The open conversation can be deleted too, where the host can do it: it
+    // tears the process down before touching the disk and then starts a fresh
+    // conversation in the same project, so the delete sticks and you land
+    // somewhere rather than nowhere. An older host refuses, so there the item
+    // stays visibly disabled and says why — the menu keeps its shape, and the
+    // reason is the truth rather than "the open session can't be deleted".
+    const activeUndeletable = !!active && !canDeleteActiveSession();
+    items.push(null, {
+      label: "Delete",
+      icon: ICON.trash,
+      danger: true,
+      disabled: activeUndeletable,
+      title: activeUndeletable
+        ? "Update the Grok extension on your computer to delete the conversation you have open"
+        : "Delete",
+      onSelect: () => {
+        uiConfirm({
+          title: s.displayName ? `Delete "${s.displayName}"?` : "Delete this session?",
+          body: deleteSessionWarning(active),
+          confirmLabel: "Delete",
+          danger: true,
+        }).then((ok) => {
+          // `cwd` names the project this row belongs to, so the host can act on a
+          // conversation in a project it has not selected. Without it the host
+          // authorizes against the selected repo only, and every row the rail
+          // draws from elsewhere is refused.
+          if (ok) vscode.postMessage({ type: "deleteSession", id: s.id, name: s.displayName, cwd });
+        });
+      },
+    });
+    return items;
+  }
+
+  /** Whether this host can delete the conversation you are READING. Older ones
+   *  refuse it outright — they deleted the files while the live CLI still owned
+   *  the conversation, so it came straight back — and a control that answers
+   *  with a refusal is worse than one that isn't there. */
+  function canDeleteActiveSession() {
+    return !!(state.hostCaps && state.hostCaps.deleteActiveSession);
+  }
+
+  /** Confirm copy for a delete. Deleting the conversation you are READING is a
+   *  bigger act than deleting a cold row — the thing on your screen goes away
+   *  and something else takes its place — so the dialog says so before you agree
+   *  to it, and says the extra part out loud when a turn is still running. */
+  function deleteSessionWarning(active) {
+    if (!active) return "This cannot be undone.";
+    const stopping = state.busy ? " Grok is still working; that stops." : "";
+    return "This is the conversation you have open. It will close and a new one will start in the same project."
+      + stopping + " This cannot be undone.";
+  }
+
+  /** Rename from the rail. The history popover renames inline in its own row;
+   *  out here there is no row to hand over to, so ask for the name directly. */
+  function railRenameSession(s, cwd) {
+    uiPrompt({
+      title: "Rename session",
+      value: s.displayName || "",
+      placeholder: "Session name",
+      confirmLabel: "Rename",
+    }).then((name) => {
+      const next = (name || "").trim();
+      if (!next || next === s.displayName) return;
+      vscode.postMessage({ type: "renameSession", id: s.id, name: next, ...(cwd ? { cwd } : {}) });
+    });
+  }
+
+  /** Opening a rail row is the same act wherever the row is drawn, so both the
+   *  full row and the capability-stripped one share it. */
+  function railSessionOpener(s, repo, active) {
+    return () => {
+      if (active || repoSwitcherLocked()) return;
+      // `cwd` rides along so a session in another repo reopens in ITS checkout —
+      // the host resolves sessions by cwd, and omitting it would look the id up
+      // under the repo we happen to be in.
+      if (!sameCwd(repo.cwd, state.selectedRepoCwd)) saveRememberedRemoteSession(null);
+      vscode.postMessage({ type: "resumeSession", id: s.id, cwd: s.cwd || repo.cwd });
+    };
+  }
+
+  function railNote(text) {
+    const el = document.createElement("div");
+    el.className = "rail-note";
+    el.textContent = text;
+    return el;
+  }
+
+  /** Take an unfiltered first page as the selected repo's rail rows. The one
+   *  place `railSelectedRows` is written, so "the rail's list" can only ever be
+   *  a whole, unsearched page for the repo currently selected. */
+  function adoptRailRows(entries) {
+    state.railSelectedRows = Array.isArray(entries) ? entries : [];
+    state.railSelectedRowsKnown = true;
+    state.railSessionsStale = false;
+    renderRail();
+  }
+
+  function selectRailRepo(repo) {
+    state.repoSwitchPending = true;
+    renderRepoChip();
+    saveRememberedRemoteSession(null);
+    vscode.postMessage({ type: "selectRepo", cwd: repo.cwd });
   }
 
   // ---------- messages ----------
@@ -6566,6 +7774,16 @@
     if (el && el.parentNode) el.remove();
   }
 
+  // NOTHING here retires a pending submission on the strength of a queue event,
+  // and that is deliberate. `sendQueue` is SESSION-wide — every attached view
+  // contributes to one collapsed string — while `pendingSubmission*` belongs to
+  // this tab alone, and the queue carries no per-contribution id to correlate
+  // the two. So a queue action (edit, remove, steer) or a process exit says
+  // nothing about whether THIS tab's in-flight send survived, and clearing the
+  // pending state on one of them would destroy the only thing a relay rejection
+  // can rebuild the message from. Only the host's own `userMessage` echo, which
+  // carries the submission id, retires a pending submission.
+
   function visibleChipIds(chips) {
     return (chips || []).filter((chip) => !chip.hidden).map((chip) => String(chip.id || ""));
   }
@@ -7086,6 +8304,29 @@
   // composing more appends to it), pinned to the end of the conversation.
   // Italic + dashed border + clock tag reads "not sent yet"; Edit pulls the
   // whole pending text back to the composer, Remove drops it.
+  /** Does the host's queue hold `text` as a WHOLE contribution?
+   *
+   *  Exact equality only, and deliberately so. The host joins contributions with
+   *  a blank line and a message may itself contain blank lines, so the joined
+   *  string genuinely cannot say where one contribution ends — queued
+   *  "prefix\n\nfix\n\nup" is indistinguishable from a queue holding "fix" as its
+   *  own entry. Only an item that IS the text is unambiguous. Deciding otherwise
+   *  needs per-contribution ids the queue does not carry (see divertRacingSend in
+   *  the host, which explains why it cannot).
+   *
+   *  So this answers "yes" for the case that actually produced the duplicate — a
+   *  send diverted into an empty queue — and "no" once another view has already
+   *  queued something. A "no" leaves a stale placeholder beside the queued block
+   *  until the next refresh, which is cosmetic; a wrong "yes" would retire a
+   *  submission that is still in flight, which is not. */
+  function queueHoldsContribution(items, text) {
+    if (!text) return false;
+    for (var i = 0; i < items.length; i++) {
+      if (String(items[i] || "") === text) return true;
+    }
+    return false;
+  }
+
   function renderQueuedBlocks() {
     let wrap = state.queuedWrapEl;
     // Defensive join: the host's invariant is a single entry, but render
@@ -7217,6 +8458,11 @@
         state.extVersion = msg.extVersion || "";
         state.platform = msg.platform || "";
         state.sandboxSupported = state.platform === "darwin";
+        // What this particular host can do, as the host itself reports it. Every
+        // remote snapshot carries an initialState, so this is answered before
+        // any control is drawn — and a host that says nothing is a host that
+        // cannot, which is the safe way round.
+        state.hostCaps = (msg.capabilities && typeof msg.capabilities === "object") ? msg.capabilities : {};
         restoreRememberedRemoteSession();
         if (typeof msg.showThinking === "boolean") state.showThinking = msg.showThinking;
         if (typeof msg.expandCommandOutputs === "boolean") state.expandCommandOutputs = msg.expandCommandOutputs;
@@ -8081,6 +9327,31 @@
         stopProcessingCue();
         hideGrokking();
         addError(`Grok exited (code ${msg.code}). Send a message to restart this session, or start a new one.`);
+        // A process that dies takes the host's send queue with it: that text
+        // never reached Grok, and the host empties the queue in the very next
+        // breath after this message — so this is the last moment it exists
+        // anywhere. Hand it back as the "Not sent" recovery block, which is
+        // exactly what it is.
+        //
+        // Read from the QUEUE, not from the pending submission. A queued
+        // contribution can be merged with another view's and flushed under a
+        // combined text this tab cannot recognise as its own, which leaves the
+        // pending marker set on a message that WAS delivered — rebuilding that
+        // as "Not sent" would invite sending it twice. The queue is the honest
+        // source: it still holds what never left, and is already empty once it
+        // did.
+        //
+        // Remote only. The same text loss exists in the VS Code webview, but
+        // there the queued block disappearing on exit is long-standing,
+        // deliberate behaviour with a test of its own — and the desk still has
+        // the composer, the transcript and the terminal in front of it. This
+        // fixes the surface where the loss was actually reported and where a
+        // phone has nothing else to fall back on.
+        if (IS_REMOTE && state.sendQueue.length) {
+          state.rejectedSubmissionText = state.sendQueue.join("\n\n");
+          state.sendQueue = [];
+          renderQueuedBlocks();
+        }
         state.busy = false;
         state.busyLocked = false; // a dead process ends any startup lock too
         updateSendButton();
@@ -8092,6 +9363,30 @@
         if (!state.sendQueue.length) {
           state.queuedSubmissionPending = false;
           state.queuedSubmissionRejected = false;
+        }
+        // A send the host QUEUED never produces the `userMessage` echo that
+        // normally retires the optimistic placeholder, so the same text was left
+        // on screen twice — once as a sent bubble, once as a queued block. The
+        // queue is the host's answer to that submission, so treat it as the
+        // acknowledgement: the queued block is now the truthful rendering, and
+        // it carries Steer/edit/cancel the placeholder never had.
+        //
+        // Matched on text because the queue deliberately collapses several
+        // contributions into one string and cannot carry a submission id (see
+        // divertRacingSend in the host).
+        if (state.optimisticSendEl && state.pendingSubmissionText) {
+          if (queueHoldsContribution(state.sendQueue, state.pendingSubmissionText)) {
+            // ONLY the placeholder. The pending submission id and text stay put:
+            // they are what the "Not sent" recovery block is rebuilt from if the
+            // relay bounces this send, and a queue snapshot is not proof the
+            // send was accepted — only the host's own `userMessage` echo is, and
+            // that path clears them. Retiring them here would mean a wrong match
+            // could swallow the text instead of merely tidying the transcript.
+            clearOptimisticSend();
+            // The placeholder's Grokking was ours to show and ours to take back;
+            // a genuinely running turn re-shows it from agentStart.
+            if (!state.busy) hideGrokking();
+          }
         }
         renderQueuedBlocks();
         break;
@@ -8224,6 +9519,12 @@
         // unfiltered first page. If the user has a search active, re-request with it
         // rather than clobbering their filtered view with the full list.
         if (open && offset === 0 && (msg.query || "") !== state.sessionSearch) {
+          // The popover wants its filtered view back, but an unfiltered first
+          // page is exactly what the RAIL needs — and it is the only unfiltered
+          // page it will see while a search is open. Dropping it wholesale left
+          // the rail pinned on "Loading…" after switching projects with a search
+          // still active, until the search was cleared or the page refreshed.
+          if (!(msg.query || "")) adoptRailRows(entries);
           requestSessions(0);
           break;
         }
@@ -8258,9 +9559,19 @@
             // bouncing: the second command lands after the first has finished
             // loading, and whichever repo you end on gets remembered, so the
             // next reconnect can flip you straight back.
+            // repoCwd must be something `selectRepo` can actually accept — i.e.
+            // a row in the catalog. A worktree session's activeCwd is the
+            // ISOLATED CHECKOUT, which is deliberately not a repo row, so
+            // remembering it produced a reconnect that asked to select a repo
+            // the host would silently refuse: identity restore then never
+            // completed and the outbox stayed queued until the tab was closed,
+            // taking anything typed meanwhile with it. Fall back to the repo
+            // that owns it.
+            const activeRepoRow = state.repos.find((r) => sameCwd(r.cwd, state.activeRepoCwd));
             saveRememberedRemoteSession({
               id: state.activeSessionId,
-              repoCwd: state.activeRepoCwd || state.selectedRepoCwd || state.cwd || "",
+              repoCwd: (activeRepoRow && activeRepoRow.cwd) ||
+                state.selectedRepoCwd || state.activeRepoCwd || state.cwd || "",
               cwd: activeEntry?.cwd || state.activeRepoCwd || state.cwd || "",
             });
           } else saveRememberedRemoteSession(null);
@@ -8276,20 +9587,79 @@
         state.sessionNextOffset = typeof msg.nextOffset === "number" ? msg.nextOffset : null;
         state.sessionLoading = false;
         if (open) renderSessionRows();
+        // The rail's selected-repo section reads this list directly, so every
+        // host-driven refresh (rename, delete, new session) repaints it for free.
+        // Skipped for a filtered/paged answer: those are the history popover's
+        // search state, not the repo's newest sessions.
+        if (offset === 0 && !(msg.query || "")) adoptRailRows(entries);
+        // A searched or paged answer skips adoptRailRows, but it can still be
+        // the frame that renames the open conversation — the header reads the
+        // active record, so refresh it either way.
+        else renderSessionHead();
         break;
       }
-      case "repos":
+      case "pinnedSessions": {
+        state.pinnedSessionsKnown = true;
+        state.pinnedSessions = Array.isArray(msg.entries) ? msg.entries : [];
+        state.dots = Object.assign({}, state.dots, msg.dots || {});
+        renderRail();
+        break;
+      }
+      case "repoSessions": {
+        // Proof this host answers per-repo previews — until now the rail has
+        // only probed with a single request.
+        const known = state.repoPreviewsSupported;
+        state.repoPreviewsSupported = true;
+        state.repoPreviewsUnsupported = false;
+        if (railProbeTimer) { clearTimeout(railProbeTimer); railProbeTimer = null; }
+        state.repoPreviews[cwdKey(msg.cwd)] = {
+          entries: Array.isArray(msg.entries) ? msg.entries : [],
+          total: typeof msg.total === "number" ? msg.total : (msg.entries || []).length,
+        };
+        state.dots = Object.assign({}, state.dots, msg.dots || {});
+        // First answer: the probe only asked about one repo, so now ask for the rest.
+        if (!known) requestRailPreviews();
+        renderRail();
+        break;
+      }
+      case "repos": {
         state.reposKnown = true;
         state.repos = Array.isArray(msg.entries) ? msg.entries : [];
+        const wasSelected = state.selectedRepoCwd;
         state.selectedRepoCwd = msg.selectedCwd || "";
         state.activeRepoCwd = msg.activeCwd || "";
+        // A repo we just left keeps stale cached rows; drop them so its section
+        // re-reads rather than showing the list from before the switch. The repo
+        // we arrived in reads the live `sessions` list, so its cache is dead weight.
+        if (wasSelected && !sameCwd(wasSelected, state.selectedRepoCwd)) {
+          // Hand the repo we are LEAVING its own rows before the holder is
+          // overwritten, so it keeps showing them as a sibling instead of
+          // dropping to a spinner the moment we walk away from it. The repo we
+          // are arriving in keeps whatever preview it already had — that is
+          // exactly the data that makes the switch look instant (railRowsFor).
+          if (!state.railSessionsStale && state.railSelectedRows.length) {
+            state.repoPreviews[cwdKey(wasSelected)] = {
+              entries: state.railSelectedRows.slice(0, RAIL_EXPANDED),
+              total: state.railSelectedRows.length,
+            };
+            state.repoPreviewsAsked[cwdKey(wasSelected)] = true;
+          }
+          // The list for the new repo has not arrived yet — see railRowsFor.
+          state.railSessionsStale = true;
+        }
         renderRepoChip();
         if (!repoPopover.hidden) renderRepoPopover();
+        renderRail();
+        requestRailPreviews();
+        // A rail "+" on another repo waits for the switch to land before starting
+        // the session, so it can never open one in the repo we were leaving.
         break;
+      }
       case "sessionDot":
         if (msg.dot && msg.dot !== "none") state.dots[msg.id] = msg.dot;
         else delete state.dots[msg.id];
         if (!historyPopover.hidden) patchSessionDot(msg.id);
+        patchSessionDot(msg.id, rail());
         break;
       default:
         // No case ran. Either the host posted a type outside the contract (drift
@@ -8653,7 +10023,10 @@
   // otherwise leave it stale until close+reopen. Only the history dropdown is panel-width
   // dependent (the composer popovers are bottom-anchored), so just re-run its positioning.
   window.addEventListener("resize", () => {
-    if (!historyPopover.hidden) positionDropdownPopover(historyPopover, historyBtn);
+    // The SAME anchor the opener used. Where the rail exists, `historyBtn` sits
+    // in a display:none top bar and measures as a zero rect, so a rotate or a
+    // window drag would re-place the popover against nothing.
+    if (!historyPopover.hidden) positionDropdownPopover(historyPopover, railHistoryAnchor() || historyBtn);
     if (!repoPopover.hidden) positionRepoPopover();
   });
 

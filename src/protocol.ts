@@ -56,10 +56,15 @@ export interface PlanHistoryItem {
 export const HOST_CAPABILITIES = {
   uploadFile: true,
   remoteVoice: true,
+  // Whether `deleteSession` can take the conversation the requester is READING.
+  // Older hosts refuse it — the live CLI re-persisted the files the moment they
+  // went, so the delete did not stick — and a client that offers the control
+  // anyway is offering one that answers with a refusal. Capability, not version.
+  deleteActiveSession: true,
 } as const;
 
 export type HostMsg =
-  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform; steerByDefault: boolean; soundNotifications: boolean; processingSound: boolean; readRepliesAloud: boolean; capabilities: { uploadFile: boolean; remoteVoice: boolean } }
+  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform; steerByDefault: boolean; soundNotifications: boolean; processingSound: boolean; readRepliesAloud: boolean; capabilities: { uploadFile: boolean; remoteVoice: boolean; deleteActiveSession?: boolean } }
   | { type: "planModeAvailability"; available: boolean; reason?: string }
   | { type: "showThinking"; value: boolean }
   // grok.soundNotifications — live toggle for the turn-complete/error sound (#59).
@@ -191,6 +196,19 @@ export type HostMsg =
   // from the on-disk index, not entries shown (hidden subagent sessions occupy
   // slots without producing rows).
   | { type: "sessions"; entries: SessionListEntry[]; activeId?: string | null; dots: Record<string, Dot>; offset: number; total: number; hasMore: boolean; nextOffset: number; query: string }
+  // A preview page for ONE repo, answering `listRepoSessions`. Deliberately a
+  // separate frame from `sessions`: that one is the focused history list and
+  // owns paging/search/auto-open state, so a sibling repo's rows arriving on it
+  // would clobber the list the user is actually reading. `cwd` echoes the scope
+  // the host resolved, which is also the capability signal — a client that
+  // never sees this frame keeps its single-repo fallback.
+  | { type: "repoSessions"; cwd: string; entries: SessionListEntry[]; dots: Record<string, Dot>; total: number }
+  // Every pinned conversation, across ALL repos — the projects rail's Pinned
+  // group. Deliberately not per-repo: a pin is only worth anything if it lifts a
+  // conversation OUT of the project you would otherwise have to open first, so
+  // no repo-scoped frame can answer it. Entries carry their own `cwd`, which is
+  // what lets a row name its repo and reopen in the right checkout.
+  | { type: "pinnedSessions"; entries: SessionListEntry[]; dots: Record<string, Dot> }
   | { type: "repos"; entries: RepoListEntry[]; selectedCwd: string; activeCwd: string }
   | { type: "sessionDot"; id: string; dot: Dot }
   // Full snapshot of the focused session's host-owned send queue (#37) — the
@@ -268,13 +286,31 @@ export type WebviewMsg =
   | { type: "updateGrok" }
   | { type: "recheckConnection" }
   | { type: "listSessions"; offset?: number; limit?: number; query?: string }
+  // Preview rows for a repo the client is NOT currently in — the projects rail
+  // shows a few sessions per repo without switching to it. `cwd` is matched
+  // against the repo catalog and dropped when it isn't a row, so this never
+  // widens what a remote can read beyond the repos it is already shown.
+  | { type: "listRepoSessions"; cwd: string; limit?: number }
+  // `cwd` names the session's own checkout so the host can find it without
+  // assuming it lives in the repo the tab happens to be in — pinning is offered
+  // on every rail row, including other projects' conversations.
+  | { type: "toggleSessionPin"; id: string; cwd?: string; pinned: boolean }
   | { type: "selectRepo"; cwd: string }
   | { type: "toggleRepoPin"; cwd: string; pinned: boolean }
+  // Where a project sits in the remote client's rail. Both answers are sent:
+  // `archived: false` means "hold this one in view", which is a different claim
+  // from never having said anything (see RepoArchiveChoice). Purely a remote
+  // affordance — the VS Code repo picker neither offers it nor reads it.
+  | { type: "setRepoArchived"; cwd: string; archived: boolean }
   // cwd is required to reopen a worktree-isolated session (sessions are keyed
   // by cwd on disk). Omitted → host resolves from meta / workspace root.
   | { type: "resumeSession"; id: string; cwd?: string }
-  | { type: "renameSession"; id: string; name: string }
-  | { type: "deleteSession"; id: string; name?: string }
+  // cwd names the PROJECT the row belongs to, so a client listing several of
+  // them (the browser rail) can act on a conversation without first switching
+  // to its repo. Optional and additive: omitted → the host authorizes against
+  // the client's selected repo, exactly as before.
+  | { type: "renameSession"; id: string; name: string; cwd?: string }
+  | { type: "deleteSession"; id: string; name?: string; cwd?: string }
   | { type: "clearAllSessions"; cwd: string }
   | { type: "pickFile" }
   // The composer's `@` file popover: the current token after `@`, posted on
@@ -355,7 +391,7 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   xaiNotification: true, subagentUpdate: true, runProgress: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true,
   soundNotifications: true, processingSound: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, imageFull: true, moveComposerCaret: true, remoteStatus: true,
   setAllToolDetails: true, focusInput: true, restoreComposer: true, truncateMessages: true, uiConfirmRequest: true,
-  sessions: true, repos: true, sessionDot: true, queuedSends: true, submitQueuedSend: true,
+  sessions: true, repoSessions: true, pinnedSessions: true, repos: true, sessionDot: true, queuedSends: true, submitQueuedSend: true,
   steerUnavailable: true, usage: true,
 };
 
@@ -369,7 +405,8 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
   questionCancel: true, setModel: true, runInstallCmd: true, runGrokLogin: true,
   logout: true, checkGrokUpdate: true, updateGrok: true, recheckConnection: true,
-  listSessions: true, selectRepo: true, toggleRepoPin: true,
+  listSessions: true, listRepoSessions: true, selectRepo: true, toggleRepoPin: true, toggleSessionPin: true,
+  setRepoArchived: true,
   resumeSession: true, renameSession: true, deleteSession: true,
   clearAllSessions: true, pickFile: true, mentionQuery: true, addMentionFile: true,
   pasteImage: true, uploadFile: true, voiceStart: true,

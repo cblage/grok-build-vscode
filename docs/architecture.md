@@ -300,6 +300,22 @@ repository. And because the relay serves a client that can be newer than the ins
 extension, the chip renders only once a `repos` frame has actually arrived — an older
 host that never sends one gets no chip rather than a dead control.
 
+At desktop width that picker becomes a **projects rail**, which is the same
+capability-gated affordance in another shape: `#projects-rail` exists only in the
+relay's page, so the element lookup is the entire gate and the VS Code webview renders
+nothing new. Other projects' rows arrive on `repoSessions` (answering `listRepoSessions`);
+where that frame never comes the rail degrades to the selected repo's own list. Which
+section a project sits in — Projects or Archived — is **derived in the client**, never a
+stored section: `setRepoArchived` records one timestamped choice per repo in
+`grok.repoArchives`, reported back on every catalog row as `archived`/`archivedAt`, and a
+project counts as archived when that choice outranks its newest conversation or when
+nothing has happened in it for thirty days. Activity newer than the choice simply
+overrides it, which is what makes "work in an archived project and it returns" need no
+bookkeeping. The age rule runs only on conversations the client actually holds — the
+catalog's `updatedAt` is the session *directory's* mtime, which does not move when an
+existing conversation continues, so trusting it against an older host would archive a
+project in daily use. Ordering and the VS Code repo picker are untouched by any of it.
+
 Selection and conversation ownership are **per remote browser tab**.
 `RemoteClientState` maps the current opaque relay `clientId` to its normalized cwd and
 active remote `Session`, while a high-entropy logical-tab token in `sessionStorage`
@@ -444,10 +460,18 @@ the steady-state fix.
 - **Empty sessions never accumulate (#24).** Beyond the model/effort restart
   case above, *any* time you leave an empty (`hasHistory === false`)
   session — New Session or switching to another — `parkFocused` deletes its on-disk
-  dir, so at most one untitled **New session** exists at a time. A one-shot startup
-  legacy sweep (`sweepEmptyPrimerSessions`) clears primer-only empties left by earlier runs, each
-  confirmed by reading `chat_history.jsonl` (`isEmptyPrimerSession`): swept only if
-  the session received our primer and **zero real user queries**. Detection is
+  dir, so at most one untitled **New session** exists at a time. `sweepEmptySessions`
+  covers what parking cannot reach — a window closed without a prompt, a host that
+  crashed — and runs on activation and after every new/opened session, in that
+  session's repo. Each candidate is confirmed by reading `chat_history.jsonl`
+  (`isEmptySession`): swept on **zero real user queries** in a history that
+  `historyIsIntelligible` could actually parse — an unparseable file is not an empty
+  conversation, and that interlock is what keeps a CLI format change from making
+  every session look sweepable. Covers both today's sessions and the legacy
+  primer-only ones. Live, being-loaded, renamed, pinned, worktree-bound and subagent
+  sessions are excluded, as is anything newer than `SWEEP_MIN_AGE_MS` (30 min) —
+  parking owns the recent ones, and another VS Code window's live sessions are
+  invisible to this process. Detection is
   content-based and agent-agnostic — `extractUserQueries` counts both
   `<user_query>`-wrapped prompts and the unwrapped ones grok/composer sends for slash
   commands — so it's safe for the `grok-build` and `cursor` (composer) agents alike.

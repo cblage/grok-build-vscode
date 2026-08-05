@@ -134,13 +134,14 @@ These actually spawn real shell children (real `/bin/sh`, or real PowerShell on 
 - Returns `undefined` when nothing is found
 - **`extensionWasUpgraded`** — true on any version change (incl. a downgrade), false on a fresh install / unchanged version / empty stored version; gates the silent `grok update` the extension runs once when its own version changes
 
-### `test/sessions.test.ts` — session listing & naming (15 tests)
+### `test/sessions.test.ts` — session listing & naming (93 tests)
 
 - Lists sessions from grok's on-disk layout (`~/.grok/sessions/<urlencoded-cwd>/<id>/`) for the current cwd only
-- Display name falls back to the first user message, then to the id, when no customName override exists
-- customName overrides (stored in VS Code `globalState`) win over the disk-derived name
+- Row naming precedence (#96): a manual `customName`, then grok's own title (`cliSessionTitle` — `session_summary`, else `generated_title`), then our first-message `autoName`, then `Untitled (<date>)`. A legacy primer-derived title is rejected in both its summarized and verbatim forms, while a real session that merely mentions a primer is kept
 - Sorts by most-recently-updated; tolerates malformed/missing session files without throwing
 - Delete removes the right entry and leaves others intact
+- **`isEmptySession`** — the predicate the sweep deletes on (#97). Chat history is authoritative: zero real user queries means empty, whatever `num_messages` says, which covers both today's never-typed-into sessions and legacy primer-only ones. Renamed, pinned, worktree-bound and subagent sessions are refused, as is a history file that exists but cannot be read; a directory holding nothing but `summary.json` is the unloadable shape and does qualify
+- **`historyIsIntelligible`** — the interlock beneath it: a history in a format we cannot parse is never called empty (one CLI schema change would otherwise make the sweep delete everything), while a truncated final line from a write in progress still leaves the real queries before it visible, and a zero-byte file falls through to the message count rather than to a parse failure
 
 ### `test/plan-gate.test.ts` — plan-mode policy (63 tests)
 
@@ -224,7 +225,7 @@ happy-dom test driving the shipped webview through a `planHistoryQueue` + `sessi
 - `agentReset` removes the in-flight agent bubble
 - Subsequent `messageChunk` after `agentReset` creates a fresh bubble (the false-approval text doesn't leak through)
 
-### `test/webview-ui.dom.test.ts` — webview regressions in a real DOM (128 tests)
+### `test/webview-ui.dom.test.ts` — webview regressions in a real DOM (170 tests)
 
 happy-dom test locking in the native-Windows regressions this build fixed (plus later busy/version/dedup behavior), so they can't silently come back:
 
@@ -237,6 +238,33 @@ happy-dom test locking in the native-Windows regressions this build fixed (plus 
 - **User-message dedup** — a `user_message_chunk` echoed live (grok ≥0.2.33) never doubles the optimistic bubble; only a `session/load` replay drives user bubbles
 - **Welcome version lifecycle** — flips to "Connected · v<version>" only when session start finishes, not at the bare ACP handshake; later busy toggles don't overwrite it
 - **Gear menu** — the Other group's About sub-view (extension + CLI versions, update check) and Config & debug sub-view render and route correctly
+
+### `test/projects-rail.dom.test.ts` — the browser's projects rail (56 tests)
+
+The rail is the relay page's surface: `#projects-rail` lives in that page, never in the
+extension's `getHtml()`, so the harness adds the mount the way the browser does — and the
+absence of that element is exactly what keeps VS Code free of it. First assertion in the
+file: with the element present but `IS_REMOTE` false, nothing renders and nothing is
+posted.
+
+- **Degrade before feature** — a host that never answers `listRepoSessions` still gets a
+  usable rail (the selected repo reads the ordinary `sessions` frame), is probed **once**
+  rather than once per project, and is never offered controls it would drop: cross-project
+  *Clear all history* and *Archive project* are both withheld until the host proves itself
+- **Ordering is by the newest conversation**, not the catalog's `updatedAt` — that is the
+  session directory's mtime, which *clearing a project touches*, so the emptied project
+  used to jump to the top. Ties break on the name for the same reason
+- **Archiving is derived, never stored as a section** — one timestamped choice per project
+  plus a 30-day rule, both read against that project's newest conversation. Covered: a
+  choice overridden the moment the project is worked in again, an explicit un-archive
+  surviving the age rule, the floor that keeps the three newest projects visible, the
+  project you are reading never being filed away, and the age rule refusing to run at all
+  on a host that cannot supply real activity
+- **The project holding the live conversation stays open** — its twisty is disabled, and a
+  project folded *before* the conversation moved there springs open — including when that
+  conversation lives in a worktree, whose cwd is not a catalog row
+- **Search** reaches into Archived and forces it open, rather than answering "No matches"
+  while the project sits collapsed below
 
 ### `test/file-ref.test.ts` — open-file refs + inline-read guard (8 tests)
 

@@ -193,8 +193,19 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // view (read-only+)
   remotePreferences: "view",
   listSessions: "view",
+  // Same read as listSessions, aimed at a repo the client is not currently in
+  // (the projects rail previews a few sessions per repo). The host resolves the
+  // cwd through the repo catalog it already published, so this reaches nothing
+  // a read-only remote could not already see by selecting that repo.
+  listRepoSessions: "view",
   selectRepo: "view",
   toggleRepoPin: "full",
+  // Rearranges the remote's own sidebar and touches nothing on disk beyond a
+  // globalState note. Nothing here can reach the workspace.
+  setRepoArchived: "full",
+  // Writes host state (globalState), same as the repo pin — classified with it
+  // rather than as a view op, even though nothing is destroyed.
+  toggleSessionPin: "full",
   resumeSession: "view",
   renameSession: "view",
   // read-only workspace file-name lookup (the composer's @ popover)
@@ -325,9 +336,14 @@ export function allowRemoteRepoTarget(msg: WebviewMsg, isKnownCwd: (cwd: string)
   switch (msg.type) {
     case "selectRepo":
     case "toggleRepoPin":
+    case "setRepoArchived":
     case "clearAllSessions":
+    case "listRepoSessions":
       return isKnownCwd(msg.cwd);
     case "resumeSession":
+    // Same shape as resume: the cwd is optional (the host falls back to its own
+    // bounded lookup), but when given it must name a discovered checkout.
+    case "toggleSessionPin":
       return !msg.cwd || isKnownCwd(msg.cwd);
     default:
       return true;
@@ -468,6 +484,8 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   truncateMessages: "mirror",
   uiConfirmRequest: "mirror",
   sessions: "mirror",
+  repoSessions: "mirror",
+  pinnedSessions: "mirror",
   repos: "mirror",
   sessionDot: "mirror",
   queuedSends: "mirror",
