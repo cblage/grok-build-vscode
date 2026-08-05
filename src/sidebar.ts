@@ -60,6 +60,7 @@ import {
 import { resolveSeatbeltBrokerRuntime, SeatbeltBroker } from "./seatbelt-broker";
 import {
   resolveAndCompileSeatbeltPolicy,
+  resolveSeatbeltProfile,
   sandboxStartupFailureDisposition,
 } from "./seatbelt-policy";
 import {
@@ -118,7 +119,7 @@ import { permissionAnswerAllowed, permissionOptionsForPlan, pickRejectOption, sh
 import { appendPlanEntry, planRestoreSource, truncateResolvedAfter, countsAsUserBubble, decideRestoreState, isInterjectionText } from "./plan-restore";
 import { planReviewFileName, sanitizePlanReviewFilePart } from "./plan-review";
 import { isPrimerText } from "./grok-primer";
-import { HOST_CAPABILITIES, HostMsg, WebviewMsg } from "./protocol";
+import { HOST_CAPABILITIES, HostMsg, WebviewMsg, type SandboxProfileRules } from "./protocol";
 import { RemoteUplink } from "./remote-uplink";
 import { RemoteClientState, serializesRemoteSessionTransition } from "./remote-client-state";
 import { RemotePcmIngress, acceptRemotePcm } from "./remote-voice";
@@ -945,7 +946,36 @@ See design doc for the full state machine diagram.`;
       globalSandbox: tomls.global,
     });
     const current = this.focused.sandboxProfile ?? this.resolveSpawnSandbox(e) ?? "off";
-    this.post({ type: "sandboxState", current, profiles, supported: true });
+    const scope = current === "off"
+      ? "off"
+      : profiles.find((profile) => profile.name === current)?.scope ?? "user";
+    let rules: SandboxProfileRules;
+    try {
+      const resolved = resolveSeatbeltProfile(current, {
+        projectSandbox: tomls.project,
+        globalSandbox: tomls.global,
+      });
+      rules = {
+        name: current,
+        scope,
+        base: resolved.builtin,
+        restrictNetwork: resolved.restrictNetwork,
+        readOnly: [...resolved.readOnly],
+        readWrite: [...resolved.readWrite],
+        deny: [...resolved.deny],
+      };
+    } catch (error) {
+      rules = {
+        name: current,
+        scope,
+        restrictNetwork: false,
+        readOnly: [],
+        readWrite: [],
+        deny: [],
+        error: (error as Error).message || String(error),
+      };
+    }
+    this.post({ type: "sandboxState", current, profiles, supported: true, rules });
   }
 
   /**

@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.0.2-sandbox.2 — 2026-08-02
+## 3.0.2-sandbox.4 — 2026-08-05
 
 ### Added
 
@@ -9,7 +9,7 @@
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
   - **Session behavior:** the chosen profile is fixed for the life of a conversation and restored when that conversation resumes. Built-in application failures warn and continue like Grok; invalid or unapplied custom profiles refuse to start; and loss of the live delegated-operation sandbox ends the affected session instead of silently weakening it.
-  - **Sandbox controls:** supported macOS hosts get a compact lock/unlock indicator stacked between the voice and Send controls; profile names, distinct source icons, and source labels for built-in, user-defined, and workspace-defined profiles live in its picker. The sandbox control stays disabled from session startup through the full active turn because its boundary is fixed for the conversation, while Agent Mode remains available mid-turn; changing the profile of an existing conversation opens the Summarize or Just Restart flow required to start a new session under the new boundary.
+  - **Sandbox controls:** supported macOS hosts get a compact lock/unlock indicator stacked between the voice and Send controls; profile names, distinct source icons, and source labels for built-in, user-defined, and workspace-defined profiles live in its picker. Hovering or keyboard-focusing the control always shows a read-only inspector with the resolved base profile, filesystem access, network behavior, and any custom read-only, writable, or deny rules; clicking it while enabled replaces that preview with the profile-switching menu. The sandbox control stays selection-locked from session startup through the full active turn because its boundary is fixed for the conversation, while Agent Mode remains available mid-turn. Changing the profile of an existing conversation opens the Summarize or Just Restart flow required to start a new session under the new boundary.
   - See the [macOS sandbox architecture guide](docs/macos-sandbox-architecture.md) for the full access matrix, profile resolution rules, process topology, and enforcement boundary.
 
 ### Fixed

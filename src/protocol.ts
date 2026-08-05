@@ -23,7 +23,8 @@
 
 import type { ModelInfo, PromptResultMeta, PromptUsage, PermissionRequest, ExitPlanRequest, QuestionRequest } from "./acp";
 import type { FileChip } from "./chips";
-import type { SandboxProfileOption } from "./grok-config";
+import type { SandboxProfileOption, SandboxProfileScope } from "./grok-config";
+import type { SeatbeltBuiltinProfile } from "./seatbelt-policy";
 import type { RepoListEntry, SessionListEntry } from "./sessions";
 import type { Dot } from "./session-pool";
 import type { RunProgressUpdate } from "./run-progress";
@@ -50,6 +51,19 @@ export interface PlanHistoryItem {
   afterHistoryEvent?: number;
   planPath?: string;
   planName?: string;
+}
+
+/** Resolved definition of the active macOS sandbox. The webview uses this only
+ * for the read-only rules inspector shown while profile switching is locked. */
+export interface SandboxProfileRules {
+  name: string;
+  scope: SandboxProfileScope | "off";
+  base?: SeatbeltBuiltinProfile;
+  restrictNetwork: boolean;
+  readOnly: string[];
+  readWrite: string[];
+  deny: string[];
+  error?: string;
 }
 
 /** host -> webview */
@@ -89,7 +103,7 @@ export type HostMsg =
   /** YOLO/Auto-accept blocked when config has disable_bypass_permissions_mode. */
   | { type: "modePolicy"; yoloDisabled: boolean; yoloDisabledReason?: string }
   /** Effective sandbox for the next spawn + profiles available in the dropdown. */
-  | { type: "sandboxState"; current: string; profiles: SandboxProfileOption[]; supported: boolean }
+  | { type: "sandboxState"; current: string; profiles: SandboxProfileOption[]; supported: boolean; rules?: SandboxProfileRules }
   | { type: "openModePopover" }
   | { type: "voiceState"; status: "listening" | "transcribing" | "idle" }
   | { type: "voiceConfigured"; value: boolean; sendPhrase?: string }

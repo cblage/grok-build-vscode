@@ -565,6 +565,15 @@ describe("sandbox picker", () => {
       current: "off",
       profiles: ["workspace", "strict", "read-only"],
       supported: true,
+      rules: {
+        name: "off",
+        scope: "off",
+        base: "off",
+        restrictNetwork: false,
+        readOnly: [],
+        readWrite: [],
+        deny: [],
+      },
     });
   };
 
@@ -659,13 +668,48 @@ describe("sandbox picker", () => {
     expect(sandboxBtn.className).toContain("disabled");
 
     enableDarwinSandbox(window);
-    dispatch(window, { type: "sandboxState", current: "strict", profiles: ["workspace", "strict", "read-only"], supported: true });
-    expect(sandboxBtn.disabled).toBe(true);
+    dispatch(window, {
+      type: "sandboxState",
+      current: "lumina",
+      profiles: [{ name: "lumina", scope: "workspace" }],
+      supported: true,
+      rules: {
+        name: "lumina",
+        scope: "workspace",
+        base: "strict",
+        restrictNetwork: true,
+        readOnly: ["/opt/homebrew"],
+        readWrite: ["~/.cache"],
+        deny: ["/bin/launchctl"],
+      },
+    });
+    // aria-disabled preserves the locked semantics while native disabled stays
+    // off so hover and keyboard focus can expose the read-only rules inspector.
+    expect(sandboxBtn.disabled).toBe(false);
+    expect(sandboxBtn.getAttribute("aria-disabled")).toBe("true");
     expect(sandboxBtn.className).toContain("disabled");
-    expect(sandboxBtn.title).toContain("available once the session is ready");
+    expect(sandboxBtn.title).toContain("hover to inspect rules");
 
     click(window, sandboxBtn);
     expect((popover as any).hidden).toBe(true);
+    expect(posted.some((msg) => msg.type === "setSandbox")).toBe(false);
+
+    sandboxBtn.dispatchEvent(new (window as any).MouseEvent("mouseenter"));
+    expect((popover as any).hidden).toBe(false);
+    expect(popover.dataset.view).toBe("rules");
+    expect(popover.querySelector(".sandbox-rules-heading strong")?.textContent).toBe("lumina");
+    expect(popover.querySelector(".sandbox-rules-heading small")?.textContent)
+      .toContain("Workspace-defined sandbox profile");
+    expect(popover.querySelectorAll(".sandbox-rules-profile-icons svg")).toHaveLength(2);
+    expect(popover.querySelector('[data-sandbox-rule="base"]')?.textContent).toContain("Extends strict");
+    expect(popover.querySelector('[data-sandbox-rule="network"]')?.textContent)
+      .toContain("not enforced by macOS Seatbelt");
+    expect(popover.querySelector('[data-sandbox-rule="read-only"] code')?.textContent).toBe("/opt/homebrew");
+    expect(popover.querySelector('[data-sandbox-rule="read-write"] code')?.textContent).toBe("~/.cache");
+    expect(popover.querySelector('[data-sandbox-rule="deny"] code')?.textContent).toBe("/bin/launchctl");
+    for (const kind of ["base", "read", "write", "network", "read-only", "read-write", "deny"]) {
+      expect(popover.querySelector(`[data-sandbox-rule="${kind}"] .sandbox-rule-icon svg`)).not.toBeNull();
+    }
     expect(posted.some((msg) => msg.type === "setSandbox")).toBe(false);
   });
 
@@ -677,10 +721,24 @@ describe("sandbox picker", () => {
     enableDarwinSandbox(window);
     dispatch(window, { type: "setBusy", value: false });
     expect(sandboxBtn.disabled).toBe(false);
+    expect(sandboxBtn.getAttribute("aria-disabled")).toBe("false");
     expect(sandboxBtn.className).not.toContain("disabled");
+    expect(sandboxBtn.title).toContain("hover to inspect rules");
 
+    sandboxBtn.dispatchEvent(new (window as any).MouseEvent("mouseenter"));
+    expect((popover as any).hidden).toBe(false);
+    expect(popover.dataset.view).toBe("rules");
+
+    // An enabled click promotes the passive rules preview into the interactive
+    // profile-switching menu instead of merely closing it.
     click(window, sandboxBtn);
     expect((popover as any).hidden).toBe(false);
+    expect(popover.dataset.view).toBe("picker");
+    expect(popover.querySelectorAll(".mode-popover-item").length).toBeGreaterThan(0);
+
+    // Hover cannot overwrite a picker that the user explicitly opened.
+    sandboxBtn.dispatchEvent(new (window as any).MouseEvent("mouseenter"));
+    expect(popover.dataset.view).toBe("picker");
   });
 
   it("locks the sandbox picker for a live turn while the mode picker stays available", () => {
@@ -691,7 +749,8 @@ describe("sandbox picker", () => {
     enableDarwinSandbox(window);
 
     dispatch(window, { type: "agentStart" });
-    expect(sandboxBtn.disabled).toBe(true);
+    expect(sandboxBtn.disabled).toBe(false);
+    expect(sandboxBtn.getAttribute("aria-disabled")).toBe("true");
     expect(sandboxBtn.className).toContain("disabled");
     expect(modeBtn.disabled).toBe(false);
 
@@ -701,6 +760,7 @@ describe("sandbox picker", () => {
 
     dispatch(window, { type: "agentEnd" });
     expect(sandboxBtn.disabled).toBe(false);
+    expect(sandboxBtn.getAttribute("aria-disabled")).toBe("false");
     expect(sandboxBtn.className).not.toContain("disabled");
     expect(modeBtn.disabled).toBe(false);
   });
