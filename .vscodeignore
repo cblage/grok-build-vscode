@@ -2,6 +2,7 @@
 .gitignore
 .env
 .claude/**
+.remember/**
 mcps/**
 research/**
 test/**
