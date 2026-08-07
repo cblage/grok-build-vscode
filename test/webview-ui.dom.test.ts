@@ -28,6 +28,89 @@ const clock = (timestampMs: number) => {
   return `${h}:${String(d.getMinutes()).padStart(2, "0")} ${ampm}`;
 };
 
+describe("focused conversation name chip", () => {
+  const row = (id: string, name: string, cwd = "/work/repo") => ({
+    id, cwd, displayName: name, rawSummary: "", updatedAt: Date.now(), createdAt: 1, numMessages: 2,
+  });
+
+  it("shows the host-provided full name, edits in place, and commits with Enter", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "sessions", entries: [row("s1", "A very long conversation title")], activeId: "s1", dots: {} });
+    dispatch(window, { type: "sessionName", sessionId: "s1", name: "A very long conversation title", cwd: "/work/repo" });
+
+    const chip = doc.getElementById("session-name-chip") as HTMLElement;
+    const label = doc.getElementById("session-name-label") as HTMLElement;
+    expect(chip.hidden).toBe(false);
+    expect(label.textContent).toBe("A very long conversation title");
+    expect(label.title).toBe("A very long conversation title");
+
+    click(window, doc.getElementById("session-name-edit")!);
+    const input = doc.getElementById("session-name-label") as HTMLInputElement;
+    expect(input.value).toBe("A very long conversation title");
+    input.value = "Renamed from the header";
+    input.dispatchEvent(new (window as any).KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+
+    expect(posted.filter((message) => message.type === "renameSession")).toEqual([
+      { type: "renameSession", id: "s1", name: "Renamed from the header", cwd: "/work/repo" },
+    ]);
+  });
+
+  it("cancels an unchanged edit and an Escape, but clearing the field drops the custom name", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "sessions", entries: [row("s1", "Keep this")], activeId: "s1", dots: {} });
+    dispatch(window, { type: "sessionName", sessionId: "s1", name: "Keep this", cwd: "/work/repo" });
+    const label = () => doc.getElementById("session-name-label")!;
+
+    click(window, label());
+    (label() as HTMLInputElement).dispatchEvent(new (window as any).FocusEvent("blur", { bubbles: true }));
+    click(window, label());
+    (label() as HTMLInputElement).value = "discard me";
+    label().dispatchEvent(new (window as any).KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+
+    expect(posted.filter((message) => message.type === "renameSession")).toEqual([]);
+    expect((label() as HTMLElement).textContent).toBe("Keep this");
+
+    // Emptying the field is the only route back to the title grok generated, so
+    // it is a rename to nothing rather than a no-op. Escape, above, is the cancel.
+    click(window, label());
+    (label() as HTMLInputElement).value = "   ";
+    (label() as HTMLInputElement).dispatchEvent(new (window as any).FocusEvent("blur", { bubbles: true }));
+    expect(posted.filter((message) => message.type === "renameSession")).toEqual([
+      { type: "renameSession", id: "s1", name: "", cwd: "/work/repo" },
+    ]);
+  });
+
+  it("adds the remote affordance only after sessionName arrives, and carries cwd", () => {
+    const { window, doc, posted } = bootWebview({ remote: true });
+    dispatch(window, { type: "sessions", entries: [row("s1", "Remote title", "/work/remote")], activeId: "s1", dots: {} });
+    expect(doc.getElementById("session-head-title")!.textContent).toBe("Remote title");
+    expect(doc.getElementById("session-head-edit")).toBeNull();
+
+    dispatch(window, { type: "sessionName", sessionId: "s1", name: "Remote title", cwd: "/work/remote" });
+    expect(doc.getElementById("session-head-title")!.getAttribute("title")).toBe("Remote title");
+    expect(doc.getElementById("session-head-edit")).not.toBeNull();
+    click(window, doc.getElementById("session-head-title")!);
+    const input = doc.getElementById("session-head-title") as HTMLInputElement;
+    input.value = "Remote renamed";
+    input.dispatchEvent(new (window as any).KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    expect(posted.filter((message) => message.type === "renameSession")).toEqual([
+      { type: "renameSession", id: "s1", name: "Remote renamed", cwd: "/work/remote" },
+    ]);
+  });
+
+  it("stays quiet against an older host that never sends the name frame", () => {
+    const local = bootWebview();
+    dispatch(local.window, { type: "sessions", entries: [row("s1", "Legacy title")], activeId: "s1", dots: {} });
+    expect((local.doc.getElementById("session-name-chip") as HTMLElement).hidden).toBe(true);
+
+    const remote = bootWebview({ remote: true });
+    dispatch(remote.window, { type: "sessions", entries: [row("s1", "Legacy title")], activeId: "s1", dots: {} });
+    expect(remote.doc.getElementById("session-head-title")!.getAttribute("title")).toBe("Legacy title");
+    expect(remote.doc.getElementById("session-head-edit")).toBeNull();
+    expect(remote.posted.filter((message) => message.type === "renameSession")).toEqual([]);
+  });
+});
+
 describe("history popover (regression: popover that never closed)", () => {
   it("opens on the history button and requests the session list", () => {
     const { window, posted, doc } = bootWebview();
@@ -1510,7 +1593,21 @@ describe("send button startup state (spinner by default until the session is rea
 describe("gear menu — Other group + About / Config & debug sub-views", () => {
   function boot() {
     const h = bootWebview();
-    dispatch(h.window, { type: "initialState", useCtrlEnter: false, effort: "", cwd: "/x", extVersion: "1.4.0" });
+    dispatch(h.window, {
+      type: "initialState",
+      useCtrlEnter: false,
+      effort: "",
+      cwd: "/x",
+      extVersion: "1.4.0",
+      // VS Code host affordances — gear gates logs / Move view on these.
+      capabilities: {
+        uploadFile: true,
+        remoteVoice: true,
+        deleteActiveSession: true,
+        relocateView: true,
+        showOutput: true,
+      },
+    });
     dispatch(h.window, { type: "initialized", info: { version: "0.2.33" } });
     dispatch(h.window, { type: "session", sessionId: "s1", models: [], currentModelId: "grok-build" });
     h.posted.length = 0;
@@ -1630,8 +1727,9 @@ describe("thinking traces toggle (#26)", () => {
     expect(doc.body.classList.contains("thinking-hidden")).toBe(true);
   });
 
-  it("toggles the body class live on a showThinking message", () => {
+  it("toggles the body class live on a showThinking message (Coding purpose)", () => {
     const { window, doc } = bootWebview();
+    dispatch(window, { type: "appPurpose", value: "coding" });
     dispatch(window, { type: "showThinking", value: true });
     expect(doc.body.classList.contains("thinking-hidden")).toBe(false);
     dispatch(window, { type: "showThinking", value: false });
@@ -1649,8 +1747,9 @@ describe("thinking traces toggle (#26)", () => {
     expect(doc.querySelector(".msg.thinking")).not.toBeNull();
   });
 
-  it("shows no stand-in when traces are visible", () => {
+  it("shows no stand-in when traces are visible (Coding purpose)", () => {
     const { window, doc } = bootWebview();
+    dispatch(window, { type: "appPurpose", value: "coding" });
     dispatch(window, { type: "showThinking", value: true });
     dispatch(window, { type: "thoughtChunk", text: "weighing options…" });
     expect(doc.querySelector(".thinking-indicator")).toBeNull();
@@ -1666,8 +1765,9 @@ describe("thinking traces toggle (#26)", () => {
     expect(doc.querySelector(".thinking-indicator")).toBeNull();
   });
 
-  it("exposes a Show thinking traces switch in Config & debug that posts setShowThinking and flips the class", () => {
+  it("exposes a Show thinking traces switch in Config & debug under Coding", () => {
     const { window, posted, doc } = bootWebview();
+    dispatch(window, { type: "appPurpose", value: "coding" });
     dispatch(window, { type: "showThinking", value: false });
     expect(doc.body.classList.contains("thinking-hidden")).toBe(true);
     click(window, $(doc, "gear-btn"));
@@ -1906,41 +2006,37 @@ describe("thinking traces toggle (#26)", () => {
   });
 });
 
-describe("gear menu — worktree/rewind gating (#65)", () => {
+describe("gear menu — session continue + worktree gating", () => {
   const gearItems = (doc: Document) =>
     [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")].map((el) => el.textContent || "");
   const has = (doc: Document, label: string) => gearItems(doc).some((t) => t.includes(label));
 
-  it("non-worktree shows Fork + New worktree; worktree shows Fork + Apply/Remove and hides only New worktree", () => {
+  it("shows Continue in a new chat; worktree sessions also show Apply/Remove", () => {
     const { window, doc } = bootWebview();
     dispatch(window, { type: "session", sessionId: "s1", models: [], currentModelId: "grok-build" });
     click(window, $(doc, "gear-btn"));
-    expect(has(doc, "Fork conversation")).toBe(true);
-    expect(has(doc, "New worktree session")).toBe(true);
+    expect(has(doc, "Continue in a new chat")).toBe(true);
+    // Old three-entry menu is gone.
+    expect(has(doc, "Fork conversation")).toBe(false);
+    expect(has(doc, "New worktree session")).toBe(false);
     expect(has(doc, "Apply worktree")).toBe(false);
     expect(has(doc, "Remove worktree")).toBe(false);
     click(window, $(doc, "gear-btn")); // close
 
     dispatch(window, { type: "session", sessionId: "s2", models: [], currentModelId: "grok-build", worktree: true });
     click(window, $(doc, "gear-btn")); // re-open
+    expect(has(doc, "Continue in a new chat")).toBe(true);
     expect(has(doc, "Apply worktree")).toBe(true);
     expect(has(doc, "Remove worktree")).toBe(true);
-    // Fork stays (a shared-checkout branch, like the Dashboard's parallel sessions);
-    // only New worktree is blocked (no nesting).
-    expect(has(doc, "Fork conversation")).toBe(true);
-    expect(has(doc, "New worktree session")).toBe(false);
   });
 
-  it("hides Rewind conversation on an empty session, shows it once a user message exists", () => {
+  it("never shows gear Rewind — rewind is per-message only", () => {
     const { window, doc } = bootWebview();
     dispatch(window, { type: "session", sessionId: "s1", models: [], currentModelId: "grok-build" });
+    dispatch(window, { type: "userMessage", text: "hello", chips: [] });
     click(window, $(doc, "gear-btn"));
     expect(has(doc, "Rewind conversation")).toBe(false);
-    click(window, $(doc, "gear-btn")); // close
-
-    dispatch(window, { type: "userMessage", text: "hello", chips: [] });
-    click(window, $(doc, "gear-btn")); // re-open
-    expect(has(doc, "Rewind conversation")).toBe(true);
+    expect(has(doc, "Continue in a new chat")).toBe(true);
   });
 });
 
@@ -2436,8 +2532,13 @@ describe("gear entry: Move view (Config & debug)", () => {
       el.textContent!.includes(label),
     ) as HTMLElement | undefined;
 
-  it("offers the three destinations, each posting moveView with its location", () => {
+  it("offers the three destinations when the host advertises relocateView", () => {
     const { window, posted, doc } = bootWebview();
+    dispatch(window, {
+      type: "initialState",
+      useCtrlEnter: false,
+      capabilities: { uploadFile: true, remoteVoice: true, relocateView: true, showOutput: true },
+    });
     const destinations: Array<[string, string]> = [
       ["To Secondary Side Bar", "auxiliarybar"],
       ["To Primary Side Bar", "sidebar"],
@@ -2450,6 +2551,54 @@ describe("gear entry: Move view (Config & debug)", () => {
       click(window, item!);
       expect(posted).toContainEqual({ type: "moveView", location });
     }
+  });
+
+  it("still shows Move view + Show logs when the host sends no capability flags (v3.1.0)", () => {
+    // Compatibility contract: the web client is always new; the extension may
+    // be an older install that never emitted relocateView/showOutput. Those
+    // gear items existed ungated before the flags — absent must mean supported.
+    const { window, posted, doc } = bootWebview();
+    dispatch(window, {
+      type: "initialState",
+      useCtrlEnter: false,
+      // No relocateView / showOutput — mirrors released v3.1.0 hosts.
+      capabilities: { uploadFile: true, remoteVoice: true },
+    });
+    openConfigDebug(window, doc);
+    expect(itemByLabel(doc, "Show extension logs")).toBeTruthy();
+    expect(itemByLabel(doc, "To Secondary Side Bar")).toBeTruthy();
+    expect(itemByLabel(doc, "To Primary Side Bar")).toBeTruthy();
+    expect(itemByLabel(doc, "To Panel")).toBeTruthy();
+    click(window, itemByLabel(doc, "Show extension logs")!);
+    expect(posted).toContainEqual({ type: "showLogs" });
+  });
+
+  it("still shows Move view + Show logs when capabilities is omitted entirely", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "initialState",
+      useCtrlEnter: false,
+      // No capabilities object at all (hostCaps stays {}).
+    });
+    openConfigDebug(window, doc);
+    expect(itemByLabel(doc, "Show extension logs")).toBeTruthy();
+    expect(itemByLabel(doc, "To Secondary Side Bar")).toBeTruthy();
+  });
+
+  it("hides Move view and Show logs only when the host opts out with false (desktop)", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "initialState",
+      useCtrlEnter: false,
+      capabilities: { uploadFile: true, remoteVoice: true, relocateView: false, showOutput: false },
+    });
+    openConfigDebug(window, doc);
+    expect(itemByLabel(doc, "To Secondary Side Bar")).toBeUndefined();
+    expect(itemByLabel(doc, "To Primary Side Bar")).toBeUndefined();
+    expect(itemByLabel(doc, "To Panel")).toBeUndefined();
+    expect(itemByLabel(doc, "Show extension logs")).toBeUndefined();
+    // Config paths still work on desktop.
+    expect(itemByLabel(doc, "Open global config")).toBeTruthy();
   });
 });
 

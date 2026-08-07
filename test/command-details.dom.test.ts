@@ -73,7 +73,7 @@ describe("command details (#41)", () => {
     dispatch(window, {
       type: "initialState",
       effort: "", cwd: "/w", useCtrlEnter: false, extVersion: "0",
-      showThinking: false, expandCommandOutputs: true,
+      showThinking: false, expandCommandOutputs: true, appPurpose: "coding",
     });
     dispatch(window, exec("a", "git status"));
     close(window);
@@ -208,12 +208,10 @@ describe("command details (#41)", () => {
     const flat = doc.querySelector(".tool-flat.has-details") as HTMLElement;
     click(window, flat);
     const details = flat.querySelector(".tool-item-details") as HTMLElement;
-    expect(details.querySelector(".tool-cmd")!.textContent).toBe(
-      Array.from({ length: 6 }, (_, i) => `command ${i + 1}`).join("\n"),
-    );
-    expect(details.querySelector(".tool-cmd-output")!.textContent).toBe(
-      Array.from({ length: 6 }, (_, i) => `output ${i + 1}`).join("\n"),
-    );
+    expect(details.querySelector(".tool-cmd")!.textContent).toBe(command);
+    expect(details.querySelector(".tool-cmd-output")!.textContent).toBe(output);
+    expect(details.querySelector(".tool-cmd")!.classList.contains("command-preview-capped")).toBe(true);
+    expect(details.querySelector(".tool-cmd-output")!.classList.contains("command-preview-capped")).toBe(true);
 
     const viewAll = [...details.querySelectorAll(".command-view-all")] as HTMLButtonElement[];
     expect(viewAll.map((b) => b.textContent)).toEqual([
@@ -223,12 +221,41 @@ describe("command details (#41)", () => {
     click(window, viewAll[0]);
     click(window, viewAll[1]);
     expect(details.hidden).toBe(false); // editor links do not toggle the tool row
-    expect(details.querySelector(".tool-cmd")!.textContent).not.toBe(command);
-    expect(details.querySelector(".tool-cmd-output")!.textContent).not.toBe(output);
+    expect(details.querySelector(".tool-cmd")!.textContent).toBe(command);
+    expect(details.querySelector(".tool-cmd-output")!.textContent).toBe(output);
     expect(posted.filter((m: any) => m.type === "openText")).toEqual([
-      { type: "openText", content: command, language: "shellscript" },
+      { type: "openText", content: command },
       { type: "openText", content: output, language: "plaintext" },
     ]);
+  });
+
+  it("clips wrapped commands at rendered rows but keeps a logical line count", () => {
+    const { window, doc } = bootWebview({
+      beforeScripts: (win) => {
+        Object.defineProperty(win.HTMLElement.prototype, "clientWidth", {
+          configurable: true,
+          get() { return this.classList?.contains("tool-cmd") ? 120 : 0; },
+        });
+        Object.defineProperty(win.HTMLElement.prototype, "scrollHeight", {
+          configurable: true,
+          get() { return this.classList?.contains("tool-cmd") ? 240 : 0; },
+        });
+        Object.defineProperty(win.HTMLElement.prototype, "clientHeight", {
+          configurable: true,
+          get() { return this.classList?.contains("tool-cmd") ? 120 : 0; },
+        });
+      },
+    });
+    const command = Array.from({ length: 3 }, () => `python -c "${"print('x');".repeat(30)}"`).join("\n");
+    dispatch(window, exec("wrapped", command));
+    close(window);
+
+    const row = doc.querySelector(".tool-flat.has-details")!;
+    click(window, row);
+    const pre = row.querySelector(".tool-cmd") as HTMLElement;
+    const viewAll = row.querySelector(".command-view-all") as HTMLButtonElement;
+    expect(pre.classList.contains("command-preview-capped")).toBe(true);
+    expect(viewAll.textContent).toBe("View all (3 lines) →");
   });
 
   it("expands long IN/OUT inline on remote clients without posting a host-local message", () => {
@@ -250,16 +277,14 @@ describe("command details (#41)", () => {
 
     click(window, viewAll[0]);
     expect(commandPre.textContent).toBe(command);
-    expect(outputPre.textContent).not.toBe(output); // each preview expands independently
+    expect(outputPre.textContent).toBe(output); // each preview expands independently
     expect(viewAll[0].textContent).toBe("Show less");
     click(window, viewAll[1]);
     expect(outputPre.textContent).toBe(output);
     expect(posted.filter((m: any) => m.type === "openText")).toHaveLength(0);
 
     click(window, viewAll[0]);
-    expect(commandPre.textContent).toBe(
-      Array.from({ length: 6 }, (_, i) => `command ${i + 1}`).join("\n"),
-    );
+    expect(commandPre.textContent).toBe(command);
     expect(viewAll[0].textContent).toBe("View all (8 lines) →");
   });
 
@@ -468,7 +493,7 @@ describe("group auto-expand under grok.expandCommandOutputs", () => {
     dispatch(h.window, {
       type: "initialState",
       effort: "", cwd: "/w", useCtrlEnter: false, extVersion: "0",
-      showThinking: false, expandCommandOutputs: true,
+      showThinking: false, expandCommandOutputs: true, appPurpose: "coding",
     });
     return h;
   };
@@ -499,6 +524,7 @@ describe("group auto-expand under grok.expandCommandOutputs", () => {
 
   it("toggling the setting live expands/collapses existing command-bearing groups only", () => {
     const { window, doc } = bootWebview(); // setting OFF by default
+    dispatch(window, { type: "appPurpose", value: "coding" });
 
     dispatch(window, exec("c1", "git status"));
     dispatch(window, read("r1", "src/a.ts"));
@@ -589,6 +615,7 @@ describe("setAllToolDetails (expand/collapse all latch)", () => {
 
   it("last action wins: flipping the gear setting clears the latch", () => {
     const { window, doc } = bootWebview();
+    dispatch(window, { type: "appPurpose", value: "coding" });
     dispatch(window, exec("c1", "git status"));
     dispatch(window, read("r1", "src/a.ts"));
     close(window);
@@ -612,7 +639,7 @@ describe("setAllToolDetails (expand/collapse all latch)", () => {
     dispatch(window, {
       type: "initialState",
       effort: "", cwd: "/w", useCtrlEnter: false, extVersion: "0",
-      showThinking: false, expandCommandOutputs: true,
+      showThinking: false, expandCommandOutputs: true, appPurpose: "coding",
     });
     dispatch(window, exec("c1", "git status"));
     dispatch(window, read("r1", "src/a.ts"));
