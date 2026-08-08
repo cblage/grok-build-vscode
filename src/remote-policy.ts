@@ -284,6 +284,14 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   openText: "host-local",
   openDiff: "host-local",
   exportExpr: "host-local",
+  // Opens a native directory picker on the machine running the host. A remote
+  // could neither see nor answer that dialog, so it would hang a phone on a
+  // control that never resolves.
+  addProjectFolder: "host-local",
+  // Same reasoning, and one more: closing a folder ends every conversation
+  // in it and kills their agents. A remote must never be able to do that to
+  // the machine it is borrowing.
+  removeProjectFolder: "host-local",
   openGlobalConfig: "host-local",
   openProjectConfig: "host-local",
   runMcpList: "host-local",
@@ -326,6 +334,8 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   remoteSignIn: "host-local",
   remoteSignOut: "host-local",
   openRemotePortal: "host-local",
+  // Desktop update notice click-through — a phone cannot update the desk.
+  openUpdateRelease: "host-local",
 };
 
 const TIER_RANK: Record<RemoteTier, number> = { "read-only": 0, propose: 1, full: 2 };
@@ -438,6 +448,8 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   appPurpose: "mirror",
   fontScale: "mirror",
   grokUpdateStatus: "mirror",
+  // Desk-only installer notice — a remote has nothing useful to do with it.
+  updateAvailable: "host-local",
   initialized: "mirror",
   cliUpdating: "mirror",
   session: "mirror",
@@ -550,6 +562,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   appPurpose: "none",
   fontScale: "none",
   grokUpdateStatus: "none",
+  updateAvailable: "none",
   cliUpdating: "none",
   onboarding: "none",
   expandCommandOutputs: "none",
@@ -647,6 +660,26 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   steerUnavailable: "scope",
   usage: "scope",
 };
+
+/**
+ * Frames that carry their own authorization cwd and are therefore ABOUT a
+ * project rather than payload FROM the recipient's conversation.
+ *
+ * This distinction is not cosmetic. The uplink filters recipients to the tab
+ * that owns a delivery's scope, which is right for transcript and wrong here:
+ * the projects rail asks for a preview of a SIBLING project on purpose, so
+ * "the recipient does not own this cwd" is the normal case, not an attack.
+ * Treating them alike silently dropped every `repoSessions` answer over the
+ * relay — the phone's rail then sat on "Update Grok Build to preview" forever
+ * against a host that was perfectly current and had already answered.
+ *
+ * Authorization is unchanged either way: {@link mayDeliverRemoteHostMsg} checks
+ * the frame's OWN `cwd` against the live authorized set and ignores the scope
+ * argument for these types.
+ */
+export function isSelfScopedOutbound(type: HostMsg["type"]): boolean {
+  return OUTBOUND_PROJECT_AUTH[type] === "message-cwd";
+}
 
 /**
  * Sole authorization predicate for remote HostMsg delivery. Callers pass the

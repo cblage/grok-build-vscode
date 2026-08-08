@@ -440,9 +440,9 @@ describe("desktop Electron app (real window + fake CLI)", () => {
 
   it("clicking a text file replaces the tree with a file viewer", async () => {
     await ensureFilePanelOpen();
-    // Leave any prior view.
+    // Leave any prior view via the project-name control (tabs stay open).
     if (await page.evaluate(() => document.body.classList.contains("desk-ft-viewing"))) {
-      await page.locator(".desk-ft-crumb-back").click();
+      await page.locator("#desk-ft-title").click();
     }
     const fileRow = page.locator('.desk-ft-node[data-rel="notes.md"] > .desk-ft-row');
     await fileRow.waitFor({ state: "visible", timeout: 10_000 });
@@ -456,8 +456,11 @@ describe("desktop Electron app (real window + fake CLI)", () => {
     expect(bodyText).toMatch(/Notes|Hello panel/i);
     // Tree body is hidden while viewing.
     expect(await page.locator("#desk-ft-body").isVisible()).toBe(false);
-    // Breadcrumb back returns to the tree.
-    await page.locator(".desk-ft-crumb-back").click();
+    // Tab strip is present while viewing; project name returns to the tree.
+    expect(await page.locator("#desk-ft-tabs").count()).toBe(1);
+    expect(await page.locator('.desk-ft-tab[data-rel="notes.md"]').count()).toBe(1);
+    expect(await page.locator(".desk-ft-crumb-back").count()).toBe(0);
+    await page.locator("#desk-ft-title").click();
     await page.waitForFunction(
       () => !document.body.classList.contains("desk-ft-viewing"),
       { timeout: 5_000 },
@@ -470,7 +473,7 @@ describe("desktop Electron app (real window + fake CLI)", () => {
     fs.writeFileSync(openSink, "", "utf8");
     await ensureFilePanelOpen();
     if (await page.evaluate(() => document.body.classList.contains("desk-ft-viewing"))) {
-      await page.locator(".desk-ft-crumb-back").click();
+      await page.locator("#desk-ft-title").click();
     }
     const fileRow = page.locator('.desk-ft-node[data-rel="payload.bin"] > .desk-ft-row');
     await fileRow.waitFor({ state: "visible", timeout: 10_000 });
@@ -525,7 +528,7 @@ describe("desktop Electron app (real window + fake CLI)", () => {
     fs.writeFileSync(openSink, "", "utf8");
     // Leave any prior view.
     if (await page.evaluate(() => document.body.classList.contains("desk-ft-viewing"))) {
-      await page.locator(".desk-ft-crumb-back").click();
+      await page.locator("#desk-ft-title").click();
     }
     // Full chat openFile path: webview post → authorize → host openFsPath → panel.
     await page.evaluate(() => {
@@ -544,15 +547,10 @@ describe("desktop Electron app (real window + fake CLI)", () => {
     // Must not have hit the OS open sink for a renderable type.
     const sink = fs.existsSync(openSink) ? fs.readFileSync(openSink, "utf8") : "";
     expect(sink).not.toMatch(/notes\.md/);
-    // Back is a button with icon, not a blue link.
-    const back = page.locator(".desk-ft-crumb-back");
-    expect(await back.count()).toBe(1);
-    expect(await back.isVisible()).toBe(true);
-    expect(await back.locator("svg").count()).toBeGreaterThan(0);
-    expect(await back.innerText()).toMatch(/Back/i);
-    const backColor = await back.evaluate((el) => getComputedStyle(el).color);
-    // Must not be the pure link-blue treatment (rgb of --vscode-textLink on dark ≈ 55,148,255).
-    expect(backColor).not.toMatch(/rgb\(\s*55,\s*148,\s*255\s*\)/);
+    // Tabs + project name replace Back/breadcrumb; open affordance still present.
+    expect(await page.locator(".desk-ft-crumb-back").count()).toBe(0);
+    expect(await page.locator("#desk-ft-tabs .desk-ft-tab").count()).toBeGreaterThan(0);
+    expect(await page.locator("#desk-ft-title").isVisible()).toBe(true);
     // "Open in default app" affordance present while viewing.
     expect(await page.locator(".desk-ft-open-ext").count()).toBe(1);
   });
@@ -560,7 +558,7 @@ describe("desktop Electron app (real window + fake CLI)", () => {
   it("chat openFile bare basename resolves under docs/ into the panel", async () => {
     fs.writeFileSync(openSink, "", "utf8");
     if (await page.evaluate(() => document.body.classList.contains("desk-ft-viewing"))) {
-      await page.locator(".desk-ft-crumb-back").click();
+      await page.locator("#desk-ft-title").click();
     }
     // Agent-style bare link: product-decisions.md lives at docs/product-decisions.md.
     await page.evaluate(() => {
@@ -1186,32 +1184,35 @@ describe("desktop multi-folder rail + isolation", () => {
       leafB,
       { timeout: 15_000 },
     );
+    // Selecting a project deliberately does NOT move you out of the conversation
+    // you are in — browsing the rail mid-turn must be free, and you must come
+    // back to what you were reading. That is the property asserted here, and it
+    // is the opposite of what this test used to require.
     await page.evaluate((name) => {
       const head = [...document.querySelectorAll(".rail-repo-head")].find((h) =>
         (h.textContent || "").includes(name),
       ) as HTMLElement | undefined;
       head?.click();
     }, leafB);
+    await page.locator(".msg.user", { hasText: msgA }).first().waitFor({ timeout: 15_000 });
 
-    // After switch: A's user bubble must not be the live conversation.
-    await page.waitForFunction(
-      (t) => {
-        const users = [...document.querySelectorAll(".msg.user")];
-        // Either cleared (new session) or only non-A messages.
-        return !users.some((el) => (el.textContent || "").includes(t));
-      },
-      msgA,
-      { timeout: 45_000 },
-    );
+    // Entering B is a separate, explicit act. Starting a conversation there is
+    // where isolation begins to mean something, and the rest of this test
+    // proves it: B never shows A's message, and A never shows B's.
+    await page.locator("#session-head-actions button").first().click();
+    await page.locator(".rail-menu-item", { hasText: /New session/ }).click();
+    await page
+      .locator(".msg.user", { hasText: msgA })
+      .waitFor({ state: "detached", timeout: 45_000 });
 
     const msgB = `isolation-B-${Date.now()}`;
     await page.locator("#input").fill(msgB);
     await page.locator("#send-btn").click();
-    await page.waitForFunction(
-      (t) => [...document.querySelectorAll(".msg.user")].some((el) => (el.textContent || "").includes(t)),
-      msgB,
-      { timeout: 30_000 },
-    );
+    // Locator waits from here on. Starting a session re-renders the document,
+    // after which Playwright re-injects its helper by evaluating a string and
+    // the page's CSP refuses it — every waitForFunction past that point died
+    // with an EvalError instead of testing anything.
+    await page.locator(".msg.user", { hasText: msgB }).first().waitFor({ timeout: 30_000 });
 
     // Back to A — B's message must not appear; A's may reload from pool/disk.
     await page.evaluate((name) => {
@@ -1220,15 +1221,12 @@ describe("desktop multi-folder rail + isolation", () => {
       ) as HTMLElement | undefined;
       head?.click();
     }, leafA);
+    await page.locator("#session-head-actions button").first().click();
+    await page.locator(".rail-menu-item", { hasText: /New session/ }).click();
 
-    await page.waitForFunction(
-      (t) => {
-        const text = document.querySelector("#messages")?.textContent || "";
-        return !text.includes(t);
-      },
-      msgB,
-      { timeout: 45_000 },
-    );
+    await page
+      .locator("#messages", { hasText: msgB })
+      .waitFor({ state: "detached", timeout: 45_000 });
 
     // A's conversation should still be reachable (pool re-focus or history).
     // Soft assert: either msgA is back, or we at least do not show msgB.

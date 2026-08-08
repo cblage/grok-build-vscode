@@ -109,10 +109,32 @@ describe("VSIX excludes desktop app", () => {
     // Both readmes excluded as files; vsce embeds marketplace content only.
     expect(vscodeignore).toMatch(/^\s*README\.marketplace\.md\s*$/m);
     expect(vscodeignore).toMatch(/^\s*README\.md\s*$/m);
-    // Trap: `!out/**/*.js` re-includes out/desktop/** and later exclude rules
-    // do not win under vsce — only top-level out/*.js may be un-ignored.
+    // Trap: `!out/**/*.js` re-includes out/desktop/** and a LATER exclude rule
+    // does not win it back under vsce's matcher. A negation placed after the
+    // exclusion does work — that is how the two modules below are re-included —
+    // but the broad form must stay out.
     expect(vscodeignore).toMatch(/^\s*!out\/\*\.js\s*$/m);
     expect(vscodeignore).not.toMatch(/^\s*!out\/\*\*\/\*\.js\s*$/m);
+  });
+
+  it("re-includes the desktop modules the EXTENSION requires at runtime", () => {
+    // #101: out/sidebar.js requires ./desktop/desktop-policy, which requires
+    // ./file-tree. Excluding them shipped six releases (3.2.0-3.2.5) that threw
+    // during activation before registering a command, so every Grok command
+    // reported "not found" and the sidebar never appeared.
+    //
+    // A tripwire, not the enforcement — `npm run check:vsix` resolves every
+    // require in the packed output against the packed file list and fails
+    // packaging. This just stops the two lines being deleted as dead weight.
+    expect(vscodeignore).toMatch(/^\s*!out\/desktop\/desktop-policy\.js\s*$/m);
+    expect(vscodeignore).toMatch(/^\s*!out\/desktop\/file-tree\.js\s*$/m);
+  });
+
+  it("packaging cannot run without the require check", () => {
+    // The check has to be reachable from `npm run package`, which CI already
+    // runs on every push and PR — otherwise it is a script nobody invokes.
+    expect(pkg.scripts["check:vsix"]).toMatch(/check-vsix-requires/);
+    expect(pkg.scripts.prepackage).toMatch(/check:vsix/);
   });
 
   it("desktop dist scripts exist and do not replace npm run package", () => {
@@ -132,8 +154,77 @@ describe("desktop artifact naming (electron-builder.yml)", () => {
     );
     expect(yml).toMatch(/productName:\s*Grok Build Desktop/);
     expect(yml).toMatch(/extraMetadata:[\s\S]*main:\s*out\/desktop\/main\.js/);
-    // Unsigned by design until certificates exist.
-    expect(yml).toMatch(/identity:\s*null/);
-    expect(yml).toMatch(/signAndEditExecutable:\s*false/);
+  });
+
+  // Comments in this file explain settings that are deliberately ABSENT, so a
+  // regex over the raw text can match prose and assert the opposite of the
+  // truth. `signAndEditExecutable: false` did exactly that: the line was removed
+  // in 3.2.1 and the assertion kept passing off the paragraph explaining why.
+  const config = yml.replace(/^\s*#.*$/gm, "");
+
+  it("signs and notarises the macOS build", () => {
+    // Mandatory for notarisation — and the reason entitlements exist at all.
+    expect(config).toMatch(/hardenedRuntime:\s*true/);
+    expect(config).toMatch(
+      /entitlements:\s*resources\/entitlements\.mac\.plist/,
+    );
+    // Helper processes inherit separately; without this the window comes up blank.
+    expect(config).toMatch(
+      /entitlementsInherit:\s*resources\/entitlements\.mac\.plist/,
+    );
+    expect(config).toMatch(/notarize:\s*true/);
+    // No usage string means macOS kills the process instead of prompting.
+    expect(config).toMatch(/NSMicrophoneUsageDescription/);
+    // `identity: null` is what shipped 3.2.2 unsigned and unopenable.
+    expect(config).not.toMatch(/identity:\s*null/);
+    // Turning Windows signing off also skips rcedit, which stamps the icon (3.2.0).
+    expect(config).not.toMatch(/signAndEditExecutable/);
+  });
+
+  it("entitlements grant what Electron and voice input need", () => {
+    const plist = read("resources/entitlements.mac.plist");
+    // V8 compiles at runtime; without these the renderer dies immediately.
+    expect(plist).toMatch(/com\.apple\.security\.cs\.allow-jit/);
+    expect(plist).toMatch(
+      /com\.apple\.security\.cs\.allow-unsigned-executable-memory/,
+    );
+    expect(plist).toMatch(
+      /com\.apple\.security\.cs\.allow-dyld-environment-variables/,
+    );
+    expect(plist).toMatch(/com\.apple\.security\.device\.audio-input/);
+    // Weakens the runtime and buys nothing: ws and jpeg-js are pure JS.
+    expect(plist).not.toMatch(/disable-library-validation/);
+  });
+});
+
+describe("desktop release workflow signing credentials", () => {
+  const workflow = read(".github/workflows/desktop-release.yml");
+
+  it("hands notarytool a key PATH, not the key itself", () => {
+    // electron-builder forwards APPLE_API_KEY verbatim to `notarytool --key`,
+    // which wants a file path. The secret can only hold text, so a macOS-only
+    // step writes it out and exports the path through $GITHUB_ENV.
+    expect(workflow).toMatch(/APPLE_API_KEY=\$key" >> "\$GITHUB_ENV"/);
+    // Step-level env outranks $GITHUB_ENV, so declaring it on the build step
+    // would put the raw key contents back and fail notarisation.
+    expect(workflow).not.toMatch(
+      /APPLE_API_KEY:\s*\$\{\{\s*secrets\.APPLE_API_KEY\s*\}\}/,
+    );
+  });
+
+  it("passes the identity and notarisation credentials to the build", () => {
+    for (const v of [
+      "CSC_LINK",
+      "CSC_KEY_PASSWORD",
+      "APPLE_API_KEY_ID",
+      "APPLE_API_ISSUER",
+    ]) {
+      expect(workflow).toMatch(
+        new RegExp(`${v}:\\s*\\$\\{\\{\\s*secrets\\.${v}\\s*\\}\\}`),
+      );
+    }
+    expect(workflow).toMatch(/APPLE_TEAM_ID:\s*L6TFKRX6QQ/);
+    // This forced signing off; leaving it would silently unsign every release.
+    expect(workflow).not.toMatch(/CSC_IDENTITY_AUTO_DISCOVERY/);
   });
 });

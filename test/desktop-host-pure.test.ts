@@ -1487,7 +1487,15 @@ describe("file-tree panel assets", () => {
     expect(boot).toContain("desk-ft-open");
     expect(boot).toContain("localStorage");
     expect(boot).toContain("api.read");
-    expect(boot).toContain("desk-ft-crumb");
+    expect(boot).toContain("desk-ft-toolbar");
+    expect(boot).toContain("desk-ft-tabs");
+    expect(boot).toContain("desk-ft-title");
+    // Navigation is tabs + project name — no Back control or breadcrumb path.
+    expect(boot).not.toContain("desk-ft-crumb-back");
+    expect(boot).not.toContain("ICON_ARROW_LEFT");
+    expect(boot).not.toContain("breadcrumbSegments");
+    expect(FILE_TREE_PANEL_CSS).not.toContain("desk-ft-crumb-back");
+    expect(FILE_TREE_PANEL_CSS).not.toContain("desk-ft-crumb-seg");
     // Multi-folder rail host: shell mounts inside .app-main when present.
     expect(boot).toContain("app-main");
     expect(boot).toContain("projects-rail");
@@ -1511,14 +1519,15 @@ describe("file-tree panel assets", () => {
     expect(boot).toContain("WIDTH_MIN");
     expect(boot).toContain("__grokDeskFtOpen");
     expect(boot).toContain("Open in default app");
-    // Back is a button with icon, not a blue text link.
-    expect(boot).toContain("desk-ft-crumb-back");
-    expect(boot).toContain("ICON_ARROW_LEFT");
-    expect(FILE_TREE_PANEL_CSS).toMatch(
-      /\.desk-ft-crumb-back[\s\S]*button-secondaryBackground|border-radius/,
+    // Cancel is mounted only while dirty (not always-present + hidden).
+    expect(boot).toMatch(/if\s*\(\s*file\.dirty\s*\)[\s\S]*desk-ft-cancel/);
+    // Markdown preview defers typography to chat.css (shared tokens), not a
+    // private panel palette that drifted from message rendering.
+    expect(FILE_TREE_PANEL_CSS).not.toMatch(
+      /\.desk-ft-md\s+code[\s\S]*textCodeBlock-background/,
     );
     expect(FILE_TREE_PANEL_CSS).not.toMatch(
-      /\.desk-ft-crumb-back\s*\{[^}]*textLink-foreground/s,
+      /\.desk-ft-md\s+th[\s\S]*textCodeBlock-background/,
     );
     // Directory disclosure: SVG chevrons, never filled triangles.
     expect(boot).toContain("ICON_CHEVRON_RIGHT");
@@ -1746,12 +1755,30 @@ describe("desktop openFile / openUrl policy (A1)", () => {
     // Must run before the OS open, not only document in comments.
     const openHandler = ipcSrc.indexOf("ipcMain.handle(CH_OPEN");
     expect(openHandler).toBeGreaterThan(0);
-    const openBody = ipcSrc.slice(openHandler, ipcSrc.indexOf("ipcMain.handle(CH_READ", openHandler));
-    const refuse = openBody.indexOf("isExecutableOpenTarget(resolved.absPath)");
+    const openBody = ipcSrc.slice(openHandler, ipcSrc.indexOf("ipcMain.handle(CH_REVEAL", openHandler));
+    // The refusal must sit on the RE-RESOLVED path and run before the OS call:
+    // checking the path resolved earlier would leave the window a symlink swap
+    // needs. Asserted per-handler rather than "somewhere in the file", because
+    // a shared validator that one handler forgets to call is exactly the shape
+    // this is guarding against.
+    const refuse = openBody.indexOf("isExecutableOpenTarget(finalCheck.absPath)");
     const openCall = openBody.indexOf("await shell.openPath(");
     expect(refuse).toBeGreaterThan(0);
     expect(openCall).toBeGreaterThan(0);
     expect(refuse).toBeLessThan(openCall);
+
+    // Reveal is weaker than open — it does not launch anything — but it still
+    // confirms a file's existence and location to whoever asked, so it gets the
+    // same gate rather than a shorter one.
+    const revealHandler = ipcSrc.indexOf("ipcMain.handle(CH_REVEAL");
+    expect(revealHandler).toBeGreaterThan(0);
+    const revealBody = ipcSrc.slice(revealHandler, ipcSrc.indexOf("ipcMain.handle(CH_READ", revealHandler));
+    const revealRefuse = revealBody.indexOf("isExecutableOpenTarget(finalCheck.absPath)");
+    const revealCall = revealBody.indexOf("shell.showItemInFolder(");
+    expect(revealRefuse).toBeGreaterThan(0);
+    expect(revealCall).toBeGreaterThan(0);
+    expect(revealRefuse).toBeLessThan(revealCall);
+    expect(revealBody).toContain("isIpcFromMainWindow");
   });
 });
 
@@ -2933,7 +2960,10 @@ describe("openFile / openDiff session roots (P2-4 / P2-5)", () => {
     // prove the abort sits BEFORE selectedRepoCwd assignment / history read.
     const refuseIdx = switchBody.indexOf("setActiveWorkspaceFolder(target)");
     const selectedIdx = switchBody.indexOf("this.selectedRepoCwd = target");
-    const historyIdx = switchBody.indexOf("buildSessionsList");
+    // Selecting a project now touches no session at all — not the newest, not a
+    // blank one. The work that must stay behind the abort is therefore the
+    // catalog/list posting, which is all that is left.
+    const historyIdx = switchBody.indexOf("postRepoCatalog");
     expect(refuseIdx).toBeGreaterThan(0);
     expect(selectedIdx).toBeGreaterThan(refuseIdx);
     expect(historyIdx).toBeGreaterThan(selectedIdx);

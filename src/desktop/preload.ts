@@ -68,8 +68,9 @@ contextBridge.exposeInMainWorld("grokDesktopShell", true);
 contextBridge.exposeInMainWorld("grokDesktopFileTree", {
   list: (relPath: string) => ipcRenderer.invoke("desk-ft:list", relPath),
   open: (relPath: string) => ipcRenderer.invoke("desk-ft:open", relPath),
+  reveal: (relPath: string) => ipcRenderer.invoke("desk-ft:reveal", relPath),
   read: (relPath: string) => ipcRenderer.invoke("desk-ft:read", relPath),
-  save: (request: { relPath: string; text: string; stamp: { mtimeMs: number; size: number } }) =>
+  save: (request: { relPath: string; text: string; stamp: { mtimeMs: number; size: number }; absPath: string }) =>
     ipcRenderer.invoke("desk-ft:save", request),
   root: () => ipcRenderer.invoke("desk-ft:root"),
   /** Subscribe to active-project changes so the panel can rebind its tree. */

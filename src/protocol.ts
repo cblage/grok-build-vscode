@@ -92,6 +92,12 @@ export type HostUiCapabilities = {
    * absent/true = show; false = hide (desktop logs to stdout only).
    */
   showOutput?: boolean;
+  /**
+   * The rail's "add project folder" control. OPT-IN, unlike the two above:
+   * absent/false = hide. A host that never sent it cannot open a folder picker,
+   * and VS Code deliberately does not — its workspace is VS Code's to manage.
+   */
+  addProjectFolder?: boolean;
 };
 
 export type HostMsg =
@@ -113,6 +119,9 @@ export type HostMsg =
   | { type: "remoteStatus"; linked: boolean }
   | { type: "fontScale"; value: number }
   | { type: "grokUpdateStatus"; current?: string | null; latest?: string | null; updateAvailable?: boolean; policy?: unknown; error?: string }
+  /** Desktop app update notice (check only — no auto-update). Host-local; VS Code
+   *  never sends this. Capability = frame arrived; no host flag. */
+  | { type: "updateAvailable"; version: string; url: string }
   | { type: "initialized"; info: { cliPath: string; cwd: string; version: string | null; init: { protocolVersion?: unknown } } }
   | { type: "cliUpdating" }
   // `worktree` gates the gear's Apply/Remove worktree items to worktree sessions.
@@ -294,6 +303,9 @@ export type WebviewMsg =
     }
   | { type: "exportExpr"; action: string; kind: string; current?: string; svg?: string; png?: string; svgDark?: string; svgLight?: string }
   | { type: "setEffort"; level: string }
+  | { type: "addProjectFolder" }
+  /** Close one project folder. It leaves the rail; nothing leaves the disk. */
+  | { type: "removeProjectFolder"; cwd?: string }
   | { type: "openGlobalConfig" }
   | { type: "openProjectConfig" }
   | { type: "runMcpList" }
@@ -417,14 +429,17 @@ export type WebviewMsg =
   // device-link flow / drop the device token / open the relay web portal.
   | { type: "remoteSignIn" }
   | { type: "remoteSignOut" }
-  | { type: "openRemotePortal"; withHint?: boolean };
+  | { type: "openRemotePortal"; withHint?: boolean }
+  /** Open the desktop release page from the update notice. Host-local — a phone
+   *  cannot update the desk. */
+  | { type: "openUpdateRelease"; url: string };
 
 // Exhaustive maps: `Record<Union["type"], true>` forces every discriminant to be
 // a key (missing -> tsc error) and forbids any extra (excess-property -> tsc
 // error). The runtime arrays are just the keys, so they can never drift from the
 // union without failing the build.
 const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
-  initialState: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true,
+  initialState: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true,
   initialized: true, cliUpdating: true, session: true, sessionName: true, modelChanged: true,
   modeChanged: true, modePolicy: true, sandboxState: true, openModePopover: true,
   voiceState: true, voiceConfigured: true,
@@ -448,6 +463,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   ready: true, remotePreferences: true, send: true, newSession: true, cancel: true, pickModel: true,
   setMode: true, setSandbox: true, removeChip: true, toggleChip: true, openFile: true, openUrl: true,
   openText: true, openDiff: true, exportExpr: true, setEffort: true, openGlobalConfig: true,
+  addProjectFolder: true, removeProjectFolder: true,
   openProjectConfig: true, runMcpList: true, showLogs: true, openSettings: true, moveView: true,
   setShowThinking: true, setAppPurpose: true, setExpandCommandOutputs: true, setSteerByDefault: true,
   setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, summarizeSpeech: true, requestImageFull: true, composerFocus: true,
@@ -465,6 +481,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   newWorktreeSession: true, applyWorktree: true, removeWorktree: true,
   rewindSession: true, editLastMessage: true, uiConfirmAnswer: true, workflowControl: true,
   remoteSignIn: true, remoteSignOut: true, openRemotePortal: true,
+  openUpdateRelease: true,
 };
 
 export const HOST_MESSAGE_TYPES: readonly HostMsg["type"][] = Object.keys(HOST_MESSAGE_TYPE_MAP) as HostMsg["type"][];

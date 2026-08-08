@@ -76,6 +76,8 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "newSession":
     case "cancel":
     case "pickModel":
+    case "addProjectFolder":
+    case "removeProjectFolder":
     case "openGlobalConfig":
     case "openProjectConfig":
     case "runMcpList":
@@ -121,6 +123,7 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       if (raw.handle !== undefined && !isString(raw.handle)) return null;
       break;
     case "openUrl":
+    case "openUpdateRelease":
       if (!isString(raw.url)) return null;
       break;
     case "openText":

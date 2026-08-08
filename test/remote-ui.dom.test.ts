@@ -45,6 +45,27 @@ function bootRemotePcm() {
   return { ...harness, getNode: () => node };
 }
 
+// #projects-rail lives in web/chat.html, never in getHtml(). The gear's
+// Basic/Advanced entry points are gated on that mount existing, so a harness
+// without it shows the VS Code shape instead of AFK Pilot's.
+const withRailMount = (w: any) => {
+  const el = w.document.createElement("aside");
+  el.id = "projects-rail";
+  el.hidden = true;
+  w.document.body.appendChild(el);
+  const search = w.document.createElement("input");
+  search.id = "rail-search";
+  w.document.body.appendChild(search);
+};
+
+/** Open the gear, then step into Basic settings where Text size lives. */
+const openBasicSettings = (window: any, doc: Document) => {
+  click(window, (doc.getElementById("rail-gear-btn") || doc.getElementById("gear-btn"))!);
+  const entry = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
+    .find((el) => /Basic settings/.test(el.textContent || ""));
+  if (entry) click(window, entry as HTMLElement);
+};
+
 describe("AFK Pilot shared webview controls", () => {
   it("inserts remote dictation at the caret and preserves the suffix", async () => {
     const { window, posted, doc } = bootRemotePcm();
@@ -548,7 +569,7 @@ describe("AFK Pilot shared webview controls", () => {
   });
 
   it("clears a pending remote prompt only when its own text-bearing echo arrives", () => {
-    const { window, posted, doc } = bootWebview({ remote: true });
+    const { window, posted, doc } = bootWebview({ remote: true, beforeScripts: withRailMount });
     const input = doc.getElementById("input") as HTMLTextAreaElement;
     input.value = "accepted phone prompt";
     click(window, doc.getElementById("send-btn")!);
@@ -738,13 +759,19 @@ describe("AFK Pilot shared webview controls", () => {
   });
 
   it("previews remote text size while dragging, then persists and applies it on release", () => {
-    const { window, doc } = bootWebview({ remote: true });
-    click(window, doc.getElementById("gear-btn")!);
-    const config = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
-      .find((el) => el.textContent?.includes("Config & debug"))!;
-    click(window, config);
+    const { window, doc } = bootWebview({ remote: true, beforeScripts: withRailMount });
+    // Text size lives in Basic settings under the rail gear, not on the
+    // composer's popover: that one is about this conversation (model, effort),
+    // and how big the text is on this device is not a property of it.
+    openBasicSettings(window, doc);
 
     const slider = doc.getElementById("remote-font-scale") as HTMLInputElement;
+    expect(slider).toBeTruthy();
+    const gearItems = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item, #gear-popover .popover-section")];
+    const firstText = (gearItems[0]?.textContent || "").replace(/\s+/g, " ").trim();
+    expect(firstText.length).toBeGreaterThan(0);
+    // Model and Effort deliberately stay on the conversation surface.
+
     const output = slider.parentElement!.querySelector("output")!;
     slider.value = "140";
     slider.dispatchEvent(new (window as any).Event("input", { bubbles: true }));
@@ -827,7 +854,7 @@ describe("AFK Pilot shared webview controls", () => {
   });
 
   it("reports browser preferences only after the host proves support", () => {
-    const { window, posted, doc } = bootWebview({ remote: true });
+    const { window, posted, doc } = bootWebview({ remote: true, beforeScripts: withRailMount });
     dispatch(window, {
       type: "session",
       sessionId: "s1",
@@ -836,11 +863,9 @@ describe("AFK Pilot shared webview controls", () => {
     });
     expect(posted.filter((message) => message.type === "remotePreferences")).toEqual([]);
 
-    click(window, doc.getElementById("gear-btn")!);
-    const config = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
-      .find((el) => el.textContent?.includes("Config & debug"))!;
-    click(window, config);
+    openBasicSettings(window, doc);
     const slider = doc.getElementById("remote-font-scale") as HTMLInputElement;
+    expect(slider).toBeTruthy();
     slider.value = "150";
     slider.dispatchEvent(new (window as any).Event("change", { bubbles: true }));
     expect(posted.filter((message) => message.type === "remotePreferences")).toEqual([]);
@@ -857,8 +882,13 @@ describe("AFK Pilot shared webview controls", () => {
       usesTouch: false,
     });
 
-    slider.value = "140";
-    slider.dispatchEvent(new (window as any).Event("change", { bubbles: true }));
+    // Re-open if needed — gear may still be open from above.
+    if (doc.getElementById("gear-popover")!.hidden) {
+      click(window, doc.getElementById("gear-btn")!);
+    }
+    const slider2 = doc.getElementById("remote-font-scale") as HTMLInputElement;
+    slider2.value = "140";
+    slider2.dispatchEvent(new (window as any).Event("change", { bubbles: true }));
 
     expect(posted.at(-1)).toEqual({
       type: "remotePreferences",

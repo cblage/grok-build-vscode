@@ -417,6 +417,9 @@
     // A deliberate repo switch stays locked until its transition settles. The
     // replay bracket also keeps the lock honest for an old conversation load.
     repoSwitchPending: false,
+    /** The cwd a rail selection is waiting on, so the catalog echo that
+     *  confirms it can release the lock. Empty when nothing is pending. */
+    repoSwitchTarget: "",
     selectedRepoCwd: "",
     activeRepoCwd: "",
     // Projects rail (browser client only). `repoPreviews` caches one page of
@@ -434,6 +437,8 @@
     // that drops `toggleSessionPin`, which is a control that looks broken
     // rather than absent (the same trap the repo chip avoids).
     pinnedSessionsKnown: false,
+    /** Desktop update notice — set only when host posts `updateAvailable`. */
+    appUpdate: null,
     repoPreviews: {},
     repoPreviewsAsked: {},
     repoPreviewsSupported: false,
@@ -1361,6 +1366,18 @@
   window.__grokRenderMarkdown = (raw) => renderMarkdown(String(raw == null ? "" : raw));
 
   function renderMarkdown(raw) {
+    // Normalise line endings FIRST. Everything below splits on a newline and
+    // then tests each line with $-anchored patterns -- and a carriage return
+    // is a line terminator in JS regex, so `.` cannot match one. On a CRLF
+    // file every $-anchored rule therefore failed at the final character:
+    // headings kept their hashes and bullets kept their dashes, falling
+    // through to the paragraph path, while tables, links and bold (not
+    // $-anchored) carried on working. That combination is what made it look
+    // like the renderer was mostly fine.
+    //
+    // Surfaced in the desktop file panel because it renders whole files off
+    // disk and most files on Windows are CRLF -- but it was never panel-only.
+    raw = String(raw == null ? "" : raw).replace(/\r\n?/g, "\n");
     const codeBlocks = [];
     // Fence is 3+ backticks; the closing fence must be the SAME length (\1
     // backreference). This lets an outer block fenced by 4/5 backticks wrap an
@@ -2122,6 +2139,7 @@
   function renderGearMain() {
     state.gearView = "main";
     gearPopover.innerHTML = "";
+    gearPopover.classList.remove("popover-centered");
 
     // Two surfaces, one popover. With a rail gear the composer holds what is
     // about THIS CONVERSATION (model, effort, where it continues) and the rail
@@ -2136,11 +2154,35 @@
     if (showApp) renderGearApp();
   }
 
+  /**
+   * Client-owned text size slider (AFK Pilot + desktop). VS Code keeps host
+   * `chatFontScale` and never sets CLIENT_OWNS_FONT_SCALE. Leads Basic
+   * settings under the rail gear — not the composer's conversation surface, and
+   * not the gear root. Ctrl/Cmd +/−/0 stay in sync via setClientFontScale.
+   */
+  function appendClientFontScaleRow() {
+    if (!CLIENT_OWNS_FONT_SCALE) return;
+    const fontRow = document.createElement("div");
+    fontRow.className = "toolbar-popover-item remote-font-row";
+    fontRow.innerHTML =
+      `<label for="remote-font-scale" title="Chat text size on this client only. Independent of the VS Code extension setting. Ctrl/Cmd +/−/0 stay in sync with this slider.">Text size</label>` +
+      `<input id="remote-font-scale" type="range" min="80" max="160" step="10" value="${Math.round(state.remoteFontScale * 100)}" aria-label="Text size">` +
+      `<output>${Math.round(state.remoteFontScale * 100)}%</output>`;
+    const slider = fontRow.querySelector("input");
+    const output = fontRow.querySelector("output");
+    slider.oninput = () => { output.textContent = `${slider.value}%`; };
+    slider.onchange = () => { setClientFontScale(Number(slider.value) / 100); };
+    gearPopover.appendChild(fontRow);
+  }
+
   /** Model + effort, and where this conversation continues. */
   function renderGearConversation() {
     // ── Model + effort header ─────────────────────────────────────────────
     const modelEffortSection = document.createElement("div");
-    modelEffortSection.className = "popover-section popover-section-first";
+    // When Text size leads, Model and Effort is no longer the first row — keep
+    // the section rule so a separator appears under the slider.
+    modelEffortSection.className = "popover-section" +
+      (CLIENT_OWNS_FONT_SCALE ? "" : " popover-section-first");
     modelEffortSection.textContent = "Model and Effort";
     gearPopover.appendChild(modelEffortSection);
 
@@ -2358,8 +2400,21 @@
   function renderContinueDestinationPicker(dests) {
     state.gearView = "continue";
     gearPopover.innerHTML = "";
-    addGearItem('<span class="popover-back">← Continue in a new chat</span>', renderGearMain);
-    addSection("Where?");
+    // This panel used to be reachable only from the gear, so it could assume the
+    // popover was already open and positioned. Its entry point moved to the
+    // conversation's overflow menu, where it is not — so the picker rendered
+    // into a hidden, unpositioned element: nothing happened at all, and when it
+    // did show it sat in the corner of the window with no anchor.
+    // Centred, and with no way "back". Both follow from where this is reached
+    // from now: the conversation's ⋯ menu, in the top bar or the rail — never
+    // the gear. A back arrow to the gear's main panel would return you to a
+    // place you were not, and anchoring the panel to a gear button you did not
+    // press puts it nowhere near the pointer. It is a question — where should
+    // this continue? — so it behaves like one: centred, dismissed by clicking
+    // away or Escape.
+    gearPopover.classList.add("popover-centered");
+    gearPopover.hidden = false;
+    addSection("Continue in a new chat");
     dests.forEach((d, i) => {
       const el = document.createElement("div");
       el.className = "toolbar-popover-item" + (i === 0 ? " active" : "");
@@ -2381,20 +2436,31 @@
     });
   }
 
-  /** Basic prefs for rail hosts (desktop / web): sounds, TTS, steer, coding toggles. */
+  /** Basic prefs for rail hosts (desktop / web): sounds + TTS. */
   function renderBasicSettingsPanel() {
     state.gearView = "basic";
     gearPopover.innerHTML = "";
     addGearItem('<span class="popover-back">← Basic settings</span>', renderGearMain);
+    // Leads Basic settings. It is a per-device display preference, which is
+    // exactly what this panel is for — on the gear root it sat above the
+    // account and purpose entries, which are not settings at all.
+    appendClientFontScaleRow();
     appendSharedPreferenceSwitches();
   }
 
-  /** Advanced prefs for rail hosts: config files, MCP, Logs (not "Extension logs"). */
+  /** Advanced prefs for rail hosts: display toggles, then config files / MCP / Logs. */
   function renderAdvancedSettingsPanel() {
     state.gearView = "advanced";
     gearPopover.innerHTML = "";
     addGearItem('<span class="popover-back">← Advanced settings</span>', renderGearMain);
-    // Host-local config openers — hide on remote (policy-dropped).
+    // Per-client display prefs first — visible on remote too (not host config).
+    appendAdvancedDisplaySwitches(() => renderAdvancedSettingsPanel());
+    // Host-local config openers — hide on remote (policy-dropped). Under a
+    // heading, because the two halves of this panel behave differently: the
+    // switches above change something here and now, while everything below
+    // leaves the app and opens a file or a log. Running them together read as
+    // one list where flipping and departing looked like the same kind of act.
+    addSection("Files & logs");
     if (!IS_REMOTE) {
       addGearItem('<span>Open global config</span><span class="popover-external">↗</span>', () => {
         vscode.postMessage({ type: "openGlobalConfig" });
@@ -2514,15 +2580,15 @@
   }
 
   /**
-   * Shared preference switches used by Config & debug (VS Code) and Basic
-   * settings (rail hosts). `rerender` repaints the open panel after a toggle.
+   * Advanced display toggles: thinking traces, tool details, steer-by-default.
+   * Used by Advanced settings (rail hosts) and Config & debug (VS Code / no-rail).
+   * Not host config — must stay visible on remote. Coding-only where noted.
    */
-  function appendSharedPreferenceSwitches(rerender) {
+  function appendAdvancedDisplaySwitches(rerender) {
     const paint = typeof rerender === "function"
       ? rerender
       : () => {
-          if (state.gearView === "basic") renderBasicSettingsPanel();
-          else if (state.gearView === "advanced") renderAdvancedSettingsPanel();
+          if (state.gearView === "advanced") renderAdvancedSettingsPanel();
           else renderConfigDebugPanel();
         };
 
@@ -2550,22 +2616,6 @@
       );
     }
 
-    // Font size: remote keeps the slider; desktop owns zoom via Ctrl/Cmd +/−/0
-    // (spec: not ported into the menu). VS Code uses host chatFontScale.
-    if (CLIENT_OWNS_FONT_SCALE && IS_REMOTE) {
-      const fontRow = document.createElement("div");
-      fontRow.className = "toolbar-popover-item remote-font-row";
-      fontRow.innerHTML =
-        `<label for="remote-font-scale" title="Chat text size on this device only. Independent of VS Code's own zoom — the desktop's setting never affects AFK Pilot.">Text size</label>` +
-        `<input id="remote-font-scale" type="range" min="80" max="160" step="10" value="${Math.round(state.remoteFontScale * 100)}" aria-label="AFK Pilot text size">` +
-        `<output>${Math.round(state.remoteFontScale * 100)}%</output>`;
-      const slider = fontRow.querySelector("input");
-      const output = fontRow.querySelector("output");
-      slider.oninput = () => { output.textContent = `${slider.value}%`; };
-      slider.onchange = () => { setClientFontScale(Number(slider.value) / 100); };
-      gearPopover.appendChild(fontRow);
-    }
-
     if (state.steerSupported) {
       addGearItem(
         `<span title="Send straight into Grok's running turn instead of queueing until it finishes. Steering does not cancel the turn or discard work in progress. Plain text only — no attached files, editor context, or /commands.">Steer by default</span><span class="popover-switch${state.steerByDefault ? " on" : ""}" role="switch" aria-checked="${state.steerByDefault}"><span class="popover-switch-knob"></span></span>`,
@@ -2576,6 +2626,23 @@
         },
       );
     }
+  }
+
+  /**
+   * Shared preference switches used by Config & debug (VS Code) and Basic
+   * settings (rail hosts): sounds + TTS. Display toggles live in Advanced /
+   * Config & debug via appendAdvancedDisplaySwitches. Text size leads the main
+   * gear conversation panel when CLIENT_OWNS_FONT_SCALE.
+   */
+  function appendSharedPreferenceSwitches(rerender) {
+    const paint = typeof rerender === "function"
+      ? rerender
+      : () => {
+          if (state.gearView === "basic") renderBasicSettingsPanel();
+          else if (state.gearView === "advanced") renderAdvancedSettingsPanel();
+          else renderConfigDebugPanel();
+        };
+
     addGearItem(
       `<span title="Play a short sound when Grok finishes or errors — only when the Grok panel isn't focused. A rising chime for done, a lower tone for errors.">Sound notifications</span><span class="popover-switch${state.soundNotifications ? " on" : ""}" role="switch" aria-checked="${state.soundNotifications}"><span class="popover-switch-knob"></span></span>`,
       () => {
@@ -2655,11 +2722,15 @@
     }
   }
 
-  // Config & debug: VS Code composer-gear path (no rail). Host config + Move view.
+  // Config & debug: VS Code composer-gear path (no rail). Display toggles +
+  // sounds/TTS + host config + Move view. (Rail hosts split Basic / Advanced.)
   function renderConfigDebugPanel() {
     state.gearView = "config";
     gearPopover.innerHTML = "";
     addGearItem('<span class="popover-back">← Config &amp; debug</span>', renderGearMain);
+    // Same advanced display toggles as Advanced settings — no-rail hosts have
+    // only this panel, so the three must stay reachable here too.
+    appendAdvancedDisplaySwitches(() => renderConfigDebugPanel());
     appendSharedPreferenceSwitches(() => renderConfigDebugPanel());
     // Opening host config files, the MCP list, and the extension log channel are
     // all host-local (the messages are policy-dropped on remotes) — hide the whole
@@ -2782,6 +2853,7 @@
   }
 
   function openGearPopover(fromBtn) {
+    gearPopover.classList.remove("popover-centered");
     // Which button was pressed decides which sections render. Without a rail
     // gear both surfaces collapse into the composer one, so this is inert there.
     const surface = fromBtn && fromBtn.id === "rail-gear-btn" ? "rail" : "composer";
@@ -2845,6 +2917,91 @@
       });
     }
     return btn;
+  }
+
+  /**
+   * "Update available" in the rail footer. Renders only because the host sent
+   * `updateAvailable` — same capability pattern as pin control + `pinnedSessions`.
+   * VS Code never posts it; no IS_DESKTOP gate.
+   */
+  function renderAppUpdateAffordance() {
+    const foot = document.querySelector("#projects-rail .rail-foot");
+    if (!foot) return;
+    let btn = document.getElementById("rail-update-btn");
+    let panel = document.getElementById("rail-update-panel");
+    if (!state.appUpdate) {
+      if (btn) btn.hidden = true;
+      if (panel) panel.hidden = true;
+      return;
+    }
+    if (!btn) {
+      btn = document.createElement("button");
+      btn.id = "rail-update-btn";
+      btn.type = "button";
+      btn.className = "rail-update-btn";
+      // After gear (first child), before theme toggle (last → margin-left auto).
+      const gear = document.getElementById("rail-gear-btn");
+      if (gear && gear.nextSibling) foot.insertBefore(btn, gear.nextSibling);
+      else if (gear) foot.appendChild(btn);
+      else foot.insertBefore(btn, foot.firstChild);
+    }
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "rail-update-panel";
+      panel.className = "rail-update-panel";
+      panel.hidden = true;
+      // Sit above the foot so it does not push the scroll region.
+      foot.parentElement?.insertBefore(panel, foot);
+    }
+    const ver = state.appUpdate.version;
+    const url = state.appUpdate.url;
+    btn.hidden = false;
+    btn.textContent = "Update available";
+    btn.title = `Version ${ver} is available`;
+    btn.setAttribute("aria-label", `Update available: version ${ver}`);
+    btn.setAttribute("aria-expanded", panel.hidden ? "false" : "true");
+    if (!btn.dataset.wired) {
+      btn.dataset.wired = "1";
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const p = document.getElementById("rail-update-panel");
+        if (!p) return;
+        p.hidden = !p.hidden;
+        btn.setAttribute("aria-expanded", p.hidden ? "false" : "true");
+      });
+    }
+    panel.innerHTML = "";
+    const title = document.createElement("div");
+    title.className = "rail-update-title";
+    title.textContent = `Version ${ver} is available`;
+    const body = document.createElement("p");
+    body.className = "rail-update-body";
+    body.textContent =
+      "Download the new installer and run it over the top of this app. Your settings and conversations are kept.";
+    const actions = document.createElement("div");
+    actions.className = "rail-update-actions";
+    const openBtn = document.createElement("button");
+    openBtn.type = "button";
+    openBtn.className = "rail-update-open";
+    openBtn.textContent = "Open release page";
+    openBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: "openUpdateRelease", url });
+    });
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "rail-update-dismiss";
+    dismiss.textContent = "Not now";
+    dismiss.addEventListener("click", (e) => {
+      e.stopPropagation();
+      panel.hidden = true;
+      btn.setAttribute("aria-expanded", "false");
+    });
+    actions.appendChild(openBtn);
+    actions.appendChild(dismiss);
+    panel.appendChild(title);
+    panel.appendChild(body);
+    panel.appendChild(actions);
   }
 
   // ---------- draggable rail edge ----------
@@ -3344,7 +3501,9 @@
       repoPopover.appendChild(empty);
       return;
     }
-    for (const repo of state.repos) {
+    // Same ordering as the rail — by name. Two lists of the same projects in two
+    // different orders is worse than either order on its own.
+    for (const repo of railRepos()) {
       const row = document.createElement("div");
       const selected = sameCwd(repo.cwd, state.selectedRepoCwd);
       const live = sameCwd(repo.cwd, state.activeRepoCwd);
@@ -3779,21 +3938,35 @@
   // would be clipped by the very rows it belongs to.
   let railMenuEl = null;
 
+  // The element the open menu hangs off, so the outside-click listener can tell
+  // a dismissal from a toggle. Deliberately the live node rather than a key: it
+  // only has to survive a single click, and identity is exactly the question.
+  let railMenuAnchorEl = null;
+
   function closeRailMenu() {
+    railMenuAnchorEl = null;
     if (railMenuEl) { railMenuEl.remove(); railMenuEl = null; }
   }
 
   /** items: [{ label, icon, danger, disabled, onSelect }] — a `null` entry is a
    *  separator, which is how the destructive tail is kept away from the thumb. */
-  function openRailMenu(anchor, items) {
-    const wasMine = railMenuEl && railMenuEl.dataset.anchorId === anchor.dataset.railMenuId;
+  function openRailMenu(anchor, items, menuKey) {
+    // Identify the menu by what it BELONGS to, not by the element it hangs off.
+    // The rail re-renders freely and recreates these buttons, so an id stamped
+    // on the node was gone by the second click: the toggle compared a fresh
+    // element against the open menu, decided it was a different menu, and
+    // reopened instead of closing. Clicking the same dots twice did nothing
+    // visible, and only clicking elsewhere dismissed it.
+    const key = menuKey || anchor.dataset.railMenuId || "";
+    const wasMine = !!railMenuEl && !!key && railMenuEl.dataset.anchorId === key;
     closeRailMenu();
     if (wasMine) return;
-    if (!anchor.dataset.railMenuId) anchor.dataset.railMenuId = String(++openRailMenu.seq);
+    if (!anchor.dataset.railMenuId) anchor.dataset.railMenuId = key || String(++openRailMenu.seq);
+    railMenuAnchorEl = anchor;
 
     const menu = document.createElement("div");
     menu.className = "rail-menu";
-    menu.dataset.anchorId = anchor.dataset.railMenuId;
+    menu.dataset.anchorId = key || anchor.dataset.railMenuId;
     menu.setAttribute("role", "menu");
     for (const item of items) {
       if (!item) {
@@ -3839,7 +4012,14 @@
   // Rail menus are fixed-position under <body>; close on outside click / Esc /
   // resize regardless of remote vs desktop once a rail mount exists (or may).
   document.addEventListener("click", (e) => {
-    if (railMenuEl && !railMenuEl.contains(e.target)) closeRailMenu();
+    if (!railMenuEl || railMenuEl.contains(e.target)) return;
+    // Not the button that owns this menu. That click is a TOGGLE, and this
+    // listener is on the capture phase — it runs before the button's own
+    // handler, so closing here would let the button reopen the menu it just
+    // closed. That is why clicking the same dots twice appeared to do nothing
+    // and only clicking elsewhere dismissed it.
+    if (railMenuAnchorEl && railMenuAnchorEl.contains(e.target)) return;
+    closeRailMenu();
   }, true);
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeRailMenu();
@@ -3848,7 +4028,7 @@
 
   /** The ⋯ button itself — same shape for a project row, a conversation row and
    *  the conversation header, so one class carries all three. */
-  function railMenuButton(label, items) {
+  function railMenuButton(label, items, menuKey) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "rail-action-btn rail-menu-btn";
@@ -3858,7 +4038,7 @@
     btn.setAttribute("aria-haspopup", "menu");
     btn.onclick = (e) => {
       e.stopPropagation();
-      openRailMenu(btn, typeof items === "function" ? items() : items);
+      openRailMenu(btn, typeof items === "function" ? items() : items, menuKey);
     };
     btn.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") e.stopPropagation(); };
     return btn;
@@ -3950,15 +4130,22 @@
    *  offers — a pin only earns its complexity where recency is a poor answer, and
    *  for projects it never is: the one you touched last is the one you want.
    *  Conversations are different, and keep their pins. */
+  /** Projects, by name.
+   *
+   *  Recency was the obvious ordering and the wrong one. The rail is a place you
+   *  navigate by memory — a project sits where you last saw it — and sorting by
+   *  activity means the list reorders itself underneath you as you work: start a
+   *  conversation and the project you are in jumps to the top, taking every
+   *  other row with it. A name does not move, so a click never lands on the row
+   *  that slid into place. Recency is still visible where it belongs, on the
+   *  conversations inside each project. */
   function railRepos() {
     return state.repos.slice().sort((a, b) =>
-      // Ties break on the NAME, never on the catalog's own stamp: that stamp is
-      // the session directory's mtime, which clearing a project's history
-      // touches — so using it here would put the just-emptied project above its
-      // equally-empty neighbours, which is the bug this ordering exists to fix,
-      // in miniature.
-      railRepoActivity(b) - railRepoActivity(a) ||
-      String(a.label || a.cwd || "").localeCompare(String(b.label || b.cwd || "")));
+      String(a.label || a.cwd || "").localeCompare(
+        String(b.label || b.cwd || ""),
+        undefined,
+        { sensitivity: "base", numeric: true },
+      ));
   }
 
   /** When this project was last worked in, read from its conversations.
@@ -3993,8 +4180,14 @@
     // Projects with nothing recent in them — deliberately. It holds back the AGE
     // rule only; an explicit Archive still takes effect immediately, or the
     // control would silently do nothing on the projects you use most.
+    // Ranked by ACTIVITY, not by the name order the rail displays. "The newest
+    // few stay in view" is a statement about recency; taking the first few rows
+    // of an alphabetical list would protect whichever projects happen to start
+    // with an early letter and archive the ones actually in use. Display order
+    // and this ranking answer different questions and must not share a list.
+    const byActivity = state.repos.slice().sort((a, b) => railRepoActivity(b) - railRepoActivity(a));
     const floorKeys = new Set(
-      ordered
+      byActivity
         .filter((r) => !sameCwd(r.cwd, state.selectedRepoCwd))
         .slice(0, RAIL_ALWAYS_VISIBLE)
         .map((r) => cwdKey(r.cwd)),
@@ -4171,7 +4364,12 @@
     // Mount + `repos` frame (+ non-empty catalog). A host that never sends
     // `repos` keeps the plain single-column chat; no mount (VS Code) never
     // lights the rail even when repos arrives for clear-all.
-    const on = railAvailable() && state.repos.length > 0;
+    // An empty catalog normally means "this host has nothing to show" — but on a
+    // host that can ADD a project, an empty rail is the one screen where the
+    // user most needs the rail, because it is where the only useful control
+    // lives. Hiding it made the empty-state action unreachable and left the
+    // File menu — which the desktop hides — as the sole route in.
+    const on = railAvailable() && (state.repos.length > 0 || canAddProjectFolder());
     const panel = railPanel();
     if (panel) panel.hidden = !on;
     root.hidden = !on;
@@ -4249,6 +4447,7 @@
         openTitle: "Hide projects",
         closedTitle: "Show projects",
         searchTitle: "Open while your search matches a project",
+        action: canAddProjectFolder() ? railAddProjectButton : undefined,
       }));
       if (open) {
         const list = document.createElement("div");
@@ -4283,7 +4482,22 @@
       shownAnything = true;
     }
 
-    if (!shownAnything) root.appendChild(railNote(q ? "No matches." : "No projects yet"));
+    if (!shownAnything) {
+      if (!q && canAddProjectFolder()) {
+        // An empty rail that only says "No projects yet" is a dead end on the
+        // one screen where the user has nothing else to click.
+        const empty = railNote("No projects yet");
+        const add = document.createElement("button");
+        add.type = "button";
+        add.className = "rail-empty-action";
+        add.textContent = "Add a project folder";
+        add.onclick = () => vscode.postMessage({ type: "addProjectFolder" });
+        empty.appendChild(add);
+        root.appendChild(empty);
+      } else {
+        root.appendChild(railNote(q ? "No matches." : "No projects yet"));
+      }
+    }
     renderSessionHead();
   }
 
@@ -4324,7 +4538,33 @@
       renderRail();
     };
     head.appendChild(btn);
+    if (opts.action) head.appendChild(opts.action());
     return head;
+  }
+
+  /**
+   * "Add project" — capability, not a host flag: only a host that answers
+   * `addProjectFolder` gets the control, and the extension never does because a
+   * VS Code workspace is managed by VS Code. Opening the picker is host-local
+   * (a native dialog on the desk that a phone could not see or answer), so a
+   * remote never shows it either.
+   */
+  function railAddProjectButton() {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "rail-action-btn rail-add-project";
+    btn.innerHTML = ICON.plus;
+    btn.title = "Add project folder";
+    btn.setAttribute("aria-label", "Add project folder");
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: "addProjectFolder" });
+    };
+    return btn;
+  }
+
+  function canAddProjectFolder() {
+    return !IS_REMOTE && !!(state.hostCaps && state.hostCaps.addProjectFolder);
   }
 
   /**
@@ -4515,6 +4755,73 @@
     };
   }
 
+  function beginNewSession() {
+    saveRememberedRemoteSession(null);
+    resetForNewSession();
+    vscode.postMessage({ type: "newSession" });
+  }
+
+  /**
+   * Conversation overflow (⋯) beside the name. Present only when the host
+   * shipped `#session-head-actions` (desktop getHtml / AFK Pilot page) — VS Code
+   * has no session header, so its top-bar New and gear Session group stay.
+   * Capability = the slot exists, not a host flag.
+   */
+  function fillSessionHeadActions() {
+    const menuSlot = document.getElementById("session-head-actions");
+    // Hide the top-bar New wherever the overflow menu exists so New is not three
+    // similar icons in a row (top-bar + rail project + menu).
+    if (newBtn) newBtn.hidden = !!menuSlot;
+    const sessionNew = document.getElementById("session-new");
+    if (sessionNew) sessionNew.hidden = !!menuSlot;
+    if (!menuSlot) return;
+
+    menuSlot.innerHTML = "";
+    // Fall back to what we already know rather than degrading the menu.
+    // activeSessionRecord() searches the loaded lists, and a conversation can be
+    // the live one before it appears in any of them — right after a fork, most
+    // visibly. The menu then dropped to New-only, and came back later when a
+    // list happened to refresh, which read as options randomly disappearing.
+    // This menu acts on the conversation you are IN; its id and cwd are state we
+    // hold, so a missing list entry is not a reason to withhold Rename, Delete
+    // or Continue in a new chat.
+    const record = activeSessionRecord() || (state.activeSessionId
+      ? {
+          id: state.activeSessionId,
+          cwd: state.activeRepoCwd || state.selectedRepoCwd || "",
+          displayName: activeSessionName() || "",
+        }
+      : null);
+    const cwd = record?.cwd || state.selectedRepoCwd || state.activeRepoCwd;
+    const repo = state.repos.find((r) => sameCwd(r.cwd, cwd)) || { cwd: cwd || "", available: true };
+    // This menu hangs off the conversation NAME at the top of the panel, so
+    // its record is the conversation you are in, by construction. Deriving
+    // "active" by comparing ids was redundant here and quietly wrong: a
+    // session whose id the host has not assigned yet compares false, and the
+    // whole Session group — Continue in a new chat, worktree apply/remove —
+    // vanished from the one menu where it always applies. The row menus below
+    // still compute it, because there the record really can be some other
+    // conversation.
+    menuSlot.appendChild(railMenuButton(
+      "Session actions",
+      () => {
+        if (record) {
+          return railSessionMenuItems(record, repo, true, {
+            inlineRename: true,
+            includeNew: true,
+          });
+        }
+        // No live record yet (brand-new / still starting): still offer New.
+        return [{
+          label: "New session",
+          icon: ICON.squarePen,
+          onSelect: () => beginNewSession(),
+        }];
+      },
+      "session-head",
+    ));
+  }
+
   function renderSessionName() {
     if (IS_REMOTE) return;
     const chip = $("session-name-chip");
@@ -4523,6 +4830,8 @@
     if (!chip || !label || !editBtn) return;
     const data = activeSessionName();
     chip.hidden = !data;
+    // Desktop rail hosts: the overflow slot lives next to this chip.
+    fillSessionHeadActions();
     if (!data || state.sessionNameEditing?.surface === "local") return;
     const name = displayedSessionName(activeSessionRecord());
     label.textContent = name;
@@ -4542,8 +4851,7 @@
     if (!head) return;
     const titleEl = document.getElementById("session-head-title");
     const subEl = document.getElementById("session-head-sub");
-    const menuSlot = document.getElementById("session-head-actions");
-    if (!titleEl || !subEl || !menuSlot) return;
+    if (!titleEl || !subEl) return;
 
     const record = activeSessionRecord();
     // A brand-new conversation has no stored name until its first turn is
@@ -4592,19 +4900,10 @@
       titleEl.onkeydown = null;
     }
 
-    menuSlot.innerHTML = "";
-    if (record) {
-      const repo = state.repos.find((r) => sameCwd(r.cwd, cwd)) || { cwd, available: true };
-      const active = record.id === state.activeSessionId && sameCwd(cwd, state.activeRepoCwd);
-      menuSlot.appendChild(railMenuButton(
-        "Session actions",
-        () => railSessionMenuItems(record, repo, active, { inlineRename: true }),
-      ));
-    }
+    fillSessionHeadActions();
 
-    // The title remains a quiet label for pointer users, but it is also the
-    // touch-sized rename target. History and New stay separate controls so a
-    // tap on the name never changes conversations by accident.
+    // History stays a separate control; New lives in the overflow menu when
+    // #session-head-actions is present (fillSessionHeadActions hides session-new).
     const history = document.getElementById("session-history");
     if (history && !history.dataset.railWired) {
       history.dataset.railWired = "1";
@@ -4618,7 +4917,7 @@
       add.onclick = (e) => {
         e.stopPropagation();
         closePopovers();
-        vscode.postMessage({ type: "newSession" });
+        beginNewSession();
       };
     }
   }
@@ -4724,10 +5023,17 @@
     add.className = "rail-action-btn";
     add.innerHTML = ICON.plus;
     add.title = selected ? "New session here" : "Switch to this project and start a new session";
-    add.disabled = !repo.available || repoSwitcherLocked();
+    // Deliberately NOT gated on repoSwitcherLocked(). Starting a conversation is
+    // the one thing that should always be available, and a lock that disables it
+    // in EVERY project at once is indistinguishable from the app being broken —
+    // which is how it read. A click during a transition supersedes it rather
+    // than racing it: this posts selectRepo for its own project and re-arms the
+    // new-session intent, so the destination is whichever "+" was clicked last.
+    // Only a folder the host cannot reach still refuses, and it says so on hover.
+    add.disabled = !repo.available;
     add.onclick = (e) => {
       e.stopPropagation();
-      if (!repo.available || repoSwitcherLocked()) return;
+      if (!repo.available) return;
       if (selected) { vscode.postMessage({ type: "newSession" }); return; }
       window.__grokRailNewIntent = repo.cwd;
       selectRailRepo(repo);
@@ -4773,6 +5079,20 @@
           archived: !inArchive,
         }),
       }, null] : []),
+      // The desktop's equivalent, and a different act despite the same intent.
+      // Its rail IS the set of open folders, so putting a project away means
+      // closing it — there is no archive flag to set, and the browser client
+      // has no business closing folders on the machine it is borrowing. Same
+      // capability as the + that adds them: a host that can open a folder can
+      // close one, and one that cannot never grows either control.
+      ...(canAddProjectFolder() ? [{
+        label: "Hide project",
+        icon: ICON.archive,
+        title:
+          "Take this project out of the list. Nothing is deleted — the folder " +
+          "stays on disk, and + adds it back.",
+        onSelect: () => vscode.postMessage({ type: "removeProjectFolder", cwd: repo.cwd }),
+      }, null] : []),
       {
         label: "Clear all history",
         icon: ICON.trash,
@@ -4797,7 +5117,7 @@
           });
         },
       },
-    ]));
+    ], "repo:" + cwdKey(repo.cwd)));
 
     head.appendChild(actions);
     sec.appendChild(head);
@@ -4958,7 +5278,11 @@
       };
       actions.appendChild(pinBtn);
     }
-    actions.appendChild(railMenuButton("Session actions", () => railSessionMenuItems(s, repo, active)));
+    actions.appendChild(railMenuButton(
+      "Session actions",
+      () => railSessionMenuItems(s, repo, active),
+      "session:" + (s.id || cwdKey(s.cwd || repo.cwd)),
+    ));
     row.appendChild(actions);
     row.onclick = railSessionOpener(s, repo, active);
     return row;
@@ -4980,6 +5304,16 @@
         onSelect: () => railRenameSession(s, cwd),
       },
     ];
+    // Header overflow only: New is folded out of the top bar on rail hosts so
+    // the bar is not three similar icons. Rail ROWS keep their own project-level
+    // New (+ on the project head) and must not gain a second one here.
+    if (opts?.includeNew) {
+      items.unshift({
+        label: "New session",
+        icon: ICON.squarePen,
+        onSelect: () => beginNewSession(),
+      });
+    }
     // "Continue in a new chat" belongs with the other things you do TO a
     // conversation (rename, pin, delete), not in the composer's settings beside
     // model and effort — those adjust how the agent answers; this one makes a
@@ -5142,6 +5476,20 @@
 
   function selectRailRepo(repo) {
     state.repoSwitchPending = true;
+    // What we are waiting for. The lock used to be released only by the frames a
+    // session start produces — a replay, setBusy, or an error — which was fine
+    // while every switch opened a conversation. Selecting a project no longer
+    // touches any session, so on that path none of the three ever arrive and the
+    // lock stuck: every "+" in the rail stayed disabled, in every project, until
+    // something unrelated started a session. The catalog echo below is the
+    // completion signal that actually belongs to a selection.
+    state.repoSwitchTarget = repo.cwd;
+    // A superseded switch drops its intent with it — otherwise clicking "+" on
+    // one project and then a plain row on another would start a conversation
+    // nobody asked for.
+    if (window.__grokRailNewIntent && !sameCwd(window.__grokRailNewIntent, repo.cwd)) {
+      window.__grokRailNewIntent = null;
+    }
     renderRepoChip();
     saveRememberedRemoteSession(null);
     vscode.postMessage({ type: "selectRepo", cwd: repo.cwd });
@@ -9682,8 +10030,10 @@
         break;
       case "steerByDefault":
         // Live toggle (grok.steerByDefault). Pure policy for the next send —
-        // nothing to re-render, the queued block's Steer button is unaffected.
+        // the queued block's Steer button is unaffected; refresh open gear.
         state.steerByDefault = !!msg.value;
+        if (state.gearView === "config") renderConfigDebugPanel();
+        else if (state.gearView === "advanced") renderAdvancedSettingsPanel();
         break;
       case "soundNotifications":
         // Live toggle (grok.soundNotifications). Only affects future turn-end/
@@ -9743,7 +10093,7 @@
         state.showThinking = !!msg.value;
         applyThinkingVisibility();
         if (state.gearView === "config") renderConfigDebugPanel();
-        else if (state.gearView === "basic") renderBasicSettingsPanel();
+        else if (state.gearView === "advanced") renderAdvancedSettingsPanel();
         break;
       case "appPurpose":
         // Live global disclosure preference (Knowledge work / Coding).
@@ -9861,6 +10211,18 @@
         if (msg.current) state.cliVersion = msg.current;
         if (!gearPopover.hidden && state.gearView === "about") renderAboutPanel(false);
         break;
+      case "updateAvailable": {
+        // Capability: the frame arrived. No host flag / IS_DESKTOP check.
+        // Host-local outbound — remotes never receive this (remote-policy).
+        const version = typeof msg.version === "string" ? msg.version.trim() : "";
+        const url = typeof msg.url === "string" ? msg.url.trim() : "";
+        if (version && url) {
+          state.appUpdate = { version, url };
+          ensureRailGear();
+          renderAppUpdateAffordance();
+        }
+        break;
+      }
       case "initialized": {
         // The ACP handshake is done, but session/new or session/load may still be
         // running. Keep showing Starting until the startup lock clears.
@@ -10454,7 +10816,9 @@
         state.expandCommandOutputs = !!msg.value;
         state.toolExpandOverride = null;
         applyExpandCommandOutputs();
-        if (state.gearView === "config") renderConfigDebugPanel(); // keep the switch in sync
+        // Keep the switch in sync wherever it lives (Config or Advanced).
+        if (state.gearView === "config") renderConfigDebugPanel();
+        else if (state.gearView === "advanced") renderAdvancedSettingsPanel();
         break;
       case "setAllToolDetails":
         // Command Palette: Grok: Expand/Collapse All Tool Details — one-shot,
@@ -10859,6 +11223,32 @@
           // The list for the new repo has not arrived yet — see railRowsFor.
           state.railSessionsStale = true;
         }
+        // The switch we asked for has landed. Release the lock here rather than
+        // waiting for a session to start: a selection that opens no conversation
+        // produces no replay, no setBusy and no error, so those releases never
+        // fire and every rail "+" stays disabled indefinitely. Gated on the
+        // catalog naming the repo we actually asked for, so an unrelated catalog
+        // push mid-switch cannot unlock a transition still in flight.
+        if (state.repoSwitchTarget && sameCwd(state.selectedRepoCwd, state.repoSwitchTarget)) {
+          state.repoSwitchTarget = "";
+          state.repoSwitchPending = false;
+          // …and now the other half of the rail "+" on a project we were not in.
+          // `newSession` names no repo — it starts wherever the host is — so the
+          // switch has to land first and this is where it lands. Without it the
+          // desktop only switched: the conversation on screen stayed whatever it
+          // was, which reads as "it started one in the wrong project", and with
+          // an empty session already open it reads as nothing happening at all.
+          //
+          // Single-shot, and coordinated through the flag itself rather than a
+          // host check: the browser page consumes __grokRailNewIntent as it
+          // forwards the selectRepo, so there it is already null here and this
+          // cannot fire twice. Where nothing consumed it — the desktop — it is
+          // still set, and this is the only place that acts on it.
+          if (window.__grokRailNewIntent && sameCwd(window.__grokRailNewIntent, state.selectedRepoCwd)) {
+            window.__grokRailNewIntent = null;
+            vscode.postMessage({ type: "newSession" });
+          }
+        }
         renderRepoChip();
         if (!repoPopover.hidden) renderRepoPopover();
         renderRail();
@@ -10907,11 +11297,10 @@
     micBtn.onclick = (e) => { e.stopPropagation(); toggleMic(); };
     renderMic();
   }
-  newBtn.onclick = () => {
-    saveRememberedRemoteSession(null);
-    resetForNewSession();
-    vscode.postMessage({ type: "newSession" });
-  };
+  newBtn.onclick = () => beginNewSession();
+  // Hide top-bar New immediately when the overflow slot is in the DOM (rail
+  // hosts). fillSessionHeadActions re-asserts this whenever the menu refreshes.
+  if (document.getElementById("session-head-actions") && newBtn) newBtn.hidden = true;
   modeBtn.onclick = (e) => { e.stopPropagation(); if (state.busyLocked) return; openModePopover(); };
   if (sandboxBtn) {
     sandboxBtn.onclick = (e) => {
