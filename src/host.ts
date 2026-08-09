@@ -15,6 +15,7 @@
  */
 
 import type { MementoLike } from "./persisted-state";
+import type { PanelPosition } from "./view-move";
 import * as path from "node:path";
 
 // ── Portable value types ─────────────────────────────────────────────────────
@@ -532,6 +533,12 @@ export interface Host {
   append(text: string): void;
   appendLine(line: string): void;
   showOutput(preserveFocus?: boolean): void;
+  /**
+   * Toggle Chromium DevTools on the chat surface. Unpackaged desktop only;
+   * no-op for VS Code and packaged builds. Wired to gear → Advanced so
+   * discoverability does not depend on an auto-hidden application menu.
+   */
+  toggleDevTools(): void;
 
   // ── Filesystem ─────────────────────────────────────────────────────────
   readonly fs: HostFileSystem;
@@ -600,6 +607,8 @@ export interface Host {
    * intent methods below — never funnel those through this path.
    */
   openResource(target: string | Uri, options?: HostTextShowOptions): Thenable<void>;
+  /** Reveal a host-resolved filesystem path in the host's file manager. */
+  showInFolder(fsPath: string): Thenable<void>;
   /**
    * Open the user's global Grok config.toml (`~/.grok/config.toml` / GROK_HOME).
    * Host resolves and may create a stub; no renderer path is involved.
@@ -646,8 +655,17 @@ export interface Host {
    * Move `viewId` into a contribution container and focus it. When
    * `destinationId` is null/undefined, open the host's move-view picker
    * preselected on that view.
+   *
+   * `panelPosition` docks the panel on that edge before revealing — for the
+   * destinations whose label promises an edge ("To Right Panel"). Null leaves
+   * the workbench layout untouched, which is what every pre-existing
+   * destination passes.
    */
-  relocateView(viewId: string, destinationId?: string | null): Thenable<void>;
+  relocateView(
+    viewId: string,
+    destinationId?: string | null,
+    panelPosition?: PanelPosition | null,
+  ): Thenable<void>;
 
   // ── Watchers / providers ───────────────────────────────────────────────
   onDidChangeConfiguration(
@@ -697,10 +715,34 @@ export interface Host {
    */
   readonly canRelocateView: boolean;
   /**
+   * Whether gear → Move view may offer the SECONDARY SIDE BAR. Cursor 3.15
+   * refuses extension containers there — it is reserved for its own agent UI —
+   * so the destination silently does nothing; the menu offers the panel by
+   * edge instead. Read at initialState time, so implementations that resolve
+   * this asynchronously must default to true (the pre-Cursor truth) rather
+   * than to false.
+   */
+  readonly canUseSecondarySideBar: boolean;
+  /**
    * Gear → Show extension logs. Same opt-out polarity as canRelocateView;
    * desktop is false (stdout only).
    */
   readonly canShowOutput: boolean;
+  /**
+   * Gear → Toggle Developer Tools. OPT-IN: absent/false = hide. True only for
+   * unpackaged desktop builds (`!app.isPackaged`); packaged and VS Code are false.
+   */
+  readonly canToggleDevTools: boolean;
+  /**
+   * Whether clicking a generated image (or the media hover "open" action's
+   * sibling click-to-enlarge path) should open a host editor tab via
+   * `openFile`. Wired into `initialState.capabilities.openInEditor`. Opt-out
+   * polarity on the wire: absent/true = editor host (VS Code); false =
+   * no editor (desktop — open the in-app lightbox instead). Remote clients
+   * force the lightbox regardless: the caps they receive are the desk
+   * machine's, and a phone must never open a desk editor.
+   */
+  readonly canOpenInEditor: boolean;
   /**
    * When true, the local webview may switch the active workspace folder via
    * the projects rail (`selectRepo` re-homes the local session). Desktop
@@ -716,6 +758,13 @@ export interface Host {
    * is attached to (field presence on `repos` rows is the wire signal).
    */
   readonly canArchiveRepos: boolean;
+  /**
+   * Whether generated media is served with honest byte ranges. Only hosts that
+   * own the media handler may advertise this to the webview.
+   */
+  readonly canServeMediaRanges: boolean;
+  /** Whether the host can reveal a filesystem path in its file manager. */
+  readonly canShowInFolder: boolean;
 }
 
 /**

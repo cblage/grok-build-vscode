@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 // @ts-expect-error — plain JS module, no types
-import { looksLikeFileRef, formatRelativeTime, FILE_EXTS, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, parseAttachmentContext, parseSelectionBlocks, parseImageTags, toolFailureText, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, spokenTextFromMarkdown, isRelaySendRejection } from "../media/webview-helpers.js";
+import { looksLikeFileRef, formatRelativeTime, FILE_EXTS, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, parseAttachmentContext, parseSelectionBlocks, parseImageTags, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx } from "../media/webview-helpers.js";
 import { buildPrompt, buildPromptWithImages } from "../src/prompt-builder";
 import { makeExplicitChip, makeImplicitChip, makeImageChip } from "../src/chips";
 
@@ -763,6 +763,155 @@ describe("subagentLabel", () => {
   });
 });
 
+describe("distributeSidePanelWidths", () => {
+  it("honours preferred widths when the window is large enough", () => {
+    const dist = distributeSidePanelWidths({
+      available: 1400,
+      chatMin: 360,
+      panels: [
+        { id: "rail", preferred: 300, min: 180, open: true },
+        { id: "panel", preferred: 400, min: 200, open: true },
+      ],
+    });
+    expect(dist).toEqual({ rail: 300, panel: 400 });
+  });
+
+  it("shrinks open panels proportionally when preferred + chat exceed available", () => {
+    // preferred 500+500 + chat 360 = 1360 > 1000 → budget for panels = 640
+    const dist = distributeSidePanelWidths({
+      available: 1000,
+      chatMin: 360,
+      panels: [
+        { id: "rail", preferred: 500, min: 180, open: true },
+        { id: "panel", preferred: 500, min: 200, open: true },
+      ],
+    });
+    expect(dist.rail + dist.panel).toBe(640);
+    // Both above floor; neither collapses to min alone while the other stays fat.
+    expect(dist.rail).toBeGreaterThan(180);
+    expect(dist.panel).toBeGreaterThan(200);
+    expect(dist.rail).toBeLessThan(500);
+    expect(dist.panel).toBeLessThan(500);
+    // Proportional: rail and panel had equal above-floor slack (320 vs 300), so
+    // rail ends slightly smaller only by min difference — both mid-range.
+    expect(Math.abs(dist.rail - dist.panel)).toBeLessThan(40);
+  });
+
+  it("never shrinks a panel below its floor", () => {
+    const dist = distributeSidePanelWidths({
+      available: 500,
+      chatMin: 360,
+      panels: [
+        { id: "rail", preferred: 400, min: 180, open: true },
+        { id: "panel", preferred: 400, min: 200, open: true },
+      ],
+    });
+    // budget 140 < minSum 380 → floors
+    expect(dist.rail).toBe(180);
+    expect(dist.panel).toBe(200);
+  });
+
+  it("ignores a closed panel so the open one can keep more width", () => {
+    const dist = distributeSidePanelWidths({
+      available: 800,
+      chatMin: 360,
+      panels: [
+        { id: "rail", preferred: 300, min: 180, open: true },
+        { id: "panel", preferred: 500, min: 200, open: false },
+      ],
+    });
+    expect(dist.panel).toBe(0);
+    expect(dist.rail).toBe(300); // 300 + 360 <= 800
+  });
+
+  it("mutation: equal preferred widths share a deficit instead of leaving chat starved", () => {
+    // Without proportional distribute, each panel would keep 350 and chat gets 300.
+    const dist = distributeSidePanelWidths({
+      available: 1000,
+      chatMin: 360,
+      panels: [
+        { id: "rail", preferred: 350, min: 180, open: true },
+        { id: "panel", preferred: 350, min: 200, open: true },
+      ],
+    });
+    expect(dist.rail + dist.panel).toBe(640);
+    expect(1000 - dist.rail - dist.panel).toBe(360);
+  });
+});
+
+describe("panelReclampOnResizeAllowed / wireFullscreenSafeReclamp", () => {
+  it("blocks re-clamp while any element is full-screen", () => {
+    expect(panelReclampOnResizeAllowed(null)).toBe(true);
+    expect(panelReclampOnResizeAllowed(undefined)).toBe(true);
+    expect(panelReclampOnResizeAllowed({ tagName: "VIDEO" })).toBe(false);
+  });
+
+  it("skips resize during full-screen and re-clamps once on exit", () => {
+    let fs: unknown = null;
+    const listeners: Record<string, Array<(...a: unknown[]) => void>> = {
+      resize: [],
+      fullscreenchange: [],
+    };
+    const win = {
+      addEventListener: (type: string, fn: (...a: unknown[]) => void) => {
+        listeners[type] = listeners[type] || [];
+        listeners[type].push(fn);
+      },
+      removeEventListener: (type: string, fn: (...a: unknown[]) => void) => {
+        listeners[type] = (listeners[type] || []).filter((f) => f !== fn);
+      },
+    };
+    const doc = {
+      get fullscreenElement() {
+        return fs;
+      },
+      addEventListener: (type: string, fn: (...a: unknown[]) => void) => {
+        listeners[type] = listeners[type] || [];
+        listeners[type].push(fn);
+      },
+      removeEventListener: (type: string, fn: (...a: unknown[]) => void) => {
+        listeners[type] = (listeners[type] || []).filter((f) => f !== fn);
+      },
+    };
+    let n = 0;
+    const dispose = wireFullscreenSafeReclamp(() => {
+      n += 1;
+    }, { window: win as any, document: doc as any });
+
+    for (const fn of listeners.resize) fn();
+    expect(n).toBe(1);
+
+    fs = { tagName: "VIDEO" };
+    for (const fn of listeners.resize) fn();
+    expect(n).toBe(1); // mutation: without the guard this would be 2
+
+    fs = null;
+    for (const fn of listeners.fullscreenchange) fn();
+    expect(n).toBe(2);
+
+    dispose();
+    for (const fn of listeners.resize) fn();
+    expect(n).toBe(2);
+  });
+});
+
+describe("chatZoomFactor / unzoomClientPx", () => {
+  it("reads --chat-zoom and converts visual px to layout px", () => {
+    const doc = {
+      body: {
+        style: {
+          getPropertyValue: (k: string) => (k === "--chat-zoom" ? "1.5" : ""),
+        },
+      },
+    };
+    expect(chatZoomFactor(doc as any)).toBe(1.5);
+    expect(unzoomClientPx(150, 1.5)).toBe(100);
+    expect(unzoomClientPx(150, 1)).toBe(150);
+    expect(unzoomClientPx(150, 0)).toBe(150);
+    expect(chatZoomFactor({ body: { style: { getPropertyValue: () => "" } } } as any)).toBe(1);
+  });
+});
+
 describe("shouldStickToBottom", () => {
   it("is pinned when scrolled exactly to the bottom", () => {
     // scrollTop + clientHeight === scrollHeight
@@ -940,6 +1089,42 @@ describe("toolFailureText", () => {
   it("returns the generic fallback when nothing stringy is present", () => {
     expect(toolFailureText({ status: "failed", rawOutput: { type: "X" } })).toBe("Tool call failed.");
     expect(toolFailureText({ status: "error" })).toBe("Tool call failed.");
+  });
+});
+
+describe("isMediaGenToolCall (webview mirror)", () => {
+  it("flags /imagine and /imagine-video titles and variants", () => {
+    expect(isMediaGenToolCall({ title: "imagine-video: a cube" })).toBe(true);
+    expect(isMediaGenToolCall({ title: "video_gen" })).toBe(true);
+    expect(isMediaGenToolCall({ title: "image_to_video", rawInput: { variant: "ImageToVideo" } })).toBe(true);
+    expect(isMediaGenToolCall({ title: "imagine: red cube" })).toBe(true);
+    expect(isMediaGenToolCall({ rawInput: { variant: "VideoGen" } })).toBe(true);
+  });
+
+  it("does not flag ordinary tools", () => {
+    expect(isMediaGenToolCall({ title: "Read `/a.ts`", kind: "read" })).toBe(false);
+    expect(isMediaGenToolCall({ title: "run_terminal_command" })).toBe(false);
+    expect(isMediaGenToolCall(null)).toBe(false);
+  });
+});
+
+describe("mediaGenZeroRetentionHint", () => {
+  const ZDR =
+    'Video generation failed with HTTP 400 Bad Request: {"code":"invalid-argument","error":"Zero Data Retention teams must provide output.upload_url for video generation."}';
+
+  it("returns the CLI Opt-in path only for the ZDR + upload_url signature", () => {
+    expect(mediaGenZeroRetentionHint(ZDR)).toBe(
+      "Grok CLI /settings → Privacy → Coding data, retention, and training → Opt in.",
+    );
+  });
+
+  it("returns null for other failures and non-strings", () => {
+    expect(mediaGenZeroRetentionHint("image reference not readable")).toBe(null);
+    expect(mediaGenZeroRetentionHint('HTTP 400: {"code":"invalid-argument","error":"prompt too long"}')).toBe(null);
+    expect(mediaGenZeroRetentionHint("Zero Data Retention but no upload field")).toBe(null);
+    expect(mediaGenZeroRetentionHint("must provide output.upload_url without ZDR wording")).toBe(null);
+    expect(mediaGenZeroRetentionHint(null as any)).toBe(null);
+    expect(mediaGenZeroRetentionHint("")).toBe(null);
   });
 });
 

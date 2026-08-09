@@ -1,10 +1,10 @@
 # Changelog
 
-## 3.2.8-sandbox.4 — 2026-08-08
+## 3.2.12-sandbox.4 — 2026-08-09
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.2.7.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.2.11.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -18,6 +18,67 @@
 - **The “Read simplified summaries” toggle no longer errors during a live extension upgrade.** If a VS Code-derived host has not yet refreshed its contributed-settings registry, the extension temporarily preserves the choice in extension state instead of rejecting it as an unregistered `grok.summarizeRepliesAloud` setting. The contributed User setting remains authoritative as soon as the host registers the current manifest.
 
 ---
+
+## 3.2.11 — 2026-08-09
+
+### Added
+
+- **Projects can have a colour.** Give each project a coloured folder in the conversation rail — *Set color* in its ⋯ menu, six colours or none. The choice is stored with your projects rather than in one browser, so it follows you to your phone. Desktop and browser.
+- **Right-click works wherever ⋯ does.** Projects and conversations in the rail, files and folders in Grok Build Desktop's file panel — right-clicking opens the same menu the ⋯ button does. Not on touch, where a long press already means something.
+- **Folders can be revealed in Finder or Explorer**, not only files, and the file panel's row actions now live in a ⋯ menu like the conversation list's do.
+
+### Fixed
+
+- **Conversations stop jumping to the top of the list for being opened.** Opening one rewrites its record on disk, and the list read that as activity — so merely looking at an old conversation promoted it above ones you had actually been working in. The list now follows the conversation itself. Measured against a real store of 1,592 conversations: 46 were sitting higher than they had earned.
+- **Closing a project takes one click.** Clicking an unselected project used to switch into it and force it open, so the first click on an already-open one appeared to do nothing. It also left the chat on one project while the rail claimed another; switching now follows from opening a conversation, which is what made that state coherent in the first place.
+- **The conversation list stops flickering while a conversation opens.** The row buttons blinked under a stationary cursor, and an open ⋯ menu was closed again on every refresh — so it could not be used at the moment you most wanted it.
+- **The store listing printed "Install" and "Quick start" twice.** It is generated from the project README, and the generator was adding its own copy on top of the one already there.
+
+### Changed
+
+- **Clicking a conversation highlights it immediately** instead of waiting for it to load, so a click never looks dropped. The few actions that act on "whichever conversation is open" — continue in a new chat, and worktree apply/remove — grey out for that moment, because until the load finishes there is genuinely no safe answer to which conversation they would act on.
+- **One waiting animation everywhere.** The status line's growing ellipsis is gone; everything that is working now shows the same three blinking dots, and they hold still if your system asks for reduced motion.
+
+## 3.2.10 — 2026-08-09
+
+### Fixed
+
+- **Generated videos play, and 3.2.9 was wrong about why they didn't.** That release said the browser engine ran out of video decoders and stopped reserving one per clip. It wasn't the decoders, and it didn't work. The real cause: Grok Build Desktop served every file whole, ignoring the "send me this part of it" requests a video player makes as it plays. Playback would start, run about a second, and die. The app answers those requests properly now. Measured against the clips that failed: 4 failures in 45 attempts before, none in 45 after. *This is Desktop only — in VS Code the editor serves the file itself, and that path is not ours to fix.*
+- **A video shows its first frame again, instead of an empty box that jumps.** The preview 3.2.9 traded away comes back now the byte-range problem is actually fixed, and the clip is the right shape before you press play rather than snapping to it afterwards.
+- **The chat scrollbar sits against the edge of the pane.** At a small chat font on a wide window it floated well inland — the further in, the smaller the font. The text column is still a comfortable reading width; it just no longer drags the scrollbar with it. Desktop only.
+- **Clicking a conversation moves the file panel to its project.** Clicking a *project* always did, and so did starting a new conversation, which is what made it look arbitrary. Desktop only.
+- **Links to a plan open the plan.** Plans are written outside your project, so clicking one did nothing at all — no window, no error.
+
+### Changed
+
+- **A generated image or video now offers "Show in folder" in Grok Build Desktop.** Opening the file gave you nothing you couldn't already see: clips play in the chat, and pictures enlarge in place. Finding the file is the useful thing. In VS Code the button still opens an editor tab, which is what an editor is for.
+- **The composer drops the words beside its two icons when it is narrow.** "Agent mode" and the token count give way to the icon and the ring; the tooltips carry what the labels stopped saying, including which mode is active.
+- **Recent lists ten conversations, not twenty**, and the file panel's title and tabs line up with the rows beneath them.
+
+## 3.2.9 — 2026-08-08
+
+### Fixed
+
+- **Links to generated images open.** When Grok makes a picture it usually links to it in its reply as well, and it writes that link relative to the conversation rather than to your project — so clicking it went looking in your repository for a file that was never there. Grok Build Desktop answered *"File not found … It is not under the open project"*; VS Code simply opened nothing. Those links now find the picture that was actually generated. The image in the transcript was always right; it was only the link beneath it that missed.
+- **The open-file button on a generated image works in Grok Build Desktop.** Generated pictures live in Grok's own conversation folder, which sits outside your project, so the button was refused every time it was pressed. It is now allowed for that one kind of file — a picture or video Grok generated for one of this project's conversations — and for nothing else. Everything the app opens on your behalf is still held to the same containment checks as before.
+- **Generated videos play after the first few.** Every video in a conversation reserved a decoder the moment it appeared, whether or not anyone watched it, and enough of them in one chat exhausted the browser engine's pool — after which pressing play on some clips did nothing, and which clips varied. A video now reserves nothing until you press play. The trade is that a clip shows an empty frame rather than a preview until it starts.
+- **A clearer answer when video generation is blocked by your account settings.** xAI refuses video generation on accounts with zero data retention, and says so by naming an API field you cannot supply. Grok Build now adds where the setting actually lives: the Grok CLI's `/settings` → Privacy → Coding data, retention, and training.
+
+### Changed
+
+- **Clicking a generated image enlarges it where there is no editor to open it in.** In Grok Build Desktop and in the browser client the picture now opens full-size in place. Previously the browser left it inert, and Desktop handed the file to whichever program your system uses for images — leaving the app to show you something already on screen. In VS Code the click still opens an editor tab, which is what an editor is for.
+
+## 3.2.8 — 2026-08-08
+
+### Fixed
+
+- **The chat opens in Cursor.** Cursor reserves the secondary side bar for its own agent UI and refuses to place an extension there, so the panel Grok Build asks for was never created — the view was dropped into Explorer and every way of opening it answered "command not found". It now opens the view wherever the editor actually put it.
+- **A fresh install lands somewhere you can see it.** On the very first run — and only then — a chat the editor has stashed somewhere unusable is moved into its own view. It has to happen without you opening anything, because someone whose chat is buried in an Explorer section has no way to open it. After that first run the placement is yours and nothing touches it again: there is no way for an extension to ask where its own view sits, so we cannot tell someone who deliberately moved it from someone who never did, and guessing would mean dragging your layout back after every update.
+
+### Changed
+
+- **Move view now appears only where the editor needs it**, as a single **Move view…** that opens the editor's own destination picker; **Grok: Move Chat View** does the same from the command palette. The three fixed destinations are gone. In an editor with a secondary side bar they duplicated a **Move To** it already offers, and in one without, all three led to the same place — because a container is not a location, and an editor is free to draw our containers wherever it likes. Its own picker moves by location, which is how it reaches docks we cannot name.
+- **Move view is hidden in the browser client.** Where the chat sits is a property of the machine running the extension, so those entries could never do anything from a phone.
 
 ## 3.2.7 — 2026-08-08
 

@@ -29,6 +29,7 @@ import {
   APP_DOCUMENT_URL,
   APP_ORIGIN,
   APP_RESOURCE_CSP_SOURCE,
+  DESKTOP_THEME_CSS,
   desktopChromeBootSource,
   isAppDocumentUrl,
 } from "../src/desktop/electron-webview";
@@ -81,7 +82,7 @@ import {
   type TreePathFs,
   writeTreeFile,
 } from "../src/desktop/file-tree";
-import { isIpcFromMainWindow } from "../src/desktop/file-tree-ipc";
+import { isIpcFromMainWindow, resolveTreeOpenTarget } from "../src/desktop/file-tree-ipc";
 import { FILE_TREE_PANEL_CSS, fileTreePanelBootSource } from "../src/desktop/file-tree-panel";
 import { mayRegisterResourcePath } from "../src/desktop/media-provenance";
 import {
@@ -118,6 +119,16 @@ import {
   shouldOpenExternally,
   windowOpenDecision,
 } from "../src/desktop/window-security";
+import {
+  DESKTOP_OPEN_DEVTOOLS_ENV,
+  DESKTOP_OPEN_DEVTOOLS_FLAG,
+  DESKTOP_DEVTOOLS_ACCELERATOR,
+  desktopAppMenuTemplate,
+  desktopDevToolsAllowed,
+  isDesktopDevToolsShortcut,
+  secondInstanceShouldOpenDevTools,
+  shouldOpenDevToolsAtStartup,
+} from "../src/desktop/app-menu";
 
 describe("desktop ConfigStore", () => {
   let dir: string;
@@ -823,6 +834,84 @@ describe("file-tree path containment", () => {
   });
 });
 
+describe("resolveTreeOpenTarget (open/reveal containment fence)", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "grok-ft-open-"));
+    fs.writeFileSync(path.join(root, "readme.txt"), "hi");
+    fs.mkdirSync(path.join(root, "src"), { recursive: true });
+    fs.writeFileSync(path.join(root, "src", "hello.ts"), "export {}");
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("resolves a workspace file for open (default)", () => {
+    const r = resolveTreeOpenTarget(root, "readme.txt");
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(path.resolve(r.absPath)).toBe(path.resolve(root, "readme.txt"));
+    }
+    const nested = resolveTreeOpenTarget(root, "src/hello.ts", undefined, "open");
+    expect(nested.ok).toBe(true);
+    if (nested.ok) {
+      expect(path.resolve(nested.absPath)).toBe(path.resolve(root, "src", "hello.ts"));
+    }
+  });
+
+  it("refuses a directory by default (open path)", () => {
+    const r = resolveTreeOpenTarget(root, "src");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toBe("not a file");
+
+    // Explicit open verb still refuses dirs.
+    const open = resolveTreeOpenTarget(root, "src", undefined, "open");
+    expect(open.ok).toBe(false);
+    if (!open.ok) expect(open.error).toBe("not a file");
+  });
+
+  it("allows a directory only when allowDirectory is set (reveal path)", () => {
+    const refused = resolveTreeOpenTarget(root, "src", undefined, "reveal");
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.error).toBe("not a file");
+
+    const allowed = resolveTreeOpenTarget(root, "src", undefined, "reveal", {
+      allowDirectory: true,
+    });
+    expect(allowed.ok).toBe(true);
+    if (allowed.ok) {
+      expect(path.resolve(allowed.absPath)).toBe(path.resolve(root, "src"));
+    }
+
+    // File still resolves under the opt-in.
+    const file = resolveTreeOpenTarget(root, "readme.txt", undefined, "reveal", {
+      allowDirectory: true,
+    });
+    expect(file.ok).toBe(true);
+  });
+
+  it("refuses a path that escapes the workspace root either way", () => {
+    const outside = path.resolve(root, "..", "not-ws-" + Date.now());
+    for (const opts of [undefined, { allowDirectory: true } as const]) {
+      expect(resolveTreeOpenTarget(root, "..", undefined, "open", opts).ok).toBe(false);
+      expect(resolveTreeOpenTarget(root, "../outside", undefined, "reveal", opts).ok).toBe(
+        false,
+      );
+      expect(resolveTreeOpenTarget(root, outside, undefined, "open", opts).ok).toBe(false);
+      expect(
+        resolveTreeOpenTarget(root, "src/../../outside", undefined, "reveal", opts).ok,
+      ).toBe(false);
+    }
+  });
+
+  it("refuses non-string / missing paths", () => {
+    expect(resolveTreeOpenTarget(root, null).ok).toBe(false);
+    expect(resolveTreeOpenTarget(root, 12 as unknown as string).ok).toBe(false);
+    expect(resolveTreeOpenTarget(root, "no-such-file.txt").ok).toBe(false);
+  });
+});
+
 describe("app-resource serve policy (no credential leak)", () => {
   let tmp: string;
   let grokHome: string;
@@ -1255,6 +1344,190 @@ describe("desktop quick pick (continued)", () => {
   });
 });
 
+describe("desktop DevTools gate (non-production only)", () => {
+  function viewRoles(isPackaged: boolean): Array<string | undefined> {
+    const template = desktopAppMenuTemplate({ isPackaged, platform: "win32" });
+    const view = template.find((item) => item.label === "View");
+    expect(view).toBeTruthy();
+    const submenu = view!.submenu as Array<{ role?: string }>;
+    return submenu.map((item) => item.role);
+  }
+
+  it("allows DevTools only when not packaged", () => {
+    expect(desktopDevToolsAllowed(false)).toBe(true);
+    expect(desktopDevToolsAllowed(true)).toBe(false);
+  });
+
+  it("includes toggleDevTools in View when not packaged", () => {
+    expect(viewRoles(false)).toContain("toggleDevTools");
+  });
+
+  it("omits toggleDevTools from View when packaged", () => {
+    expect(viewRoles(true)).not.toContain("toggleDevTools");
+  });
+
+  it("mutation: flipping isPackaged is the only menu difference for DevTools", () => {
+    const open = viewRoles(false);
+    const packed = viewRoles(true);
+    expect(open.filter((r) => r !== "toggleDevTools")).toEqual(packed);
+    expect(open.includes("toggleDevTools")).toBe(true);
+    expect(packed.includes("toggleDevTools")).toBe(false);
+  });
+
+  it("sets an explicit accelerator so DevTools works with autoHideMenuBar", () => {
+    const template = desktopAppMenuTemplate({ isPackaged: false, platform: "win32" });
+    const view = template.find((item) => item.label === "View");
+    const submenu = view!.submenu as Array<{ role?: string; accelerator?: string }>;
+    const item = submenu.find((i) => i.role === "toggleDevTools");
+    expect(item?.accelerator).toBe(DESKTOP_DEVTOOLS_ACCELERATOR);
+    expect(DESKTOP_DEVTOOLS_ACCELERATOR).toMatch(/Shift\+I/i);
+  });
+
+  it("keyboard shortcut helper accepts F12 and Ctrl/Cmd+Shift+I without Alt", () => {
+    expect(isDesktopDevToolsShortcut({ type: "keyDown", key: "F12" })).toBe(true);
+    expect(
+      isDesktopDevToolsShortcut({
+        type: "keyDown",
+        key: "I",
+        control: true,
+        shift: true,
+      }),
+    ).toBe(true);
+    expect(
+      isDesktopDevToolsShortcut({
+        type: "keyDown",
+        key: "i",
+        meta: true,
+        shift: true,
+      }),
+    ).toBe(true);
+    // Mutation: plain I / keyUp / Alt chord must not open DevTools.
+    expect(isDesktopDevToolsShortcut({ type: "keyDown", key: "I", control: true })).toBe(false);
+    expect(isDesktopDevToolsShortcut({ type: "keyUp", key: "F12" })).toBe(false);
+    expect(
+      isDesktopDevToolsShortcut({
+        type: "keyDown",
+        key: "I",
+        control: true,
+        shift: true,
+        alt: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("second-instance opens DevTools when the new argv asked for it", () => {
+    expect(
+      secondInstanceShouldOpenDevTools({
+        isPackaged: false,
+        commandLine: ["electron", DESKTOP_OPEN_DEVTOOLS_FLAG],
+      }),
+    ).toBe(true);
+    expect(
+      secondInstanceShouldOpenDevTools({
+        isPackaged: false,
+        commandLine: ["electron"],
+      }),
+    ).toBe(false);
+    // Packaged must never open even if argv is forged.
+    expect(
+      secondInstanceShouldOpenDevTools({
+        isPackaged: true,
+        commandLine: ["electron", DESKTOP_OPEN_DEVTOOLS_FLAG],
+      }),
+    ).toBe(false);
+  });
+
+  it("opens at startup only with explicit signal and only when unpackaged", () => {
+    expect(
+      shouldOpenDevToolsAtStartup({
+        isPackaged: false,
+        env: { [DESKTOP_OPEN_DEVTOOLS_ENV]: "1" },
+      }),
+    ).toBe(true);
+    expect(
+      shouldOpenDevToolsAtStartup({
+        isPackaged: false,
+        argv: [DESKTOP_OPEN_DEVTOOLS_FLAG],
+      }),
+    ).toBe(true);
+    // Packaged must never open — even if someone forges the env.
+    expect(
+      shouldOpenDevToolsAtStartup({
+        isPackaged: true,
+        env: { [DESKTOP_OPEN_DEVTOOLS_ENV]: "1" },
+        argv: [DESKTOP_OPEN_DEVTOOLS_FLAG],
+      }),
+    ).toBe(false);
+    // No signal → closed (plain `npm run desktop` stays quiet).
+    expect(shouldOpenDevToolsAtStartup({ isPackaged: false, env: {}, argv: [] })).toBe(
+      false,
+    );
+    // Relay URL alone must NOT open DevTools (separate concerns).
+    expect(
+      shouldOpenDevToolsAtStartup({
+        isPackaged: false,
+        env: { GROK_RELAY_URL: "wss://staging.example" },
+      }),
+    ).toBe(false);
+  });
+
+  it("wires main + launcher to the packaging gate and explicit open signal", () => {
+    const main = fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "desktop", "main.ts"),
+      "utf8",
+    );
+    expect(main).toContain("desktopAppMenuTemplate");
+    expect(main).toContain("shouldOpenDevToolsAtStartup");
+    expect(main).toContain("desktopDevToolsAllowed");
+    expect(main).toContain("isDesktopDevToolsShortcut");
+    expect(main).toContain("secondInstanceShouldOpenDevTools");
+    expect(main).toContain("before-input-event");
+    expect(main).toMatch(/devTools:\s*allowDevTools/);
+    expect(main).toMatch(/openDevTools\(\s*\{\s*mode:\s*["']detach["']/);
+    // Child viewers share the packaging lock but never auto-open.
+    // Gear door (capability + host method) so discoverability is not Alt→View only.
+    const host = fs.readFileSync(
+      path.join(
+        path.dirname(fileURLToPath(import.meta.url)),
+        "..",
+        "src",
+        "desktop",
+        "electron-host.ts",
+      ),
+      "utf8",
+    );
+    expect(host).toMatch(/devTools:\s*!app\.isPackaged/);
+    expect(host).not.toContain("openDevTools");
+    expect(host).toMatch(/canToggleDevTools/);
+    expect(host).toContain("toggleDevTools()");
+    const chatJs = fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "media", "chat.js"),
+      "utf8",
+    );
+    expect(chatJs).toContain("Toggle Developer Tools");
+    expect(chatJs).toMatch(/type:\s*["']toggleDevTools["']/);
+    // Launcher: explicit flag → env; not keyed off GROK_RELAY_URL.
+    const launcher = fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "run-desktop.cjs"),
+      "utf8",
+    );
+    expect(launcher).toContain(DESKTOP_OPEN_DEVTOOLS_FLAG);
+    expect(launcher).toContain(DESKTOP_OPEN_DEVTOOLS_ENV);
+    expect(launcher).toContain("includes(OPEN_DEVTOOLS_FLAG)");
+    expect(launcher).toMatch(/env\[OPEN_DEVTOOLS_ENV\]\s*=\s*["']1["']/);
+    const pkg = JSON.parse(
+      fs.readFileSync(
+        path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json"),
+        "utf8",
+      ),
+    ) as { scripts: Record<string, string> };
+    expect(pkg.scripts["desktop-dev"]).toContain(DESKTOP_OPEN_DEVTOOLS_FLAG);
+    expect(pkg.scripts["desktop-dev"]).toContain("--relay-dev");
+    // Plain desktop must not open DevTools by default.
+    expect(pkg.scripts.desktop).not.toContain(DESKTOP_OPEN_DEVTOOLS_FLAG);
+  });
+});
+
 describe("desktop branding and menu", () => {
   it("names the product Grok Build Desktop (Community) and links this repo only", () => {
     expect(DESKTOP_APP_FULL_NAME).toBe("Grok Build Desktop (Community)");
@@ -1281,7 +1554,7 @@ describe("desktop branding and menu", () => {
       ),
       "utf8",
     );
-    expect(theme).toContain("max-width: 1120px");
+    expect(theme).toContain("calc((100% - 1120px) / 2)");
     const chatCss = fs.readFileSync(
       path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "media", "chat.css"),
       "utf8",
@@ -1455,6 +1728,59 @@ describe("IPC sender validation helper", () => {
 });
 
 describe("file-tree panel assets", () => {
+  it("top-bar order is Remote, History, overflow, then Panel with separator on Panel only", () => {
+    // Owner preference: Remote, Session history, ⋯, |, Panel — not ⋯ first.
+    // Separator lives on the Panel toggle so remote (no panel) has no dangling |.
+    const sidebar = fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "sidebar.ts"),
+      "utf8",
+    );
+    const topBar = sidebar.match(/<header class="top-bar">[\s\S]*?<\/header>/)?.[0] ?? "";
+    expect(topBar).toBeTruthy();
+    const remote = topBar.indexOf('id="remote-btn"');
+    const history = topBar.indexOf('id="history-btn"');
+    const overflow = topBar.indexOf('id="session-head-actions"');
+    expect(remote).toBeGreaterThan(-1);
+    expect(history).toBeGreaterThan(remote);
+    expect(overflow).toBeGreaterThan(history);
+    // Mutation: overflow before remote would fail.
+    expect(overflow).toBeGreaterThan(remote);
+
+    const chatCss = fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "media", "chat.css"),
+      "utf8",
+    );
+    // No trailing separator on the overflow slot itself.
+    const headActionsRule = chatCss.match(/#session-head-actions\s*\{[^}]+\}/)?.[0] ?? "";
+    expect(headActionsRule).toBeTruthy();
+    expect(headActionsRule).not.toMatch(/border-right/);
+    // The separator is its OWN element now, not a border on the toggle. As a
+    // border it made the button read as a box and pushed its glyph off centre —
+    // a border on a fixed-size button always distorts the button. Still
+    // desktop-only by construction: remote mounts neither node.
+    expect(FILE_TREE_PANEL_CSS).toMatch(/\.desk-ft-top-sep\s*\{[\s\S]*?background:/);
+    const toggleRule = FILE_TREE_PANEL_CSS.match(/\.desk-ft-top-toggle\s*\{[^}]+\}/)?.[0] ?? "";
+    expect(toggleRule).toBeTruthy();
+    expect(toggleRule).not.toMatch(/border-left/);
+    expect(toggleRule).not.toMatch(/padding-left/);
+    // ...and it now matches the other top-bar icon buttons instead of shouting:
+    // muted foreground, no border, chat.css's .icon-btn radius.
+    expect(toggleRule).toMatch(/color:\s*var\(--vscode-descriptionForeground\)/);
+    expect(toggleRule).toMatch(/border:\s*0/);
+    expect(toggleRule).toMatch(/border-radius:\s*8px/);
+    // Anchored: an unanchored `.icon-btn {` also matches `.top-bar > .icon-btn`,
+    // which carries only `flex: none`.
+    const iconBtnRule = chatCss.match(/^\.icon-btn\s*\{[^}]+\}/m)?.[0] ?? "";
+    expect(iconBtnRule).toMatch(/border-radius:\s*8px/);
+    expect(iconBtnRule).toMatch(/color:\s*var\(--vscode-descriptionForeground\)/);
+
+    // Created and torn down together. A border could not be orphaned; a
+    // sibling can, and a re-inject would stack them up.
+    const boot = fileTreePanelBootSource();
+    expect(boot).toContain('sep.id = "desk-ft-top-sep"');
+    expect(boot).toContain('getElementById("desk-ft-top-sep")?.remove()');
+  });
+
   it("scopes CSS under desk-ft- and boots without chat.js symbols", () => {
     expect(FILE_TREE_PANEL_CSS).toContain(".desk-ft-panel");
     expect(FILE_TREE_PANEL_CSS).toContain("desk-ft-closed");
@@ -1517,8 +1843,30 @@ describe("file-tree panel assets", () => {
     // Resize persistence + host chat-open hook.
     expect(boot).toContain("desk-ft-width");
     expect(boot).toContain("WIDTH_MIN");
+    // Full-screen video resize must not re-measure the panel (same trap as the rail).
+    expect(boot).toContain("fullscreenElement");
+    expect(boot).toMatch(/wireFullscreenSafeReclamp|fullscreenchange/);
     expect(boot).toContain("__grokDeskFtOpen");
     expect(boot).toContain("Open in default app");
+    // Tree-row overflow: hover ⋯ (rail pattern) + right-click; files get Open +
+    // Reveal, folders Reveal only. Menu position uses chat zoom helpers.
+    expect(boot).toContain("openRowMenu");
+    expect(boot).toContain("showRowContextMenu");
+    expect(boot).toContain("desk-ft-row-actions");
+    expect(boot).toContain("desk-ft-menu-btn");
+    expect(boot).toContain('addEventListener("contextmenu"');
+    expect(boot).toContain("desk-ft-ctx-menu");
+    expect(boot).toContain("chatZoomFactor");
+    expect(boot).toContain("unzoomClientPx");
+    expect(boot).toMatch(/kind\s*!==\s*["']dir["']/);
+    expect(FILE_TREE_PANEL_CSS).toContain("desk-ft-ctx-menu");
+    expect(FILE_TREE_PANEL_CSS).toContain("desk-ft-row-actions");
+    expect(FILE_TREE_PANEL_CSS).toMatch(
+      /\.desk-ft-row-actions\s*\{[^}]*position:\s*absolute/s,
+    );
+    expect(FILE_TREE_PANEL_CSS).toMatch(
+      /\.desk-ft-row-actions\s*\{[^}]*linear-gradient/s,
+    );
     // Cancel is mounted only while dirty (not always-present + hidden).
     expect(boot).toMatch(/if\s*\(\s*file\.dirty\s*\)[\s\S]*desk-ft-cancel/);
     // Markdown preview defers typography to chat.css (shared tokens), not a
@@ -1552,6 +1900,21 @@ describe("desktop chrome boot (scroll fade + spacing shell)", () => {
     // Does not touch shared chat.js / Host messaging.
     expect(src).not.toContain("acquireVsCodeApi");
     expect(src).not.toContain("postMessage");
+  });
+});
+
+describe("desktop reading measure CSS", () => {
+  it("keeps the scrollport full-bleed and expresses both measures as padding", () => {
+    expect(DESKTOP_THEME_CSS).toContain("body.desk #messages-wrap");
+    expect(DESKTOP_THEME_CSS).toContain("body.desk #messages-wrap {\n  max-width: none;");
+    expect(DESKTOP_THEME_CSS).toContain(
+      "padding-inline: max(calc(var(--pad) + 5px), calc((100% - 800px) / 2));",
+    );
+    expect(DESKTOP_THEME_CSS).toContain(
+      "padding-inline: max(calc(var(--pad) + 5px), calc((100% - 1120px) / 2));",
+    );
+    expect(DESKTOP_THEME_CSS).not.toContain("max-width: 800px;");
+    expect(DESKTOP_THEME_CSS).not.toContain("max-width: 1120px;");
   });
 });
 
@@ -1721,6 +2084,754 @@ describe("desktop openFile / openUrl policy (A1)", () => {
       expect(authorizeOpenFile(outside, { workspaceRoot: root }).ok).toBe(false);
     } finally {
       fs.unlinkSync(outside);
+    }
+  });
+
+  it("message gate PASSES trusted generated-media and refuses arbitrary out-of-workspace", () => {
+    const grokHome = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-home-"));
+    try {
+      const catalog = path.join(grokHome, "sessions", "cwd-enc");
+      const sessionDir = path.join(catalog, "sess-abc");
+      const img = path.join(sessionDir, "images", "1.jpg");
+      fs.mkdirSync(path.dirname(img), { recursive: true });
+      fs.writeFileSync(img, "fake-jpeg");
+      const catalogs = [catalog];
+
+      const trusted = authorizeOpenFile(img, {
+        workspaceRoot: root,
+        grokHome,
+        sessionCatalogDirs: catalogs,
+      });
+      expect(trusted.ok).toBe(true);
+      if (trusted.ok) expect(path.resolve(trusted.absPath)).toBe(path.resolve(img));
+
+      const gate = authorizeDesktopWebviewMsg(
+        { type: "openFile", path: img },
+        { workspaceRoot: root, grokHome, sessionCatalogDirs: catalogs },
+      );
+      expect("msg" in gate).toBe(true);
+
+      // Relative media link with sessionDir (workspace file absent).
+      const rel = authorizeOpenFile("images/1.jpg", {
+        workspaceRoot: root,
+        grokHome,
+        sessionDir,
+        pathFs: {
+          realpathSync: (p: string) => fs.realpathSync(p),
+          existsSync: (p: string) => fs.existsSync(p),
+          statSync: (p: string) => fs.statSync(p),
+          readdirSync: (p: string, o: { withFileTypes: true }) => fs.readdirSync(p, o),
+        },
+      });
+      // Lexical under workspace is authorized first (may not exist); message gate still passes.
+      expect(rel.ok).toBe(true);
+
+      // Use-time must open the session file when workspace miss.
+      // Re-auth of the resolved absolute path needs project catalogs (same as hover).
+      const opened = resolveAuthorizedFileForOpen("images/1.jpg", {
+        workspaceRoot: root,
+        grokHome,
+        sessionDir,
+        sessionCatalogDirs: catalogs,
+        pathFs: {
+          realpathSync: (p: string) => fs.realpathSync(p),
+          existsSync: (p: string) => fs.existsSync(p),
+          statSync: (p: string) => fs.statSync(p),
+          readdirSync: (p: string, o: { withFileTypes: true }) => fs.readdirSync(p, o),
+        },
+      });
+      expect(opened.ok).toBe(true);
+      if (opened.ok) expect(path.resolve(opened.absPath)).toBe(path.resolve(img));
+
+      // Arbitrary out-of-workspace path still refused (no general ~/.grok open).
+      const secret = path.join(grokHome, "auth.json");
+      fs.writeFileSync(secret, '{"token":"x"}');
+      expect(
+        authorizeOpenFile(secret, {
+          workspaceRoot: root,
+          grokHome,
+          sessionCatalogDirs: catalogs,
+        }).ok,
+      ).toBe(false);
+      const loose = path.join(grokHome, "loose.png");
+      fs.writeFileSync(loose, "x");
+      expect(
+        authorizeOpenFile(loose, {
+          workspaceRoot: root,
+          grokHome,
+          sessionCatalogDirs: catalogs,
+        }).ok,
+      ).toBe(false);
+    } finally {
+      fs.rmSync(grokHome, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveAuthorizedFileForOpen prefers workspace images/ when present", () => {
+    const grokHome = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-ws-"));
+    try {
+      const sessionDir = path.join(grokHome, "sessions", "cwd-enc", "sess-ws");
+      const sessionImg = path.join(sessionDir, "images", "1.jpg");
+      fs.mkdirSync(path.dirname(sessionImg), { recursive: true });
+      fs.writeFileSync(sessionImg, "session");
+      const wsImg = path.join(root, "images", "1.jpg");
+      fs.mkdirSync(path.dirname(wsImg), { recursive: true });
+      fs.writeFileSync(wsImg, "workspace");
+
+      const opened = resolveAuthorizedFileForOpen("images/1.jpg", {
+        workspaceRoot: root,
+        grokHome,
+        sessionDir,
+      });
+      expect(opened.ok).toBe(true);
+      if (opened.ok) {
+        expect(path.resolve(opened.absPath)).toBe(path.resolve(wsImg));
+        expect(fs.readFileSync(opened.absPath, "utf8")).toBe("workspace");
+      }
+    } finally {
+      fs.rmSync(grokHome, { recursive: true, force: true });
+    }
+  });
+
+  it("absolute missing workspace path is NOT remapped onto session media", () => {
+    // A named absolute under the workspace that no longer exists must stay
+    // "not found" — never open ~/.grok/.../images/logo.png as a substitute.
+    const grokHome = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-nopeel-"));
+    try {
+      const sessionDir = path.join(grokHome, "sessions", "cwd-enc", "sess-nopeel");
+      const sessionImg = path.join(sessionDir, "images", "logo.png");
+      fs.mkdirSync(path.dirname(sessionImg), { recursive: true });
+      fs.writeFileSync(sessionImg, "session-only");
+
+      const missingWs = path.join(root, "images", "logo.png");
+      // Ensure workspace candidate is absent.
+      try {
+        fs.unlinkSync(missingWs);
+      } catch {
+        /* ok */
+      }
+
+      const opened = resolveAuthorizedFileForOpen(missingWs, {
+        workspaceRoot: root,
+        grokHome,
+        sessionDir,
+        pathFs: {
+          realpathSync: (p: string) => fs.realpathSync(p),
+          existsSync: (p: string) => fs.existsSync(p),
+          statSync: (p: string) => fs.statSync(p),
+          readdirSync: (p: string, o: { withFileTypes: true }) => fs.readdirSync(p, o),
+        },
+      });
+      expect(opened.ok).toBe(false);
+      if (!opened.ok) expect(opened.reason).toMatch(/not found/i);
+    } finally {
+      fs.rmSync(grokHome, { recursive: true, force: true });
+    }
+  });
+
+  it("authorizeOpenFile refuses trusted media when no workspace root (matches openFsPath)", () => {
+    const grokHome = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-noroot-"));
+    try {
+      const catalog = path.join(grokHome, "sessions", "cwd-enc");
+      const sessionDir = path.join(catalog, "sess-noroot");
+      const img = path.join(sessionDir, "images", "1.jpg");
+      fs.mkdirSync(path.dirname(img), { recursive: true });
+      fs.writeFileSync(img, "fake-jpeg");
+
+      const abs = authorizeOpenFile(img, {
+        grokHome,
+        sessionDir,
+        sessionCatalogDirs: [catalog],
+      });
+      expect(abs.ok).toBe(false);
+      if (!abs.ok) expect(abs.reason).toBe("no workspace root");
+
+      const rel = authorizeOpenFile("images/1.jpg", { grokHome, sessionDir });
+      expect(rel.ok).toBe(false);
+      if (!rel.ok) expect(rel.reason).toBe("no workspace root");
+    } finally {
+      fs.rmSync(grokHome, { recursive: true, force: true });
+    }
+  });
+
+  // Use-time path openFsPath actually calls. Message-gate authorizeOpenFile alone
+  // does not prove these: the desktop hover open posts an absolute session-media
+  // path, and sidebar hands the same after resolveChatOpenFilePath; relative
+  // links that still reach openFsPath fall through trySessionMediaOpen.
+  it("resolveAuthorizedFileForOpen opens ABSOLUTE session-media path (desktop hover / post-resolve)", () => {
+    const grokHome = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-abs-use-"));
+    try {
+      const catalog = path.join(grokHome, "sessions", "cwd-enc");
+      const sessionDir = path.join(catalog, "sess-abs-use");
+      const img = path.join(sessionDir, "images", "1.jpg");
+      fs.mkdirSync(path.dirname(img), { recursive: true });
+      fs.writeFileSync(img, "fake-jpeg");
+
+      const ctx = {
+        workspaceRoot: root,
+        grokHome,
+        sessionDir,
+        sessionCatalogDirs: [catalog],
+        pathFs: {
+          realpathSync: (p: string) => fs.realpathSync(p),
+          existsSync: (p: string) => fs.existsSync(p),
+          statSync: (p: string) => fs.statSync(p),
+          readdirSync: (p: string, o: { withFileTypes: true }) => fs.readdirSync(p, o),
+        },
+      };
+
+      // Load-bearing steps openFsPath's resolveAuthorizedFileForOpen runs for this input.
+      const revalidated = revalidateOpenFileForUse(img, ctx);
+      expect(revalidated.ok).toBe(true);
+      if (revalidated.ok) expect(path.resolve(revalidated.absPath)).toBe(path.resolve(img));
+      expect(isExecutableOpenTarget(img, { pathFs: ctx.pathFs })).toBe(false);
+      expect(fs.statSync(img).isFile()).toBe(true);
+
+      const opened = resolveAuthorizedFileForOpen(img, ctx);
+      expect(opened.ok).toBe(true);
+      if (opened.ok) expect(path.resolve(opened.absPath)).toBe(path.resolve(img));
+    } finally {
+      fs.rmSync(grokHome, { recursive: true, force: true });
+    }
+  });
+
+  it("absolute sibling-REPO media path is refused by message gate and use-time open", () => {
+    // Project-catalog fence: media under another repo's sessions/<cwd>/… is
+    // still under ~/.grok and still has generated-session shape, but must not
+    // open from this project's auth context.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-xrepo-"));
+    const grokHome = path.join(base, "home");
+    const repoA = path.join(base, "repo-a");
+    const repoB = path.join(base, "repo-b");
+    try {
+      fs.mkdirSync(repoA, { recursive: true });
+      fs.mkdirSync(repoB, { recursive: true });
+      const catalogA = sessionsDirFor(grokHome, repoA);
+      const catalogB = sessionsDirFor(grokHome, repoB);
+      const imgB = path.join(catalogB, "sess-b", "images", "x.jpg");
+      fs.mkdirSync(path.dirname(imgB), { recursive: true });
+      fs.writeFileSync(imgB, "other-repo");
+      // Active project is A; only A's catalog is authorized.
+      fs.mkdirSync(path.join(catalogA, "sess-a"), { recursive: true });
+
+      const ctx = {
+        workspaceRoot: repoA,
+        grokHome,
+        sessionDir: path.join(catalogA, "sess-a"),
+        sessionCatalogDirs: [catalogA],
+        pathFs: {
+          realpathSync: (p: string) => fs.realpathSync(p),
+          existsSync: (p: string) => fs.existsSync(p),
+          statSync: (p: string) => fs.statSync(p),
+          readdirSync: (p: string, o: { withFileTypes: true }) => fs.readdirSync(p, o),
+        },
+      };
+
+      const gate = authorizeDesktopWebviewMsg({ type: "openFile", path: imgB }, ctx);
+      expect("refused" in gate).toBe(true);
+      expect(authorizeOpenFile(imgB, ctx).ok).toBe(false);
+
+      const opened = resolveAuthorizedFileForOpen(imgB, ctx);
+      expect(opened.ok).toBe(false);
+
+      // Mutation: authorizing absolute media under whole grokHome (pre-fix)
+      // would pass both gates for any session under ~/.grok — including repo B.
+      const underHome = isTrustedGeneratedMediaPath(imgB, grokHome, (p) =>
+        fs.realpathSync(p),
+      );
+      expect(underHome).toBe(true);
+      // That is exactly the hole this test pins closed at the desktop gate.
+      expect(isTrustedGeneratedMediaPath(imgB, catalogA, (p) => fs.realpathSync(p))).toBe(
+        false,
+      );
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("absolute media under a catalog junction escaping ~/.grok is refused", () => {
+    // sessionCatalogDirs lists entries with existsSync/readdirSync and never
+    // proves they canonically stay under home. isTrustedGeneratedMediaPath
+    // contains against the realpath of whichever root it is given: catalog-only
+    // accepts a junction at ~/.grok/sessions/<cwd> → /anywhere (shape check
+    // still sees /sessions/ on the link path; containment runs on the target).
+    // Gate requires BOTH home and catalog — this pins the home half.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-junc-esc-"));
+    const grokHome = path.join(base, "home");
+    const outside = path.join(base, "outside");
+    const repo = path.join(base, "repo");
+    try {
+      fs.mkdirSync(repo, { recursive: true });
+      fs.mkdirSync(grokHome, { recursive: true });
+      // Real bytes live only outside home (junction destination).
+      const outsideImg = path.join(outside, "sess-j", "images", "secret.jpg");
+      fs.mkdirSync(path.dirname(outsideImg), { recursive: true });
+      fs.writeFileSync(outsideImg, "escaped-secret");
+
+      // Link path still looks like a normal project catalog under home.
+      const catalog = sessionsDirFor(grokHome, repo);
+      const linkImg = path.join(catalog, "sess-j", "images", "secret.jpg");
+
+      // Fake realpath: catalog (and everything under it) maps onto outside —
+      // same as an OS junction without needing symlink privileges.
+      const realpathMap = (p: string): string => {
+        const resolved = path.resolve(p);
+        const cat = path.resolve(catalog);
+        const home = path.resolve(grokHome);
+        if (resolved === cat || resolved.startsWith(cat + path.sep)) {
+          return path.resolve(outside, path.relative(cat, resolved));
+        }
+        if (resolved === home || resolved.startsWith(home + path.sep)) {
+          return resolved;
+        }
+        try {
+          return fs.realpathSync(p);
+        } catch {
+          return resolved;
+        }
+      };
+
+      const pathFs: TreePathFs = {
+        realpathSync: realpathMap,
+        existsSync: (p: string) => {
+          try {
+            return fs.existsSync(realpathMap(p));
+          } catch {
+            return fs.existsSync(p);
+          }
+        },
+        statSync: (p: string) => fs.statSync(realpathMap(p)),
+        readdirSync: (p: string, o: { withFileTypes: true }) =>
+          fs.readdirSync(realpathMap(p), o),
+      };
+
+      const ctx = {
+        workspaceRoot: repo,
+        grokHome,
+        sessionDir: path.join(catalog, "sess-j"),
+        sessionCatalogDirs: [catalog],
+        pathFs,
+      };
+
+      // Catalog-only trust would accept — that is the hole without the home half.
+      expect(isTrustedGeneratedMediaPath(linkImg, catalog, realpathMap)).toBe(true);
+      // Home trust refuses: canonical target is outside ~/.grok.
+      expect(isTrustedGeneratedMediaPath(linkImg, grokHome, realpathMap)).toBe(false);
+
+      const gate = authorizeDesktopWebviewMsg({ type: "openFile", path: linkImg }, ctx);
+      expect("refused" in gate).toBe(true);
+      expect(authorizeOpenFile(linkImg, ctx).ok).toBe(false);
+      expect(resolveAuthorizedFileForOpen(linkImg, ctx).ok).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("absolute media under a catalog junction to another project catalog is refused", () => {
+    // Catalog A → junction → catalog B, both inside ~/.grok. Home trust and
+    // catalog trust (against realpath(A) ≡ B) both pass; the leaf discriminator
+    // does not (basename of realpath(A) is B's urlencoded cwd).
+    // Mutation: drop catalogKeepsEncodedLeaf and this test fails (authorizes
+    // imgB through catalogA's junction).
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-junc-xcat-"));
+    const grokHome = path.join(base, "home");
+    const repoA = path.join(base, "repo-a");
+    const repoB = path.join(base, "repo-b");
+    try {
+      fs.mkdirSync(repoA, { recursive: true });
+      fs.mkdirSync(repoB, { recursive: true });
+      const catalogA = sessionsDirFor(grokHome, repoA);
+      const catalogB = sessionsDirFor(grokHome, repoB);
+      // Distinct leaves are the property under test (urlencoded cwd differs).
+      expect(path.basename(catalogA)).not.toBe(path.basename(catalogB));
+
+      const imgB = path.join(catalogB, "sess-b", "images", "x.jpg");
+      fs.mkdirSync(path.dirname(imgB), { recursive: true });
+      fs.writeFileSync(imgB, "other-catalog");
+      // Link path under A that realpaths onto B's file.
+      const linkImg = path.join(catalogA, "sess-b", "images", "x.jpg");
+
+      const realpathMap = (p: string): string => {
+        const resolved = path.resolve(p);
+        const catA = path.resolve(catalogA);
+        const catB = path.resolve(catalogB);
+        if (resolved === catA || resolved.startsWith(catA + path.sep)) {
+          return path.join(catB, path.relative(catA, resolved));
+        }
+        return resolved;
+      };
+
+      const pathFs: TreePathFs = {
+        realpathSync: realpathMap,
+        existsSync: (p: string) => {
+          try {
+            return fs.existsSync(realpathMap(p));
+          } catch {
+            return fs.existsSync(p);
+          }
+        },
+        statSync: (p: string) => fs.statSync(realpathMap(p)),
+        readdirSync: (p: string, o: { withFileTypes: true }) =>
+          fs.readdirSync(realpathMap(p), o),
+      };
+
+      const ctx = {
+        workspaceRoot: repoA,
+        grokHome,
+        sessionDir: path.join(catalogA, "sess-a"),
+        // Auth context only lists A — the junction rewrites it onto B.
+        sessionCatalogDirs: [catalogA],
+        pathFs,
+      };
+
+      // Both containment halves pass through the junction — leaf check is the
+      // only refusal. (Media path can be the link path or the real target.)
+      expect(isTrustedGeneratedMediaPath(linkImg, grokHome, realpathMap)).toBe(true);
+      expect(isTrustedGeneratedMediaPath(linkImg, catalogA, realpathMap)).toBe(true);
+      expect(path.basename(realpathMap(catalogA))).toBe(path.basename(path.resolve(catalogB)));
+      expect(path.basename(realpathMap(catalogA))).not.toBe(
+        path.basename(path.resolve(catalogA)),
+      );
+
+      const gate = authorizeDesktopWebviewMsg({ type: "openFile", path: linkImg }, ctx);
+      expect("refused" in gate).toBe(true);
+      expect(authorizeOpenFile(linkImg, ctx).ok).toBe(false);
+      expect(resolveAuthorizedFileForOpen(linkImg, ctx).ok).toBe(false);
+
+      // Real target under B with only A authorized is also refused (no leaf
+      // match on A, and B is not listed).
+      expect(authorizeOpenFile(imgB, ctx).ok).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("absolute media under a catalog junction relocating within ~/.grok is refused", () => {
+    // sessions/<leaf> → other/<leaf>: same basename, still under home. Home
+    // trust + catalog trust + leaf match all pass; only the direct-child-of-
+    // <grokHome>/sessions half of catalogKeepsEncodedLeaf refuses.
+    // Mutation: drop the isSessionDirChild(realParent, realChild) half of
+    // keepsCanonicalDirectChildIdentity (keep leaf-only) and this test fails —
+    // authorizes the relocated catalog.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-junc-reloc-"));
+    const grokHome = path.join(base, "home");
+    const repo = path.join(base, "repo");
+    try {
+      fs.mkdirSync(repo, { recursive: true });
+      fs.mkdirSync(path.join(grokHome, "sessions"), { recursive: true });
+      const catalog = sessionsDirFor(grokHome, repo);
+      const leaf = path.basename(catalog);
+      // Real bytes live under ~/.grok/other/<same-leaf>/… (not under sessions/).
+      const relocated = path.join(grokHome, "other", leaf);
+      const realImg = path.join(relocated, "sess-j", "images", "secret.jpg");
+      fs.mkdirSync(path.dirname(realImg), { recursive: true });
+      fs.writeFileSync(realImg, "relocated-secret");
+      const linkImg = path.join(catalog, "sess-j", "images", "secret.jpg");
+
+      const realpathMap = (p: string): string => {
+        const resolved = path.resolve(p);
+        const cat = path.resolve(catalog);
+        if (resolved === cat || resolved.startsWith(cat + path.sep)) {
+          return path.join(path.resolve(relocated), path.relative(cat, resolved));
+        }
+        return resolved;
+      };
+
+      const pathFs: TreePathFs = {
+        realpathSync: realpathMap,
+        existsSync: (p: string) => {
+          try {
+            return fs.existsSync(realpathMap(p));
+          } catch {
+            return fs.existsSync(p);
+          }
+        },
+        statSync: (p: string) => fs.statSync(realpathMap(p)),
+        readdirSync: (p: string, o: { withFileTypes: true }) =>
+          fs.readdirSync(realpathMap(p), o),
+      };
+
+      const ctx = {
+        workspaceRoot: repo,
+        grokHome,
+        sessionDir: path.join(catalog, "sess-j"),
+        sessionCatalogDirs: [catalog],
+        pathFs,
+      };
+
+      // Prove the hole halves that are NOT enough alone:
+      expect(path.basename(realpathMap(catalog))).toBe(leaf);
+      expect(isTrustedGeneratedMediaPath(linkImg, grokHome, realpathMap)).toBe(true);
+      expect(isTrustedGeneratedMediaPath(linkImg, catalog, realpathMap)).toBe(true);
+      // Relocated parent is under home but not the sessions root.
+      expect(path.dirname(realpathMap(catalog))).toBe(path.resolve(grokHome, "other"));
+      expect(path.dirname(realpathMap(catalog))).not.toBe(
+        path.resolve(path.join(grokHome, "sessions")),
+      );
+
+      const gate = authorizeDesktopWebviewMsg({ type: "openFile", path: linkImg }, ctx);
+      expect("refused" in gate).toBe(true);
+      expect(authorizeOpenFile(linkImg, ctx).ok).toBe(false);
+      expect(resolveAuthorizedFileForOpen(linkImg, ctx).ok).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("relative media under a catalog junction relocating within ~/.grok is refused", () => {
+    // sessionDirFor derives sessionDir as catalog/<id> under the junctioned
+    // catalog. resolveTrustedMediaOpenPath's relative branch applies
+    // catalogKeepsEncodedLeaf to dirname(sessionDir) — same helper as the
+    // absolute catalog loop — so the relocating junction is refused before
+    // resolveSessionGeneratedMediaPath. Use-time trySessionMediaOpen then
+    // re-auths the absolute path through that same fence via sessionCatalogDirs.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-junc-reloc-rel-"));
+    const grokHome = path.join(base, "home");
+    const repo = path.join(base, "repo");
+    try {
+      fs.mkdirSync(repo, { recursive: true });
+      fs.mkdirSync(path.join(grokHome, "sessions"), { recursive: true });
+      const catalog = sessionsDirFor(grokHome, repo);
+      const leaf = path.basename(catalog);
+      const relocated = path.join(grokHome, "other", leaf);
+      const realImg = path.join(relocated, "sess-j", "images", "secret.jpg");
+      fs.mkdirSync(path.dirname(realImg), { recursive: true });
+      fs.writeFileSync(realImg, "relocated-secret");
+
+      const realpathMap = (p: string): string => {
+        const resolved = path.resolve(p);
+        const cat = path.resolve(catalog);
+        if (resolved === cat || resolved.startsWith(cat + path.sep)) {
+          return path.join(path.resolve(relocated), path.relative(cat, resolved));
+        }
+        return resolved;
+      };
+
+      const pathFs: TreePathFs = {
+        realpathSync: realpathMap,
+        existsSync: (p: string) => {
+          try {
+            return fs.existsSync(realpathMap(p));
+          } catch {
+            return fs.existsSync(p);
+          }
+        },
+        statSync: (p: string) => fs.statSync(realpathMap(p)),
+        readdirSync: (p: string, o: { withFileTypes: true }) =>
+          fs.readdirSync(realpathMap(p), o),
+      };
+
+      // sessionDir layout matches sessionDirFor: catalog/<id> on the link path.
+      const sessionDir = path.join(catalog, "sess-j");
+      const ctx = {
+        workspaceRoot: repo,
+        grokHome,
+        sessionDir,
+        sessionCatalogDirs: [catalog],
+        pathFs,
+      };
+
+      // Without the relative-branch dirname(sessionDir) fence, home+session
+      // containment alone would still trust the resolved file under other/<leaf>.
+      const joined = path.join(sessionDir, "images", "secret.jpg");
+      expect(isTrustedGeneratedMediaPath(joined, sessionDir, realpathMap)).toBe(true);
+      expect(isTrustedGeneratedMediaPath(joined, grokHome, realpathMap)).toBe(true);
+
+      // Message-gate relative path is workspace-first (lexical), so pin the
+      // media gate via absolute authorize + use-time relative open.
+      expect(authorizeOpenFile(joined, ctx).ok).toBe(false);
+      const opened = resolveAuthorizedFileForOpen("images/secret.jpg", ctx);
+      expect(opened.ok).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("relative media under a sessionDir junction to a sibling session is refused", () => {
+    // sessions/<cwd>/<active-id> → sibling session under the *same* catalog.
+    // sessionDirFor's child check is lexical, so it can hand back the junction
+    // path. realpath(sessionDir) is the sibling; isTrustedGeneratedMediaPath
+    // against that root accepts images/1.jpg, home trust passes, AND absolute
+    // re-auth under the honest catalog also passes (sibling is still in-catalog
+    // — that is the fork-replay case for absolute paths). Only
+    // keepsCanonicalDirectChildIdentity(sessionDir, catalog) refuses the
+    // relative open: the leaf is no longer the active session id.
+    // Mutation: drop the sessionDir keepsCanonicalDirectChildIdentity check in
+    // resolveTrustedMediaOpenPath (and the same fence in
+    // resolveSessionGeneratedMediaPath) and this test fails — authorizes the
+    // sibling session's media via the relative open path.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-sess-junc-"));
+    const grokHome = path.join(base, "home");
+    const repo = path.join(base, "repo");
+    try {
+      fs.mkdirSync(repo, { recursive: true });
+      fs.mkdirSync(path.join(grokHome, "sessions"), { recursive: true });
+      const catalog = sessionsDirFor(grokHome, repo);
+
+      // Real bytes live only under the sibling session.
+      const siblingSession = path.join(catalog, "sess-sibling");
+      const siblingImg = path.join(siblingSession, "images", "1.jpg");
+      fs.mkdirSync(path.dirname(siblingImg), { recursive: true });
+      fs.writeFileSync(siblingImg, "sibling-session-media");
+
+      // Active session path is a junction onto the sibling.
+      const sessionDir = path.join(catalog, "sess-active");
+      const linkImg = path.join(sessionDir, "images", "1.jpg");
+
+      const realpathMap = (p: string): string => {
+        const resolved = path.resolve(p);
+        const sess = path.resolve(sessionDir);
+        if (resolved === sess || resolved.startsWith(sess + path.sep)) {
+          return path.join(path.resolve(siblingSession), path.relative(sess, resolved));
+        }
+        return resolved;
+      };
+
+      const pathFs: TreePathFs = {
+        realpathSync: realpathMap,
+        existsSync: (p: string) => {
+          try {
+            return fs.existsSync(realpathMap(p));
+          } catch {
+            return fs.existsSync(p);
+          }
+        },
+        statSync: (p: string) => fs.statSync(realpathMap(p)),
+        readdirSync: (p: string, o: { withFileTypes: true }) =>
+          fs.readdirSync(realpathMap(p), o),
+      };
+
+      const ctx = {
+        workspaceRoot: repo,
+        grokHome,
+        sessionDir,
+        sessionCatalogDirs: [catalog],
+        pathFs,
+      };
+
+      // Prove the hole without the identity fence: home + sessionDir containment
+      // pass, and absolute re-auth under the (honest) catalog would also pass.
+      expect(isTrustedGeneratedMediaPath(linkImg, sessionDir, realpathMap)).toBe(true);
+      expect(isTrustedGeneratedMediaPath(linkImg, grokHome, realpathMap)).toBe(true);
+      expect(isTrustedGeneratedMediaPath(linkImg, catalog, realpathMap)).toBe(true);
+      // Catalog itself is honest — only the session leaf is junctioned.
+      expect(path.basename(realpathMap(catalog))).toBe(path.basename(path.resolve(catalog)));
+      // Leaf diverges (sess-active → sess-sibling); parent stays the catalog.
+      expect(path.dirname(realpathMap(sessionDir))).toBe(path.resolve(catalog));
+      expect(path.basename(realpathMap(sessionDir))).toBe("sess-sibling");
+      expect(path.basename(realpathMap(sessionDir))).not.toBe(
+        path.basename(path.resolve(sessionDir)),
+      );
+
+      // Relative open is the load-bearing hole without the sessionDir fence.
+      // (Message-gate authorize is workspace-first and may accept a lexical
+      // in-tree path; use-time resolveAuthorizedFileForOpen is the media gate.)
+      const opened = resolveAuthorizedFileForOpen("images/1.jpg", ctx);
+      expect(opened.ok).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("absolute sibling-SESSION media path in same project is allowed (fork-replay case)", () => {
+    // Forks replay transcripts whose absolute media paths still point at the
+    // *parent* session directory. Scoping absolute opens to sessionDir alone
+    // would refuse those clicks; project-catalog scope keeps them open.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-xsess-"));
+    const grokHome = path.join(base, "home");
+    const repo = path.join(base, "repo");
+    try {
+      fs.mkdirSync(repo, { recursive: true });
+      const catalog = sessionsDirFor(grokHome, repo);
+      const parentDir = path.join(catalog, "parent-sess");
+      const forkDir = path.join(catalog, "fork-sess");
+      const parentImg = path.join(parentDir, "images", "1.jpg");
+      fs.mkdirSync(path.dirname(parentImg), { recursive: true });
+      fs.mkdirSync(forkDir, { recursive: true });
+      fs.writeFileSync(parentImg, "parent-media");
+
+      const ctx = {
+        workspaceRoot: repo,
+        grokHome,
+        // Active conversation is the fork; media path names the parent.
+        sessionDir: forkDir,
+        sessionCatalogDirs: [catalog],
+        pathFs: {
+          realpathSync: (p: string) => fs.realpathSync(p),
+          existsSync: (p: string) => fs.existsSync(p),
+          statSync: (p: string) => fs.statSync(p),
+          readdirSync: (p: string, o: { withFileTypes: true }) => fs.readdirSync(p, o),
+        },
+      };
+
+      const gate = authorizeDesktopWebviewMsg({ type: "openFile", path: parentImg }, ctx);
+      expect("msg" in gate).toBe(true);
+      const authorized = authorizeOpenFile(parentImg, ctx);
+      expect(authorized.ok).toBe(true);
+      if (authorized.ok) {
+        expect(path.resolve(authorized.absPath)).toBe(path.resolve(parentImg));
+      }
+
+      const opened = resolveAuthorizedFileForOpen(parentImg, ctx);
+      expect(opened.ok).toBe(true);
+      if (opened.ok) {
+        expect(path.resolve(opened.absPath)).toBe(path.resolve(parentImg));
+      }
+
+      // Relative links stay session-local: fork has no images/1.jpg of its own.
+      const relOpened = resolveAuthorizedFileForOpen("images/1.jpg", ctx);
+      // Workspace miss → trySessionMediaOpen against fork sessionDir only.
+      expect(relOpened.ok).toBe(false);
+
+      // Mutation: if absolute used sessionDir as the only root (rejected design),
+      // parent media would fail isTrustedGeneratedMediaPath under forkDir.
+      expect(
+        isTrustedGeneratedMediaPath(parentImg, forkDir, (p) => fs.realpathSync(p)),
+      ).toBe(false);
+      expect(
+        isTrustedGeneratedMediaPath(parentImg, catalog, (p) => fs.realpathSync(p)),
+      ).toBe(true);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveAuthorizedFileForOpen opens RELATIVE images/ via trySessionMediaOpen (workspace miss)", () => {
+    const grokHome = fs.mkdtempSync(path.join(os.tmpdir(), "grok-media-rel-use-"));
+    try {
+      const catalog = path.join(grokHome, "sessions", "cwd-enc");
+      const sessionDir = path.join(catalog, "sess-rel-use");
+      const img = path.join(sessionDir, "images", "1.jpg");
+      fs.mkdirSync(path.dirname(img), { recursive: true });
+      fs.writeFileSync(img, "session-jpeg");
+      // Workspace candidate must be absent so the use-time path reaches trySessionMediaOpen.
+      const wsCandidate = path.join(root, "images", "1.jpg");
+      try {
+        fs.unlinkSync(wsCandidate);
+      } catch {
+        /* ok */
+      }
+
+      const opened = resolveAuthorizedFileForOpen("images/1.jpg", {
+        workspaceRoot: root,
+        grokHome,
+        sessionDir,
+        // Absolute re-auth after resolveSessionGeneratedMediaPath uses catalog fence.
+        sessionCatalogDirs: [catalog],
+        pathFs: {
+          realpathSync: (p: string) => fs.realpathSync(p),
+          existsSync: (p: string) => fs.existsSync(p),
+          statSync: (p: string) => fs.statSync(p),
+          readdirSync: (p: string, o: { withFileTypes: true }) => fs.readdirSync(p, o),
+        },
+      });
+      expect(opened.ok).toBe(true);
+      if (opened.ok) {
+        expect(path.resolve(opened.absPath)).toBe(path.resolve(img));
+        expect(fs.readFileSync(opened.absPath, "utf8")).toBe("session-jpeg");
+      }
+    } finally {
+      fs.rmSync(grokHome, { recursive: true, force: true });
     }
   });
 
@@ -2583,6 +3694,59 @@ describe("local workspace switch serialization (P1-2)", () => {
     expect(sidebar).toMatch(
       /switchLocalWorkspaceFolder[\s\S]*localWorkspaceSwitchQueue\.run/,
     );
+  });
+
+  it("local resume follows the host-owned session project", () => {
+    const sidebar = fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "sidebar.ts"),
+      "utf8",
+    );
+    const openStart = sidebar.indexOf("private async openSession(id: string");
+    const openEnd = sidebar.indexOf("private localTrustedSessionCwds(", openStart);
+    const openBody = sidebar.slice(openStart, openEnd);
+    const reserveAt = openBody.indexOf("this.reserveSessionLoad(id)");
+    const queueAt = openBody.indexOf("this.localWorkspaceSwitchQueue.run(open)");
+    expect(reserveAt).toBeGreaterThanOrEqual(0);
+    expect(queueAt).toBeGreaterThan(reserveAt);
+    expect(openBody).toContain("const open = () => this.openSessionReserved(id, sessionCwd)");
+
+    const reservedStart = sidebar.indexOf("private async openSessionReserved(");
+    const reservedEnd = sidebar.indexOf("private revealAndFocusComposer", reservedStart);
+    const reservedBody = sidebar.slice(reservedStart, reservedEnd);
+    expect(reservedBody).toContain("await this.followSessionWorkspace(s)");
+    expect(reservedBody).toContain("await this.followSessionWorkspace(this.focused)");
+    expect(reservedBody).not.toMatch(/await this\.switchLocalWorkspaceFolder\(/);
+    expect(sidebar).toContain("await this.switchLocalWorkspaceFolderExclusive(target, { warnOnRefusal: false })");
+  });
+
+  it("worktree resume follows its owning project, not the worktree cwd", () => {
+    const sidebar = fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "sidebar.ts"),
+      "utf8",
+    );
+    const followStart = sidebar.indexOf("private async followSessionWorkspace(");
+    const followEnd = sidebar.indexOf("private async openSessionReserved(", followStart);
+    const followBody = sidebar.slice(followStart, followEnd);
+    expect(followBody).toContain("if (!this.host.canSwitchWorkspaceFolder) return");
+    expect(followBody).toContain("session.worktree?.sourceGitRoot ?? session.cwd");
+    expect(followBody).toContain("this.resolveLocalRepoTarget(session.cwd)?.cwd : undefined");
+    expect(followBody).toContain("warnOnRefusal: false");
+    // ONE resolution, from session.cwd. Neither a bare sourceGitRoot fallback
+    // nor an exact-match shortcut on it: both walk past the ambiguity guard
+    // below, because a worktree's source root can itself be an open folder
+    // while two folders claim the worktree.
+    expect(followBody).not.toMatch(/\?\?\s*intendedTarget;/);
+    expect(followBody).not.toContain("this.resolveLocalRepoTarget(intendedTarget)");
+
+    const resolveStart = sidebar.indexOf("private resolveLocalRepoTarget(");
+    const resolveEnd = sidebar.indexOf("private buildRepoSessionsPreview(", resolveStart);
+    const resolveBody = sidebar.slice(resolveStart, resolveEnd);
+    expect(resolveBody).toContain("entries.find((r) => pathsEqual(r.cwd, cwd))");
+    // Ownership resolves by GIT ROOT, so every open folder sharing a checkout
+    // claims the same worktree. Exactly one owner or no switch — never a
+    // `.find` taking whichever the catalog happened to list first.
+    expect(resolveBody).toMatch(/const owners = entries\.filter\(/);
+    expect(resolveBody).toContain("owners.length === 1 ? owners[0] : undefined");
   });
 });
 

@@ -82,6 +82,7 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "openProjectConfig":
     case "runMcpList":
     case "showLogs":
+    case "toggleDevTools":
     case "openSettings":
       if (type === "openSettings" && raw.section !== undefined && !isString(raw.section)) return null;
       break;
@@ -112,6 +113,7 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       if (!isString(raw.id)) return null;
       break;
     case "openFile":
+    case "showInFolder":
       if (!isString(raw.path)) return null;
       break;
     case "dropFile":
@@ -211,6 +213,9 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "setRepoArchived":
       if (!isString(raw.cwd) || !isBoolean(raw.archived)) return null;
       break;
+    case "setRepoColor":
+      if (!isString(raw.cwd) || !isString(raw.color)) return null;
+      break;
     case "resumeSession":
       if (!isString(raw.id)) return null;
       if (!opt(raw.cwd, isString)) return null;
@@ -232,6 +237,32 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "addMentionFile":
       if (!isString(raw.relPath)) return null;
       break;
+    case "listProjectDir":
+      if (!isString(raw.cwd)) return null;
+      if (!opt(raw.relPath, isString)) return null;
+      break;
+    case "readProjectFile":
+      if (!isString(raw.cwd) || !isString(raw.relPath)) return null;
+      break;
+    case "writeProjectFile": {
+      if (
+        !isString(raw.cwd) ||
+        !isString(raw.relPath) ||
+        !isString(raw.text) ||
+        !isString(raw.expectedAbsPath)
+      ) {
+        return null;
+      }
+      const stamp = raw.stamp;
+      if (
+        !isObject(stamp) ||
+        !isNumber(stamp.mtimeMs) ||
+        !isNumber(stamp.size)
+      ) {
+        return null;
+      }
+      break;
+    }
     case "pasteImage":
       if (!isString(raw.mimeType) || !isString(raw.data)) return null;
       if (!opt(raw.previewId, isString)) return null;

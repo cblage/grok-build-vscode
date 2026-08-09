@@ -39,6 +39,11 @@ import type {
   HostWebviewView,
 } from "./host";
 import { Uri, isFsPathInWorkspace } from "./host";
+import {
+  hostAcceptedSecondarySideBar,
+  SECONDARY_SIDE_BAR_PROBE_KEY,
+  type PanelPosition,
+} from "./view-move";
 
 function toVsCodeTarget(target: ConfigTarget | undefined): vscode.ConfigurationTarget {
   switch (target) {
@@ -193,7 +198,31 @@ const hostFs: HostFileSystem = {
  * command can still call `output.show()` without going through the sidebar);
  * we only borrow it for append/show.
  */
-export function createVsCodeHost(output: vscode.OutputChannel): Host {
+export function createVsCodeHost(
+  output: vscode.OutputChannel,
+  context?: vscode.ExtensionContext,
+): Host {
+  // `capabilities` is assembled synchronously when the webview announces itself,
+  // but the only way to ask whether the host honoured our container contribution
+  // is `getCommands`, which is async. So: seed from what the last run learned,
+  // then correct and persist.
+  //
+  // Defaulting to TRUE on a first run matters — it is the pre-Cursor truth, and
+  // being briefly wrong there costs one menu item that does nothing, where being
+  // wrong the other way would hide the correct destination in every VS Code.
+  // In practice the probe wins the race anyway: in the host this exists for, the
+  // webview is not resolved until activation's relocation focuses it.
+  let secondarySideBar = context?.globalState.get<boolean>(SECONDARY_SIDE_BAR_PROBE_KEY) ?? true;
+  void Promise.resolve(vscode.commands.getCommands(true)).then(
+    (cmds) => {
+      secondarySideBar = hostAcceptedSecondarySideBar(cmds);
+      void context?.globalState.update(SECONDARY_SIDE_BAR_PROBE_KEY, secondarySideBar);
+    },
+    () => {
+      /* keep the seeded value — a failed probe is not evidence of a refusal */
+    },
+  );
+
   return {
     showInformationMessage(message, ...items) {
       const { options, buttons } = splitMessageArgs(items);
@@ -271,13 +300,45 @@ export function createVsCodeHost(output: vscode.OutputChannel): Host {
     setContext(key: string, value: unknown) {
       return vscode.commands.executeCommand("setContext", key, value);
     },
-    async relocateView(viewId: string, destinationId?: string | null) {
+    async relocateView(
+      viewId: string,
+      destinationId?: string | null,
+      panelPosition?: PanelPosition | null,
+    ) {
       if (destinationId) {
+        // Timed per step. Moving a webview view makes VS Code dispose and
+        // rebuild it, so this is one of the few user actions that can visibly
+        // stall — and which of the three steps costs it is not guessable from
+        // the outside. `Grok: Show Logs` after a move answers it.
+        const started = Date.now();
+        const lap = (step: string) => {
+          output.appendLine(`[move] ${step} ${Date.now() - started}ms`);
+        };
         await vscode.commands.executeCommand("vscode.moveViews", {
           viewIds: [viewId],
           destinationId,
         });
+        lap("moveViews");
+        if (panelPosition) {
+          // Dock the edge the menu label promised, before revealing, so the
+          // view appears where the user was told it would. Best effort on
+          // purpose: a fork missing these built-ins must still get the move and
+          // the reveal, which are the parts that matter.
+          try {
+            await vscode.commands.executeCommand(
+              panelPosition === "right"
+                ? "workbench.action.positionPanelRight"
+                : "workbench.action.positionPanelBottom",
+            );
+          } catch {
+            /* layout nudge unavailable — the move itself already landed */
+          }
+          lap("positionPanel");
+        }
+        // Focus last: it opens whichever dock now holds the view, so "any option
+        // shows the panel" falls out of the move rather than needing its own call.
         await vscode.commands.executeCommand(`${viewId}.focus`);
+        lap("focus");
       } else {
         await vscode.commands.executeCommand("workbench.action.moveFocusedView", viewId);
       }
@@ -316,6 +377,9 @@ export function createVsCodeHost(output: vscode.OutputChannel): Host {
     },
     appendLine(line: string) {
       output.appendLine(line);
+    },
+    toggleDevTools() {
+      // VS Code has its own Developer: Toggle Developer Tools command.
     },
     showOutput(preserveFocus?: boolean) {
       output.show(preserveFocus);
@@ -384,6 +448,9 @@ export function createVsCodeHost(output: vscode.OutputChannel): Host {
         uri,
         options ? toVsCodeShowOptions(options) : undefined,
       );
+    },
+    async showInFolder(fsPath: string) {
+      await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(fsPath));
     },
     async openGlobalConfig() {
       const p = globalConfigPath();
@@ -511,9 +578,20 @@ export function createVsCodeHost(output: vscode.OutputChannel): Host {
     webviewReloadsUnderLiveSession: false,
     remoteInstallIdSuffix: "",
     canRelocateView: true,
+    get canUseSecondarySideBar() {
+      return secondarySideBar;
+    },
     canShowOutput: true,
+    canToggleDevTools: false,
+    canOpenInEditor: true,
     canSwitchWorkspaceFolder: false,
     canArchiveRepos: true,
+    // Media goes through asWebviewUri, i.e. the editor's own resource pipeline.
+    // We do not own it and cannot vouch for its range handling.
+    canServeMediaRanges: false,
+    // Deliberately off for now; enable this one capability when VS Code's
+    // generated-video action should use revealFileInOS too.
+    canShowInFolder: false,
   };
 }
 

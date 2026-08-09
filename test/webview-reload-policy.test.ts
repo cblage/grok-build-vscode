@@ -81,6 +81,8 @@ describe("source gates — capability at the ownership boundary", () => {
     expect(src).toMatch(/remoteInstallIdSuffix:\s*""/);
     expect(src).toMatch(/canRelocateView:\s*true/);
     expect(src).toMatch(/canShowOutput:\s*true/);
+    expect(src).toMatch(/canToggleDevTools:\s*false/);
+    expect(src).toMatch(/canOpenInEditor:\s*true/);
     expect(src).toMatch(/canSwitchWorkspaceFolder:\s*false/);
     expect(src).toMatch(/canArchiveRepos:\s*true/);
   });
@@ -91,6 +93,8 @@ describe("source gates — capability at the ownership boundary", () => {
     expect(src).toMatch(/remoteInstallIdSuffix:\s*":desktop"/);
     expect(src).toMatch(/canRelocateView:\s*false/);
     expect(src).toMatch(/canShowOutput:\s*false/);
+    expect(src).toMatch(/canToggleDevTools/);
+    expect(src).toMatch(/canOpenInEditor:\s*false/);
     expect(src).toMatch(/canSwitchWorkspaceFolder:\s*true/);
     expect(src).toMatch(/canArchiveRepos:\s*false/);
   });

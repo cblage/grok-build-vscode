@@ -227,6 +227,7 @@ body.desk-ft-resizing * {
      hides information for no one's benefit. */
   max-width: none;
   min-width: 0;
+  min-height: var(--rail-row-min-height, 30px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -238,13 +239,13 @@ body.desk-ft-resizing * {
   padding: 4px 8px;
   margin: 0;
   border: none;
-  border-right: 1px solid var(--vscode-editorWidget-border, #454545);
   background: transparent;
   font-family: inherit;
   line-height: var(--rail-row-line-height, 1.5);
   cursor: default;
   text-align: left;
   box-sizing: border-box;
+  position: relative;
 }
 /* Tabs present: the name yields to them. Scoped through the shared parent
    because the title is the FIRST child and a sibling combinator only looks
@@ -277,12 +278,12 @@ button.desk-ft-title:focus-visible {
   flex: 0 1 auto;
   max-width: 160px;
   min-width: 56px;
+  min-height: var(--rail-row-min-height, 30px);
   display: inline-flex;
   align-items: center;
   gap: 4px;
   padding: 4px 4px 4px 10px;
   border: none;
-  border-right: 1px solid var(--vscode-editorWidget-border, #454545);
   background: transparent;
   color: var(--vscode-descriptionForeground, #9d9d9d);
   cursor: pointer;
@@ -307,6 +308,17 @@ button.desk-ft-title:focus-visible {
   outline: 1px solid var(--vscode-focusBorder, #007fd4);
   outline-offset: -1px;
   z-index: 1;
+}
+.desk-ft-title::after,
+.desk-ft-tab::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  right: 0;
+  bottom: 4px;
+  width: 1px;
+  background: var(--vscode-editorWidget-border, #454545);
+  pointer-events: none;
 }
 .desk-ft-tab-name {
   flex: 1 1 auto;
@@ -384,6 +396,8 @@ body.desk-ft-viewing .desk-ft-body {
   display: none !important;
 }
 .desk-ft-row {
+  /* relative: hover ⋯ overlays the trailing edge (see .desk-ft-row-actions). */
+  position: relative;
   display: flex;
   align-items: center;
   /* Tight lead→label gap: chevron/icon + name read as one unit (not rail's 6px). */
@@ -410,6 +424,84 @@ body.desk-ft-viewing .desk-ft-body {
 .desk-ft-row:focus-visible {
   outline: 2px solid var(--vscode-focusBorder, #007fd4);
   outline-offset: -1px;
+}
+/* Hover ⋯ — same overlay model as .rail-session-actions: absolute over the row
+   with a gradient scrim matching the row surface so a long name slides UNDER the
+   button instead of being squeezed. The rail also has an .active scrim variant
+   because a selected session paints list-activeSelectionBackground; tree rows
+   have no selected paint today, so one scrim (hover) is enough. */
+.desk-ft-row-actions {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  display: flex;
+  flex: none;
+  gap: 1px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .1s ease;
+  background: linear-gradient(
+    to right,
+    transparent 0%,
+    var(--rail-hover-bg, var(--vscode-list-hoverBackground, #2a2d2e)) 28%
+  );
+  padding-left: 14px;
+  border-radius: 4px;
+}
+.desk-ft-row:hover .desk-ft-row-actions,
+.desk-ft-row:focus-within .desk-ft-row-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+.desk-ft-action-btn {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 25px;
+  height: 24px;
+  padding: 0;
+  color: var(--vscode-descriptionForeground, #9d9d9d);
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+/* Icons sit on the row's own hover surface — no darker per-icon chip (Codex /
+   rail pattern). Focus outline remains for keyboard. */
+.desk-ft-action-btn:hover {
+  color: var(--vscode-foreground, #ccc);
+  background: transparent;
+}
+.desk-ft-action-btn:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -1px;
+}
+.desk-ft-action-btn svg {
+  width: 12px;
+  height: 12px;
+  display: block;
+}
+/* No hover means no hover-reveal: force the ⋯ visible and in-flow on touch so
+   it does not permanently cover the trailing name (mirrors rail @media). */
+@media (hover: none) {
+  .desk-ft-row-actions {
+    position: static;
+    right: auto;
+    top: auto;
+    transform: none;
+    flex: 0 0 auto;
+    opacity: 1;
+    pointer-events: auto;
+    background: transparent;
+    padding-left: 0;
+  }
+  .desk-ft-action-btn {
+    width: 32px;
+    height: 30px;
+  }
 }
 /* Single leading glyph column (Codex / VS Code): dir chevron OR file icon —
    never both, never an empty disclosure spacer beside the icon. Same 16px
@@ -496,19 +588,25 @@ body.desk-ft-viewing .desk-ft-body {
 .desk-ft-node.desk-ft-open > .desk-ft-children {
   display: block;
 }
-/* Top-bar panel toggle (Lucide panel-right) */
+/* Top-bar panel toggle (Lucide panel-right). Deliberately identical to
+   chat.css's .icon-btn — the muted descriptionForeground, no padding, no
+   border, the same 8px radius — because it sits in the same row as History and
+   the overflow menu, and had been reading as a boxed, brighter, off-centre
+   outlier. The glyph was off-centre for a concrete reason: a padding-left
+   inside a fixed 28px box centres within what is LEFT of it. The old
+   border-left was doing double duty as a separator; that is now its own
+   element (.desk-ft-top-sep), because a border on the button will always
+   distort the button. */
 .desk-ft-top-toggle {
   flex: 0 0 auto;
   width: 28px;
   height: 28px;
-  margin-left: 2px;
   padding: 0;
-  border: none;
-  border-radius: 4px;
+  border: 0;
+  border-radius: 8px;
   background: transparent;
-  color: var(--vscode-foreground, #ccc);
+  color: var(--vscode-descriptionForeground);
   cursor: pointer;
-  font-size: 14px;
   line-height: 1;
   display: inline-flex;
   align-items: center;
@@ -520,7 +618,19 @@ body.desk-ft-viewing .desk-ft-body {
   display: block;
 }
 .desk-ft-top-toggle:hover {
+  color: var(--vscode-foreground, #ccc);
   background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08));
+}
+/* The separator, as its own element rather than a border on the button. Only
+   this desktop control exists after the ⋯ overflow — remote clients never mount
+   it, so the divider is absent there by construction. Inset vertically so it
+   reads as a divider between groups rather than a full-height rule. */
+.desk-ft-top-sep {
+  flex: 0 0 1px;
+  width: 1px;
+  align-self: stretch;
+  margin: 4px 6px;
+  background: var(--vscode-editorWidget-border, rgba(128,128,128,.35));
 }
 /* Rail collapse toggle (Lucide panel-left) — desktop shell only */
 .desk-rail-toggle {
@@ -694,6 +804,15 @@ body.desk-ft-viewing .desk-ft-viewer {
 .desk-ft-overflow-item:focus-visible {
   outline: 1px solid var(--vscode-focusBorder, #007fd4);
   outline-offset: -1px;
+}
+/* Row overflow menu — body-fixed (panel is overflow:auto and would clip it).
+   Opened from the hover ⋯ or right-click; positioned in layout px via the same
+   zoom-aware maths as the rail menu (chatZoomFactor / unzoomClientPx). */
+.desk-ft-ctx-menu {
+  position: fixed;
+  right: auto;
+  top: auto;
+  z-index: 50;
 }
 .desk-ft-viewer-action {
   /* Icon + optional label; narrow panel drops the label via container query. */
@@ -898,6 +1017,9 @@ export function fileTreePanelBootSource(iconsDir?: string): string {
   }
   document.getElementById("desk-ft-style")?.remove();
   document.getElementById("desk-ft-top-toggle")?.remove();
+  // Its separator is a sibling now, not a border on the button — so it needs
+  // removing too, or a re-inject leaves one behind on every reload.
+  document.getElementById("desk-ft-top-sep")?.remove();
   document.getElementById("desk-rail-toggle")?.remove();
   document.getElementById("desk-rail-open-btn")?.remove();
   document.body.classList.remove("desk-ft-closed", "desk-with-ft", "desk-ft-viewing", "desk-ft-collapsed", "desk-rail-collapsed");
@@ -1030,6 +1152,15 @@ export function fileTreePanelBootSource(iconsDir?: string): string {
   const topBar = document.querySelector(".top-bar");
   let topToggle = document.getElementById("desk-ft-top-toggle");
   if (!topToggle && topBar) {
+    // Separator first, as a sibling. It used to be a border-left on the button,
+    // which is what made the button look boxed and pushed its glyph off centre.
+    if (!document.getElementById("desk-ft-top-sep")) {
+      const sep = document.createElement("span");
+      sep.id = "desk-ft-top-sep";
+      sep.className = "desk-ft-top-sep";
+      sep.setAttribute("aria-hidden", "true");
+      topBar.appendChild(sep);
+    }
     topToggle = document.createElement("button");
     topToggle.type = "button";
     topToggle.id = "desk-ft-top-toggle";
@@ -1073,10 +1204,14 @@ export function fileTreePanelBootSource(iconsDir?: string): string {
     return Math.min(max, Math.max(WIDTH_MIN, n));
   }
 
-  function applyPanelWidth(px) {
+  function applyPanelWidth(px, persist) {
     const w = clampPanelWidth(px);
     panel.style.setProperty("--desk-ft-width", w + "px");
-    try { localStorage.setItem(WIDTH_KEY, String(w)); } catch (_) { /* */ }
+    // Drag path persists; window-narrow reclamp paints only so a later grow
+    // can restore the user's drag width from localStorage.
+    if (persist !== false) {
+      try { localStorage.setItem(WIDTH_KEY, String(w)); } catch (_) { /* */ }
+    }
     return w;
   }
 
@@ -1119,11 +1254,51 @@ export function fileTreePanelBootSource(iconsDir?: string): string {
     resizer.addEventListener("pointermove", onMove);
     resizer.addEventListener("pointerup", onUp);
     resizer.addEventListener("pointercancel", onUp);
-    window.addEventListener("resize", () => {
-      // Re-clamp so a narrow window cannot leave the panel overgrown.
+    // Register with chat.js so a window-narrow reclamp can share the deficit
+    // with the projects rail (proportional shrink from stored drag widths).
+    // Full-screen video fires resize mid-transition with a meaningless width —
+    // chat's wireFullscreenSafeReclamp skips those; we share that path.
+    function preferredPanelWidth() {
+      try {
+        const s = localStorage.getItem(WIDTH_KEY);
+        if (s != null && s !== "") {
+          const n = Math.round(Number(s));
+          if (Number.isFinite(n) && n > 0) return n;
+        }
+      } catch (_) { /* */ }
+      return panel.getBoundingClientRect().width || WIDTH_DEFAULT;
+    }
+    if (typeof window.__grokRegisterSidePanel === "function") {
+      window.__grokRegisterSidePanel({
+        id: "panel",
+        min: WIDTH_MIN,
+        maxFrac: 0.7,
+        isOpen: () => !document.body.classList.contains("desk-ft-closed"),
+        preferredWidth: preferredPanelWidth,
+        applyWidth: (px) => { applyPanelWidth(px, false); },
+      });
+    }
+    const reclampPanel = () => {
+      if (typeof window.__grokReclampSidePanels === "function") {
+        window.__grokReclampSidePanels();
+        return;
+      }
+      // Fallback when chat.js is not present (should not happen on desk).
       const cur = panel.getBoundingClientRect().width;
-      if (cur > 0) applyPanelWidth(cur);
-    });
+      if (cur > 0) applyPanelWidth(cur, false);
+    };
+    const wireFs = window.GrokWebviewHelpers && window.GrokWebviewHelpers.wireFullscreenSafeReclamp;
+    if (typeof wireFs === "function") {
+      wireFs(reclampPanel);
+    } else {
+      window.addEventListener("resize", () => {
+        if (document.fullscreenElement) return;
+        reclampPanel();
+      });
+      document.addEventListener("fullscreenchange", () => {
+        if (!document.fullscreenElement) reclampPanel();
+      });
+    }
   })();
 
   function applyOpen(open) {
@@ -1682,11 +1857,136 @@ export function fileTreePanelBootSource(iconsDir?: string): string {
     return true;
   }
 
+  // Shared by the tab-toolbar ⋯ menu and the tree-row overflow (⋯ / right-click).
+  let ctxMenuEl = null;
+  // Anchor of the open row menu — capture-phase outside-click must NOT close when
+  // the click is on this node, or the button's own toggle reopens it (rail scar:
+  // second click on the same ⋯ appeared to do nothing).
+  let ctxMenuAnchorEl = null;
+
   function closeOverflowMenu() {
     const menu = toolbar.querySelector(".desk-ft-overflow-menu");
     const btn = toolbar.querySelector(".desk-ft-overflow-btn");
     if (menu) menu.classList.remove("desk-ft-open");
     if (btn) btn.setAttribute("aria-expanded", "false");
+  }
+
+  function closeContextMenu() {
+    if (ctxMenuEl) {
+      ctxMenuEl.remove();
+      ctxMenuEl = null;
+    }
+    ctxMenuAnchorEl = null;
+  }
+
+  function closeAllMenus() {
+    closeOverflowMenu();
+    closeContextMenu();
+  }
+
+  const mkItem = (menu, cls, icon, label, onClick) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "desk-ft-overflow-item" + (cls ? " " + cls : "");
+    item.setAttribute("role", "menuitem");
+    item.innerHTML = icon + "<span>" + escapeHtml(label) + "</span>";
+    item.title = label;
+    item.setAttribute("aria-label", label);
+    item.addEventListener("click", async () => {
+      closeAllMenus();
+      await onClick();
+    });
+    menu.appendChild(item);
+    return item;
+  };
+
+  /** Body zoom helpers — do not re-derive; the rail's openRailMenu uses the same. */
+  function ftZoomHelpers() {
+    const h = window.GrokWebviewHelpers || {};
+    return {
+      chatZoomFactor: typeof h.chatZoomFactor === "function" ? h.chatZoomFactor : function () { return 1; },
+      unzoomClientPx: typeof h.unzoomClientPx === "function" ? h.unzoomClientPx : function (px) { return px; },
+    };
+  }
+
+  /**
+   * Tree-row overflow: files get Open + Reveal; folders Reveal only.
+   * \`anchor\` is either the ⋯ button (Element) or a pointer {clientX,clientY}
+   * from right-click. \`opts.toggle\` + \`opts.menuKey\` make a second click on
+   * the same ⋯ close rather than reopen (rail openRailMenu pattern).
+   */
+  function openRowMenu(anchor, relPath, kind, opts) {
+    const menuKey = (opts && opts.menuKey) || "";
+    const allowToggle = !!(opts && opts.toggle);
+    const wasMine = !!ctxMenuEl && !!menuKey && ctxMenuEl.dataset.anchorId === menuKey;
+    closeAllMenus();
+    if (allowToggle && wasMine) return;
+
+    const menu = document.createElement("div");
+    menu.className = "desk-ft-overflow-menu desk-ft-open desk-ft-ctx-menu";
+    menu.setAttribute("role", "menu");
+    if (menuKey) menu.dataset.anchorId = menuKey;
+    if (kind !== "dir") {
+      // desk-ft-open-ext kept for e2e / contract that still look for this affordance.
+      mkItem(menu, "desk-ft-open-ext", FT_ICON.openExternal, "Open in default app", async () => {
+        try { await api.open(relPath); } catch (_) { /* */ }
+      });
+    }
+    if (typeof api.reveal === "function") {
+      mkItem(menu, "desk-ft-reveal", FT_ICON.reveal, REVEAL_LABEL, async () => {
+        try { await api.reveal(relPath); } catch (_) { /* */ }
+      });
+    }
+    // Older host without reveal + a folder → nothing to show.
+    if (!menu.childNodes.length) return;
+    document.body.appendChild(menu);
+    ctxMenuEl = menu;
+    ctxMenuAnchorEl = (anchor && anchor.nodeType === 1) ? anchor : null;
+
+    // Flip up / pull left rather than run off the viewport. Body \`zoom\` scales
+    // visual rects; fixed style top/left are layout px — unzoomClientPx converts
+    // (zoom 1 is a no-op). Same maths as openRailMenu in chat.js.
+    const helpers = ftZoomHelpers();
+    const z = helpers.chatZoomFactor();
+    const size = menu.getBoundingClientRect();
+    const gap = 4;
+    const menuH = helpers.unzoomClientPx(size.height, z);
+    const menuW = helpers.unzoomClientPx(size.width, z);
+    const vh = helpers.unzoomClientPx(window.innerHeight, z);
+    const vw = helpers.unzoomClientPx(window.innerWidth, z);
+    let top;
+    let left;
+    if (anchor && typeof anchor.getBoundingClientRect === "function") {
+      const box = anchor.getBoundingClientRect();
+      top = helpers.unzoomClientPx(box.bottom, z) + gap;
+      if (top + menuH > vh - 8) top = Math.max(8, helpers.unzoomClientPx(box.top, z) - menuH - gap);
+      left = helpers.unzoomClientPx(box.right, z) - menuW;
+      left = Math.max(8, Math.min(left, vw - menuW - 8));
+    } else {
+      // Right-click: place at the pointer, still zoom-corrected and clamped.
+      const cx = (anchor && typeof anchor.clientX === "number") ? anchor.clientX : 0;
+      const cy = (anchor && typeof anchor.clientY === "number") ? anchor.clientY : 0;
+      top = helpers.unzoomClientPx(cy, z);
+      left = helpers.unzoomClientPx(cx, z);
+      if (top + menuH > vh - 8) top = Math.max(8, vh - menuH - 8);
+      if (left + menuW > vw - 8) left = Math.max(8, vw - menuW - 8);
+    }
+    menu.style.top = Math.round(top) + "px";
+    menu.style.left = Math.round(left) + "px";
+    const first = menu.querySelector(".desk-ft-overflow-item:not(:disabled)");
+    if (first) first.focus();
+  }
+
+  /** Right-click entry point — same menu as the ⋯ button, pointer-anchored. */
+  function showRowContextMenu(event, relPath, kind) {
+    event.preventDefault();
+    event.stopPropagation();
+    openRowMenu(
+      { clientX: event.clientX, clientY: event.clientY },
+      relPath,
+      kind,
+      { menuKey: "ctx:" + relPath },
+    );
   }
 
   function renderToolbar(relPath) {
@@ -1767,28 +2067,12 @@ export function fileTreePanelBootSource(iconsDir?: string): string {
     menu.className = "desk-ft-overflow-menu";
     menu.setAttribute("role", "menu");
 
-    const mkItem = (cls, icon, label, onClick) => {
-      const item = document.createElement("button");
-      item.type = "button";
-      item.className = "desk-ft-overflow-item" + (cls ? " " + cls : "");
-      item.setAttribute("role", "menuitem");
-      item.innerHTML = icon + "<span>" + escapeHtml(label) + "</span>";
-      item.title = label;
-      item.setAttribute("aria-label", label);
-      item.addEventListener("click", async () => {
-        closeOverflowMenu();
-        await onClick();
-      });
-      menu.appendChild(item);
-      return item;
-    };
-
     // desk-ft-open-ext kept for e2e / contract that still look for this affordance.
-    mkItem("desk-ft-open-ext", FT_ICON.openExternal, "Open in default app", async () => {
+    mkItem(menu, "desk-ft-open-ext", FT_ICON.openExternal, "Open in default app", async () => {
       try { await api.open(relPath); } catch (_) { /* */ }
     });
     if (typeof api.reveal === "function") {
-      mkItem("desk-ft-reveal", FT_ICON.reveal, REVEAL_LABEL, async () => {
+      mkItem(menu, "desk-ft-reveal", FT_ICON.reveal, REVEAL_LABEL, async () => {
         try { await api.reveal(relPath); } catch (_) { /* */ }
       });
     }
@@ -1796,7 +2080,7 @@ export function fileTreePanelBootSource(iconsDir?: string): string {
     moreBtn.addEventListener("click", (event) => {
       event.stopPropagation();
       const open = !menu.classList.contains("desk-ft-open");
-      closeOverflowMenu();
+      closeAllMenus();
       if (open) {
         menu.classList.add("desk-ft-open");
         moreBtn.setAttribute("aria-expanded", "true");
@@ -1807,15 +2091,29 @@ export function fileTreePanelBootSource(iconsDir?: string): string {
     toolbar.appendChild(overflow);
   }
 
-  // Dismiss overflow on outside click / Escape.
+  // Dismiss overflow / row menu on outside click / Escape / resize.
   document.addEventListener("click", (event) => {
     const t = event.target;
     if (t && t.closest && t.closest(".desk-ft-overflow")) return;
-    closeOverflowMenu();
+    if (t && t.closest && t.closest(".desk-ft-ctx-menu")) return;
+    // Anchor click is a TOGGLE — capture would close before the button reopens.
+    if (ctxMenuAnchorEl && ctxMenuAnchorEl.contains && ctxMenuAnchorEl.contains(t)) return;
+    closeAllMenus();
   }, true);
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeOverflowMenu();
+    if (event.key === "Escape") closeAllMenus();
   }, true);
+  window.addEventListener("resize", closeContextMenu);
+  // Right-click outside a tree row closes a lingering context menu.
+  document.addEventListener("contextmenu", (event) => {
+    const t = event.target;
+    if (t && t.closest && t.closest(".desk-ft-row")) return;
+    closeContextMenu();
+  }, true);
+  // The menu is position:fixed, so scrolling the tree slides the rows out from
+  // under it and leaves it pointing at whatever landed there instead. Capture,
+  // because the scroll happens on the inner tree container.
+  document.addEventListener("scroll", closeContextMenu, true);
 
   async function openFileView(relPath, force) {
     // Already open: just activate (unless force-reload after conflict).
@@ -1956,9 +2254,12 @@ export function fileTreePanelBootSource(iconsDir?: string): string {
     node.setAttribute("data-kind", entry.kind);
 
     const depth = entry.relPath.split("/").length - 1;
-    const row = document.createElement("button");
-    row.type = "button";
+    // div + role=button (not a real <button>): the hover ⋯ is a real button and
+    // nesting buttons is invalid HTML. Same shape as .rail-session rows.
+    const row = document.createElement("div");
     row.className = "desk-ft-row";
+    row.setAttribute("role", "button");
+    row.tabIndex = 0;
     row.setAttribute("data-kind", entry.kind);
     // Indent matches rail session indent rhythm (--rail-indent ≈ 16px step).
     const indent = 8 + depth * 12;
@@ -1998,16 +2299,46 @@ export function fileTreePanelBootSource(iconsDir?: string): string {
     name.className = "desk-ft-name";
     name.textContent = entry.name;
 
+    // Hover ⋯ — primary affordance; right-click is a second trigger for the same
+    // menu. Absolute overlay + scrim so long names slide under it (rail pattern).
+    const actions = document.createElement("div");
+    actions.className = "desk-ft-row-actions";
+    const menuBtn = document.createElement("button");
+    menuBtn.type = "button";
+    menuBtn.className = "desk-ft-action-btn desk-ft-menu-btn";
+    menuBtn.innerHTML = FT_ICON.more;
+    menuBtn.title = "More actions";
+    menuBtn.setAttribute("aria-label", "More actions");
+    menuBtn.setAttribute("aria-haspopup", "menu");
+    const menuKey = "row:" + entry.relPath;
+    menuBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      openRowMenu(menuBtn, entry.relPath, entry.kind, { menuKey: menuKey, toggle: true });
+    });
+    // Enter/Space on the ⋯ must not also activate the row under it.
+    menuBtn.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") event.stopPropagation();
+    });
+    actions.appendChild(menuBtn);
+
     row.appendChild(lead);
     row.appendChild(name);
+    row.appendChild(actions);
     node.appendChild(row);
 
+    // Right-click keeps working as a file-tree convention once the menu is shared.
+    row.addEventListener("contextmenu", (event) => {
+      showRowContextMenu(event, entry.relPath, entry.kind);
+    });
+
+    let activateRow;
     if (entry.kind === "dir") {
       const kids = document.createElement("div");
       kids.className = "desk-ft-children";
       node.appendChild(kids);
       let loaded = false;
-      row.addEventListener("click", async () => {
+      activateRow = async () => {
         const open = node.classList.toggle("desk-ft-open");
         lead.innerHTML = twistGlyph(open);
         if (open && !loaded) {
@@ -2015,12 +2346,25 @@ export function fileTreePanelBootSource(iconsDir?: string): string {
           await fillDir(kids, entry.relPath);
           applyFilter(body);
         }
-      });
+      };
     } else {
-      row.addEventListener("click", async () => {
+      activateRow = async () => {
         await openFileView(entry.relPath);
-      });
+      };
     }
+
+    row.addEventListener("click", async (event) => {
+      // Clicks on the ⋯ (or future action buttons) must not open the file/folder.
+      if (event.target && event.target.closest && event.target.closest(".desk-ft-row-actions")) return;
+      await activateRow();
+    });
+    row.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      // Only when the ROW itself has focus — the ⋯ is a real button.
+      if (event.target !== row) return;
+      event.preventDefault();
+      void activateRow();
+    });
     return node;
   }
 

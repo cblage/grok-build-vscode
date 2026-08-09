@@ -137,14 +137,17 @@ and the update retries once if a lingering lock still slips through.
 `maybeUpdateCliOnUpgrade` retains the normal session-start trigger: once per
 activation it compares `CLI_UPDATE_VERSION_KEY`, updating only after an extension
 version change; a fresh install records its baseline without updating. After that,
-every session start reads `grok --version`. On Windows, `maybePinBrokenCli` uses the
+every session start reads `grok --version` through `probeVersionOutput` (one short
+retry when the first read is empty/unparseable). On Windows, `maybePinBrokenCli` uses the
 bounded `isStdioBrokenGrokVersion` check to move 0.2.61–0.2.70 to the current
 `GROK_STDIO_DOWNGRADE_TARGET` before ACP spawn. `GROK_REQUIRED_VERSION` is the
-cross-platform ACP behavior floor and the current recovery target. A CLI below the floor, or whose version cannot be
-verified, still starts in Agent/Auto accept, but that `Session` carries
-`planModeAvailable:false`: the host emits `planModeAvailability`, the picker disables
-only Plan and shows the exact reason, and `setMode` rejects stale or forged Plan
-requests. Agent-initiated and restored Plan transitions raise the client safety gate.
+cross-platform ACP behavior floor and the current recovery target.
+`decidePlanModeAvailability` is fail-closed: a parseable CLI below the floor latches
+Plan off (`planModeVersionVerified:true`); an unreadable probe also sets
+`planModeAvailable:false` but stays re-checkable — the picker keeps Plan clickable
+(`planModeAvailability.recheckable`) and `setMode` re-probes via
+`recheckPlanModeAvailability` instead of forcing a restart. A verified-old CLI still
+hard-disables the Plan row and rejects forged Plan requests. Agent-initiated and restored Plan transitions raise the client safety gate.
 A live untrusted planning turn is cancelled, and the gate stays raised until both
 that `session/prompt` settles and `session/set_mode(default)` confirms Agent; a
 failure or stalled recovery stays gated and is surfaced explicitly.
@@ -252,7 +255,7 @@ The full pedagogical write-up lives in
 | [src/mention.ts](../src/mention.ts) | The composer's `@` file popover, host half (pure) — `filterMentionFiles` ranking, `buildExcludeGlob` (files.exclude + search.exclude → one findFiles exclude), `orderMentionIndex`, `clampMentionIndexLimit` (`grok.mentionIndexLimit`) and `mergeMentionEntries` (open tabs layered over the capped findFiles snapshot, #69); the webview half (`getMentionQuery`/`applyMentionPick`) lives in webview-helpers.js |
 | [src/grok-config.ts](../src/grok-config.ts) | Reads permission/sandbox selection config, filters repository `.env` control-plane overrides, and discovers custom profiles (pure) |
 | [src/mode-prefs.ts](../src/mode-prefs.ts) | Remembered-mode policy (pure) — persist Agent/Auto-accept (never Plan), apply on new sessions only |
-| [src/view-move.ts](../src/view-move.ts) | View placement (pure) — maps the gear-menu "Move view" destinations to the extension-owned per-location view containers targeted via `vscode.moveViews` (view default-homes in the Secondary Side Bar) |
+| [src/view-move.ts](../src/view-move.ts) | View placement (pure) — the view default-homes in the Secondary Side Bar, which Cursor refuses to create. Decides the one first-run correction into the activity-bar container, and which move mechanism applies: `vscode.moveViews` names a CONTAINER (a host may render ours anywhere), the host's own picker names a LOCATION and is the only route to a dock the host draws itself |
 | [src/sessions.ts](../src/sessions.ts) | Disk-driven session listing/delete + name overrides (pure) — `indexSessions` (stat-only ordering), `readSessionEntries` (windowed read), `listSessions` (whole-list), `clearSessions`, `discoverRepos` (the repo catalog behind the remote switcher) |
 | [src/file-ref.ts](../src/file-ref.ts) | Open-file ref parsing + large-file inline-read guard (pure) |
 | [src/file-upload.ts](../src/file-upload.ts) | Pure remote-document upload validation, owned staging-path checks, and session/fork lifetime accounting |
@@ -479,9 +482,15 @@ the steady-state fix.
   `/imagine-video` write a file into the session dir and report its *path* as
   JSON-in-text on the completed tool result. The host parses the path, classifies
   image-vs-video by extension, realpaths it beneath the active session's
-  `images/` or `videos/` root, and only then serves it via `asWebviewUri`. This
-  rejects arbitrary-host paths and symlink escapes while still streaming a
-  multi-MB video. See
+  `images/` or `videos/` root, and only then serves it via `asWebviewUri`
+  (streamed from disk) so even a multi-MB video renders. This fork keeps that
+  containment where upstream relaxed it in 3.2.0, so arbitrary-host paths and
+  symlink escapes are rejected rather than merely refused by name. A host-local
+  `showInFolder` action replaces the open action for BOTH generated images and
+  videos on a host that advertises the capability (the desktop app, whose media
+  handler it owns), and reuses the same path authorization as `openFile`. An
+  editor host keeps `openFile` — a tab is somewhere new to put the file, whereas
+  the desktop already plays clips inline and enlarges images in place. See
   [research/image-generation.md](../research/image-generation.md).
 - **Math renders via vendored MathJax (SVG), extracted before HTML-escaping.** Grok
   answers with TeX (inline `\(…\)`, display `\[…\]`, `\begin{pmatrix}` matrices).

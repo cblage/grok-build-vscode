@@ -125,6 +125,30 @@ export interface RepoArchiveChoice {
 }
 export type RepoArchives = Record<string, RepoArchiveChoice>;
 
+/**
+ * Project-folder colour ids the rail understands. Empty string is "none"
+ * (default): the host still puts `color: ""` on every catalog row so the client
+ * can tell "no colour" from "this host cannot colour" without a version check.
+ * Non-empty values map 1:1 to CSS `--repo-color-*` custom properties.
+ */
+export const REPO_COLOR_IDS = ["blue", "teal", "green", "amber", "coral", "purple"] as const;
+export type RepoColorId = (typeof REPO_COLOR_IDS)[number];
+/** Wire value: one of {@link REPO_COLOR_IDS}, or `""` for none. */
+export type RepoColor = RepoColorId | "";
+
+export function isRepoColor(value: unknown): value is RepoColor {
+  if (value === "") return true;
+  return typeof value === "string" && (REPO_COLOR_IDS as readonly string[]).includes(value);
+}
+
+/** Stored folder colour for one project. Absent entry ≡ none; the wire still
+ *  emits `color: ""` so capability detection stays field-presence based. */
+export interface RepoColorChoice {
+  cwd: string;
+  color: RepoColorId;
+}
+export type RepoColors = Record<string, RepoColorChoice>;
+
 export interface RepoListEntry {
   cwd: string;
   label: string;
@@ -144,6 +168,15 @@ export interface RepoListEntry {
    */
   archived?: boolean;
   archivedAt?: number;
+  /**
+   * Folder-icon colour id flattened for the wire. **Present when the host
+   * supports project colours** — even when unset (`""`), which is how the client
+   * tells "no colour" from "this host cannot colour" without a version number
+   * (same capability rule as {@link RepoListEntry.archived}). One of
+   * {@link REPO_COLOR_IDS}, or empty for none. Ordering in {@link discoverRepos}
+   * deliberately ignores this field.
+   */
+  color?: RepoColor;
 }
 
 /** Move a renamed session's `customName` from one id to another and drop the source entry. Used when
@@ -242,6 +275,44 @@ export function isSessionDirChild(
   return platform === "win32"
     ? parent.toLowerCase() === b.toLowerCase()
     : parent === b;
+}
+
+/** Injectable realpath for layout-identity checks (tests simulate junctions). */
+export type PathRealpathFn = (p: string) => string;
+
+/**
+ * True when `child`'s **canonical** form is a direct child of the **canonical**
+ * `parent` **and** keeps the same leaf basename as the given `child` path.
+ *
+ * Fences the class of unsafe shapes where a layout directory is a junction or
+ * symlink onto another directory of the same kind: leaf-only is not enough
+ * (same name relocated under a different parent), and parent containment alone
+ * is not enough (sibling under the same parent with a different leaf). A
+ * symlinked ancestor that remaps parent and child together still passes.
+ * Case-insensitive leaf compare on win32 for case-aliases of the same segment.
+ */
+export function keepsCanonicalDirectChildIdentity(
+  child: string,
+  parent: string,
+  realpath: PathRealpathFn,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  try {
+    const givenLeaf = path.basename(path.resolve(child));
+    if (!givenLeaf) return false;
+    const realChild = path.normalize(realpath(child));
+    const realLeaf = path.basename(realChild);
+    if (!realLeaf) return false;
+    const leafOk =
+      platform === "win32"
+        ? givenLeaf.toLowerCase() === realLeaf.toLowerCase()
+        : givenLeaf === realLeaf;
+    if (!leafOk) return false;
+    const realParent = path.normalize(realpath(parent));
+    return isSessionDirChild(realParent, realChild, platform);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -393,6 +464,9 @@ export interface DiscoverReposDeps {
   /** Remote-rail archive choices. Reported on every row and acted on by nobody
    *  here — see RepoListEntry.archived. */
   archives?: RepoArchives;
+  /** Project folder colours. Always flattened onto every row as `color` (empty
+   *  string when unset) so the client can capability-probe without a version. */
+  colors?: RepoColors;
   tmpDir: string;
   platform?: NodeJS.Platform;
   /** Host-known roots that remain selectable before Grok creates a catalog.
@@ -428,6 +502,12 @@ export function discoverRepos(deps: DiscoverReposDeps): RepoListEntry[] {
     const choice = deps.archives?.[key];
     return { archived: !!choice?.archived, archivedAt: choice?.at ?? 0 };
   };
+  // Always emit `color` (possibly "") — field presence is the capability signal.
+  // Stored choices are non-empty palette ids; anything else collapses to none.
+  const colorOf = (key: string): RepoColor => {
+    const raw = deps.colors?.[key]?.color;
+    return raw && (REPO_COLOR_IDS as readonly string[]).includes(raw) ? raw : "";
+  };
   for (const name of encoded) {
     let cwd = "";
     try { cwd = decodeURIComponent(name).trim(); } catch { continue; }
@@ -459,6 +539,7 @@ export function discoverRepos(deps: DiscoverReposDeps): RepoListEntry[] {
       pinnedAt: pin?.pinnedAt,
       updatedAt,
       worktreeLabel: deps.worktreeLabels?.get(key),
+      color: colorOf(key),
       ...archiveOf(key),
     });
   }
@@ -478,6 +559,7 @@ export function discoverRepos(deps: DiscoverReposDeps): RepoListEntry[] {
       pinnedAt: pin?.pinnedAt,
       updatedAt: 0,
       worktreeLabel: deps.worktreeLabels?.get(key),
+      color: colorOf(key),
       ...archiveOf(key),
     });
   }
@@ -501,6 +583,7 @@ export function discoverRepos(deps: DiscoverReposDeps): RepoListEntry[] {
       pinnedAt: pin.pinnedAt,
       updatedAt: 0,
       worktreeLabel: deps.worktreeLabels?.get(key),
+      color: colorOf(key),
       ...archiveOf(key),
     });
   }
@@ -562,11 +645,16 @@ function buildEntry(
   cwd: string,
   overrides: SessionMetaOverrides,
   fallbackNow: number,
+  /** Transcript mtime — last time the conversation actually MOVED. Preferred
+   *  over `updated_at`, which the CLI restamps on a mere open. */
+  activityAt?: number,
 ): SessionListEntry {
   const id = (raw?.info?.id as string) ?? dirName;
   const sessCwd = (raw?.info?.cwd as string) ?? cwd;
   const rawSummary = typeof raw?.session_summary === "string" ? raw.session_summary : "";
-  const updatedAt = parseTimestamp(raw?.updated_at, fallbackNow);
+  const updatedAt = typeof activityAt === "number" && activityAt > 0
+    ? activityAt
+    : parseTimestamp(raw?.updated_at, fallbackNow);
   const createdAt = parseTimestamp(raw?.created_at, updatedAt);
   const numMessages = typeof raw?.num_messages === "number" ? raw.num_messages : 0;
   const modelId = typeof raw?.current_model_id === "string" ? raw.current_model_id : undefined;
@@ -699,14 +787,29 @@ export function indexSessions(deps: IndexDeps): SessionIndexEntry[] {
       if (!isValidSessionId(name)) continue;
       const resolvedSessionDir = path.join(dir, name);
       if (!isSessionDirChild(dir, resolvedSessionDir, platform)) continue;
-      const summaryPath = path.join(resolvedSessionDir, "summary.json");
       let st: { mtimeMs: number };
       try {
-        // A stat on summary.json doubles as the "is this a real session dir?" check: a stray file
-        // entry (or a dir without summary.json) makes the join non-existent and statSync throws.
-        st = fs.statSync(summaryPath);
+        // Order by the TRANSCRIPT, not by summary.json. Opening a conversation
+        // rewrites summary.json — the CLI rebuilds system_prompt.txt and
+        // prompt_context.json and restamps `updated_at` — without adding a
+        // single message, so merely visiting a conversation promoted it to the
+        // top of Recent and of its project. Measured against a real
+        // 1592-session store: 46 were sitting above their true activity for
+        // exactly that reason, which is why it read as intermittent.
+        // `events.jsonl` only moves when the conversation does.
+        //
+        // It also carries the "is this a real session dir?" check the
+        // summary.json stat used to provide: a stray file entry makes the join
+        // non-existent and statSync throws.
+        st = fs.statSync(path.join(resolvedSessionDir, "events.jsonl"));
       } catch {
-        continue;
+        try {
+          // No transcript yet — created but never spoken to. Fall back so it
+          // still lists, and keep the dir-validity check for that case.
+          st = fs.statSync(path.join(resolvedSessionDir, "summary.json"));
+        } catch {
+          continue;
+        }
       }
       const prev = byId.get(name);
       if (prev === undefined || st.mtimeMs > prev) byId.set(name, st.mtimeMs);
@@ -814,7 +917,15 @@ export function readSessionEntries(deps: ReadEntriesDeps): SessionListEntry[] {
       log?.(`[sessions] could not read summary.json for ${id}: ${(e as Error).message}`);
       continue;
     }
-    out.push(buildEntry(id, raw, cwd, overrides, now));
+    // Last real activity, for the same reason indexSessions stats it: `updated_at`
+    // inside summary.json is restamped by merely OPENING the conversation, so
+    // sorting on it moved a session you only glanced at to the top. Undefined
+    // when there is no transcript yet, and buildEntry then keeps `updated_at`.
+    let activityAt: number | undefined;
+    try {
+      activityAt = fs.statSync(path.join(resolvedSessionDir, "events.jsonl")).mtimeMs;
+    } catch { /* no transcript yet — fall back to the recorded stamp */ }
+    out.push(buildEntry(id, raw, cwd, overrides, now, activityAt));
   }
   return out;
 }

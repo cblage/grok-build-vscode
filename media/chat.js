@@ -405,6 +405,9 @@
     pendingDiffByToolCallId: new Map(),
     toolItemsByToolCallId: new Map(),
     toolFailuresById: new Map(), // toolCallId → error text, so a single-call group carries it onto the flat
+    // Media-gen toolCallIds (isMediaGenToolCall on the initial tool_call). The
+    // completed/failed update often has title:null, so ZDR hints need this set.
+    mediaGenCallIds: new Set(),
 
     agentRenderScheduled: false,
     thoughtBuffer: "",
@@ -449,6 +452,25 @@
     // until it says, so a control that needs one is withheld rather than offered
     // and then refused.
     hostCaps: {},
+    // Remote file browse (list + open + optional edit). Capability-gated; never
+    // mounted in the local VS Code / desktop webview even if the host flag is
+    // true — those hosts already have a real explorer. Phone UI stays collapsed
+    // by default (screen space is scarce; the rail is already a drawer).
+    filesBrowse: {
+      open: false,
+      relPath: "",
+      entries: [],
+      truncated: false,
+      error: "",
+      loading: false,
+      // In-page viewer (phone has no host editor to hand off to).
+      // edit fields when host advertises editProjectFiles + text kind:
+      // stamp, absPath, editing, draft, dirty, saveGen, conflict, notice
+      viewer: null,
+      listGen: 0,
+      readGen: 0,
+      writeGen: 0,
+    },
     railCollapsed: {},
     /** The project the live conversation was in at the last render. Only used to
      *  notice it MOVED, so a fold can be corrected once on arrival instead of
@@ -472,6 +494,22 @@
     // indistinguishable from a project that genuinely has no conversations, and
     // the two answer "when was this last worked in" very differently.
     railSelectedRowsKnown: false,
+    // Renderer-local only. Drives the optimistic rail highlight + loading veil
+    // while a resume/new click is in flight. NEVER written into activeSessionId
+    // (that stays host-confirmed), never remembered, never used by rename /
+    // delete / send / the session header. See railDisplayTarget.
+    railTransition: null,
+    // "We have asked the host to move and it has not told us where it landed."
+    // Outlives railTransition deliberately — the watchdog and a stray error
+    // tear that down without learning anything about the host. Gates the
+    // session actions that carry no id. See railIdlessActionsAllowed.
+    railIdentityUnknown: false,
+    // WHAT we are waiting to hear about, kept alive past the watchdog. Giving up
+    // on the optimistic paint says nothing about where the host went, and a
+    // superseded resume stays queued host-side and can land later — so without
+    // this, a stale confirmation for an abandoned click reads as authoritative.
+    // `{ kind: "resume", sessionId }` or `{ kind: "new", previousSessionId }`.
+    railExpectedIdentity: null,
     activeSessionId: null,
     // The host sends this independently of history pagination. The latch is
     // also the compatibility gate for the new inline rename affordance.
@@ -549,6 +587,8 @@
     startingPhase: false,
     planModeAvailable: true,
     planModeUnavailableReason: "",
+    // Unverified version probe: Plan row stays clickable so a pick re-probes.
+    planModeRecheckable: false,
     // Extension version (from initialState) — shown in the gear → About panel.
     extVersion: "",
     // Which gear-popover view is showing ("main"|"model"|"about"|"config"), so an
@@ -694,6 +734,8 @@
     // Lucide folder-closed / folder-open — project expand/collapse (replaces chevron).
     folderClosed: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/><path d="M2 10h20"/></svg>`,
     folderOpen: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>`,
+    // Palette glyph for "Set color" — stroke-only so it inherits menu icon tint.
+    palette: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="13.5" cy="6.5" r="0.5" fill="currentColor"/><circle cx="17.5" cy="10.5" r="0.5" fill="currentColor"/><circle cx="8.5" cy="7.5" r="0.5" fill="currentColor"/><circle cx="6.5" cy="12.5" r="0.5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg>`,
     pin: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="m5 17 2-7V5l-2-2h14l-2 2v5l2 7Z"/></svg>`,
     // Same Lucide pin path with a filled head (outline stroke kept for the needle).
     pinFilled: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="m5 17 2-7V5l-2-2h14l-2 2v5l2 7Z" fill="currentColor"/></svg>`,
@@ -896,11 +938,26 @@
     return `${h}:${m.toString().padStart(2, "0")} ${ampm}`;
   }
 
+  // The title carries the mode name because the label beside the glyph is the
+  // first thing dropped in a narrow composer — take the id from the caller so
+  // the tooltip can never name a different mode than the icon is showing.
+  function modeButtonTitle(modeId) {
+    // modeMeta() rather than upstream's MODE_META constant: this fork computes
+    // the yolo row's disabled state per call, so the labels have to be built
+    // fresh rather than frozen at module load.
+    const modes = modeMeta();
+    const meta = modes[modeId] || modes.agent;
+    if (state.busyLocked) return `${meta.label} — available once the session is ready`;
+    if (!state.planModeAvailable) return `${meta.label} — Pick mode — ${state.planModeUnavailableReason}`;
+    return `${meta.label} — Pick mode`;
+  }
+
   function updateModeBtn(modeId) {
     const meta = modeMeta()[modeId] || modeMeta().agent;
     modeBtn.innerHTML = `${meta.icon}<span class="btn-label">${escapeHtml(meta.label)}</span>`;
     modeBtn.classList.toggle("plan-active", modeId === "plan");
     modeBtn.classList.toggle("yolo-active", modeId === "yolo");
+    modeBtn.title = modeButtonTitle(modeId);
   }
 
   function updateSandboxBtn() {
@@ -960,7 +1017,7 @@
 
   // ---------- markdown ----------
 
-  const { looksLikeFileRef, formatRelativeTime, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection } = globalThis.GrokWebviewHelpers;
+  const { looksLikeFileRef, formatRelativeTime, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx } = globalThis.GrokWebviewHelpers;
 
   function escapeAttr(s) {
     return String(s == null ? "" : s)
@@ -1819,27 +1876,32 @@
   }
 
   function positionPopover(popover, btn) {
+    // getBoundingClientRect is visual px; style offsets under body `zoom` are
+    // layout px — unzoomClientPx converts (zoom 1 is a no-op).
+    const z = chatZoomFactor();
     const composerRect = popover.parentElement.getBoundingClientRect();
     const btnRect = btn.getBoundingClientRect();
     popover.style.top = "auto";
-    popover.style.bottom = (composerRect.bottom - btnRect.top + 4) + "px";
-    popover.style.left = (btnRect.left - composerRect.left) + "px";
+    popover.style.bottom = (unzoomClientPx(composerRect.bottom - btnRect.top, z) + 4) + "px";
+    popover.style.left = unzoomClientPx(btnRect.left - composerRect.left, z) + "px";
     popover.style.right = "auto";
     requestAnimationFrame(() => {
-      const pw = popover.getBoundingClientRect().width;
-      const leftOffset = btnRect.left - composerRect.left;
-      if (leftOffset + pw > composerRect.width) {
-        popover.style.left = Math.max(0, composerRect.width - pw) + "px";
+      const pw = unzoomClientPx(popover.getBoundingClientRect().width, z);
+      const leftOffset = unzoomClientPx(btnRect.left - composerRect.left, z);
+      const parentW = unzoomClientPx(composerRect.width, z);
+      if (leftOffset + pw > parentW) {
+        popover.style.left = Math.max(0, parentW - pw) + "px";
       }
     });
   }
 
   function positionDropdownPopover(popover, btn) {
+    const z = chatZoomFactor();
     const parentRect = popover.parentElement.getBoundingClientRect();
     const btnRect = btn.getBoundingClientRect();
     const EDGE = 6; // gap kept from the panel's right edge (and minimum gap on the left)
     popover.style.bottom = "auto";
-    popover.style.top = (btnRect.bottom - parentRect.top + 4) + "px";
+    popover.style.top = (unzoomClientPx(btnRect.bottom - parentRect.top, z) + 4) + "px";
     // Right-align to the panel edge (respecting padding) and grow leftward. The width
     // isn't settled when it opens — session rows stream in asynchronously (requestSessions
     // → "sessions" message → render) and widen it from min-width toward max-width — so a
@@ -1850,24 +1912,26 @@
     // overflowing the LEFT edge in a narrow panel — common-case sizing, not extreme.
     popover.style.left = "auto";
     popover.style.right = EDGE + "px";
-    const available = Math.max(0, parentRect.width - EDGE * 2);
+    const available = Math.max(0, unzoomClientPx(parentRect.width, z) - EDGE * 2);
     popover.style.maxWidth = Math.min(360, available) + "px";
     popover.style.minWidth = Math.min(280, available) + "px";
   }
 
   function positionRepoPopover() {
+    const z = chatZoomFactor();
     const parentRect = repoPopover.parentElement.getBoundingClientRect();
     const btnRect = repoBtn.getBoundingClientRect();
     const EDGE = 6;
-    const available = Math.max(0, parentRect.width - EDGE * 2);
+    const parentW = unzoomClientPx(parentRect.width, z);
+    const available = Math.max(0, parentW - EDGE * 2);
     const maxWidth = Math.min(360, available);
-    const chipLeft = btnRect.left - parentRect.left;
+    const chipLeft = unzoomClientPx(btnRect.left - parentRect.left, z);
     const left = Math.min(
       Math.max(EDGE, chipLeft),
-      Math.max(EDGE, parentRect.width - EDGE - maxWidth),
+      Math.max(EDGE, parentW - EDGE - maxWidth),
     );
     repoPopover.style.bottom = "auto";
-    repoPopover.style.top = (btnRect.bottom - parentRect.top + 4) + "px";
+    repoPopover.style.top = (unzoomClientPx(btnRect.bottom - parentRect.top, z) + 4) + "px";
     repoPopover.style.left = left + "px";
     repoPopover.style.right = "auto";
     repoPopover.style.maxWidth = maxWidth + "px";
@@ -2482,6 +2546,14 @@
         vscode.postMessage({ type: "showLogs" });
         closePopovers();
       });
+      // Unpackaged desktop: gear is the discoverable DevTools door when the
+      // Windows menu bar is auto-hidden (F12 / Ctrl+Shift+I also work).
+      if (state.hostCaps && state.hostCaps.toggleDevTools === true) {
+        addGearItem("<span>Toggle Developer Tools</span>", () => {
+          vscode.postMessage({ type: "toggleDevTools" });
+          closePopovers();
+        });
+      }
     } else {
       addGearInfo("<span>Host config is managed on the desk</span>");
     }
@@ -2520,7 +2592,7 @@
 
     let statusHtml, canUpdate = false;
     if (u.checking) {
-      statusHtml = '<span class="loading-dots">Checking for updates</span>';
+      statusHtml = `<span>Checking for updates</span>${BLINK_DOTS}`;
     } else if (blocked) {
       statusHtml = '<span class="popover-ver">On the supported version</span>';
     } else if (u.error) {
@@ -2559,7 +2631,7 @@
     fine.className = "popover-fineprint";
     fine.textContent =
       "Unofficial · community-built · MIT | " +
-      "A VS Code UI for xAI’s Grok Build CLI - not affiliated with or endorsed by xAI. " +
+      "A VS Code UI for SpaceXAI’s Grok Build CLI - not affiliated with or endorsed by SpaceXAI (formerly xAI). " +
       "Grok, Grok Build, and xAI are trademarks of xAI; this project uses those names only to describe what it’s compatible with.";
     gearPopover.appendChild(fine);
 
@@ -2758,6 +2830,12 @@
         vscode.postMessage({ type: "showLogs" });
         closePopovers();
       });
+      if (state.hostCaps && state.hostCaps.toggleDevTools === true) {
+        addGearItem("<span>Toggle Developer Tools</span>", () => {
+          vscode.postMessage({ type: "toggleDevTools" });
+          closePopovers();
+        });
+      }
       // Link into VS Code settings (owner of extension settings). Desktop's
       // openSettings is a stub — hide when relocateView is already false AND
       // showOutput is false (desktop host signature via capabilities).
@@ -2771,20 +2849,26 @@
         });
       }
     }
-    // Move view: same polarity as before — missing flags still show; only
-    // explicit false hides (desktop has no view containers).
-    if (!(state.hostCaps && state.hostCaps.relocateView === false)) {
+    // Move view: shown ONLY where the editor refused our secondary-side-bar
+    // container, and then as a single item.
+    //
+    // Everywhere else the section is gone. It existed to work around Cursor
+    // hiding the built-in "Move To" from a view's context menu — but an editor
+    // that gives us the secondary side bar also has that menu, so we were
+    // duplicating a control the editor already provides, in a worse form: our
+    // items name CONTAINERS, and a container cannot reach a dock the editor
+    // draws for itself.
+    //
+    // Where it does show, it opens the editor's OWN picker, which moves by
+    // location and can therefore reach the secondary side bar that editor would
+    // not give us directly. Hidden in the browser client regardless — `moveView`
+    // is host-local, so the relay drops it.
+    const noSecondarySideBar = !!(state.hostCaps && state.hostCaps.secondarySideBar === false);
+    const canRelocate = !(state.hostCaps && state.hostCaps.relocateView === false);
+    if (!IS_REMOTE && noSecondarySideBar && canRelocate) {
       addSection("Move view");
-      addGearItem(`<span class="popover-icon-label">${ICON.panelRight} To Secondary Side Bar</span>`, () => {
-        vscode.postMessage({ type: "moveView", location: "auxiliarybar" });
-        closePopovers();
-      });
-      addGearItem(`<span class="popover-icon-label">${ICON.panelLeft} To Primary Side Bar</span>`, () => {
-        vscode.postMessage({ type: "moveView", location: "sidebar" });
-        closePopovers();
-      });
-      addGearItem(`<span class="popover-icon-label">${ICON.panelBottom} To Panel</span>`, () => {
-        vscode.postMessage({ type: "moveView", location: "panel" });
+      addGearItem(`<span class="popover-icon-label">${ICON.panelRight} Move view…</span>`, () => {
+        vscode.postMessage({ type: "moveView", location: "pick" });
         closePopovers();
       });
     }
@@ -2831,19 +2915,23 @@
   function positionGearPopover(btn) {
     const anchor = btn || activeGearButton();
     if (anchor && anchor.id === "rail-gear-btn") {
+      const z = chatZoomFactor();
       const rect = anchor.getBoundingClientRect();
+      // Fixed under body zoom: client rects are visual; style left/bottom are layout.
+      const vw = unzoomClientPx(window.innerWidth, z);
+      const vh = unzoomClientPx(window.innerHeight, z);
       gearPopover.style.position = "fixed";
-      gearPopover.style.left = Math.min(window.innerWidth - GEAR_POPOVER_WIDTH, Math.max(8, rect.right + 6)) + "px";
-      gearPopover.style.bottom = Math.max(8, window.innerHeight - rect.bottom) + "px";
+      gearPopover.style.left = Math.min(vw - GEAR_POPOVER_WIDTH, Math.max(8, unzoomClientPx(rect.right, z) + 6)) + "px";
+      gearPopover.style.bottom = Math.max(8, vh - unzoomClientPx(rect.bottom, z)) + "px";
       gearPopover.style.top = "auto";
       gearPopover.style.right = "auto";
-      gearPopover.style.maxHeight = Math.min(420, window.innerHeight - 24) + "px";
+      gearPopover.style.maxHeight = Math.min(420, vh - 24) + "px";
       // Fixed positioning with `right: auto` leaves the width shrink-to-fit and
       // uncapped, so the Version & about panel's long strings stretched it most
       // of the way across the window. The composer path is bounded by the
       // composer; this one has to say so. Same number the left-clamp above
       // reserves, so the popover can never be pushed off-screen.
-      gearPopover.style.maxWidth = Math.min(GEAR_POPOVER_WIDTH, window.innerWidth - 16) + "px";
+      gearPopover.style.maxWidth = Math.min(GEAR_POPOVER_WIDTH, vw - 16) + "px";
       return;
     }
     gearPopover.style.position = "";
@@ -3022,6 +3110,9 @@
   const RAIL_WIDTH_KEY = "rail-width";
   const RAIL_WIDTH_MIN = 180;
   const RAIL_CHAT_MIN = 360;
+  // Shared conversation floor when both side panels compete for space. Matches
+  // the rail's own floor so distribute and solo clamp agree on chat room.
+  const SIDE_PANELS_CHAT_MIN = RAIL_CHAT_MIN;
 
   function clampRailWidth(px) {
     const total = window.innerWidth || 1200;
@@ -3039,6 +3130,100 @@
     if (persist) { try { localStorage.setItem(RAIL_WIDTH_KEY, String(w)); } catch (_) { /* */ } }
     return w;
   }
+
+  /** Preferred (drag-saved) width; never the painted width after a shrink. */
+  function preferredWidthFromStorage(key, fallback) {
+    try {
+      const s = localStorage.getItem(key);
+      if (s != null && s !== "") {
+        const n = Math.round(Number(s));
+        if (Number.isFinite(n) && n > 0) return n;
+      }
+    } catch (_) { /* */ }
+    return fallback;
+  }
+
+  /**
+   * Extra side panels (desktop file panel) register here so a window-narrow
+   * reclamp can share the deficit without chat.js naming desktop-only ids.
+   * Provider: { id, min, maxFrac?, isOpen(), preferredWidth(), applyWidth(px) }.
+   */
+  const sidePanelProviders = [];
+  window.__grokRegisterSidePanel = function registerSidePanel(provider) {
+    if (!provider || !provider.id) return;
+    // Replace same id on re-inject (panel boot tears down and remounts).
+    const i = sidePanelProviders.findIndex((p) => p.id === provider.id);
+    if (i >= 0) sidePanelProviders[i] = provider;
+    else sidePanelProviders.push(provider);
+  };
+
+  /**
+   * Window-narrow reclamp: shrink open side panels proportionally so the chat
+   * keeps a floor. Uses stored drag widths (not painted) so growing the window
+   * restores what the user set. Does not persist the temporary shrink.
+   * Exposed as window.__grokReclampSidePanels so a desktop panel boot script
+   * can share one path instead of racing a second independent clamp.
+   */
+  function reclampSidePanels() {
+    const rail = railMount();
+    const railOpen = !!(
+      rail &&
+      !rail.hidden &&
+      !document.body.classList.contains("desk-rail-collapsed")
+    );
+    const total = window.innerWidth || 1200;
+    const railMax = Math.max(RAIL_WIDTH_MIN, Math.floor(total * 0.5));
+    let preferredRail = preferredWidthFromStorage(
+      RAIL_WIDTH_KEY,
+      rail ? (rail.getBoundingClientRect().width || 260) : 260,
+    );
+    preferredRail = Math.min(railMax, Math.max(RAIL_WIDTH_MIN, preferredRail));
+
+    const panels = [
+      { id: "rail", preferred: preferredRail, min: RAIL_WIDTH_MIN, open: railOpen },
+    ];
+    for (const p of sidePanelProviders) {
+      try {
+        const min = Math.max(0, Math.round(Number(p.min) || 0));
+        const maxFrac = Number(p.maxFrac);
+        const max = Number.isFinite(maxFrac) && maxFrac > 0
+          ? Math.max(min, Math.floor(total * maxFrac))
+          : total;
+        let preferred = Math.max(min, Math.round(Number(p.preferredWidth && p.preferredWidth()) || min));
+        preferred = Math.min(max, preferred);
+        panels.push({
+          id: p.id,
+          preferred,
+          min,
+          open: !!(p.isOpen && p.isOpen()),
+        });
+      } catch (_) { /* provider best-effort */ }
+    }
+    if (!panels.some((p) => p.open)) return;
+
+    const dist = typeof distributeSidePanelWidths === "function"
+      ? distributeSidePanelWidths({
+          available: total,
+          chatMin: SIDE_PANELS_CHAT_MIN,
+          panels,
+        })
+      : null;
+    if (!dist) {
+      if (railOpen) applyRailWidth(preferredRail, false);
+      return;
+    }
+    if (railOpen && dist.rail > 0) {
+      // Set the var directly: applyRailWidth's solo clamp does not know about
+      // sibling panels and can re-expand the rail past the coordinated share.
+      document.documentElement.style.setProperty("--rail-width", Math.round(dist.rail) + "px");
+    }
+    for (const p of sidePanelProviders) {
+      try {
+        if (dist[p.id] > 0 && p.applyWidth) p.applyWidth(dist[p.id]);
+      } catch (_) { /* */ }
+    }
+  }
+  window.__grokReclampSidePanels = reclampSidePanels;
 
   let railResizerWired = false;
   function ensureRailResizer() {
@@ -3097,11 +3282,11 @@
       };
       handle.addEventListener("pointerup", end);
       handle.addEventListener("pointercancel", end);
-      // Re-clamp so shrinking the window cannot leave the rail overgrown.
-      window.addEventListener("resize", () => {
-        const cur = rail.getBoundingClientRect().width;
-        if (cur > 0) applyRailWidth(cur, false);
-      });
+      // Re-clamp so shrinking the window cannot leave the rail overgrown —
+      // and so the deficit is shared with the file panel when both are open.
+      // Full-screen video fires resize mid-transition with a meaningless width;
+      // wireFullscreenSafeReclamp skips those and re-clamps once on exit.
+      wireFullscreenSafeReclamp(() => { reclampSidePanels(); });
     }
     return handle;
   }
@@ -3143,8 +3328,11 @@
     for (const [id, meta] of Object.entries(metas)) {
       const el = document.createElement("div");
       const active = id === state.currentModeId;
+      // Verified-old CLI: hard-disable Plan. Unverified probe: keep it clickable
+      // so the host re-checks on pick instead of forcing a session restart (#105).
       const planUnavailable = id === "plan" && !state.planModeAvailable;
-      const disabled = !!meta.disabled || planUnavailable;
+      const planRecheckable = planUnavailable && state.planModeRecheckable;
+      const disabled = !!meta.disabled || (planUnavailable && !planRecheckable);
       const disabledNote = planUnavailable ? state.planModeUnavailableReason : meta.disabledNote;
       el.className = "toolbar-popover-item mode-popover-item" +
         (active ? " active" : "") +
@@ -3849,7 +4037,8 @@
 
   const RAIL_PREVIEW = 3;      // rows per list before "Show more"
   const RAIL_EXPANDED = 20;    // rows after it — the rail is a jump list, not history
-  // Synthetic expand key for the RECENT group (shares railExpanded with repos).
+  const RAIL_RECENT_EXPANDED = 10; // RECENT is a shorter cross-project shortcut list
+  // Synthetic expand key for the RECENT group.
   const RAIL_RECENT_KEY = "__recent__";
 
   // A project nobody has touched in a month is not one you are choosing between
@@ -3862,10 +4051,19 @@
   // Generous: the host answers by scanning the session store on disk, and a slow
   // first read must not be mistaken for an extension that cannot answer at all.
   const RAIL_PROBE_TIMEOUT_MS = 8000;
+  // A silent host must not strand a highlight forever. 10s is long enough for a
+  // cold session/load over a slow link and short enough that a dropped request
+  // is still visibly "nothing happened" rather than a stuck selection.
+  const RAIL_TRANSITION_TIMEOUT_MS = 10000;
 
   let railEl = null;
   let railResolved = false;
   let railProbeTimer = null;
+  // Monotonic renderer-local counter for railTransition.token. Not a grok
+  // session id — never sent to the host; only used so superseded timers and
+  // late frames cannot complete a transition that a later click replaced.
+  let railTransitionSeq = 0;
+  let railTransitionTimer = null;
 
   /** Host shipped a rail surface (desktop multi-folder / AFK Pilot page). */
   function railMount() {
@@ -3943,14 +4141,151 @@
   // only has to survive a single click, and identity is exactly the question.
   let railMenuAnchorEl = null;
 
+  // Project colour swatch popover (sibling of the overflow menu, same anchor
+  // discipline). Closed together with the menu so Esc / outside-click never
+  // leave a stranded picker after a rail rebuild.
+  let railColorPickerEl = null;
+  let railColorPickerAnchorEl = null;
+
+  /** Palette the host accepts — keep ids in lockstep with REPO_COLOR_IDS in
+   *  sessions.ts. Labels are accessible names for each swatch. */
+  const REPO_COLOR_SWATCHES = [
+    { id: "", label: "None" },
+    { id: "blue", label: "Blue" },
+    { id: "teal", label: "Teal" },
+    { id: "green", label: "Green" },
+    { id: "amber", label: "Amber" },
+    { id: "coral", label: "Coral" },
+    { id: "purple", label: "Purple" },
+  ];
+
+  function closeRailColorPicker() {
+    railColorPickerAnchorEl = null;
+    if (railColorPickerEl) { railColorPickerEl.remove(); railColorPickerEl = null; }
+  }
+
   function closeRailMenu() {
     railMenuAnchorEl = null;
     if (railMenuEl) { railMenuEl.remove(); railMenuEl = null; }
+    closeRailColorPicker();
+  }
+
+  /** Position a fixed popover under/above an anchor (shared by menu + colour
+   *  picker so they never disagree about zoom/viewport edges). */
+  function placeRailPopover(el, anchor, at) {
+    const z = chatZoomFactor();
+    const size = el.getBoundingClientRect();
+    const gap = 4;
+    const menuH = unzoomClientPx(size.height, z);
+    const menuW = unzoomClientPx(size.width, z);
+    const vh = unzoomClientPx(window.innerHeight, z);
+    const vw = unzoomClientPx(window.innerWidth, z);
+    // `at` is a pointer position (right-click); otherwise hang off the control.
+    // Both arrive as VISUAL px — body `zoom` scales client rects and pointer
+    // coordinates alike, while fixed top/left are layout px.
+    const anchorTop = at ? unzoomClientPx(at.y, z) : unzoomClientPx(anchor.getBoundingClientRect().top, z);
+    const anchorBottom = at ? anchorTop : unzoomClientPx(anchor.getBoundingClientRect().bottom, z);
+    const anchorRight = at ? unzoomClientPx(at.x, z) + menuW : unzoomClientPx(anchor.getBoundingClientRect().right, z);
+    let top = anchorBottom + gap;
+    if (top + menuH > vh - 8) top = Math.max(8, anchorTop - menuH - gap);
+    let left = anchorRight - menuW;
+    left = Math.max(8, Math.min(left, vw - menuW - 8));
+    el.style.top = `${Math.round(top)}px`;
+    el.style.left = `${Math.round(left)}px`;
+  }
+
+  /** Right-click opens the same ⋯ menu, at the pointer.
+   *
+   *  Hover-capable pointers only. On touch a long-press synthesises
+   *  `contextmenu`, so wiring it there would hijack the gesture the browser
+   *  already uses for selection — and on a phone the rail is a drawer where the
+   *  ⋯ buttons are permanently visible anyway (see the `hover: none` rules in
+   *  chat.css), so there is nothing to reveal. */
+  function wireRailRowContextMenu(row, getAnchor, items, menuKey) {
+    if (!row || !window.matchMedia || !window.matchMedia("(hover: hover)").matches) return;
+    row.addEventListener("contextmenu", (e) => {
+      const anchor = getAnchor();
+      if (!anchor) return;
+      e.preventDefault();
+      e.stopPropagation();
+      // Close first so openRailMenu's same-key toggle cannot swallow this as a
+      // "clicked the open menu again" and dismiss instead of repositioning.
+      closeRailMenu();
+      openRailMenu(anchor, typeof items === "function" ? items() : items, menuKey, {
+        x: e.clientX,
+        y: e.clientY,
+      });
+    });
+  }
+
+  /** Small swatch grid for a project's folder colour. Host-persisted via
+   *  setRepoColor; capability-gated by railColorSupported. */
+  function openRepoColorPicker(anchor, repo) {
+    closeRailColorPicker();
+    if (!anchor || !repo) return;
+    railColorPickerAnchorEl = anchor;
+    const current = typeof repo.color === "string" ? repo.color : "";
+    const picker = document.createElement("div");
+    picker.className = "rail-color-picker";
+    picker.setAttribute("role", "listbox");
+    picker.setAttribute("aria-label", "Project color");
+    const swatches = [];
+    for (const sw of REPO_COLOR_SWATCHES) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "rail-color-swatch" +
+        (sw.id ? "" : " is-none") +
+        (sw.id === current ? " is-selected" : "");
+      if (sw.id) btn.dataset.repoColor = sw.id;
+      btn.setAttribute("role", "option");
+      btn.setAttribute("aria-label", sw.label);
+      btn.setAttribute("aria-selected", sw.id === current ? "true" : "false");
+      btn.title = sw.label;
+      btn.tabIndex = sw.id === current ? 0 : -1;
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        closeRailColorPicker();
+        // Skip a no-op write: re-picking the current colour should not churn
+        // the catalog (and a remote round-trip for nothing).
+        if (sw.id === current) return;
+        vscode.postMessage({ type: "setRepoColor", cwd: repo.cwd, color: sw.id });
+      };
+      picker.appendChild(btn);
+      swatches.push(btn);
+    }
+    // Arrow-key roving tabindex across the seven swatches (left/right/up/down
+    // all advance in row order — a 7-wide grid is one row on desktop).
+    picker.addEventListener("keydown", (e) => {
+      const keys = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"];
+      if (!keys.includes(e.key)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const i = swatches.indexOf(document.activeElement);
+      if (i < 0) return;
+      let next = i;
+      if (e.key === "ArrowRight" || e.key === "ArrowDown") next = (i + 1) % swatches.length;
+      else if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = (i - 1 + swatches.length) % swatches.length;
+      else if (e.key === "Home") next = 0;
+      else if (e.key === "End") next = swatches.length - 1;
+      for (const b of swatches) b.tabIndex = -1;
+      swatches[next].tabIndex = 0;
+      swatches[next].focus();
+    });
+    document.body.appendChild(picker);
+    railColorPickerEl = picker;
+    placeRailPopover(picker, anchor);
+    const focusBtn = swatches.find((b) => b.classList.contains("is-selected")) || swatches[0];
+    if (focusBtn) focusBtn.focus();
   }
 
   /** items: [{ label, icon, danger, disabled, onSelect }] — a `null` entry is a
-   *  separator, which is how the destructive tail is kept away from the thumb. */
-  function openRailMenu(anchor, items, menuKey) {
+   *  separator, which is how the destructive tail is kept away from the thumb.
+   *
+   *  `at` ({x, y} in VISUAL client px, i.e. straight off a pointer event) opens
+   *  the menu at the pointer instead of under the ⋯ button — the right-click
+   *  path. The anchor is still passed so dismissal and the toggle keep working
+   *  off the control the menu belongs to. */
+  function openRailMenu(anchor, items, menuKey, at) {
     // Identify the menu by what it BELONGS to, not by the element it hangs off.
     // The rail re-renders freely and recreates these buttons, so an id stamped
     // on the node was gone by the second click: the toggle compared a fresh
@@ -3995,15 +4330,8 @@
 
     // Flip up / pull left rather than run off the viewport — the rail sits at the
     // left edge on desktop and the drawer covers the screen on a phone.
-    const box = anchor.getBoundingClientRect();
-    const size = menu.getBoundingClientRect();
-    const gap = 4;
-    let top = box.bottom + gap;
-    if (top + size.height > window.innerHeight - 8) top = Math.max(8, box.top - size.height - gap);
-    let left = box.right - size.width;
-    left = Math.max(8, Math.min(left, window.innerWidth - size.width - 8));
-    menu.style.top = `${Math.round(top)}px`;
-    menu.style.left = `${Math.round(left)}px`;
+    // Body `zoom` scales visual rects; fixed style top/left are layout px.
+    placeRailPopover(menu, anchor, at);
     const first = menu.querySelector(".rail-menu-item:not(:disabled)");
     if (first) first.focus();
   }
@@ -4012,6 +4340,14 @@
   // Rail menus are fixed-position under <body>; close on outside click / Esc /
   // resize regardless of remote vs desktop once a rail mount exists (or may).
   document.addEventListener("click", (e) => {
+    if (railColorPickerEl) {
+      if (railColorPickerEl.contains(e.target)) return;
+      if (railColorPickerAnchorEl && railColorPickerAnchorEl.contains(e.target)) return;
+      closeRailColorPicker();
+      // A colour picker and a menu are never open together (opening either
+      // closes the other), so fall through only when no menu is up.
+      if (!railMenuEl) return;
+    }
     if (!railMenuEl || railMenuEl.contains(e.target)) return;
     // Not the button that owns this menu. That click is a TOGGLE, and this
     // listener is on the capture phase — it runs before the button's own
@@ -4022,7 +4358,10 @@
     closeRailMenu();
   }, true);
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeRailMenu();
+    if (e.key === "Escape") {
+      if (railColorPickerEl) { closeRailColorPicker(); return; }
+      closeRailMenu();
+    }
   });
   window.addEventListener("resize", closeRailMenu);
 
@@ -4036,6 +4375,10 @@
     btn.title = label;
     btn.setAttribute("aria-label", label);
     btn.setAttribute("aria-haspopup", "menu");
+    // Stamped at build time (not only once a menu has been opened from it) so a
+    // rebuild can find the replacement button for an already-open menu and
+    // re-anchor to it instead of closing. See renderRail.
+    if (menuKey) btn.dataset.railMenuKey = menuKey;
     btn.onclick = (e) => {
       e.stopPropagation();
       openRailMenu(btn, typeof items === "function" ? items() : items, menuKey);
@@ -4223,21 +4566,398 @@
     return at > 0 ? now - at > RAIL_ARCHIVE_AFTER_MS : true;
   }
 
-  /** Whether the live conversation is one of THIS project's.
+  /**
+   * What the rail should paint as the current conversation.
    *
-   *  `activeRepoCwd` is the live session's own cwd, and for a worktree session
+   * While a click is in flight this is the optimistic target from
+   * `railTransition`; once the host confirms, it is the host-owned identity.
+   * Callers must NOT write this back into `state.activeSessionId` — that field
+   * stays strictly host-confirmed so rename/delete/send/remember cannot act on
+   * a pending id.
+   *
+   * Why this is not `pendingSessionId || activeSessionId`:
+   * `railRepoOwnsTarget` needs the full `{id, sessionCwd, repoCwd}` triple. A
+   * cross-repo resume has a pending id whose project is not yet
+   * `activeRepoCwd`, so an ownership check that only closed over the confirmed
+   * globals returned false and the highlight never appeared. The display
+   * target carries the project the user clicked so ownership can pass.
+   */
+  function railDisplayTarget() {
+    const t = state.railTransition;
+    if (t) {
+      if (t.kind === "resume") {
+        return {
+          id: t.sessionId,
+          sessionCwd: t.sessionCwd || t.repoCwd,
+          repoCwd: t.repoCwd,
+        };
+      }
+      // kind === "new": synthetic id until an identity frame binds the real one.
+      return {
+        id: t.resolvedSessionId || ("pending-new:" + t.token),
+        sessionCwd: t.repoCwd,
+        repoCwd: t.repoCwd,
+      };
+    }
+    return railConfirmedTarget();
+  }
+
+  /**
+   * The conversation the HOST is actually on — never optimistic.
+   *
+   * Separate from `railDisplayTarget` because the two answer different
+   * questions, and conflating them is a work-loss bug rather than a cosmetic
+   * one. Several row actions carry **no session id** at all — "Continue in a
+   * new chat" (`newWorktreeSession` / the workspace fork) and Apply / Remove
+   * worktree — so the host executes them against ITS focused session. Offer
+   * them on an optimistic row and clicking a cold session B while A is open
+   * gives B a menu that forks A, or removes A's worktree and discards A's
+   * unapplied edits.
+   *
+   * So: paint with the display target, gate id-less actions on this one.
+   */
+  function railConfirmedTarget() {
+    if (!state.activeSessionId) return null;
+    // Confirmed path. Prefer the catalog project that actually lists this
+    // session so a worktree's parent (not the worktree path) owns the highlight.
+    let repoCwd = state.activeRepoCwd || state.selectedRepoCwd || "";
+    for (const repo of state.repos || []) {
+      if (sameCwd(repo.cwd, state.activeRepoCwd)) {
+        repoCwd = repo.cwd;
+        break;
+      }
+      const rows = railRowsFor(repo);
+      if (rows && rows.entries.some(
+        (s) => s.id === state.activeSessionId && sameCwd(s.cwd, state.activeRepoCwd),
+      )) {
+        repoCwd = repo.cwd;
+        break;
+      }
+    }
+    return {
+      id: state.activeSessionId,
+      sessionCwd: state.activeRepoCwd || repoCwd,
+      repoCwd,
+    };
+  }
+
+  /**
+   * Whether the ⋯ menu may offer the actions that carry NO session id —
+   * "Continue in a new chat", Apply worktree, Remove worktree.
+   *
+   * The host runs all three against ITS OWN focused session
+   * (`forkFocusedSession`, `applyFocusedWorktree`, `removeFocusedWorktree`),
+   * and `openSessionReserved` reassigns `this.focused` BEFORE it switches the
+   * workspace, starts the session, or emits `sessionName` / `sessions.activeId`.
+   *
+   * So for the whole length of a rail transition the client genuinely cannot
+   * say which conversation these would hit: the clicked row is not confirmed
+   * yet, and the previously confirmed row may already have been left. Neither
+   * row may offer them. Remove worktree discards unapplied edits, so guessing
+   * wrong here is work loss, not a cosmetic slip.
+   *
+   * Both directions of this were found the hard way: offering them on the
+   * PENDING row let B's menu fork A, and the fix for that then let A's menu
+   * fork B. The only safe answer is neither, until identity is confirmed.
+   */
+  function railIdlessActionsAllowed() {
+    return !state.railTransition && !state.railIdentityUnknown;
+  }
+
+  /**
+   * An identity frame arrived. Do we now know what the host is focused on?
+   *
+   * **Call this AFTER the noteRailTransition* handlers have had their say** —
+   * the answer is read off whether a transition survived them. If one did, this
+   * frame named some OTHER conversation, so it tells us where the host WAS, not
+   * where it is: on rapid A→B→C, B's delayed `activeId` must not disarm the
+   * latch while C is still unresolved, or C outliving the watchdog would reopen
+   * the id-less actions with the renderer still showing B.
+   *
+   * With nothing in flight, any identity frame counts. That is what makes this
+   * self-healing rather than a latch that sticks forever after a dropped
+   * resume: the next ordinary catalog push clears it.
+   */
+  function noteHostIdentityKnown(sessionId) {
+    if (state.railTransition || !state.railIdentityUnknown) return;
+    // The paint may have been abandoned by the watchdog, but the REQUEST is
+    // still out there — resumes are serialised host-side, so a superseded one
+    // can confirm long afterwards. On rapid A→B→C where C outlives the
+    // watchdog, B's late frame must not read as "we know where the host is":
+    // C is still queued and may already be focused. Only a frame that answers
+    // what we last asked for settles it.
+    if (!railIdentitySatisfies(sessionId)) return;
+    state.railIdentityUnknown = false;
+    state.railExpectedIdentity = null;
+    // Repaint. Each row's ⋯ menu is a closure that captured the gate value when
+    // the row was BUILT, and the transition's own completion already
+    // re-rendered before this ran — so without this the actions stay hidden
+    // until something unrelated happens to re-render the rail.
+    renderRail();
+  }
+
+  /** Every conversation id the client can currently see, across all groups. */
+  function railKnownSessionIds() {
+    const ids = new Set();
+    for (const repo of state.repos || []) {
+      const known = railKnownRows(repo);
+      if (!known) continue;
+      for (const s of known.entries) if (s && s.id) ids.add(s.id);
+    }
+    for (const s of state.sessions || []) if (s && s.id) ids.add(s.id);
+    for (const s of state.pinnedSessions || []) if (s && s.id) ids.add(s.id);
+    return ids;
+  }
+
+  /** Does this identity frame answer the question we last asked the host? */
+  function railIdentitySatisfies(sessionId) {
+    const e = state.railExpectedIdentity;
+    if (!e) return true;
+    if (!sessionId) return false;
+    if (e.kind === "resume") return sessionId === e.sessionId;
+    // New: must be an id we had never seen when the request went out. A
+    // superseded resume names a conversation that already existed, so it can no
+    // longer masquerade as the one being created.
+    return sessionId !== e.previousSessionId
+      && !(e.knownIds && e.knownIds.has(sessionId));
+  }
+
+  /** Whether THIS project owns the display target (confirmed or optimistic). */
+  function railRepoOwnsTarget(repo, row, target) {
+    if (!target || !target.id) return false;
+    // Explicit catalog project wins — the pending cross-repo case sets this to
+    // the row the user clicked before activeRepoCwd has moved.
+    if (target.repoCwd && sameCwd(repo.cwd, target.repoCwd)) return true;
+    if (sameCwd(repo.cwd, target.sessionCwd)) return true;
+    if (row) return sameCwd(row.cwd, target.sessionCwd);
+    const rows = railRowsFor(repo);
+    return !!rows && rows.entries.some(
+      (s) => s.id === target.id && sameCwd(s.cwd, target.sessionCwd),
+    );
+  }
+
+  /** Whether the live (or pending) conversation is one of THIS project's.
+   *
+   *  `sessionCwd` is the live session's own cwd, and for a worktree session
    *  that is the worktree — a directory that is deliberately not a catalog row.
    *  So the parent project has to recognise its own conversation by the rows it
    *  actually draws, or the project holding the conversation you are reading
-   *  claims to hold nothing. */
+   *  claims to hold nothing. Takes an explicit target so a pending cross-repo
+   *  selection still owns its project (see railDisplayTarget). */
   function railRepoOwnsActive(repo, row) {
-    if (!state.activeSessionId) return false;
-    if (sameCwd(repo.cwd, state.activeRepoCwd)) return true;
-    if (row) return sameCwd(row.cwd, state.activeRepoCwd);
-    const rows = railRowsFor(repo);
-    return !!rows && rows.entries.some(
-      (s) => s.id === state.activeSessionId && sameCwd(s.cwd, state.activeRepoCwd),
-    );
+    return railRepoOwnsTarget(repo, row, railDisplayTarget());
+  }
+
+  function isRailPendingSessionId(id) {
+    return typeof id === "string" && id.startsWith("pending-new:");
+  }
+
+  function isRailPendingRow(s) {
+    return !!(s && (s._railPending || isRailPendingSessionId(s.id)));
+  }
+
+  function clearRailTransitionTimer() {
+    if (railTransitionTimer) {
+      clearTimeout(railTransitionTimer);
+      railTransitionTimer = null;
+    }
+  }
+
+  /**
+   * Replace any in-flight transition. One at a time; a new click bumps the
+   * token so a late frame for the old one cannot complete or clear the new.
+   * Navigation is deliberately NOT locked — supersession is the concurrency
+   * model.
+   */
+  function startRailTransition(fields) {
+    clearRailTransitionTimer();
+    const token = ++railTransitionSeq;
+    state.railTransition = { token, ...fields };
+    // Separate from the transition on purpose. The transition is a UI state and
+    // gets torn down by the watchdog and by any uncorrelated error — neither of
+    // which tells us anything about the HOST. It reassigns `focused` up front
+    // and can take longer than the watchdog on a cold resume, so treating
+    // "transition gone" as "identities agree" would re-open the id-less actions
+    // while we still do not know what the host is on. Only an identity frame
+    // clears this. Fail closed.
+    state.railIdentityUnknown = true;
+    // Newest request wins: a superseded one may still land, but it no longer
+    // answers the question we are asking.
+    state.railExpectedIdentity = fields.kind === "resume"
+      ? { kind: "resume", sessionId: fields.sessionId }
+      : {
+        kind: "new",
+        previousSessionId: fields.previousSessionId || null,
+        // A new conversation has no id until the host mints one, so the only
+        // honest correlation is "an id that did not exist when we asked".
+        // "Anything but the one we were on" is too weak: resume B, then New,
+        // and B's delayed echo — a real id, and not the previous one — passed
+        // as confirmation of a conversation the host had not created yet.
+        knownIds: railKnownSessionIds(),
+      };
+    // Highlight without a veil would claim conversation X while Y is still on
+    // screen and fully actionable. Pair them so the click is visibly owned.
+    setConversationLoading(true);
+    const ms = Number(window.__grokRailTransitionTimeoutMs) > 0
+      ? Number(window.__grokRailTransitionTimeoutMs)
+      : RAIL_TRANSITION_TIMEOUT_MS;
+    railTransitionTimer = setTimeout(() => {
+      railTransitionTimer = null;
+      if (state.railTransition && state.railTransition.token === token) {
+        abortRailTransition();
+      }
+    }, ms);
+    renderRail();
+  }
+
+  function startRailResumeTransition(sessionId, sessionCwd, repoCwd) {
+    startRailTransition({
+      kind: "resume",
+      sessionId,
+      sessionCwd: sessionCwd || repoCwd,
+      repoCwd,
+    });
+  }
+
+  function startRailNewTransition(repoCwd, phase, previousSessionId) {
+    startRailTransition({
+      kind: "new",
+      repoCwd,
+      previousSessionId: previousSessionId || null,
+      resolvedSessionId: null,
+      phase: phase || "creating",
+    });
+  }
+
+  /**
+   * Drop the optimistic highlight. Does not touch activeSessionId — that is
+   * host-owned and may still be the previous conversation, which is exactly
+   * the state we want to fall back to when a click never confirms.
+   */
+  function abortRailTransition() {
+    if (!state.railTransition) return;
+    clearRailTransitionTimer();
+    state.railTransition = null;
+    // historyReplay owns the veil while a transcript is materialising; leave
+    // it up if we are mid-replay so aborting a superseded click cannot blank a
+    // real load still in progress.
+    if (!state.replaying) setConversationLoading(false);
+    renderRail();
+  }
+
+  function completeRailTransition(token) {
+    if (!state.railTransition || state.railTransition.token !== token) return;
+    clearRailTransitionTimer();
+    state.railTransition = null;
+    // Identity is confirmed. The veil continues only while the host is still
+    // replaying history — otherwise a silent empty new-session would leave
+    // "Loading conversation" up forever.
+    if (!state.replaying) setConversationLoading(false);
+    renderRail();
+  }
+
+  /** True when the selected-repo catalog (or a known preview) already lists id. */
+  function railCatalogHasSession(sessionId, repoCwd) {
+    if (!sessionId || isRailPendingSessionId(sessionId)) return false;
+    const has = (list) => Array.isArray(list) && list.some((e) => e && e.id === sessionId);
+    if (has(state.railSelectedRows) && sameCwd(repoCwd, state.selectedRepoCwd)) return true;
+    if (has(state.sessions) && sameCwd(repoCwd, state.selectedRepoCwd)) return true;
+    const preview = state.repoPreviews[cwdKey(repoCwd)];
+    if (preview && has(preview.entries)) return true;
+    return false;
+  }
+
+  /**
+   * Identity frames only — see the table on railTransition. A frame that
+   * "usually arrives" during the op is not enough; it must name the result.
+   */
+  function noteRailTransitionSessionName(msg) {
+    const t = state.railTransition;
+    if (!t || !msg || !msg.sessionId) return;
+    if (t.kind === "resume") {
+      if (msg.sessionId === t.sessionId) completeRailTransition(t.token);
+      return;
+    }
+    // kind === "new": bind the real id only when it is not the conversation we
+    // left, and it lives in the project we asked to create in. Multi-tab:
+    // another tab's sessionName for a different id must not bind ours.
+    if (msg.sessionId === t.previousSessionId) return;
+    const msgCwd = msg.cwd || "";
+    if (msgCwd && t.repoCwd && !sameCwd(msgCwd, t.repoCwd)) return;
+    t.resolvedSessionId = msg.sessionId;
+    // Keep the synthetic row until the catalog actually contains this id so a
+    // "placeholder next to the real row" is impossible: either we show the
+    // synthetic, or the catalog row, never both.
+    if (railCatalogHasSession(t.resolvedSessionId, t.repoCwd)) {
+      completeRailTransition(t.token);
+    } else {
+      renderRail();
+    }
+  }
+
+  function noteRailTransitionSessions(msg, entries) {
+    const t = state.railTransition;
+    if (!t || !msg || msg.activeId === undefined) return;
+    const activeId = msg.activeId || null;
+    if (t.kind === "resume") {
+      // Confirm only when THIS tab's activeId is the one we asked to open.
+      // Catalog refreshes fan out to every tab, but each tab gets its own
+      // activeId — matching on presence of the row alone would let tab A's
+      // echo clear tab B's pending highlight.
+      if (activeId && activeId === t.sessionId) completeRailTransition(t.token);
+      return;
+    }
+    // kind === "new"
+    if (!activeId || activeId === t.previousSessionId) return;
+    if (!t.resolvedSessionId) t.resolvedSessionId = activeId;
+    const list = Array.isArray(entries) ? entries : [];
+    const present = list.some((e) => e && e.id === t.resolvedSessionId)
+      || railCatalogHasSession(t.resolvedSessionId, t.repoCwd);
+    if (present && t.resolvedSessionId === activeId) {
+      completeRailTransition(t.token);
+    } else {
+      renderRail();
+    }
+  }
+
+  function noteRailTransitionRepos(msg) {
+    const t = state.railTransition;
+    if (!t || t.kind !== "new") return;
+    // repos may advance a necessary project move; it never confirms a resume
+    // and never finishes a new-session on its own.
+    if (t.phase === "switching-repo" && sameCwd(msg.selectedCwd, t.repoCwd)) {
+      t.phase = "creating";
+    }
+  }
+
+  /**
+   * Inject the new-conversation placeholder for the target project only.
+   * Never mutates state.sessions / railSelectedRows — the synthetic row lives
+   * only in the render path.
+   */
+  function railEntriesWithNewPlaceholder(repo, entries) {
+    const t = state.railTransition;
+    const list = Array.isArray(entries) ? entries.slice() : [];
+    if (!t || t.kind !== "new" || !sameCwd(repo.cwd, t.repoCwd)) return list;
+    if (t.resolvedSessionId && list.some((e) => e && e.id === t.resolvedSessionId)) {
+      // Real row is here — no synthetic. Transition completion is handled by
+      // the identity-frame notes; this only prevents a double paint.
+      return list;
+    }
+    const id = t.resolvedSessionId || ("pending-new:" + t.token);
+    // Already showing this id as a real row (above) or we are about to inject.
+    if (list.some((e) => e && e.id === id)) return list;
+    list.unshift({
+      id,
+      cwd: t.repoCwd,
+      displayName: "New session",
+      updatedAt: Date.now(),
+      createdAt: Date.now(),
+      numMessages: 0,
+      rawSummary: "",
+      _railPending: true,
+    });
+    return list;
   }
 
   /** Whether the host can record an archive choice. `archived` rides on every
@@ -4246,6 +4966,13 @@
    *  absent field cannot be told from "nothing archived yet". */
   function railArchiveSupported() {
     return state.repos.some((r) => typeof r.archived === "boolean");
+  }
+
+  /** Whether the host can store a project folder colour. Same capability rule
+   *  as archive: `color` is present (even as `""`) on every row from a host that
+   *  knows about it, and omitted entirely by one that does not. */
+  function railColorSupported() {
+    return state.repos.some((r) => typeof r.color === "string");
   }
 
   /** Rows we can draw conclusions FROM, as opposed to rows we merely have none
@@ -4344,12 +5071,15 @@
    *  refuse the fold forever. Keyed on the repo changing, so re-collapsing the
    *  project you are working in sticks until you go somewhere else. */
   function railFollowLiveRepo() {
-    // Via railRepoOwnsActive, not the active cwd: a worktree conversation
-    // reports the WORKTREE as its cwd and a worktree is deliberately not a
-    // catalog row, so keying on the path alone would never match the project
-    // that actually holds it — and that project would stay folded.
-    const owner = state.activeSessionId
-      ? (state.repos || []).find((repo) => railRepoOwnsActive(repo))
+    // Via the display target (confirmed or pending), not the host-confirmed
+    // active cwd alone: a worktree conversation reports the WORKTREE as its
+    // cwd and a worktree is deliberately not a catalog row, so keying on the
+    // path alone would never match the project that actually holds it — and
+    // that project would stay folded. A pending cross-repo click must also
+    // open the project it is about to land in.
+    const target = railDisplayTarget();
+    const owner = target
+      ? (state.repos || []).find((repo) => railRepoOwnsTarget(repo, null, target))
       : undefined;
     const live = owner ? cwdKey(owner.cwd) : "";
     if (live === state.railLiveRepoKey) return;
@@ -4376,7 +5106,18 @@
     document.body.classList.toggle("has-rail", on);
     if (!on) { renderSessionHead(); return; }
     wireRailSearch();
-    closeRailMenu();
+    // The rail rebuilds itself wholesale, and a session load produces a burst of
+    // frames that each trigger one. Closing the menu here meant an open ⋯ was
+    // slammed shut repeatedly mid-load — the menu could not be kept open at all
+    // while the thing you were opening was still opening. The menu is parented
+    // to <body>, so the wipe below does not destroy it; only its anchor button
+    // dies. Remember which one it belonged to and re-anchor after the rebuild.
+    const openMenuKey = railMenuEl ? railMenuEl.dataset.anchorId || "" : "";
+    // Same burst, same cause, second symptom: the hover action buttons start at
+    // opacity 0 and fade in over .1s, so recreating them under a stationary
+    // cursor replayed that fade on every rebuild — a blinking row. Suppress the
+    // transition for this repaint only; hovering normally still fades.
+    root.classList.add("rail-rebuilding");
 
     root.innerHTML = "";
     syncGearPlacement();
@@ -4424,6 +5165,7 @@
         list.className = "rail-list rail-recent";
         appendRailSessionSlice(list, recentAll, RAIL_RECENT_KEY, (s) =>
           renderRailSessionRow(s, { cwd: s.cwd, available: true }, { showRepo: true }),
+          RAIL_RECENT_EXPANDED,
         );
         root.appendChild(list);
       }
@@ -4497,6 +5239,33 @@
       } else {
         root.appendChild(railNote(q ? "No matches." : "No projects yet"));
       }
+    }
+
+    // Re-anchor an open ⋯ to its rebuilt button, or close it if the row it
+    // belonged to is gone (deleted, filtered out, its project collapsed).
+    if (openMenuKey) {
+      const esc = window.CSS && CSS.escape ? CSS.escape(openMenuKey) : openMenuKey;
+      const anchor = root.querySelector('[data-rail-menu-key="' + esc + '"]');
+      if (anchor) {
+        railMenuAnchorEl = anchor;
+        // Re-place it. Keeping the menu open but leaving it at the old fixed
+        // coordinates is worse than closing it: rows insert and reorder as
+        // frames arrive, so the menu would end up beside whichever row moved
+        // into that spot while still acting on the one it was opened from.
+        if (railMenuEl) placeRailPopover(railMenuEl, anchor);
+      } else closeRailMenu();
+    }
+    // Colour picker is one-shot and short-lived — the rebuild destroys its
+    // anchor button, and re-opening it mid-catalog-refresh is not worth the
+    // bookkeeping. Closing avoids a fixed popover stranded over a gone row.
+    if (railColorPickerEl) closeRailColorPicker();
+    // Let the browser paint this rebuild with transitions off, then restore them
+    // so an ordinary hover still fades. rAF (not a timer) so it lands after the
+    // paint rather than at an arbitrary later moment.
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => root.classList.remove("rail-rebuilding"));
+    } else {
+      root.classList.remove("rail-rebuilding");
     }
     renderSessionHead();
   }
@@ -4599,12 +5368,12 @@
    * Labels carry no digits — three disagreeing totals stranded rows behind a
    * lying count (see the scar comment on renderRailSessions).
    */
-  function appendRailSessionSlice(body, entries, expandKey, rowFactory) {
+  function appendRailSessionSlice(body, entries, expandKey, rowFactory, expandedLimit = RAIL_EXPANDED) {
     const expanded = !!state.railExpanded[expandKey];
-    const visible = expanded ? RAIL_EXPANDED : RAIL_PREVIEW;
+    const visible = expanded ? expandedLimit : RAIL_PREVIEW;
     const shown = entries.slice(0, visible);
     for (const s of shown) body.appendChild(rowFactory(s));
-    const reachable = Math.min(entries.length, RAIL_EXPANDED);
+    const reachable = Math.min(entries.length, expandedLimit);
     const hidden = Math.max(0, reachable - shown.length);
     if (hidden > 0 && !expanded) {
       const more = document.createElement("button");
@@ -4756,16 +5525,25 @@
   }
 
   function beginNewSession() {
+    // Capture before reset — activeSessionId is host-confirmed and is the only
+    // honest "what we are leaving" for the identity frames that will confirm
+    // the new conversation (they must differ from previousSessionId).
+    const previousSessionId = state.activeSessionId;
+    const repoCwd = state.selectedRepoCwd || state.activeRepoCwd || "";
     saveRememberedRemoteSession(null);
     resetForNewSession();
+    // After reset so setConversationLoading wins over the "Starting" welcome
+    // status resetForNewSession paints. The placeholder is renderer-local and
+    // never enters state.sessions.
+    startRailNewTransition(repoCwd, "creating", previousSessionId);
     vscode.postMessage({ type: "newSession" });
   }
 
   /**
-   * Conversation overflow (⋯) beside the name. Present only when the host
-   * shipped `#session-head-actions` (desktop getHtml / AFK Pilot page) — VS Code
-   * has no session header, so its top-bar New and gear Session group stay.
-   * Capability = the slot exists, not a host flag.
+   * Conversation overflow (⋯) in the top-right cluster (after Remote + History).
+   * Present only when the host shipped `#session-head-actions` (desktop getHtml /
+   * AFK Pilot page) — VS Code has no session header, so its top-bar New and gear
+   * Session group stay. Capability = the slot exists, not a host flag.
    */
   function fillSessionHeadActions() {
     const menuSlot = document.getElementById("session-head-actions");
@@ -4802,6 +5580,11 @@
     // vanished from the one menu where it always applies. The row menus below
     // still compute it, because there the record really can be some other
     // conversation.
+    //
+    // "By construction" stops holding mid-transition, though: the name still
+    // reads the conversation being LEFT while the host has already moved to the
+    // one being opened. railSessionMenuItems disables the id-less actions for
+    // that window rather than this call site withholding them.
     menuSlot.appendChild(railMenuButton(
       "Session actions",
       () => {
@@ -4830,7 +5613,7 @@
     if (!chip || !label || !editBtn) return;
     const data = activeSessionName();
     chip.hidden = !data;
-    // Desktop rail hosts: the overflow slot lives next to this chip.
+    // Desktop rail hosts: overflow lives in the top-right cluster (after History).
     fillSessionHeadActions();
     if (!data || state.sessionNameEditing?.surface === "local") return;
     const name = displayedSessionName(activeSessionRecord());
@@ -4964,10 +5747,15 @@
     );
 
     // Folder open/closed indicator — same `expanded` flag as the session list.
+    // Colour tints the stroke via currentColor (`data-repo-color` → CSS vars);
+    // none/absent leaves the default descriptionForeground.
     const twisty = document.createElement("span");
     twisty.className = "rail-twisty";
     twisty.innerHTML = expanded ? ICON.folderOpen : ICON.folderClosed;
     twisty.setAttribute("aria-hidden", "true");
+    if (typeof repo.color === "string" && repo.color) {
+      twisty.dataset.repoColor = repo.color;
+    }
     head.appendChild(twisty);
 
     const name = document.createElement("span");
@@ -4988,14 +5776,20 @@
     head.onclick = (e) => {
       // Actions (and anything inside them) must not fold the section.
       if (e.target.closest(".rail-repo-actions")) return;
-      // Unselected project: switch into it and ensure the section is open
-      // (desktop multi-folder / AFK Pilot). Selected project: toggle fold.
-      if (!selected && repo.available && !repoSwitcherLocked()) {
-        delete state.railCollapsed[key];
-        saveRailShape();
-        selectRailRepo(repo);
-        return;
-      }
+      // Purely a disclosure control. It used to ALSO switch into an unselected
+      // project — which had two problems. It selected a repo without opening
+      // anything in it, leaving the chat on the old conversation while the rail
+      // claimed a different project (the state the repo chip has to explain as
+      // "Browsing X; live session is in Y"). And because that branch forced the
+      // section open and returned, clicking an already-expanded unselected
+      // project did nothing visible: the owner's "closing a project sometimes
+      // needs two clicks".
+      //
+      // Switching now follows from opening something — a session row, or the
+      // "+" (which switches and then creates). The chip's project popover
+      // remains the explicit switch. Unselected projects still list their
+      // conversations here: requestRailPreviews fetches those regardless of
+      // selection or fold state.
       toggleRepoExpand();
     };
     head.onkeydown = (e) => {
@@ -5034,7 +5828,16 @@
     add.onclick = (e) => {
       e.stopPropagation();
       if (!repo.available) return;
-      if (selected) { vscode.postMessage({ type: "newSession" }); return; }
+      if (selected) {
+        // Same path as the header New — optimistic placeholder + host create.
+        beginNewSession();
+        return;
+      }
+      // Switch first, create once the catalog names this project. The transition
+      // starts in switching-repo so the placeholder paints on the destination
+      // immediately; repos advances it to creating (and __grokRailNewIntent
+      // still posts newSession when the switch lands).
+      startRailNewTransition(repo.cwd, "switching-repo", state.activeSessionId);
       window.__grokRailNewIntent = repo.cwd;
       selectRailRepo(repo);
     };
@@ -5059,7 +5862,11 @@
     // that has not cannot draw another project's rows either. The SELECTED
     // project is never gated — clearing where you already are has always worked.
     const reachable = selected || state.repoPreviewsSupported;
-    actions.appendChild(railMenuButton("Project actions", () => [
+    // Capture the menu button so "Set color" can re-anchor the swatch picker
+    // after the menu closes (onSelect runs after closeRailMenu).
+    // Named so right-click can build the same menu. Evaluated lazily, so the
+    // `projectMenuBtn` reference below is bound by the time it runs.
+    const projectMenuItems = () => [
       // First, because it is the everyday one: putting a project away is
       // housekeeping, and it has to be reachable without passing the delete.
       // The verb follows the section this row is drawn in rather than the stored
@@ -5078,6 +5885,15 @@
           cwd: repo.cwd,
           archived: !inArchive,
         }),
+      }, null] : []),
+      // Folder colour — host-persisted, capability-gated the same way as archive
+      // (`color` present on catalog rows). Opens a swatch picker rather than a
+      // nested menu so six hues + none stay one glance away.
+      ...(railColorSupported() ? [{
+        label: "Set color",
+        icon: ICON.palette,
+        title: "Tint this project's folder icon so it is easy to find",
+        onSelect: () => openRepoColorPicker(projectMenuBtn, repo),
       }, null] : []),
       // The desktop's equivalent, and a different act despite the same intent.
       // Its rail IS the set of open folders, so putting a project away means
@@ -5117,9 +5933,14 @@
           });
         },
       },
-    ], "repo:" + cwdKey(repo.cwd)));
+    ];
+    const projectMenuKey = "repo:" + cwdKey(repo.cwd);
+    const projectMenuBtn = railMenuButton("Project actions", projectMenuItems, projectMenuKey);
+    actions.appendChild(projectMenuBtn);
 
     head.appendChild(actions);
+    // Right-click anywhere on the project row opens the same menu.
+    wireRailRowContextMenu(head, () => projectMenuBtn, projectMenuItems, projectMenuKey);
     sec.appendChild(head);
 
     // Same `expanded` as the folder icon — never a second, independent flag.
@@ -5137,7 +5958,19 @@
     }
 
     const rows = railRowsFor(repo);
+    // Optimistic new-session placeholder still has to paint when we have no
+    // catalog yet (cross-project "+" while the switch is in flight, or cold
+    // selected project). Without this the click highlights nothing until the
+    // host answers — the whole bug this transition exists to fix.
+    const pendingNewHere = state.railTransition
+      && state.railTransition.kind === "new"
+      && sameCwd(repo.cwd, state.railTransition.repoCwd);
     if (!rows) {
+      if (pendingNewHere) {
+        const entries = railEntriesWithNewPlaceholder(repo, []);
+        appendRailSessionSlice(body, entries, key, (s) => renderRailSessionRow(s, repo));
+        return body;
+      }
       // No rows yet. Two very different reasons, and saying "Loading…" for both
       // is the wrong answer: a host too old to answer `listRepoSessions` will
       // NEVER answer, and the probe is sent for one repo only — so every other
@@ -5164,7 +5997,8 @@
       sameCwd(repo.cwd, state.selectedRepoCwd) &&
       !rows.entries.length &&
       !state.railSelectedRowsKnown &&
-      !state.railSessionsStale
+      !state.railSessionsStale &&
+      !pendingNewHere
     ) {
       body.appendChild(railNote("Loading…"));
       return body;
@@ -5173,15 +6007,17 @@
     // A search answers itself: showing three of five matches behind a "Show
     // more" would hide the very rows the query asked for. Matching by project
     // name instead means the whole project matched, so its list stays as it was.
+    // Placeholder injection is render-only (never into state.sessions).
+    const entries = railEntriesWithNewPlaceholder(repo, rows.entries);
     const q = railFilterText();
     const nameMatched = !q || railMatches(repo.label || cwdLeaf(repo.cwd));
     if (q && !nameMatched) {
-      const hits = rows.entries.filter((s) => railMatches(s.displayName)).slice(0, RAIL_EXPANDED);
+      const hits = entries.filter((s) => railMatches(s.displayName)).slice(0, RAIL_EXPANDED);
       for (const s of hits) body.appendChild(renderRailSessionRow(s, repo));
       return body;
     }
 
-    if (!rows.entries.length) {
+    if (!entries.length) {
       body.appendChild(railNote("No sessions yet"));
       return body;
     }
@@ -5189,13 +6025,25 @@
     // One-step reveal, no counters. Three numbers disagree (host total, loaded
     // length, RAIL_EXPANDED cap); a count-labelled control stranded rows. Depth
     // belongs in the history popover. See appendRailSessionSlice.
-    appendRailSessionSlice(body, rows.entries, key, (s) => renderRailSessionRow(s, repo));
+    appendRailSessionSlice(body, entries, key, (s) => renderRailSessionRow(s, repo));
     return body;
   }
 
   function renderRailSessionRow(s, repo, opts) {
     const row = document.createElement("div");
-    const active = s.id === state.activeSessionId && railRepoOwnsActive(repo, s);
+    // Two different questions, and they must not share one boolean.
+    //
+    // `active` = what to PAINT: the display target, so an optimistic click
+    // highlights immediately. A pending cross-repo id is deliberately not in
+    // activeSessionId, so this cannot read that field alone.
+    //
+    // `hostActive` = may this row offer the id-less session actions. While a
+    // transition is in flight the answer is no for EVERY row — see
+    // railIdlessActionsAllowed. With no transition the display target IS the
+    // confirmed one, so `active` is already the right answer.
+    const target = railDisplayTarget();
+    const active = !!(target && s.id === target.id && railRepoOwnsTarget(repo, s, target));
+    const hostActive = railIdlessActionsAllowed() && active;
     row.className = "rail-session" + (active ? " active" : "");
     row.title = s.displayName || "";
     // The row is the primary control, so it has to behave like one: reachable by
@@ -5256,34 +6104,47 @@
     const isPinned = typeof s.pinnedAt === "number";
     if (isPinned) row.classList.add("pinned");
 
-    const actions = document.createElement("div");
-    actions.className = "rail-session-actions";
-    // Hover pin control (one click). Hidden until :hover / :focus-within; forced
-    // visible on touch via @media (hover: none). Capability-gated like the menu.
-    if (state.pinnedSessionsKnown) {
-      const pinBtn = document.createElement("button");
-      pinBtn.type = "button";
-      pinBtn.className = "rail-action-btn rail-pin-btn" + (isPinned ? " active" : "");
-      pinBtn.innerHTML = isPinned ? ICON.pinFilled : ICON.pin;
-      pinBtn.title = isPinned ? "Unpin conversation" : "Pin conversation";
-      pinBtn.setAttribute("aria-label", pinBtn.title);
-      pinBtn.onclick = (e) => {
-        e.stopPropagation();
-        vscode.postMessage({
-          type: "toggleSessionPin",
-          id: s.id,
-          cwd: s.cwd || repo.cwd,
-          pinned: !isPinned,
-        });
-      };
-      actions.appendChild(pinBtn);
+    // Optimistic new-session placeholder: presentation only. No pin/rename/
+    // delete — those would ship a pending-new: token (or an unbound real id
+    // that is not yet host-open on this client) to the host.
+    if (!isRailPendingRow(s)) {
+      const actions = document.createElement("div");
+      actions.className = "rail-session-actions";
+      // Hover pin control (one click). Hidden until :hover / :focus-within; forced
+      // visible on touch via @media (hover: none). Capability-gated like the menu.
+      if (state.pinnedSessionsKnown) {
+        const pinBtn = document.createElement("button");
+        pinBtn.type = "button";
+        pinBtn.className = "rail-action-btn rail-pin-btn" + (isPinned ? " active" : "");
+        pinBtn.innerHTML = isPinned ? ICON.pinFilled : ICON.pin;
+        pinBtn.title = isPinned ? "Unpin conversation" : "Pin conversation";
+        pinBtn.setAttribute("aria-label", pinBtn.title);
+        pinBtn.onclick = (e) => {
+          e.stopPropagation();
+          vscode.postMessage({
+            type: "toggleSessionPin",
+            id: s.id,
+            cwd: s.cwd || repo.cwd,
+            pinned: !isPinned,
+          });
+        };
+        actions.appendChild(pinBtn);
+      }
+      const menuKey = "session:" + (s.id || cwdKey(s.cwd || repo.cwd));
+      const menuBtn = railMenuButton(
+        "Session actions",
+        // `active` (the painted target) decides WHICH row owns the id-less
+        // actions; railSessionMenuItems disables them while the host has not
+        // confirmed it is on that conversation yet.
+        () => railSessionMenuItems(s, repo, active),
+        menuKey,
+      );
+      actions.appendChild(menuBtn);
+      row.appendChild(actions);
+      // Right-click is the second way in, same menu — matching the desktop file
+      // tree, where both triggers already share one menu.
+      wireRailRowContextMenu(row, () => menuBtn, () => railSessionMenuItems(s, repo, active), menuKey);
     }
-    actions.appendChild(railMenuButton(
-      "Session actions",
-      () => railSessionMenuItems(s, repo, active),
-      "session:" + (s.id || cwdKey(s.cwd || repo.cwd)),
-    ));
-    row.appendChild(actions);
     row.onclick = railSessionOpener(s, repo, active);
     return row;
   }
@@ -5321,9 +6182,19 @@
     // fork continues from the live transcript, so offering it on some other row
     // in the history list would promise something it cannot do.
     if (active) {
+      // None of the three below name a conversation on the wire — the host runs
+      // them against whichever one it currently has open. While a conversation
+      // is still opening the two can disagree, so they are DISABLED rather than
+      // removed: they belong to this row, they are coming back in a moment, and
+      // a menu whose contents reshuffle mid-open is its own kind of wrong.
+      const pending = !railIdlessActionsAllowed();
+      const waiting = pending
+        ? { disabled: true, title: "Available once the conversation has finished opening" }
+        : null;
       items.push({
         label: "Continue in a new chat",
         icon: ICON.gitFork,
+        ...waiting,
         onSelect: () => beginContinueInNewChat(),
       });
       // Worktree upkeep rides along for the same reason, and only while you are
@@ -5339,6 +6210,7 @@
         items.push({
           label: "Apply worktree",
           icon: ICON.gitBranch,
+          ...waiting,
           onSelect: () => uiConfirm({
             title: "Apply worktree?",
             body: "Merges this worktree's edits back into the main checkout.",
@@ -5349,6 +6221,7 @@
           label: "Remove worktree",
           icon: ICON.gitBranch,
           danger: true,
+          ...waiting,
           onSelect: () => uiConfirm({
             title: "Remove worktree?",
             body: "This deletes the isolated checkout. Unapplied edits are lost.",
@@ -5447,7 +6320,15 @@
    *  full row and the capability-stripped one share it. */
   function railSessionOpener(s, repo, active) {
     return () => {
-      if (active || repoSwitcherLocked()) return;
+      // Already the display target (confirmed or this pending click) — no-op.
+      // Deliberately NOT gated on repoSwitcherLocked: a new click supersedes any
+      // in-flight rail transition, and stacking resumeSession is the host's job
+      // to serialise. Locking here is what made a second click during load feel
+      // dropped.
+      if (active || isRailPendingRow(s)) return;
+      // Optimistic highlight + veil before the host answers. activeSessionId is
+      // left alone until sessionName / sessions.activeId confirm this id.
+      startRailResumeTransition(s.id, s.cwd || repo.cwd, repo.cwd);
       // `cwd` rides along so a session in another repo reopens in ITS checkout —
       // the host resolves sessions by cwd, and omitting it would look the id up
       // under the repo we happen to be in.
@@ -5513,7 +6394,6 @@
   function setWelcomeStatus(text, busy) {
     const ver = $("welcome-version");
     if (!ver) return;
-    ver.classList.remove("loading-dots");
     ver.classList.toggle("welcome-status-busy", !!busy);
     ver.dataset.status = busy ? text : "";
     if (!busy) {
@@ -5539,6 +6419,79 @@
     const ver = $("welcome-version");
     if (ver && ver.dataset.status === "Loading conversation") {
       setWelcomeStatus(state.cliVersion ? `Connected \u00b7 v${state.cliVersion}` : "Connected", false);
+    }
+  }
+
+  /**
+   * The one hint we show, in the empty state, in editors that refuse our
+   * secondary-side-bar container.
+   *
+   * It exists because of a limit we cannot engineer around: nothing in the API
+   * reports where a view lives, so the extension may place the chat somewhere
+   * usable on a first-ever run and must never touch it again. That leaves the
+   * better spot — the editor's own secondary side bar, beside its agent —
+   * reachable only through the editor's own picker. So we say so, once, instead
+   * of moving anything.
+   *
+   * `moveViewHint` is decided by the host and goes false the moment that picker
+   * is opened from anywhere, so taking the advice retires the advice.
+   */
+  function renderWelcomeTip() {
+    const welcome = $("welcome");
+    if (!welcome) return;
+    const existing = $("welcome-tip");
+    // Never in the browser client. The capability is mirrored to remotes with
+    // the rest of initialState, but where the chat sits is a property of the
+    // machine running the extension — `moveView` is host-local and the relay
+    // drops it, so a phone would get advice it cannot take.
+    if (IS_REMOTE || !(state.hostCaps && state.hostCaps.moveViewHint === true)) {
+      if (existing) existing.remove();
+      return;
+    }
+    if (existing) return;
+    const tip = document.createElement("p");
+    tip.id = "welcome-tip";
+    tip.className = "welcome-tip muted";
+    // Built here rather than in the host's HTML skeleton, so the relay's mirror
+    // of that skeleton cannot drift out of sync over an element it never shows.
+    // Two steps, because the second cannot be done for the user. The host's
+    // picker command does NOT wait for the pick — it opens the quickpick and
+    // resolves immediately — so a reveal issued after it steals focus and
+    // dismisses the picker before anything is chosen. And the move itself does
+    // not open the container it landed in, which in Cursor is a collapsed agents
+    // side bar. Say what to do, rather than half-doing it.
+    //
+    // The follow-up step is stated FIRST, above the action: acting on the link
+    // dismisses this tip, so anything written below it would be read only by
+    // someone who had already lost the chance to act on it.
+    //
+    // A <span>, not an <a href="#">: an anchor makes the webview attempt a
+    // navigation, and the editor answers by trying to open a file that does not
+    // exist. `role`/`tabindex`/keydown put back the semantics the anchor was
+    // providing.
+    tip.innerHTML =
+      "\u{1F4A1} <b>To move Grok to the right</b>" +
+      "<br>After moving, click <b>Toggle Agents Side Bar</b> to show it." +
+      '<br><span id="welcome-tip-link" class="muted-link" role="button" tabindex="0">Click here</span>' +
+      " and select <b>New Secondary Side Bar Entry</b>.";
+    welcome.appendChild(tip);
+    const link = $("welcome-tip-link");
+    if (link) {
+      const open = (e) => {
+        e.preventDefault();
+        vscode.postMessage({ type: "moveView", location: "pick" });
+        // Clear the LOCAL capability too, not just the node. `initialState` is
+        // not re-sent on a session swap, so `resetForNewSession` would rebuild
+        // the empty state, re-read a still-true flag and put the hint straight
+        // back. The host records it as well, for the next window.
+        if (state.hostCaps) state.hostCaps.moveViewHint = false;
+        tip.remove();
+      };
+      link.onclick = open;
+      // Keyboard parity, which the anchor used to give for free.
+      link.onkeydown = (e) => {
+        if (e.key === "Enter" || e.key === " ") open(e);
+      };
     }
   }
 
@@ -5568,12 +6521,21 @@
       welcome.hidden = false;
       const onb = $("welcome-onboarding");
       if (onb) onb.innerHTML = "";
-      setWelcomeStatus("Starting", true);
+      // A host clearMessages during an optimistic new-session transition must
+      // not replace the paired "Loading conversation" veil with Starting — the
+      // click already owns that wait. Otherwise the rail highlights the
+      // placeholder while the welcome says something unrelated.
+      if (state.railTransition) setConversationLoading(true);
+      else setWelcomeStatus("Starting", true);
+      // The empty state is rebuilt on every new session, so the tip is too —
+      // until the host stops advertising it.
+      renderWelcomeTip();
     }
     state.welcomeVisible = true;
     state.pendingDiffByToolCallId.clear();
     state.toolItemsByToolCallId.clear();
     state.toolFailuresById.clear();
+    state.mediaGenCallIds.clear();
     state.subagentCards.clear();
     state.runProgressCards.clear();
     // Question/restored-card maps too, or a new session's tool updates could
@@ -5628,6 +6590,11 @@
     state.pendingSubmissionChipIds = [];
     state.rejectedSubmissionText = "";
     updateSendButton();
+    // Body-attached lightbox outlives #messages — close it on every session
+    // swap so the previous conversation's image cannot cover the next one.
+    // (confirm-overlay / uiPrompt are action-scoped and remove themselves;
+    // only the image preview persists across a reset.)
+    closeImagePreview();
   }
 
   function showOnboarding(mode, info) {
@@ -7002,10 +7969,17 @@
     scrollToBottom();
   }
 
+  // Does this surface open files in a host editor tab? Opt-out polarity on
+  // capabilities.openInEditor (absent/true = yes). Remote always answers no:
+  // the caps a phone receives are the DESK machine's, and a tap must never
+  // open an editor 200 km away.
+  function hostOpensInEditor() {
+    return !IS_REMOTE && !(state.hostCaps && state.hostCaps.openInEditor === false);
+  }
+
   // Hover actions for an inlined image/video, anchored top-right like the
-  // code-block copy button: copy the on-disk path, or open it in VS Code. Both
-  // are the only way to reach a *video's* file (its click drives playback
-  // controls, so the click-to-open we give images can't apply there).
+  // code-block copy button: copy the on-disk path, or open/reveal the file.
+  // Which of open-vs-reveal is a host capability, not a media kind.
   function buildMediaActions(path, src) {
     const actions = document.createElement("div");
     actions.className = "generated-media-actions";
@@ -7013,7 +7987,7 @@
     // Remote clients: there is no host to copy a path to or open a file in — the
     // one action that means anything on a phone is saving the image, which
     // arrives inlined as a self-contained data: URI. Show only Download; the
-    // copy-path / open-in-VS-Code buttons would post host-local messages the
+    // copy-path / open-file buttons would post host-local messages the
     // relay drops.
     if (IS_REMOTE) {
       const dlBtn = document.createElement("button");
@@ -7047,11 +8021,19 @@
     const openBtn = document.createElement("button");
     openBtn.type = "button";
     openBtn.className = "generated-media-btn";
-    openBtn.title = "Open in VS Code";
-    openBtn.innerHTML = ICON.file;
+    // Both kinds, on a host that advertises it. A generated clip already plays
+    // inline and a generated image already enlarges in place, so handing either
+    // to the OS default app shows you nothing you cannot already see — finding
+    // the file is the thing you actually want. An editor host keeps Open,
+    // because there a tab genuinely is somewhere else to put it.
+    const showInFolder = !!(state.hostCaps && state.hostCaps.showInFolder === true);
+    openBtn.title = showInFolder
+      ? "Show in folder"
+      : (hostOpensInEditor() ? "Open in VS Code" : "Open file");
+    openBtn.innerHTML = showInFolder ? ICON.folder : ICON.file;
     openBtn.onclick = (e) => {
       e.stopPropagation();
-      vscode.postMessage({ type: "openFile", path });
+      vscode.postMessage({ type: showInFolder ? "showInFolder" : "openFile", path });
     };
 
     actions.appendChild(copyBtn);
@@ -7062,9 +8044,10 @@
   // Render generated media (grok `/imagine` image or `/imagine-video` video).
   // `src` is a renderable source the host resolved for a generated file — a
   // webview URI streamed from disk (big videos) or a base64 data: URI; `url` is
-  // a remote link we open externally. Clicking an image opens its source file in
-  // VS Code; video gets native <video> controls. Both expose hover icons (copy
-  // path / open in VS Code) over the top-right corner.
+  // a remote link we open externally. Clicking an image opens a host editor tab
+  // when the host can (VS Code); otherwise the in-app lightbox. Video gets
+  // native <video> controls. Hover icons: copy path / open file, or show video
+  // in its folder.
   function addGeneratedMedia(msg) {
     if (state.suppressReplayTurn) return;
     const isVideo = msg.media === "video";
@@ -7078,7 +8061,27 @@
         const video = document.createElement("video");
         video.src = msg.src;
         video.controls = true;
-        video.preload = "metadata";
+        // Chromium's native overflow (⋯) menu is drawn outside the zoomed
+        // layout and misplaces itself under body CSS zoom — we cannot position
+        // it. Its entries are Download + Picture-in-Picture; our hover actions
+        // already cover download (remote) and open-file (desk). Drop those so
+        // the overflow is unreachable rather than reachable-and-wrong.
+        // controlsList tokens (Chromium): nodownload, nofullscreen,
+        // noremoteplayback, noplaybackrate. Keep fullscreen + play/scrub.
+        // disablePictureInPicture is a separate attribute (not controlsList).
+        video.controlsList = "nodownload noremoteplayback noplaybackrate";
+        video.disablePictureInPicture = true;
+        // Metadata preload is safe only when the host advertises honest byte
+        // ranges for its media handler. It restores the first frame and the
+        // video's intrinsic aspect ratio there; every other host keeps the
+        // lazy behavior because its resource pipeline may not serve ranges.
+        //
+        // What "none" costs, so nobody reads it as free: with no metadata the
+        // box has no intrinsic ratio, so height:auto renders Chromium's default
+        // ~2:1 until play and then jumps. Deliberately NOT pinned to 16:9 — a
+        // fixed ratio would mis-shape portrait and square clips, and a jump
+        // beats a wrong shape.
+        video.preload = state.hostCaps?.servesMediaRanges === true ? "metadata" : "none";
         video.playsInline = true;
         el.appendChild(video);
       } else {
@@ -7086,13 +8089,18 @@
         img.src = msg.src;
         img.alt = "Generated image";
         img.loading = "lazy";
-        // Click-to-open is a host action (opens the file in VS Code); on a remote
-        // client it's dead, so leave the image inert there and let the Download
-        // button below be the one affordance.
-        if (msg.path && !IS_REMOTE) {
+        const mediaLabel = (msg.path && String(msg.path).split(/[\\/]/).pop()) || "Generated image";
+        // Editor host → openFile (tab). No editor / remote → lightbox. No
+        // fullId: generated media is already full-size on the wire (remote
+        // inlines the whole file as a data: URI; it never downscales).
+        if (hostOpensInEditor() && msg.path) {
           img.title = "Open " + msg.path;
           img.style.cursor = "pointer";
           img.onclick = () => vscode.postMessage({ type: "openFile", path: msg.path });
+        } else {
+          img.title = "View " + mediaLabel;
+          img.style.cursor = "pointer";
+          img.onclick = () => openImagePreview(msg.src, mediaLabel);
         }
         el.appendChild(img);
       }
@@ -7976,8 +8984,8 @@
   // "Grokking…" — the generic waiting indicator shown on every user-initiated
   // turn from agentStart until grok produces its first content (thought /
   // message / tool / card), which removes it and renders in its place. Mirrors
-  // the Thinking header's look (loading-dots ellipsis, same muted font) without
-  // the chevron, and is not expandable.
+  // the Thinking header's look (blink-dots, same muted font) without the
+  // chevron, and is not expandable.
   function showGrokking() {
     hideGrokking(); // dedupe
     hideThinkingIndicator();
@@ -8005,8 +9013,8 @@
   // default). grok's thought stream is suppressed from view, so this lightweight
   // row signals it's reasoning — but only when nothing else already conveys work
   // (no running tool group, no Grokking). Styled like a tool row: brain icon +
-  // muted label + animated loading-dots. Stable while thoughts stream; removed
-  // the moment a tool, agent message, or turn-end takes over.
+  // muted label + blink-dots. Stable while thoughts stream; removed the moment
+  // a tool, agent message, or turn-end takes over.
   function showThinkingIndicator() {
     if (state.thinkingIndicatorEl) return; // already up — keep it stable
     if (state.activeToolGroupEl) return; // a running tool already indicates work
@@ -8930,6 +9938,24 @@
     }, 20000);
   }
 
+  /** Hide the body-attached lightbox and drop any in-flight full-size request.
+   *  Called from the close control, Escape, and session reset — the overlay
+   *  outlives the transcript, so a focus swap must not leave the previous
+   *  session's image sitting over the next one. */
+  function closeImagePreview() {
+    const overlay = document.querySelector(".image-preview-overlay");
+    if (overlay) {
+      overlay.hidden = true;
+      const img = overlay.querySelector("img");
+      if (img) {
+        img.removeAttribute("src");
+        img.alt = "";
+      }
+    }
+    setImagePreviewLoading(false);
+    state.pendingImageFullId = null;
+  }
+
   function openImagePreview(src, label, fullId) {
     if (!src) return;
     let overlay = document.querySelector(".image-preview-overlay");
@@ -8939,14 +9965,8 @@
       overlay.hidden = true;
       overlay.innerHTML = `<button type="button" class="image-preview-close" aria-label="Close image preview">&times;</button><img>`
         + `<div class="image-preview-spinner" role="status" aria-label="Loading full-size image" hidden>${ICON.spinner}</div>`;
-      const close = () => {
-        overlay.hidden = true;
-        // Whatever was in flight is for a picture nobody is looking at now.
-        setImagePreviewLoading(false);
-        state.pendingImageFullId = null;
-      };
-      overlay.onclick = (e) => { if (e.target === overlay) close(); };
-      overlay.querySelector(".image-preview-close").onclick = close;
+      overlay.onclick = (e) => { if (e.target === overlay) closeImagePreview(); };
+      overlay.querySelector(".image-preview-close").onclick = closeImagePreview;
       document.body.appendChild(overlay);
     }
     const img = overlay.querySelector("img");
@@ -8971,7 +9991,7 @@
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     const overlay = document.querySelector(".image-preview-overlay");
-    if (overlay && !overlay.hidden) overlay.hidden = true;
+    if (overlay && !overlay.hidden) closeImagePreview();
   });
 
   function previewCacheForCurrentSession() {
@@ -9097,6 +10117,7 @@
     donutArc.setAttribute("stroke", color);
     donutLabel.textContent = `${toK(used)}/${toK(max)}`;
     donutLabel.title = `${used.toLocaleString()} / ${max.toLocaleString()} tokens`;
+    donutEl.title = `Context usage — ${used.toLocaleString()} / ${max.toLocaleString()} tokens`;
   }
 
   // ---------- slash autocomplete ----------
@@ -9228,11 +10249,7 @@
     // locked, where a setMode would throw "no session"; that flag always clears.
     modeBtn.disabled = state.busyLocked;
     modeBtn.classList.toggle("disabled", state.busyLocked);
-    modeBtn.title = state.busyLocked
-      ? "Mode — available once the session is ready"
-      : state.planModeAvailable
-        ? "Pick mode"
-        : `Pick mode — ${state.planModeUnavailableReason}`;
+    modeBtn.title = modeButtonTitle(state.currentModeId);
     updateSandboxBtn();
     if (!state.busy) {
       sendBtn.innerHTML = ICON.arrowUp;
@@ -9993,6 +11010,8 @@
         // cannot, which is the safe way round.
         state.hostCaps = (msg.capabilities && typeof msg.capabilities === "object") ? msg.capabilities : {};
         restoreRememberedRemoteSession();
+        // Capability field presence — never a version check. Local hosts ignore.
+        ensureRemoteFilesBrowser();
         if (typeof msg.showThinking === "boolean") state.showThinking = msg.showThinking;
         if (typeof msg.expandCommandOutputs === "boolean") state.expandCommandOutputs = msg.expandCommandOutputs;
         if (typeof msg.steerByDefault === "boolean") state.steerByDefault = msg.steerByDefault;
@@ -10011,12 +11030,23 @@
         applyExpandCommandOutputs();
         syncGearPlacement();
         updateSandboxBtn();
+        renderWelcomeTip();
+        break;
+      case "moveViewHint":
+        // Live retraction. `initialState` is not re-sent on a session swap, so a
+        // webview holding a stale true would rebuild the hint the user has
+        // already acted on — and opening the picker and cancelling causes no
+        // rebuild that would refresh it.
+        if (state.hostCaps) state.hostCaps.moveViewHint = msg.value === true;
+        renderWelcomeTip();
         break;
       case "planModeAvailability":
         state.planModeAvailable = msg.available !== false;
         state.planModeUnavailableReason = state.planModeAvailable
           ? ""
           : String(msg.reason || "Plan mode is unavailable.");
+        // Only an unverified probe is recheckable; a verified-old CLI stays latched.
+        state.planModeRecheckable = !state.planModeAvailable && msg.recheckable === true;
         updateSendButton();
         break;
       case "remoteStatus":
@@ -10256,7 +11286,13 @@
           name: String(msg.name || "New session"),
           cwd: String(msg.cwd || ""),
         };
+        // Host-confirmed identity only. Optimistic rail clicks never write here.
         state.activeSessionId = msg.sessionId;
+        // May complete a resume (id match) or bind a new-session resolved id.
+        noteRailTransitionSessionName(msg);
+        // AFTER the note: a surviving transition means this frame was about a
+        // different conversation. See noteHostIdentityKnown.
+        noteHostIdentityKnown(msg.sessionId);
         renderSessionName();
         renderSessionHead();
         break;
@@ -10507,7 +11543,11 @@
           if (state.replayDepth > 0) break;
           state.replaying = false;
           state.repoSwitchPending = false;
-          setConversationLoading(false);
+          // historyReplay is never identity confirmation. If a rail click is
+          // still waiting for sessionName/sessions.activeId, keep the veil so
+          // the highlight and the load indicator stay paired.
+          if (!state.railTransition) setConversationLoading(false);
+          else setConversationLoading(true);
           renderRepoChip();
           // A remote snapshot can end while its latest turn is still running.
           // Seed the already-rendered prefix only in that case, so the eventual
@@ -10577,11 +11617,24 @@
         // a flattened text blob) — fold its result into the matching subagent
         // card and drop the redundant "[subagent:…]" poller row.
         if (maybeFinishSubagentFromTaskOutput(msg.call) || maybeFinishSubagentFromTaskText(msg.call)) break;
+        if (isMediaGenToolCall(msg.call) && msg.call.toolCallId) {
+          state.mediaGenCallIds.add(msg.call.toolCallId);
+        }
         addToToolGroup(msg.call);
         // On session/load a completed edit replays as a single `tool_call` that
         // already carries its diff (no follow-up update) — attach the preview here
         // or the restored edit has no "open diff →" (#30).
         applyToolDiffs(msg.call);
+        // One-shot failed media-gen on resume (title + status together, no update).
+        {
+          const failure = toolFailureText(msg.call);
+          if (failure) {
+            const hint = isMediaGenToolCall(msg.call)
+              ? mediaGenZeroRetentionHint(failure)
+              : null;
+            markToolFailed(msg.call.toolCallId, hint ? failure + "\n" + hint : failure);
+          }
+        }
         // Resume: if this tool was permission-gated, drop the restored (collapsed)
         // card right here — exactly where it was answered — instead of at the turn
         // boundary.
@@ -10639,9 +11692,16 @@
         }
         // A failed tool (e.g. `image_to_video failed: image reference not readable`)
         // — surface the reason on its row instead of silently dropping it.
+        // ZDR video-gen 400s name a useless API field; append a CLI settings path
+        // when this is a known media-gen call (tracked at toolCall — updates often
+        // have title:null) and the error signature matches.
         const failure = toolFailureText(msg.call);
         if (failure) {
-          markToolFailed(msg.call?.toolCallId, failure);
+          const id = msg.call?.toolCallId;
+          const isMedia =
+            (id && state.mediaGenCallIds.has(id)) || isMediaGenToolCall(msg.call);
+          const hint = isMedia ? mediaGenZeroRetentionHint(failure) : null;
+          markToolFailed(id, hint ? failure + "\n" + hint : failure);
           break;
         }
         applyToolDiffs(msg.call);
@@ -11034,8 +12094,9 @@
         clearWelcome();
         const si = document.createElement("div");
         si.id = "summarizing-indicator";
-        si.className = "session-context-banner loading-dots";
+        si.className = "session-context-banner";
         si.textContent = "Summarizing";
+        si.insertAdjacentHTML("beforeend", BLINK_DOTS);
         messagesEl.appendChild(si);
         scrollToBottom();
         break;
@@ -11055,6 +12116,13 @@
           setConversationLoading(false);
           renderRepoChip();
         }
+        // A generic error cannot be attributed to a specific rail transition
+        // (the frame carries no request id). An error from a superseded resume
+        // therefore aborts whatever is currently in flight — worst case the
+        // highlight backs out early and the real confirmation re-establishes
+        // it (a flicker, not work loss). Leaving a stranded highlight forever
+        // would be worse.
+        if (state.railTransition) abortRailTransition();
         if (state.queuedSubmissionPending && isRelaySendRejection(msg.text)) {
           state.queuedSubmissionPending = false;
           state.queuedSubmissionRejected = true;
@@ -11100,6 +12168,13 @@
           // the rail pinned on "Loading…" after switching projects with a search
           // still active, until the search was cleared or the page refreshed.
           if (!(msg.query || "")) adoptRailRows(entries);
+          // Still an identity frame for the rail transition — activeId is this
+          // tab's, even when the popover is about to re-request a filtered page.
+          if (msg.activeId !== undefined) {
+            state.activeSessionId = msg.activeId || null;
+            noteRailTransitionSessions(msg, entries);
+            noteHostIdentityKnown(msg.activeId || null);
+          }
           requestSessions(0);
           break;
         }
@@ -11119,6 +12194,10 @@
           state.sessionQuery = msg.query || "";
         }
         if (msg.activeId !== undefined) {
+          // Host-confirmed only — never an optimistic rail-transition id.
+          // noteHostIdentityKnown is deliberately NOT here — this handler's
+          // noteRailTransitionSessions runs at the end (it needs the adopted
+          // rows), and the latch has to be read after it. See below.
           state.activeSessionId = msg.activeId || null;
           if (state.activeSessionId) {
             const activeEntry = entries.find((entry) => entry.id === state.activeSessionId)
@@ -11142,6 +12221,8 @@
             // completed and the outbox stayed queued until the tab was closed,
             // taking anything typed meanwhile with it. Fall back to the repo
             // that owns it.
+            // Also deliberately uses host-confirmed activeSessionId only — a
+            // pending rail click must not be remembered as this tab's session.
             const activeRepoRow = state.repos.find((r) => sameCwd(r.cwd, state.activeRepoCwd));
             saveRememberedRemoteSession({
               id: state.activeSessionId,
@@ -11172,6 +12253,15 @@
         // the frame that renames the open conversation — the header reads the
         // active record, so refresh it either way.
         else renderSessionHead();
+        // After adopt so railCatalogHasSession sees the new rows. Confirms a
+        // resume only when activeId equals the requested id; for new, binds /
+        // drops the placeholder only when activeId left the previous session
+        // and the real row is present (never on a foreign tab's activeId).
+        if (offset === 0) noteRailTransitionSessions(msg, entries);
+        // AFTER the note, and only for a frame that actually carried identity.
+        // A paged/filtered answer says nothing about what the host is focused
+        // on, so it must not disarm the latch.
+        if (msg.activeId !== undefined && offset === 0) noteHostIdentityKnown(msg.activeId || null);
         break;
       }
       case "pinnedSessions": {
@@ -11246,13 +12336,32 @@
           // still set, and this is the only place that acts on it.
           if (window.__grokRailNewIntent && sameCwd(window.__grokRailNewIntent, state.selectedRepoCwd)) {
             window.__grokRailNewIntent = null;
+            // Advance the optimistic new-transition (if any) before posting so
+            // the placeholder stays in creating rather than looking stuck on
+            // a switch that already completed.
+            noteRailTransitionRepos(msg);
             vscode.postMessage({ type: "newSession" });
+          } else {
+            noteRailTransitionRepos(msg);
           }
+        } else {
+          // Unrelated catalog push, or a switch that has not named our target
+          // yet — still allow phase advance when selectedCwd matches.
+          noteRailTransitionRepos(msg);
         }
         renderRepoChip();
         if (!repoPopover.hidden) renderRepoPopover();
         renderRail();
         requestRailPreviews();
+        // Selected repo is the file-browse root — a switch must not leave the
+        // panel listing another project's paths under the new name.
+        if (state.filesBrowse.open && remoteFilesBrowseAvailable()) {
+          state.filesBrowse.relPath = "";
+          state.filesBrowse.viewer = null;
+          requestRemoteDir("");
+        } else {
+          ensureRemoteFilesBrowser();
+        }
         // A rail "+" on another repo waits for the switch to land before starting
         // the session, so it can never open one in the repo we were leaving.
         break;
@@ -11262,6 +12371,15 @@
         else delete state.dots[msg.id];
         if (!historyPopover.hidden) patchSessionDot(msg.id);
         patchSessionDot(msg.id, rail());
+        break;
+      case "projectDirListing":
+        handleProjectDirListing(msg);
+        break;
+      case "projectFileContent":
+        handleProjectFileContent(msg);
+        break;
+      case "projectFileWriteResult":
+        handleProjectFileWriteResult(msg);
         break;
       default:
         // No case ran. Either the host posted a type outside the contract (drift
@@ -11322,6 +12440,553 @@
     sandboxBtn.addEventListener("blur", scheduleSandboxRulesPopoverClose);
   }
   gearBtn.onclick = (e) => { e.stopPropagation(); openGearPopover(); };
+
+  // ---------- remote project files ----------
+  //
+  // Browse + open under the tab's selected repo; edit+save when the host also
+  // advertises editProjectFiles. Host fence is repoScopeFor + resolveTreePath
+  // (see src/remote-files.ts). No create/delete/rename. Capability-gated (field
+  // presence); local VS Code / desktop never mount it even when the host
+  // advertises the flag.
+
+  function remoteFilesBrowseAvailable() {
+    return IS_REMOTE && !!(state.hostCaps && state.hostCaps.browseProjectFiles);
+  }
+
+  /** Edit is a separate capability so a host can offer browse without a write path. */
+  function remoteFilesEditAvailable() {
+    return remoteFilesBrowseAvailable() && !!(state.hostCaps && state.hostCaps.editProjectFiles);
+  }
+
+  function remoteFilesRepoCwd() {
+    return state.selectedRepoCwd || state.activeRepoCwd || state.cwd || "";
+  }
+
+  function remoteFileIsEditableKind(kind) {
+    return kind === "markdown" || kind === "json" || kind === "text";
+  }
+
+  function ensureRemoteFilesBrowser() {
+    const on = remoteFilesBrowseAvailable();
+    let btn = document.getElementById("files-browse-btn");
+    let panel = document.getElementById("files-browse-panel");
+    if (!on) {
+      if (btn) btn.hidden = true;
+      if (panel) {
+        panel.hidden = true;
+        document.body.classList.remove("files-browse-open");
+      }
+      return;
+    }
+    const topBar = document.querySelector(".top-bar");
+    if (!btn && topBar) {
+      btn = document.createElement("button");
+      btn.type = "button";
+      btn.id = "files-browse-btn";
+      btn.className = "icon-btn";
+      btn.title = "Project files";
+      btn.setAttribute("aria-label", "Project files");
+      btn.setAttribute("aria-expanded", "false");
+      btn.innerHTML = ICON.listTree;
+      // After history so the remote chrome order stays: remote · history · files · …
+      const history = document.getElementById("history-btn");
+      if (history && history.parentNode === topBar) {
+        topBar.insertBefore(btn, history.nextSibling);
+      } else {
+        topBar.appendChild(btn);
+      }
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleRemoteFilesBrowser();
+      });
+    }
+    if (btn) btn.hidden = false;
+
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "files-browse-panel";
+      panel.className = "files-browse-panel";
+      panel.hidden = true;
+      panel.setAttribute("role", "dialog");
+      panel.setAttribute("aria-label", "Project files");
+      panel.innerHTML =
+        `<div class="files-browse-head">` +
+          `<button type="button" class="icon-btn files-browse-back" title="Up" aria-label="Parent folder" hidden>${ICON.chevronRight}</button>` +
+          `<div class="files-browse-title"></div>` +
+          `<button type="button" class="icon-btn files-browse-close" title="Close" aria-label="Close">${ICON.x}</button>` +
+        `</div>` +
+        `<div class="files-browse-path" aria-live="polite"></div>` +
+        `<div class="files-browse-body"></div>` +
+        `<div class="files-browse-viewer" hidden></div>`;
+      // Sibling of the chat column so it can overlay on a phone without
+      // reflowing the projects rail. Prefer .app-main when present.
+      const host = document.querySelector(".app-main") || document.body;
+      host.appendChild(panel);
+      panel.querySelector(".files-browse-close").addEventListener("click", () => {
+        setRemoteFilesOpen(false);
+      });
+      panel.querySelector(".files-browse-back").addEventListener("click", () => {
+        navigateRemoteFilesUp();
+      });
+      // On a phone the rail is already a drawer — keep this one collapsed by
+      // default. Wider remote browsers may open it once (memory in sessionStorage).
+      try {
+        const remembered = sessionStorage.getItem("grok.remote.filesOpen");
+        if (remembered === "1" && !remoteUsesTouchComposer()) {
+          setRemoteFilesOpen(true);
+        }
+      } catch (_) { /* private mode */ }
+    }
+    renderRemoteFilesChrome();
+  }
+
+  function setRemoteFilesOpen(open) {
+    state.filesBrowse.open = !!open;
+    const panel = document.getElementById("files-browse-panel");
+    const btn = document.getElementById("files-browse-btn");
+    if (panel) panel.hidden = !state.filesBrowse.open;
+    if (btn) btn.setAttribute("aria-expanded", String(state.filesBrowse.open));
+    document.body.classList.toggle("files-browse-open", state.filesBrowse.open);
+    try {
+      sessionStorage.setItem("grok.remote.filesOpen", state.filesBrowse.open ? "1" : "0");
+    } catch (_) { /* */ }
+    if (state.filesBrowse.open) {
+      // Close viewer when reopening so the tree is the entry point.
+      if (!state.filesBrowse.viewer) requestRemoteDir(state.filesBrowse.relPath || "");
+      renderRemoteFilesChrome();
+    }
+  }
+
+  function toggleRemoteFilesBrowser() {
+    if (!remoteFilesBrowseAvailable()) return;
+    ensureRemoteFilesBrowser();
+    setRemoteFilesOpen(!state.filesBrowse.open);
+  }
+
+  function requestRemoteDir(relPath) {
+    const cwd = remoteFilesRepoCwd();
+    if (!cwd) {
+      state.filesBrowse.error = "No repository selected.";
+      state.filesBrowse.loading = false;
+      renderRemoteFilesChrome();
+      return;
+    }
+    state.filesBrowse.listGen += 1;
+    const gen = state.filesBrowse.listGen;
+    state.filesBrowse.relPath = relPath || "";
+    state.filesBrowse.loading = true;
+    state.filesBrowse.error = "";
+    state.filesBrowse.viewer = null;
+    renderRemoteFilesChrome();
+    // Host does not echo gen — accept the next listing that matches this path/cwd.
+    state.filesBrowse._pendingList = { gen, cwd, relPath: state.filesBrowse.relPath };
+    vscode.postMessage({
+      type: "listProjectDir",
+      cwd,
+      relPath: state.filesBrowse.relPath,
+    });
+  }
+
+  function requestRemoteFile(relPath) {
+    const cwd = remoteFilesRepoCwd();
+    if (!cwd || !relPath) return;
+    state.filesBrowse.readGen += 1;
+    const gen = state.filesBrowse.readGen;
+    state.filesBrowse.loading = true;
+    state.filesBrowse.error = "";
+    state.filesBrowse.viewer = { relPath, loading: true };
+    state.filesBrowse._pendingRead = { gen, cwd, relPath };
+    renderRemoteFilesChrome();
+    vscode.postMessage({ type: "readProjectFile", cwd, relPath });
+  }
+
+  function handleProjectDirListing(msg) {
+    const pending = state.filesBrowse._pendingList;
+    if (pending && (msg.cwd !== pending.cwd || (msg.relPath || "") !== (pending.relPath || ""))) {
+      // Stale answer for a previous path — ignore.
+      return;
+    }
+    state.filesBrowse.loading = false;
+    if (!msg.ok) {
+      state.filesBrowse.error = msg.reason || "Could not list folder.";
+      state.filesBrowse.entries = [];
+      state.filesBrowse.truncated = false;
+    } else {
+      state.filesBrowse.error = "";
+      state.filesBrowse.entries = Array.isArray(msg.entries) ? msg.entries : [];
+      state.filesBrowse.truncated = !!msg.truncated;
+      state.filesBrowse.relPath = msg.relPath || "";
+    }
+    renderRemoteFilesChrome();
+  }
+
+  function handleProjectFileContent(msg) {
+    const pending = state.filesBrowse._pendingRead;
+    if (pending && (msg.cwd !== pending.cwd || msg.relPath !== pending.relPath)) return;
+    // A re-read for overwrite must not clobber the user's draft if it races a
+    // normal open of a different path (pending already gates cwd/relPath).
+    const keepDraft = pending && pending.forOverwrite && state.filesBrowse.viewer;
+    state.filesBrowse.loading = false;
+    if (!msg.ok) {
+      if (keepDraft) {
+        state.filesBrowse.viewer.notice = msg.reason || "Could not reload the current file version.";
+        state.filesBrowse.viewer.conflict = false;
+      } else {
+        state.filesBrowse.viewer = {
+          relPath: msg.relPath || (pending && pending.relPath) || "",
+          error: msg.reason || "Could not open file.",
+        };
+      }
+    } else if (keepDraft) {
+      // Fresh stamp for a deliberate overwrite — do not replace the draft text.
+      const v = state.filesBrowse.viewer;
+      v.stamp = msg.stamp;
+      v.absPath = msg.absPath;
+      v.conflict = false;
+      v.notice = "";
+      // Proceed with the overwrite save using the new stamp.
+      if (v.stamp && v.absPath && typeof v.draft === "string") {
+        postRemoteFileWrite(v, v.draft);
+      } else {
+        v.notice = "Could not reload the current file version.";
+      }
+    } else {
+      state.filesBrowse.viewer = {
+        relPath: msg.relPath,
+        kind: msg.kind,
+        text: msg.text,
+        dataUrl: msg.dataUrl,
+        pretty: msg.pretty,
+        stamp: msg.stamp,
+        absPath: msg.absPath,
+        editing: false,
+        draft: typeof msg.text === "string" ? msg.text : "",
+        dirty: false,
+        conflict: false,
+        notice: "",
+      };
+    }
+    renderRemoteFilesChrome();
+  }
+
+  function handleProjectFileWriteResult(msg) {
+    const pending = state.filesBrowse._pendingWrite;
+    if (pending && (msg.cwd !== pending.cwd || msg.relPath !== pending.relPath)) return;
+    const v = state.filesBrowse.viewer;
+    if (!v || v.relPath !== msg.relPath) return;
+    v.saving = false;
+    if (msg.ok) {
+      v.text = typeof v.draft === "string" ? v.draft : v.text;
+      v.stamp = msg.stamp;
+      v.dirty = false;
+      v.editing = false;
+      v.conflict = false;
+      v.notice = "Saved.";
+      state.filesBrowse._pendingWrite = null;
+      renderRemoteFilesChrome();
+      return;
+    }
+    // Stamp mismatch: do NOT silently overwrite — same as the desktop panel.
+    // "workspace changed" means a different file (cross-project); no overwrite.
+    if (msg.reason === "changed") {
+      v.conflict = true;
+      v.notice = "File changed on disk. Reload the host's version, or keep your edits and overwrite.";
+    } else if (msg.reason === "workspace changed") {
+      v.conflict = false;
+      v.notice = "This file is no longer the one you opened (project may have switched). Re-open it from the list.";
+    } else {
+      v.conflict = false;
+      v.notice = msg.reason || "Save refused.";
+    }
+    state.filesBrowse._pendingWrite = null;
+    renderRemoteFilesChrome();
+  }
+
+  function postRemoteFileWrite(viewer, text) {
+    const cwd = remoteFilesRepoCwd();
+    if (!cwd || !viewer || !viewer.relPath || !viewer.stamp || !viewer.absPath) return;
+    if (!remoteFilesEditAvailable()) return;
+    state.filesBrowse.writeGen += 1;
+    viewer.saving = true;
+    viewer.notice = "";
+    state.filesBrowse._pendingWrite = {
+      gen: state.filesBrowse.writeGen,
+      cwd,
+      relPath: viewer.relPath,
+    };
+    renderRemoteFilesChrome();
+    vscode.postMessage({
+      type: "writeProjectFile",
+      cwd,
+      relPath: viewer.relPath,
+      text,
+      stamp: viewer.stamp,
+      expectedAbsPath: viewer.absPath,
+    });
+  }
+
+  function startRemoteFileOverwrite() {
+    const v = state.filesBrowse.viewer;
+    if (!v || !v.relPath || !remoteFilesEditAvailable()) return;
+    // Deliberate second action: re-read for a fresh stamp, then save the draft
+    // with that stamp. Never re-use a failed stamp.
+    const cwd = remoteFilesRepoCwd();
+    if (!cwd) return;
+    state.filesBrowse.readGen += 1;
+    const gen = state.filesBrowse.readGen;
+    state.filesBrowse.loading = true;
+    state.filesBrowse._pendingRead = {
+      gen,
+      cwd,
+      relPath: v.relPath,
+      forOverwrite: true,
+    };
+    v.notice = "Refreshing version…";
+    v.conflict = false;
+    renderRemoteFilesChrome();
+    vscode.postMessage({ type: "readProjectFile", cwd, relPath: v.relPath });
+  }
+
+  function navigateRemoteFilesUp() {
+    const cur = state.filesBrowse.relPath || "";
+    if (!cur) return;
+    const parts = cur.replace(/\\/g, "/").split("/").filter(Boolean);
+    parts.pop();
+    requestRemoteDir(parts.join("/"));
+  }
+
+  function renderRemoteFilesChrome() {
+    const panel = document.getElementById("files-browse-panel");
+    if (!panel || !remoteFilesBrowseAvailable()) return;
+    const title = panel.querySelector(".files-browse-title");
+    const pathEl = panel.querySelector(".files-browse-path");
+    const body = panel.querySelector(".files-browse-body");
+    const viewer = panel.querySelector(".files-browse-viewer");
+    const back = panel.querySelector(".files-browse-back");
+    if (!title || !pathEl || !body || !viewer || !back) return;
+
+    const repo = remoteFilesRepoCwd();
+    const leaf = cwdLeaf(repo) || "Project";
+    title.textContent = leaf;
+    const rel = state.filesBrowse.relPath || "";
+    pathEl.textContent = rel ? rel.replace(/\\/g, "/") : "/";
+    back.hidden = !rel;
+    // Chevron points right in the icon set; flip for "up/back".
+    back.style.transform = "rotate(180deg)";
+
+    const v = state.filesBrowse.viewer;
+    if (v) {
+      body.hidden = true;
+      viewer.hidden = false;
+      viewer.innerHTML = "";
+      const vHead = document.createElement("div");
+      vHead.className = "files-browse-viewer-head";
+      const backToList = document.createElement("button");
+      backToList.type = "button";
+      backToList.className = "icon-btn";
+      backToList.title = "Back to files";
+      backToList.setAttribute("aria-label", "Back to files");
+      backToList.innerHTML = ICON.chevronRight;
+      backToList.style.transform = "rotate(180deg)";
+      backToList.addEventListener("click", () => {
+        // Discard in-progress edit when leaving — no silent write.
+        state.filesBrowse.viewer = null;
+        state.filesBrowse._pendingWrite = null;
+        renderRemoteFilesChrome();
+      });
+      const vName = document.createElement("div");
+      vName.className = "files-browse-viewer-name";
+      vName.textContent = (v.relPath || "").split(/[\\/]/).pop() || v.relPath || "File";
+      if (v.dirty) vName.textContent += " •";
+      vHead.appendChild(backToList);
+      vHead.appendChild(vName);
+      // Edit/Save only when the host advertised edit AND we have stamp+absPath
+      // from the read (without both, a save cannot prove identity/version).
+      const canEdit =
+        remoteFilesEditAvailable() &&
+        remoteFileIsEditableKind(v.kind) &&
+        v.stamp &&
+        v.absPath &&
+        !v.error &&
+        !v.loading;
+      if (canEdit) {
+        if (v.editing) {
+          const cancelBtn = document.createElement("button");
+          cancelBtn.type = "button";
+          cancelBtn.className = "files-browse-action";
+          cancelBtn.textContent = "Cancel";
+          cancelBtn.disabled = !!v.saving;
+          cancelBtn.addEventListener("click", () => {
+            v.editing = false;
+            v.draft = typeof v.text === "string" ? v.text : "";
+            v.dirty = false;
+            v.conflict = false;
+            v.notice = "";
+            renderRemoteFilesChrome();
+          });
+          const saveBtn = document.createElement("button");
+          saveBtn.type = "button";
+          saveBtn.className = "files-browse-action files-browse-action-primary";
+          saveBtn.textContent = v.saving ? "Saving…" : "Save";
+          saveBtn.disabled = !!v.saving || !v.dirty;
+          saveBtn.addEventListener("click", () => {
+            if (!v.dirty || v.saving) return;
+            postRemoteFileWrite(v, typeof v.draft === "string" ? v.draft : "");
+          });
+          vHead.appendChild(cancelBtn);
+          vHead.appendChild(saveBtn);
+        } else {
+          const editBtn = document.createElement("button");
+          editBtn.type = "button";
+          editBtn.className = "files-browse-action";
+          editBtn.title = "Edit file";
+          editBtn.setAttribute("aria-label", "Edit file");
+          editBtn.innerHTML = ICON.pencil;
+          editBtn.addEventListener("click", () => {
+            v.editing = true;
+            v.draft = typeof v.text === "string" ? v.text : "";
+            v.dirty = false;
+            v.notice = "";
+            v.conflict = false;
+            renderRemoteFilesChrome();
+          });
+          vHead.appendChild(editBtn);
+        }
+      }
+      viewer.appendChild(vHead);
+      if (v.notice) {
+        const notice = document.createElement("div");
+        notice.className = "files-browse-notice" + (v.conflict || (v.notice && v.notice !== "Saved.") ? " files-browse-notice-warn" : "");
+        notice.textContent = v.notice;
+        viewer.appendChild(notice);
+        if (v.conflict) {
+          const actions = document.createElement("div");
+          actions.className = "files-browse-conflict-actions";
+          const reloadBtn = document.createElement("button");
+          reloadBtn.type = "button";
+          reloadBtn.className = "files-browse-action";
+          reloadBtn.textContent = "Reload";
+          reloadBtn.addEventListener("click", () => {
+            // Drop draft; re-open the host's version.
+            requestRemoteFile(v.relPath);
+          });
+          const overwriteBtn = document.createElement("button");
+          overwriteBtn.type = "button";
+          overwriteBtn.className = "files-browse-action files-browse-action-danger";
+          overwriteBtn.textContent = "Overwrite";
+          overwriteBtn.addEventListener("click", () => startRemoteFileOverwrite());
+          actions.appendChild(reloadBtn);
+          actions.appendChild(overwriteBtn);
+          viewer.appendChild(actions);
+        }
+      }
+      const vBody = document.createElement("div");
+      vBody.className = "files-browse-viewer-body";
+      if (v.loading || state.filesBrowse.loading && v.loading !== false && !v.error && !v.kind) {
+        vBody.className += " muted";
+        vBody.textContent = "Loading…";
+      } else if (v.error) {
+        vBody.className += " files-browse-error";
+        vBody.textContent = v.error;
+      } else if (v.editing) {
+        const ta = document.createElement("textarea");
+        ta.className = "files-browse-editor";
+        ta.value = typeof v.draft === "string" ? v.draft : (v.text || "");
+        ta.spellcheck = false;
+        ta.setAttribute("aria-label", "Edit " + (v.relPath || "file"));
+        ta.addEventListener("input", () => {
+          v.draft = ta.value;
+          v.dirty = ta.value !== (v.text || "");
+          // Update dirty marker + Save enablement without rebuilding the textarea
+          // (would steal focus / lose caret on every keystroke).
+          const nameEl = viewer.querySelector(".files-browse-viewer-name");
+          if (nameEl) {
+            const base = (v.relPath || "").split(/[\\/]/).pop() || v.relPath || "File";
+            nameEl.textContent = v.dirty ? base + " •" : base;
+          }
+          const save = viewer.querySelector(".files-browse-action-primary");
+          if (save) save.disabled = !!v.saving || !v.dirty;
+        });
+        vBody.appendChild(ta);
+      } else if (v.kind === "image" && v.dataUrl) {
+        const img = document.createElement("img");
+        img.src = v.dataUrl;
+        img.alt = v.relPath || "";
+        vBody.appendChild(img);
+      } else if (v.kind === "markdown" && typeof v.text === "string") {
+        const md = document.createElement("div");
+        // Shared markdown styles: class files-browse-md in chat.css (paired with
+        // the desktop panel's preview class). chat.js must not mention the
+        // desktop panel class prefix (isolation test in desktop-host-pure).
+        md.className = "files-browse-md";
+        md.innerHTML = renderMarkdown(v.text);
+        applyAutoDir(md);
+        vBody.appendChild(md);
+      } else {
+        const pre = document.createElement("pre");
+        pre.textContent = typeof v.text === "string" ? v.text : "";
+        vBody.appendChild(pre);
+      }
+      viewer.appendChild(vBody);
+      return;
+    }
+
+    viewer.hidden = true;
+    viewer.innerHTML = "";
+    body.hidden = false;
+    body.innerHTML = "";
+    if (state.filesBrowse.loading) {
+      const loading = document.createElement("div");
+      loading.className = "files-browse-empty muted";
+      loading.textContent = "Loading…";
+      body.appendChild(loading);
+      return;
+    }
+    if (state.filesBrowse.error) {
+      const err = document.createElement("div");
+      err.className = "files-browse-empty files-browse-error";
+      err.textContent = state.filesBrowse.error;
+      body.appendChild(err);
+      return;
+    }
+    const entries = state.filesBrowse.entries || [];
+    if (!entries.length) {
+      const empty = document.createElement("div");
+      empty.className = "files-browse-empty muted";
+      empty.textContent = "Empty folder";
+      body.appendChild(empty);
+      return;
+    }
+    for (const ent of entries) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "files-browse-row";
+      const icon = document.createElement("span");
+      icon.className = "files-browse-row-icon";
+      icon.innerHTML = ent.kind === "dir" ? ICON.folder : ICON.file;
+      const name = document.createElement("span");
+      name.className = "files-browse-row-name";
+      name.textContent = ent.name;
+      row.appendChild(icon);
+      row.appendChild(name);
+      if (ent.kind === "dir") {
+        const chev = document.createElement("span");
+        chev.className = "files-browse-row-chev";
+        chev.innerHTML = ICON.chevronRight;
+        row.appendChild(chev);
+        row.addEventListener("click", () => requestRemoteDir(ent.relPath));
+      } else {
+        row.addEventListener("click", () => requestRemoteFile(ent.relPath));
+      }
+      body.appendChild(row);
+    }
+    if (state.filesBrowse.truncated) {
+      const note = document.createElement("div");
+      note.className = "files-browse-empty muted";
+      note.textContent = "Listing truncated — folder has more entries.";
+      body.appendChild(note);
+    }
+  }
 
   // Welcome screen's "about" link → open the gear popover's Version & about panel.
   const welcomeAboutLink = $("welcome-about-link");

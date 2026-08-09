@@ -10,7 +10,7 @@
 //   - inbound  (remote client -> host): WebviewMsg, gated by capability tier.
 //   - outbound (host -> remote client): HostMsg, mirrored / transformed / suppressed.
 
-import type { HostMsg, WebviewMsg } from "./protocol";
+import type { HostMsg, HostUiCapabilities, WebviewMsg } from "./protocol";
 import { isImageChip, type FileChip } from "./chips";
 import { isPrimerText } from "./grok-primer";
 import { countsAsUserBubble } from "./plan-restore";
@@ -204,6 +204,10 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // Rearranges the remote's own sidebar and touches nothing on disk beyond a
   // globalState note. Nothing here can reach the workspace.
   setRepoArchived: "full",
+  // Host-persisted project colour (globalState / client-state file), same class
+  // as archive/pin: rearranges the remote's rail and touches nothing on disk
+  // beyond that note.
+  setRepoColor: "full",
   // Writes host state (globalState), same as the repo pin — classified with it
   // rather than as a view op, even though nothing is destroyed.
   toggleSessionPin: "full",
@@ -211,6 +215,11 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   renameSession: "view",
   // read-only workspace file-name lookup (the composer's @ popover)
   mentionQuery: "view",
+  // Project file browse (list dir + open one file). The fence is repoScopeFor
+  // + resolveTreePath — not a second root concept. Writes are a separate type
+  // (writeProjectFile) at the mutation tier below.
+  listProjectDir: "view",
+  readProjectFile: "view",
   // input/turn control (propose+)
   send: "propose",
   newSession: "propose",
@@ -259,6 +268,10 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   pasteImage: "propose",
   // Host validates the extension/name/bytes before staging under globalStorage.
   uploadFile: "propose",
+  // Workspace file mutation — same propose tier as upload/send, NOT view. A
+  // read-only remote must not rewrite the desk tree. Existing files only
+  // (create/delete/rename are deliberately out of scope).
+  writeProjectFile: "propose",
   removeChip: "propose",
   toggleChip: "propose",
   // attaches a chip only after an exact host mention-catalog lookup plus
@@ -280,6 +293,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // host-local: native pickers/editors/config/mic on the dev box
   pickModel: "host-local",
   openFile: "host-local",
+  showInFolder: "host-local",
   openUrl: "host-local",
   openText: "host-local",
   openDiff: "host-local",
@@ -296,6 +310,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   openProjectConfig: "host-local",
   runMcpList: "host-local",
   showLogs: "host-local",
+  toggleDevTools: "host-local",
   openSettings: "host-local",
   moveView: "host-local",
   dropFile: "host-local",
@@ -366,8 +381,17 @@ export function allowRemoteRepoTarget(msg: WebviewMsg, isKnownCwd: (cwd: string)
     case "selectRepo":
     case "toggleRepoPin":
     case "setRepoArchived":
+    case "setRepoColor":
     case "clearAllSessions":
     case "listRepoSessions":
+    // File browse names a cwd. Without this case the default branch returns
+    // true and a remote could claim an arbitrary path that never appeared in
+    // the catalog — the exact trap the comment on this function exists for.
+    case "listProjectDir":
+    case "readProjectFile":
+    // Write names a cwd too. Without this case the default branch returns true
+    // and a remote could claim an arbitrary path — same trap as list/read.
+    case "writeProjectFile":
       return isKnownCwd(msg.cwd);
     case "resumeSession":
     // Same shape as resume: the cwd is optional (the host falls back to its own
@@ -427,6 +451,36 @@ export function repoScopeFor(
 
 // ---------- outbound: HostMsg to a remote client ----------
 
+/**
+ * Capabilities that describe THE DESK MACHINE and would be actively misleading
+ * on a phone, so they are removed from the `initialState` a remote receives.
+ *
+ * - `servesMediaRanges` — the desk host's own byte-range serving. A remote gets
+ *   media through the remote media policy instead, so inheriting this would
+ *   make the browser preload video the relay never sends.
+ * - `showInFolder` — would offer "Show in folder" on a phone for a folder that
+ *   only exists on the desk machine.
+ *
+ * A list rather than a destructure at the call site so there is ONE place to
+ * look when a capability is added, and so the removal is testable without a
+ * whole sidebar. Belt-and-braces: `allowFromRemote` already refuses the
+ * messages these unlock. Capabilities a remote genuinely needs — the file
+ * browser, for one — must NOT be listed here.
+ */
+export const DESK_ONLY_CAPABILITIES = [
+  "servesMediaRanges",
+  "showInFolder",
+] as const satisfies ReadonlyArray<keyof HostUiCapabilities>;
+
+/** `capabilities` as a remote may see them. Pure; see DESK_ONLY_CAPABILITIES. */
+export function capabilitiesForRemote(
+  capabilities: HostUiCapabilities,
+): HostUiCapabilities {
+  const out = { ...capabilities };
+  for (const key of DESK_ONLY_CAPABILITIES) delete out[key];
+  return out;
+}
+
 export type OutboundDisposition =
   /** Pure data — ferry as-is. */
   | "mirror"
@@ -444,6 +498,9 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   voiceTranscript: "mirror",
   voiceError: "mirror",
   initialState: "mirror",
+  // Placement is a property of the machine running the extension, and `moveView`
+  // is host-local anyway — a remote could neither act on the hint nor need it.
+  moveViewHint: "host-local",
   showThinking: "mirror",
   appPurpose: "mirror",
   fontScale: "mirror",
@@ -465,6 +522,11 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   chips: "mirror",
   commandsUpdate: "mirror",
   mentionResults: "mirror",
+  // Targeted answers to a phone's list/read/write. absPath on content is
+  // edit-meta only (capability-gated host-side) and round-trips on save.
+  projectDirListing: "mirror",
+  projectFileContent: "mirror",
+  projectFileWriteResult: "mirror",
   userMessage: "mirror",
   agentStart: "mirror",
   thoughtChunk: "mirror",
@@ -558,6 +620,7 @@ export type OutboundProjectAuth =
 
 export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth> = {
   // Device-global / host chrome — not project data.
+  moveViewHint: "none",
   showThinking: "none",
   appPurpose: "none",
   fontScale: "none",
@@ -615,6 +678,11 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   sandboxState: "scope",
   commandsUpdate: "scope",
   mentionResults: "scope",
+  // Carry the scoped repo cwd; authorize against that field (message-cwd) so a
+  // closed project cannot keep answering file reads after rehome.
+  projectDirListing: "message-cwd",
+  projectFileContent: "message-cwd",
+  projectFileWriteResult: "message-cwd",
   userMessage: "scope",
   agentStart: "scope",
   thoughtChunk: "scope",

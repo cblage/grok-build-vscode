@@ -45,6 +45,7 @@ import type {
   Uri,
 } from "../host";
 import { isFsPathInWorkspace } from "../host";
+import type { PanelPosition } from "../view-move";
 import {
   canonicalizeSeedProjectPath,
   selectProjectsToSeed,
@@ -205,6 +206,9 @@ function openHtmlDocumentWindow(
   html: string,
 ): BrowserWindow {
   const parent = parentWindow(getWindow);
+  // Same packaging gate as the main window: no DevTools door in signed builds.
+  // Deliberately do NOT auto-open DevTools here — these are ephemeral
+  // diff/text viewers, not the chat surface under test.
   const win = new BrowserWindow({
     width: 960,
     height: 720,
@@ -217,6 +221,7 @@ function openHtmlDocumentWindow(
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      devTools: !app.isPackaged,
     },
   });
   installWindowSecurityLocks(win, {
@@ -244,6 +249,8 @@ function showHtmlDialog(
   return new Promise((resolve) => {
     const parent = parentWindow(getWindow);
     const dialogPreload = path.join(__dirname, "dialog-preload.js");
+    // Same packaging gate as main/diff viewers. No auto-open — modal dialogs
+    // are short-lived and not the rendering surface owners debug.
     const win = new BrowserWindow({
       width: size.width,
       height: size.height,
@@ -260,6 +267,7 @@ function showHtmlDialog(
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: false,
+        devTools: !app.isPackaged,
       },
     });
     installWindowSecurityLocks(win, {
@@ -893,6 +901,12 @@ export function createElectronHost(opts: ElectronHostOptions): Host {
     showOutput(_preserveFocus?: boolean) {
       // Desktop logs to stdout; nothing to show.
     },
+    toggleDevTools() {
+      if (app.isPackaged) return;
+      const win = getWindow();
+      if (!win || win.isDestroyed()) return;
+      win.webContents.toggleDevTools();
+    },
 
     fs: hostFs,
 
@@ -993,6 +1007,19 @@ export function createElectronHost(opts: ElectronHostOptions): Host {
       }
       await messageBox(getWindow, "error", `Could not open resource:\n${String(target)}`, ["OK"]);
     },
+    async showInFolder(fsPath: string) {
+      const ctx = getAuthContext?.();
+      if (!ctx || (!ctx.workspaceRoot && !(ctx.allowedRoots && ctx.allowedRoots.length))) {
+        log(`[desktop] reveal refused: no auth context for ${fsPath}`);
+        return;
+      }
+      const check = resolveAuthorizedFileForOpen(fsPath, ctx);
+      if (!check.ok) {
+        log(`[desktop] reveal refused at use-time: ${check.reason} (${fsPath})`);
+        return;
+      }
+      shell.showItemInFolder(check.absPath);
+    },
     async openGlobalConfig() {
       const p = globalConfigPath();
       ensureConfigToml(p, GLOBAL_CONFIG_STUB);
@@ -1047,7 +1074,11 @@ export function createElectronHost(opts: ElectronHostOptions): Host {
     async setContext(_key: string, _value: unknown) {
       // VS Code when-clause context — no-op on desktop.
     },
-    async relocateView(_viewId: string, _destinationId?: string | null) {
+    async relocateView(
+      _viewId: string,
+      _destinationId?: string | null,
+      _panelPosition?: PanelPosition | null,
+    ) {
       // Capability `canRelocateView` is false — gear must not offer this. Stub
       // remains for typed Host completeness; never user-reachable from the UI.
       await notYet("Move view");
@@ -1099,9 +1130,24 @@ export function createElectronHost(opts: ElectronHostOptions): Host {
     webviewReloadsUnderLiveSession: true,
     remoteInstallIdSuffix: ":desktop",
     canRelocateView: false,
+    // Moot while canRelocateView is false (the gear hides the whole section),
+    // but false is the truthful answer: a single-window desktop app has no
+    // side bars to move a view between.
+    canUseSecondarySideBar: false,
     canShowOutput: false,
+    // Unpackaged only — packaged builds hard-disable DevTools at webPreferences.
+    get canToggleDevTools() {
+      return !app.isPackaged;
+    },
+    // No editor tabs — a generated-image click must use the in-app lightbox,
+    // not openFile (which would hand the file to the OS image viewer).
+    canOpenInEditor: false,
     canSwitchWorkspaceFolder: true,
     canArchiveRepos: false,
+    // This host owns its own app-resource:// handler, and that handler answers
+    // byte ranges — see app-resource-handler.ts. No other host may claim this.
+    canServeMediaRanges: true,
+    canShowInFolder: true,
   };
 }
 

@@ -38,7 +38,13 @@ import type { PromptResultMeta, PromptUsage } from "./acp-dispatch";
 import { MediaRef, agentTimestampMsFromMeta, autoCompactStartedNote, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isRateLimitError, isSubagentLifecycleUpdate, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement } from "./acp-dispatch";
 import { modeToRemember, startsInYolo } from "./mode-prefs";
 import { beginAuthRecovery, oauthShadowsXaiApiKey } from "./auth-recovery";
-import { GROK_VIEW_ID, moveViewContainerFor } from "./view-move";
+import {
+  GROK_VIEW_ID,
+  MOVE_VIEW_HINT_USED_KEY,
+  moveViewContainerFor,
+  panelPositionFor,
+  shouldShowMoveViewHint,
+} from "./view-move";
 import {
   APTABASE_APP_KEY_PROD,
   buildSessionStartEvent,
@@ -54,12 +60,13 @@ import { listGitWorktreePaths } from "./git-worktree-list";
 import {
   locateGrokCli,
   extensionWasUpgraded,
-  isGrokVersionBelowRequired,
   isStdioBrokenGrokVersion,
   parseGrokVersion,
   grokUpdatePolicy,
   shouldReactivelyDowngrade,
   isLockedBinaryError,
+  decidePlanModeAvailability,
+  probeVersionOutput,
   GROK_REQUIRED_VERSION,
   GROK_STDIO_DOWNGRADE_TARGET,
 } from "./cli-locator";
@@ -135,7 +142,10 @@ import {
 import { MAX_DIFF_EXPAND_BYTES, expandDiffToWholeFile } from "./diff-view";
 import { permissionAnswerAllowed, permissionOptionsForPlan, pickRejectOption, shouldRejectPermission } from "./plan-gate";
 import { appendPlanEntry, planRestoreSource, truncateResolvedAfter, countsAsUserBubble, decideRestoreState, isInterjectionText } from "./plan-restore";
-import { planReviewFileName, sanitizePlanReviewFilePart } from "./plan-review";
+import {
+  planReviewFileName,
+  planReviewSessionDirectoryName,
+} from "./plan-review";
 import { isPrimerText } from "./grok-primer";
 import { AsyncSerialQueue } from "./async-serial";
 import { HOST_CAPABILITIES, HostMsg, WebviewMsg, type SandboxProfileRules } from "./protocol";
@@ -144,8 +154,15 @@ import { RemoteUplink } from "./remote-uplink";
 import { RemoteClientState, serializesRemoteSessionTransition } from "./remote-client-state";
 import { RemotePcmIngress, acceptRemotePcm } from "./remote-voice";
 import { SessionRequestState } from "./session-request-state";
-import { allowFromRemote, allowRemoteRepoTarget, bracketRemoteSnapshot, mayDeliverRemoteHostMsg, repoScopeFor, sessionCwdBelongsToRepo, sessionForRequest, shouldAdoptDeskSession, transformHostMsgForRemote, type MediaInlineDeps, type MsgOrigin, type RemoteTier } from "./remote-policy";
-import { deviceDisplayName, httpBaseFromRelayUrl, parseRelayFrame, REMOTE_RELAY_URL } from "./remote-frames";
+import { allowFromRemote, capabilitiesForRemote, allowRemoteRepoTarget, bracketRemoteSnapshot, mayDeliverRemoteHostMsg, repoScopeFor, sessionCwdBelongsToRepo, sessionForRequest, shouldAdoptDeskSession, transformHostMsgForRemote, type MediaInlineDeps, type MsgOrigin, type RemoteTier } from "./remote-policy";
+import {
+  listRemoteProjectDir,
+  projectFileContentForWire,
+  readRemoteProjectFile,
+  resolveRemoteFileRoot,
+  writeRemoteProjectFile,
+} from "./remote-files";
+import { deviceDisplayName, httpBaseFromRelayUrl, parseRelayFrame, resolveRelayUrl } from "./remote-frames";
 import { KeepAwake, shouldKeepAwake } from "./keep-awake";
 import { thumbnailImage, thumbnailMime } from "./image-thumbnail";
 import { historyImagePreviews } from "./image-history";
@@ -153,6 +170,7 @@ import {
   SessionListEntry,
   SessionMetaOverrides,
   RepoArchives,
+  RepoColors,
   RepoListEntry,
   RepoPins,
   carrySessionName,
@@ -167,12 +185,15 @@ import {
   indexSessions,
   isEmptySession,
   isPathInside,
+  isRepoColor,
+  REPO_COLOR_IDS,
   mostRecentSession,
   normalizeRepoPath,
   orderedResumeCwdCandidates,
   readContextUsage,
   readSessionEntries,
   resolveGrokHome,
+  sessionCatalogDirs,
   sessionDirFor,
   sessionsDirFor,
 } from "./sessions";
@@ -181,8 +202,9 @@ import {
   isRefusedMediaPath,
   isTrustedGeneratedMediaPath,
   MAX_INLINE_MEDIA_BYTES,
+  resolveChatOpenFilePath,
 } from "./media-serve";
-import { revalidateOpenFileForUse } from "./desktop/desktop-policy";
+import { isExecutableOpenTarget, revalidateOpenFileForUse } from "./desktop/desktop-policy";
 import {
   describeFfmpegProblem,
   ffmpegInstallHint,
@@ -262,6 +284,12 @@ const REPO_PINS_KEY = "grok.repoPins";
  *  is curation of your projects, not a preference about one sidebar. Read by the
  *  browser client only; the VS Code repo picker ignores it entirely. */
 const REPO_ARCHIVES_KEY = "grok.repoArchives";
+/** Shared client-state key for per-project folder colours in the conversation
+ *  rail. Stored under ~/.grok/client-state so the choice follows you to a phone
+ *  and survives a cleared browser — same home as pins/archives. Both desktop
+ *  and VS Code host this (unlike archives, which desktop strips because open/
+ *  close already owns the curated list). */
+const REPO_COLORS_KEY = "grok.repoColors";
 /** Shared client-state key for the anonymous per-install telemetry GUID (survives
  *  updates and identifies this machine across clients).
  *
@@ -324,6 +352,8 @@ interface RemoteBrowserPreferences {
 interface CliCompatibilityResult {
   planModeAvailable: boolean;
   planModeUnavailableReason?: string;
+  /** False only when the probe got no parseable version (re-checkable). */
+  planModeVersionVerified: boolean;
 }
 
 // History pagination: rows fetched per "page" (initial open + each load-more / search page).
@@ -408,7 +438,11 @@ function guessMediaMime(p: string): string {
 
 export class GrokSidebar {
   public static readonly viewId = "grok.chat";
+  /** Primary side bar projects rail — separate webview, not a second chat client. */
+  public static readonly projectsViewId = "grok.projects";
   private view?: HostWebviewView;
+  /** Second local consumer of catalog-shaped host messages. Absent until resolved. */
+  private projectsRail?: HostWebviewView;
   /** The session currently shown in the chat — one member of {@link pool}. */
   private focused = this.newLocalSession();
   /**
@@ -594,15 +628,7 @@ export class GrokSidebar {
       enableScripts: true,
       // Extension assets keep extensionUri identity (vscode-remote on remote hosts).
       // Staging + grok home are genuinely local disk paths → Uri.file.
-      localResourceRoots: [
-        Uri.joinPath(this.context.extensionUri, "media"),
-        Uri.joinPath(this.context.extensionUri, "resources"),
-        Uri.file(this.imageStagingDir()),
-        // grok writes generated media under ~/.grok/sessions/<cwd>/<id>/{images,videos};
-        // serving it via asWebviewUri (instead of a base64 data: URI) lets the
-        // webview stream a multi-MB video from disk — see postGeneratedMedia.
-        Uri.file(resolveGrokHome()),
-      ],
+      localResourceRoots: this.chatLocalResourceRoots(),
     };
     view.webview.html = this.getHtml(view.webview);
     // Message handlers run async; without this catch a throw (e.g. an fs error
@@ -717,6 +743,72 @@ export class GrokSidebar {
     this.configWatcher = disposeAll(configChanges, authWatcher);
     this.applyTerminalShellPref();
     void this.maybeStartUplink();
+  }
+
+  /**
+   * Primary side bar projects rail. Same catalog stream as the chat webview
+   * (`repos` / `sessions` / `repoSessions` / `pinnedSessions` / `sessionDot`),
+   * never chat traffic — a second `chat.js` client would double-own sessions.
+   */
+  resolveProjectsRailView(view: HostWebviewView): void {
+    this.projectsRail = view;
+    view.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [
+        Uri.joinPath(this.context.extensionUri, "media"),
+        Uri.joinPath(this.context.extensionUri, "resources"),
+      ],
+    };
+    view.webview.html = this.getProjectsRailHtml(view.webview);
+    view.webview.onDidReceiveMessage((raw) => {
+      const m = raw as WebviewMsg;
+      void this.onProjectsRailMessage(m).catch((e) => {
+        const msg = (e as Error)?.message ?? String(e);
+        this.host.appendLine(`[projects-rail] ${m.type} failed: ${msg}`);
+        void this.host.showErrorMessage(`Grok Projects: ${m.type} failed — ${msg}`);
+      });
+    });
+  }
+
+  /** Drop the rail handle when the view is disposed (or re-created). */
+  disposeProjectsRailView(): void {
+    this.projectsRail = undefined;
+  }
+
+  private chatLocalResourceRoots(): Uri[] {
+    return [
+      Uri.joinPath(this.context.extensionUri, "media"),
+      Uri.joinPath(this.context.extensionUri, "resources"),
+      Uri.file(this.imageStagingDir()),
+      // grok writes generated media under ~/.grok/sessions/<cwd>/<id>/{images,videos};
+      // serving it via asWebviewUri (instead of a base64 data: URI) lets the
+      // webview stream a multi-MB video from disk — see postGeneratedMedia.
+      Uri.file(resolveGrokHome()),
+    ];
+  }
+
+  /**
+   * Rail actions only. `ready` pushes catalog — never postInitialState / startSession
+   * (those belong to the chat view). Everything else reuses onMessage so there is
+   * one host path for resume/pin/rename/delete.
+   */
+  private async onProjectsRailMessage(msg: WebviewMsg): Promise<void> {
+    if (msg.type === "ready") {
+      this.pushProjectsRailCatalog();
+      return;
+    }
+    if (!GrokSidebar.PROJECTS_RAIL_WEBVIEW_TYPES.has(msg.type)) {
+      this.host.appendLine(`[projects-rail] ignored ${msg.type}`);
+      return;
+    }
+    await this.onMessage(msg, "local");
+  }
+
+  /** Catalog snapshot for a freshly-resolved rail (or its ready handshake). */
+  private pushProjectsRailCatalog(): void {
+    if (!this.projectsRail) return;
+    this.postRepoCatalog();
+    this.postSessionsList();
   }
 
   /** Push the `grok.terminalShell` preference (#46) into the shared shell
@@ -1298,12 +1390,27 @@ Only continue if you trust this code.`,
     // The mode button is disabled while busy; this backstops the toggle-mode command.
     if (!session.client || !session.client.sessionId || session.priming) return;
     if (modeId === "plan" && !session.planModeAvailable) {
-      this.reportRequester(
-        requester,
-        "warning",
-        session.planModeUnavailableReason ?? "Plan mode is unavailable for this Grok CLI version.",
-      );
-      return;
+      // Unverified probe: re-check now rather than forcing a session restart.
+      // A verified-old CLI is latched and stays refused.
+      if (!session.planModeVersionVerified) {
+        const rechecked = await this.recheckPlanModeAvailability(session);
+        if (!rechecked || !session.planModeAvailable) {
+          this.reportRequester(
+            requester,
+            "warning",
+            session.planModeUnavailableReason ?? "Plan mode is unavailable for this Grok CLI version.",
+          );
+          return;
+        }
+        // Probe succeeded — fall through and enter Plan on this same click.
+      } else {
+        this.reportRequester(
+          requester,
+          "warning",
+          session.planModeUnavailableReason ?? "Plan mode is unavailable for this Grok CLI version.",
+        );
+        return;
+      }
     }
     if (!session.planModeAvailable && session.planActive) {
       // An agent-initiated unavailable Plan transition is still being forced
@@ -2238,6 +2345,30 @@ Only continue if you trust this code.`,
     await this.context.globalState.update(key, map);
   }
 
+  /** Resolve the same workspace/media path used by the chat openFile action. */
+  private resolveChatOpenPath(session: Session, rawPath: string): {
+    ref: ReturnType<typeof parseFileRef>;
+    path: string;
+  } {
+    const ref = parseFileRef(rawPath);
+    const { grokHome, sessionDir } = this.desktopOpenMediaContext(session);
+    const resolved = resolveChatOpenFilePath({
+      rawPath: ref.path,
+      workspaceRoots: [this.sessionCwd(session)],
+      sessionDir,
+      grokHome,
+      exists: (abs) => {
+        try {
+          return fs.statSync(abs).isFile();
+        } catch {
+          return false;
+        }
+      },
+      realpath: (candidate) => fs.realpathSync(candidate),
+    });
+    return { ref, path: resolved };
+  }
+
   private setSessionCwd(session: Session, cwd: string, fallbackSourceGitRoot: string): void {
     session.cwd = cwd;
     session.worktree = undefined;
@@ -2708,6 +2839,10 @@ Only continue if you trust this code.`,
       archives: this.host.canArchiveRepos
         ? this.state.get<RepoArchives>(REPO_ARCHIVES_KEY, {})
         : undefined,
+      // Colours are host-persisted on every surface that has a rail (desktop +
+      // AFK Pilot). Always passed so every row carries `color` (possibly "") —
+      // field presence is the client capability probe.
+      colors: this.state.get<RepoColors>(REPO_COLORS_KEY, {}),
       tmpDir: os.tmpdir(),
       // Open folders remain selectable before Grok creates a catalog row (and
       // bypass managed-worktree exclusion when the user opened a worktree).
@@ -2746,12 +2881,20 @@ Only continue if you trust this code.`,
             continue;
           }
           // Trusted open folder with no catalog row yet — still show it.
+          // Colour still comes from the shared store so a painted project
+          // keeps its tint when Grok has not created a sessions catalog yet.
+          const colors = this.state.get<RepoColors>(REPO_COLORS_KEY, {});
+          const colorChoice = colors[key]?.color;
           entries.push({
             cwd,
             label: path.basename(cwd) || cwd,
             available: true,
             pinned: false,
             updatedAt: 0,
+            // Stored choices are non-empty ids; missing/invalid → "" for none.
+            color: colorChoice && (REPO_COLOR_IDS as readonly string[]).includes(colorChoice)
+              ? colorChoice
+              : "",
           });
         }
       }
@@ -2917,10 +3060,27 @@ Only continue if you trust this code.`,
    * Resolve a renderer/local `cwd` against the host-owned local catalog only.
    * Desktop: open folders (via {@link localRepoCatalogEntries}). VS Code: the
    * full historical catalog (same helper returns the full list when the host
-   * cannot switch folders). Never the remote full-catalog-or-fallback probe.
+   * cannot switch folders). A registered worktree cwd resolves to its owning
+   * catalog row through {@link sessionCwdsForRepo}. Never the remote
+   * full-catalog-or-fallback probe.
    */
   private resolveLocalRepoTarget(cwd: string): RepoListEntry | undefined {
-    const hit = this.localRepoCatalogEntries().find((r) => pathsEqual(r.cwd, cwd));
+    const entries = this.localRepoCatalogEntries();
+    let hit = entries.find((r) => pathsEqual(r.cwd, cwd));
+    if (!hit) {
+      const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+      // Ownership resolves by GIT ROOT, so every open folder sharing one
+      // checkout claims the same worktree — two sibling monorepo packages both
+      // answer yes. Taking the first would silently pick whichever the catalog
+      // listed first, which is normally just the active folder, so an ambiguous
+      // claim is treated as no claim.
+      const owners = entries.filter(
+        (r) =>
+          r.available
+          && this.sessionCwdsForRepo(r.cwd, overrides).some((c) => pathsEqual(c, cwd)),
+      );
+      hit = owners.length === 1 ? owners[0] : undefined;
+    }
     if (!hit || !hit.available) return undefined;
     return hit;
   }
@@ -3002,22 +3162,28 @@ Only continue if you trust this code.`,
   }
 
   /**
-   * Desktop multi-folder: switch the host's active folder and open that
-   * project's newest conversation (or start a blank one). Reuses the session
-   * pool + openSession path — no parallel multi-cwd machinery.
+   * Desktop multi-folder: switch the host's active folder for project browsing.
+   * Reuses the host's active-folder path; session selection remains a separate
+   * action.
    *
    * Serialized on {@link localWorkspaceSwitchQueue} so concurrent `selectRepo`
    * cannot interleave. The target cwd is captured once for the whole action —
    * never re-read from a shared active-root field after an await.
    */
-  private async switchLocalWorkspaceFolder(cwd: string): Promise<void> {
+  private async switchLocalWorkspaceFolder(
+    cwd: string,
+    options: { warnOnRefusal?: boolean } = {},
+  ): Promise<void> {
     const target = cwd;
     return this.localWorkspaceSwitchQueue.run(() =>
-      this.switchLocalWorkspaceFolderExclusive(target),
+      this.switchLocalWorkspaceFolderExclusive(target, options),
     );
   }
 
-  private async switchLocalWorkspaceFolderExclusive(target: string): Promise<void> {
+  private async switchLocalWorkspaceFolderExclusive(
+    target: string,
+    options: { warnOnRefusal?: boolean } = {},
+  ): Promise<void> {
     const prevRoot = this.workspaceRoot();
     if (!pathsEqual(target, prevRoot)) {
       // A rejected host call must abort — never treat setActive as advisory
@@ -3026,9 +3192,14 @@ Only continue if you trust this code.`,
         this.host.appendLine(
           `[workspace] refused setActiveWorkspaceFolder (not an open folder): ${target}`,
         );
-        void this.host.showWarningMessage(
-          `That folder is not open in this app:\n${target}`,
-        );
+        // Explicit project selection is actionable, so keep its warning. A
+        // resume only tries to keep the file-tree view in sync; its session
+        // must still open when the view switch is refused.
+        if (options.warnOnRefusal !== false) {
+          void this.host.showWarningMessage(
+            `That folder is not open in this app:\n${target}`,
+          );
+        }
         return;
       }
     }
@@ -3097,6 +3268,48 @@ Only continue if you trust this code.`,
     if (session.worktree?.sourceGitRoot) add(session.worktree.sourceGitRoot);
     add(this.workspaceRoot());
     return roots;
+  }
+
+  /**
+   * Grok home + on-disk session directory + project session catalogs for desktop
+   * openFile authorization of trusted session-generated media
+   * (`images|videos` under `~/.grok/sessions/<cwd>/…`). Absolute opens are scoped
+   * to the project catalogs (sibling sessions OK for fork replay; cross-repo not).
+   * Public so Electron main can wire both message-gate and use-time contexts.
+   */
+  desktopOpenMediaContext(session: Session = this.focused): {
+    grokHome?: string;
+    sessionDir?: string;
+    sessionCatalogDirs?: string[];
+  } {
+    let grokHome: string | undefined;
+    try {
+      grokHome = resolveGrokHome(process.env);
+    } catch {
+      grokHome = undefined;
+    }
+    const cwd = this.sessionCwd(session);
+    const sid = session.activeSessionId;
+    const sessionDir =
+      grokHome && sid
+        ? sessionDirFor(grokHome, cwd, sid, { fs: defaultFs })
+        : undefined;
+    const catalogs =
+      grokHome
+        ? sessionCatalogDirs({ fs: defaultFs, grokHome, cwd })
+        : undefined;
+    return { grokHome, sessionDir, sessionCatalogDirs: catalogs };
+  }
+
+  /** Review directory authorized for the focused desktop conversation. No I/O. */
+  desktopPlanReviewSessionRoot(session: Session = this.focused): string {
+    const sessionId =
+      session.activeSessionId ?? session.client?.sessionId ?? "session";
+    return Uri.joinPath(
+      this.context.globalStorageUri,
+      "plan-reviews",
+      planReviewSessionDirectoryName(sessionId),
+    ).fsPath;
   }
 
   /**
@@ -3410,6 +3623,22 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.postRepoCatalog();
   }
 
+  /** Record a project's folder-icon colour (or clear it). Empty `color` removes
+   *  the stored entry so the wire reports `""` again. Invalid ids are ignored —
+   *  a remote must not invent a palette entry the host never offered. */
+  private async setRepoColor(cwd: string, color: string): Promise<void> {
+    if (!isRepoColor(color)) return;
+    const hit = this.localRepoCatalogEntries().find((r) => pathsEqual(r.cwd, cwd));
+    if (!hit) return;
+    const colors = this.state.get<RepoColors>(REPO_COLORS_KEY, {});
+    const key = normalizeRepoPath(hit.cwd);
+    const next: RepoColors = { ...colors };
+    if (color === "") delete next[key];
+    else next[key] = { cwd: hit.cwd, color };
+    await this.state.update(REPO_COLORS_KEY, next);
+    this.postRepoCatalog();
+  }
+
   /** Pin/unpin one conversation. Stored on the session's own override entry, so
    *  it survives a rename and travels with nothing else — `pinnedCwd` is kept
    *  alongside because the Pinned group spans repos and has to know where to
@@ -3523,7 +3752,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private postPinnedSessions(clientId?: string): void {
     const hasRemote = this.remoteClients.clients().length > 0;
-    const hasLocalRail = this.host.canSwitchWorkspaceFolder;
+    // Desktop multi-folder rail OR the VS Code primary-side-bar projects view.
+    const hasLocalRail = this.host.canSwitchWorkspaceFolder || !!this.projectsRail;
     if (!clientId && !hasRemote && !hasLocalRail) return;
     // Built against the live authorized set for every recipient (same open set
     // on desktop; full catalog on VS Code).
@@ -3850,33 +4080,86 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
   }
 
-  /** Read the installed version and decide Plan availability. This deliberately
-   * performs no update, availability check, caching, or pool orchestration. */
-  private async planModeCompatibility(cliPath: string): Promise<CliCompatibilityResult> {
-    const versionOutput = await this.readGrokVersion(cliPath);
-    const installed = parseGrokVersion(versionOutput)?.join(".");
-    if (!installed) {
-      const message = `Could not verify the grok CLI version; this extension requires grok ${GROK_REQUIRED_VERSION} or newer.`;
-      this.host.appendLine(`${message} Continuing best-effort with the current binary.`);
-      void this.host.showWarningMessage(message);
-      return {
-        planModeAvailable: false,
-        planModeUnavailableReason:
-          `Plan mode requires Grok CLI ${GROK_REQUIRED_VERSION} or newer; ` +
-          "the installed version could not be verified.",
-      };
+  /**
+   * Probe the installed CLI and decide Plan availability. Fail-closed when the
+   * version cannot be read, but that outcome is *not* latched — only a parseable
+   * below-floor banner sticks for the session. Retries once on empty/unparseable
+   * output (slow first spawn). Performs no update or pool orchestration.
+   */
+  private async planModeCompatibility(
+    cliPath: string,
+    opts: { notify?: boolean } = {},
+  ): Promise<CliCompatibilityResult> {
+    const notify = opts.notify !== false;
+    const versionOutput = await probeVersionOutput(
+      () => this.readGrokVersion(cliPath),
+      (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    );
+    const decision = decidePlanModeAvailability(versionOutput);
+    if (decision.available) {
+      return { planModeAvailable: true, planModeVersionVerified: true };
     }
-    if (isGrokVersionBelowRequired(versionOutput)) {
-      const message = `grok CLI ${installed} is below required version ${GROK_REQUIRED_VERSION}; Plan mode is unavailable.`;
+    if (decision.verified) {
+      const message =
+        `grok CLI ${decision.installed} is below required version ${GROK_REQUIRED_VERSION}; ` +
+        "Plan mode is unavailable.";
       this.host.appendLine(message);
-      void this.host.showWarningMessage(message);
+      if (notify) void this.host.showWarningMessage(message);
       return {
         planModeAvailable: false,
-        planModeUnavailableReason:
-          `Plan mode requires Grok CLI ${GROK_REQUIRED_VERSION} or newer; installed version is ${installed}.`,
+        planModeVersionVerified: true,
+        planModeUnavailableReason: decision.reason,
       };
     }
-    return { planModeAvailable: true };
+    // Unverified: log + optional toast once at session start; a later Plan pick
+    // re-probes without forcing a restart (#105).
+    const message =
+      `Could not verify the Grok CLI version; Plan mode is unavailable until it can be checked ` +
+      `(needs ${GROK_REQUIRED_VERSION}+). Continuing best-effort with the current binary.`;
+    this.host.appendLine(message);
+    if (notify) {
+      void this.host.showWarningMessage(
+        `Could not verify the Grok CLI version; Plan mode is unavailable until it can be checked ` +
+          `(needs ${GROK_REQUIRED_VERSION}+).`,
+      );
+    }
+    return {
+      planModeAvailable: false,
+      planModeVersionVerified: false,
+      planModeUnavailableReason: decision.reason,
+    };
+  }
+
+  /** Push a Plan-availability decision onto the session and its views. */
+  private applyPlanModeCompatibility(session: Session, compatibility: CliCompatibilityResult): void {
+    session.planModeAvailable = compatibility.planModeAvailable;
+    session.planModeUnavailableReason = compatibility.planModeUnavailableReason;
+    session.planModeVersionVerified = compatibility.planModeVersionVerified;
+    this.emit(session, {
+      type: "planModeAvailability",
+      available: compatibility.planModeAvailable,
+      reason: compatibility.planModeUnavailableReason,
+      recheckable: !compatibility.planModeAvailable && !compatibility.planModeVersionVerified,
+    });
+  }
+
+  /**
+   * Re-run the version probe for an unverified session when the user picks Plan.
+   * Returns false if the CLI path is missing or the session was torn down mid-probe.
+   */
+  private async recheckPlanModeAvailability(session: Session): Promise<boolean> {
+    const gen = session.gen;
+    const cliPath = this.cliPath || locateGrokCli(
+      this.host.getConfiguration("grok").get<string>("cliPath", ""),
+    );
+    if (!cliPath) return false;
+    this.host.appendLine("Re-checking Grok CLI version for Plan mode…");
+    // Silent: the initial session-start probe already notified; a second toast
+    // on every pick would turn a transient into noise.
+    const compatibility = await this.planModeCompatibility(cliPath, { notify: false });
+    if (gen !== session.gen) return false;
+    this.applyPlanModeCompatibility(session, compatibility);
+    return true;
   }
 
   /** Pin the bounded Windows stdio-hang range before spawning ACP. */
@@ -4298,13 +4581,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (gen !== session.gen) return undefined;
     const compatibility = await this.planModeCompatibility(cliPath);
     if (gen !== session.gen) return undefined;
-    session.planModeAvailable = compatibility.planModeAvailable;
-    session.planModeUnavailableReason = compatibility.planModeUnavailableReason;
-    this.emit(session, {
-      type: "planModeAvailability",
-      available: compatibility.planModeAvailable,
-      reason: compatibility.planModeUnavailableReason,
-    });
+    this.applyPlanModeCompatibility(session, compatibility);
 
     // Worktree sessions pin cwd at creation/open; everyone else uses the workspace root.
     const cwd = session.cwd || this.workspaceRoot();
@@ -5288,7 +5565,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await this.unlinkRemoteDevice();
         break;
       case "openRemotePortal":
-        void this.host.openExternal(httpBaseFromRelayUrl(REMOTE_RELAY_URL) + (msg.withHint ? "/?remoteHint=1" : ""));
+        void this.host.openExternal(httpBaseFromRelayUrl(this.relayUrl()) + (msg.withHint ? "/?remoteHint=1" : ""));
         break;
       case "rewindSession":
         await this.rewindFocusedSession(
@@ -5367,9 +5644,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "openFile": {
-        const ref = parseFileRef(msg.path);
-        let p = ref.path;
-        if (!path.isAbsolute(p)) p = path.join(this.sessionCwd(session), p);
+        const { ref, path: p } = this.resolveChatOpenPath(session, msg.path);
         if (ref.startLine != null) {
           const startLine = Math.max(0, ref.startLine - 1);
           const endLine = ref.endLine != null ? Math.max(startLine, ref.endLine - 1) : startLine;
@@ -5386,6 +5661,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         } else {
           void this.host.openResource(p);
         }
+        break;
+      }
+      case "showInFolder": {
+        if (!this.host.canShowInFolder) break;
+        const { path: p } = this.resolveChatOpenPath(session, msg.path);
+        await this.host.showInFolder(p);
         break;
       }
       case "openUrl":
@@ -5560,6 +5841,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       case "showLogs":
         this.host.showOutput();
         break;
+      case "toggleDevTools":
+        if (this.host.canToggleDevTools) this.host.toggleDevTools();
+        break;
       case "openSettings":
         await this.host.openSettings(typeof msg.section === "string" ? msg.section : "grok");
         break;
@@ -5569,7 +5853,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // unknown location falls back to the built-in destination picker
         // preselected on our view (the view-id argument also sidesteps the
         // focusedView context, which Cursor never sets for webview views).
-        await this.host.relocateView(GROK_VIEW_ID, moveViewContainerFor(msg.location));
+        await this.retireMoveViewHint();
+        await this.host.relocateView(
+          GROK_VIEW_ID,
+          moveViewContainerFor(msg.location),
+          panelPositionFor(msg.location),
+        );
         break;
       }
       case "setShowThinking":
@@ -5667,8 +5956,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       case "listRepoSessions":
         // Preview rows for a repo WITHOUT selecting it (the projects rail).
-        // Local answers when the host can switch folders (desktop rail); VS Code
-        // never posts this (no rail mount), so the local branch is inert there.
+        // Local: desktop multi-folder rail and the VS Code primary-side-bar rail.
         if (origin === "remote" && clientId) {
           this.sendRepoSessionsPreview(clientId, msg.cwd, msg.limit);
         } else {
@@ -5676,8 +5964,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         break;
       case "toggleSessionPin":
-        // Rail pin. Remote always; local when multi-folder desktop has a rail.
-        if (origin === "remote" || this.host.canSwitchWorkspaceFolder) {
+        // Rail pin. Remote always; local when any projects rail is live
+        // (desktop multi-folder or VS Code primary-side-bar view).
+        if (origin === "remote" || this.host.canSwitchWorkspaceFolder || this.projectsRail) {
           await this.toggleSessionPin(msg.id, msg.cwd, msg.pinned);
         }
         break;
@@ -5687,6 +5976,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       case "setRepoArchived":
         await this.setRepoArchived(msg.cwd, msg.archived);
+        break;
+      case "setRepoColor":
+        await this.setRepoColor(msg.cwd, msg.color);
         break;
       case "toggleRepoPin":
         await this.toggleRepoPin(msg.cwd, msg.pinned);
@@ -5774,6 +6066,190 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           break;
         }
         await this.trackAttach(this.addDroppedFile(abs, false, attachmentOwner));
+        break;
+      }
+      case "listProjectDir": {
+        // Remote file browse. Fence: repoScopeFor (which root) +
+        // listTreeDir/resolveTreePath (paths inside it).
+        // Local VS Code / desktop webviews may receive the capability flag but
+        // never mount a second explorer — only remotes post these messages.
+        const rel = typeof msg.relPath === "string" ? msg.relPath : "";
+        const selectedCwd = origin === "remote" && clientId
+          ? this.remoteClients.cwd(clientId)
+          : this.workspaceRoot();
+        const rootResult = resolveRemoteFileRoot({
+          origin,
+          claimedCwd: msg.cwd,
+          selectedCwd,
+          workspaceRoot: this.workspaceRoot(),
+          isKnownCwd: (cwd) =>
+            origin === "remote"
+              ? this.remoteTargetableCwd(cwd)
+              : pathsEqual(cwd, this.workspaceRoot()),
+          sameCwd: pathsEqual,
+        });
+        const replyList = (body: Extract<HostMsg, { type: "projectDirListing" }>) => {
+          if (requester) this.sendRemoteRequester(requester, body);
+          else this.post(body);
+        };
+        if (!rootResult.ok) {
+          this.host.appendLine(`[remote-files] list rejected: ${rootResult.reason} (${msg.cwd})`);
+          replyList({ type: "projectDirListing", cwd: msg.cwd, relPath: rel, ok: false, reason: rootResult.reason });
+          break;
+        }
+        const listed = listRemoteProjectDir(rootResult.root, rel);
+        if (!listed.ok) {
+          replyList({ type: "projectDirListing", cwd: msg.cwd, relPath: rel, ok: false, reason: listed.reason });
+        } else {
+          replyList({
+            type: "projectDirListing",
+            cwd: msg.cwd,
+            relPath: rel,
+            ok: true,
+            entries: listed.entries,
+            truncated: listed.truncated,
+          });
+        }
+        break;
+      }
+      case "readProjectFile": {
+        // One file, text/image preview caps from file-tree.ts. When the host
+        // advertises edit, text kinds also carry stamp + absPath for a save
+        // round-trip (see writeProjectFile).
+        const selectedCwd = origin === "remote" && clientId
+          ? this.remoteClients.cwd(clientId)
+          : this.workspaceRoot();
+        const rootResult = resolveRemoteFileRoot({
+          origin,
+          claimedCwd: msg.cwd,
+          selectedCwd,
+          workspaceRoot: this.workspaceRoot(),
+          isKnownCwd: (cwd) =>
+            origin === "remote"
+              ? this.remoteTargetableCwd(cwd)
+              : pathsEqual(cwd, this.workspaceRoot()),
+          sameCwd: pathsEqual,
+        });
+        const replyFile = (body: Extract<HostMsg, { type: "projectFileContent" }>) => {
+          if (requester) this.sendRemoteRequester(requester, body);
+          else this.post(body);
+        };
+        if (!rootResult.ok) {
+          this.host.appendLine(`[remote-files] read rejected: ${rootResult.reason} (${msg.cwd})`);
+          replyFile({
+            type: "projectFileContent",
+            cwd: msg.cwd,
+            relPath: msg.relPath,
+            ok: false,
+            reason: rootResult.reason,
+          });
+          break;
+        }
+        const read = readRemoteProjectFile(rootResult.root, msg.relPath);
+        // includeEditMeta only when we advertise the write path — otherwise a
+        // browse-only host must not leak absPath/stamp to the phone.
+        const wire = projectFileContentForWire(read, {
+          includeEditMeta: !!HOST_CAPABILITIES.editProjectFiles,
+        });
+        if (wire.ok) {
+          replyFile({
+            type: "projectFileContent",
+            cwd: msg.cwd,
+            relPath: wire.relPath,
+            ok: true,
+            kind: wire.kind,
+            ...(wire.text !== undefined ? { text: wire.text } : {}),
+            ...(wire.dataUrl !== undefined ? { dataUrl: wire.dataUrl } : {}),
+            ...(wire.pretty !== undefined ? { pretty: wire.pretty } : {}),
+            ...(wire.stamp !== undefined ? { stamp: wire.stamp } : {}),
+            ...(wire.absPath !== undefined ? { absPath: wire.absPath } : {}),
+          });
+        } else {
+          replyFile({
+            type: "projectFileContent",
+            cwd: msg.cwd,
+            relPath: msg.relPath,
+            ok: false,
+            reason: wire.reason,
+          });
+        }
+        break;
+      }
+      case "writeProjectFile": {
+        // Existing-file save only (no create/delete/rename). Reuses writeTreeFile
+        // so stamp + expectedAbsPath both apply — a remote tab that went stale
+        // after the desk switched projects is the expectedAbsPath scenario.
+        // Capability gate: a host that does not advertise edit refuses here so
+        // an older client cannot invent a write path the UI never offered.
+        const replyWrite = (body: Extract<HostMsg, { type: "projectFileWriteResult" }>) => {
+          if (requester) this.sendRemoteRequester(requester, body);
+          else this.post(body);
+        };
+        if (!HOST_CAPABILITIES.editProjectFiles) {
+          replyWrite({
+            type: "projectFileWriteResult",
+            cwd: msg.cwd,
+            relPath: msg.relPath,
+            ok: false,
+            reason: "editing is not available",
+          });
+          break;
+        }
+        const selectedCwd = origin === "remote" && clientId
+          ? this.remoteClients.cwd(clientId)
+          : this.workspaceRoot();
+        const rootResult = resolveRemoteFileRoot({
+          origin,
+          claimedCwd: msg.cwd,
+          selectedCwd,
+          workspaceRoot: this.workspaceRoot(),
+          isKnownCwd: (cwd) =>
+            origin === "remote"
+              ? this.remoteTargetableCwd(cwd)
+              : pathsEqual(cwd, this.workspaceRoot()),
+          sameCwd: pathsEqual,
+        });
+        if (!rootResult.ok) {
+          this.host.appendLine(`[remote-files] write rejected: ${rootResult.reason} (${msg.cwd})`);
+          replyWrite({
+            type: "projectFileWriteResult",
+            cwd: msg.cwd,
+            relPath: msg.relPath,
+            ok: false,
+            reason: rootResult.reason,
+          });
+          break;
+        }
+        const written = writeRemoteProjectFile(
+          rootResult.root,
+          msg.relPath,
+          msg.text,
+          msg.stamp,
+          {
+            expectedAbsPath: msg.expectedAbsPath,
+            // Same executable policy as desktop opens/saves — do not weaken it
+            // for remote just because the phone never shell.opens the path.
+            isExecutableOpenTarget: (absPath) => isExecutableOpenTarget(absPath),
+          },
+        );
+        if (written.ok) {
+          replyWrite({
+            type: "projectFileWriteResult",
+            cwd: msg.cwd,
+            relPath: written.relPath,
+            ok: true,
+            stamp: written.stamp,
+          });
+        } else {
+          this.host.appendLine(`[remote-files] write refused: ${written.reason} (${msg.relPath})`);
+          replyWrite({
+            type: "projectFileWriteResult",
+            cwd: msg.cwd,
+            relPath: msg.relPath,
+            ok: false,
+            reason: written.reason,
+          });
+        }
         break;
       }
       case "voiceStart":
@@ -6165,8 +6641,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  catalog alone refused every action on one. The catalog is still the whole
    *  boundary: the parent has to be a repo this host exposes (open on desktop,
    *  discovered on VS Code). */
-  private repoOwningSessionCwd(cwd: string, overrides: SessionMetaOverrides): string | undefined {
-    return this.localRepoCatalogEntries().find(
+  private repoOwningSessionCwd(
+    cwd: string,
+    overrides: SessionMetaOverrides,
+    entries: RepoListEntry[] = this.localRepoCatalogEntries(),
+  ): string | undefined {
+    return entries.find(
       (r) => r.available && this.sessionCwdsForRepo(r.cwd, overrides).some((c) => pathsEqual(c, cwd)),
     )?.cwd;
   }
@@ -7530,7 +8010,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const plan = req.plan || session.lastPlanText;
     let snapshot: { path: string; name: string } | undefined;
     try {
-      snapshot = await this.createPlanReviewSnapshot(plan);
+      snapshot = await this.createPlanReviewSnapshot(
+        plan,
+        session.activeSessionId ?? session.client?.sessionId,
+      );
     } catch (e) {
       this.host.appendLine(`[plan-review] ${(e as Error).message}`);
     }
@@ -7572,7 +8055,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const dir = Uri.joinPath(
       this.context.globalStorageUri,
       "plan-reviews",
-      sanitizePlanReviewFilePart(sessionId).slice(0, 80),
+      planReviewSessionDirectoryName(sessionId),
     );
     void this.host.fs.delete(dir, { recursive: true, useTrash: false }).then(
       undefined,
@@ -7625,9 +8108,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private async createPlanReviewSnapshot(plan: string, sessionId?: string): Promise<{ path: string; name: string }> {
     const content = plan && plan.trim() ? plan : "(empty plan)\n";
-    const sessionPart = sanitizePlanReviewFilePart(
+    const sessionPart = planReviewSessionDirectoryName(
       sessionId ?? this.focused.activeSessionId ?? this.focused.client?.sessionId ?? "session",
-    ).slice(0, 80);
+    );
     // Join under globalStorageUri so workspace.fs targets the same scheme VS Code
     // gave us (vscode-remote on remote hosts — never rebuild with Uri.file).
     const dir = Uri.joinPath(this.context.globalStorageUri, "plan-reviews", sessionPart);
@@ -8432,12 +8915,35 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.sessionCache.delete(sid);
   }
 
+  /**
+   * The user has opened the host's move-view picker — from the gear, the palette
+   * command, or the empty-state hint's own link. Retires that hint for good.
+   *
+   * The single place both routes record it, and it does two things because one
+   * is not enough: persist, for future windows, and tell the LIVE webview, for
+   * this one. `initialState` is not re-sent on a session swap, so a webview
+   * holding a stale true would rebuild the hint the user had already acted on —
+   * and if they open the picker and cancel, no rebuild happens to refresh it.
+   *
+   * Called BEFORE the move, never after: relocating a view makes the host tear
+   * the webview down and rebuild it, and the rebuilt one asks for capabilities
+   * immediately, so a write afterwards loses that race.
+   *
+   * Recorded for ANY destination, including one the user then cancels out of:
+   * they have found the control, which is all the hint was for. It never affects
+   * where the view goes — that decision takes no account of it.
+   */
+  async retireMoveViewHint(): Promise<void> {
+    await this.state.update(MOVE_VIEW_HINT_USED_KEY, true);
+    this.post({ type: "moveViewHint", value: false });
+  }
+
   /** Global "Use this app for" from ~/.grok/client-state (absent → Knowledge work). */
   private appPurpose(): AppPurpose {
     return parseAppPurpose(this.state.get<string>(APP_PURPOSE_KEY));
   }
 
-  private buildInitialStateMsg(): HostMsg {
+  private buildInitialStateMsg(): Extract<HostMsg, { type: "initialState" }> {
     const cfg = this.host.getConfiguration("grok");
     const cwd = this.workspaceRoot();
     return {
@@ -8458,7 +8964,26 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       capabilities: {
         ...HOST_CAPABILITIES,
         relocateView: this.host.canRelocateView,
+        // Cursor refuses extension containers in the secondary side bar, so the
+        // menu offers the panel by edge there rather than a destination that
+        // would silently do nothing.
+        secondarySideBar: this.host.canUseSecondarySideBar,
+        moveViewHint: shouldShowMoveViewHint({
+          hostAcceptedSecondarySideBar: this.host.canUseSecondarySideBar,
+          canRelocateView: this.host.canRelocateView,
+          pickerAlreadyUsed: this.state.get<boolean>(MOVE_VIEW_HINT_USED_KEY) === true,
+        }),
         showOutput: this.host.canShowOutput,
+        // OPT-IN: unpackaged desktop only. Gear → Advanced offers the control so
+        // DevTools is discoverable without the auto-hidden application menu.
+        toggleDevTools: this.host.canToggleDevTools,
+        // Absent/true = host opens files in an editor tab; false = no editor
+        // (desktop → in-app lightbox for generated images). See Host.canOpenInEditor.
+        openInEditor: this.host.canOpenInEditor,
+        // Only a host that owns the media handler may opt generated videos into
+        // metadata preload; every other host keeps the lazy default.
+        servesMediaRanges: this.host.canServeMediaRanges,
+        showInFolder: this.host.canShowInFolder,
         // Only a host that owns its own folder set can add one. VS Code's
         // workspace is VS Code's to manage, so the extension never advertises
         // this and the rail never draws the control — capability, not a flag.
@@ -8629,9 +9154,37 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private static readonly TRANSIENT_TYPES = new Set([
     "restoreComposer", "focusInput", "openModePopover",
   ]);
+  /**
+   * Host→rail catalog surface. Everything else stays chat-only so a user who
+   * never opens the rail sees exactly today's behaviour.
+   */
+  private static readonly PROJECTS_RAIL_HOST_TYPES = new Set<HostMsg["type"]>([
+    "repos",
+    "sessions",
+    "repoSessions",
+    "pinnedSessions",
+    "sessionDot",
+    "session",
+    "sessionName",
+  ]);
+  /** Webview→host actions the rail may post. Closed set — never send/cancel/etc. */
+  private static readonly PROJECTS_RAIL_WEBVIEW_TYPES = new Set<WebviewMsg["type"]>([
+    "listSessions",
+    "listRepoSessions",
+    "selectRepo",
+    "resumeSession",
+    "newSession",
+    "toggleSessionPin",
+    "renameSession",
+    "deleteSession",
+    "clearAllSessions",
+    "setRepoArchived",
+    "setRepoColor",
+  ]);
   private post(message: HostMsg): void {
     if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     this.view?.webview.postMessage(message);
+    this.mirrorToProjectsRail(message);
     if (GrokSidebar.DEVICE_GLOBAL_REMOTE_TYPES.has(message.type)) {
       this.broadcastRemoteDevice(message);
     } else {
@@ -8639,10 +9192,21 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
   }
 
-  /** Post to the VS Code webview only. */
+  /** Post to the VS Code webview only (plus catalog mirror to the projects rail). */
   private postLocal(message: HostMsg): void {
     this.postTap?.("local", message);
     this.view?.webview.postMessage(message);
+    this.mirrorToProjectsRail(message);
+  }
+
+  /**
+   * Second local destination for catalog-shaped frames. A view that has never
+   * resolved is simply skipped — no parallel data path, no throw.
+   */
+  private mirrorToProjectsRail(message: HostMsg): void {
+    if (!this.projectsRail) return;
+    if (!GrokSidebar.PROJECTS_RAIL_HOST_TYPES.has(message.type)) return;
+    void this.projectsRail.webview.postMessage(message);
   }
 
   /**
@@ -8673,11 +9237,21 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       return;
     }
     this.postTap?.("remote", message, [...clientIds]);
-    const out = transformHostMsgForRemote(message, this.remoteMediaDeps);
+    const out = transformHostMsgForRemote(this.messageForRemote(message), this.remoteMediaDeps);
     if (!out) return;
     // Pass scope through so the uplink gate does not re-derive from a stale
     // per-tab mapping for multi-client session fan-out.
     this.uplink?.broadcastTo([...clientIds], out, scopeCwd);
+  }
+
+  /** Remote clients receive media bytes only through the remote media policy;
+   *  they must never inherit capabilities that describe the DESK machine. The
+   *  list lives with the rest of the remote policy (DESK_ONLY_CAPABILITIES) so
+   *  adding a capability has one obvious place to check, and so the stripping
+   *  is testable without standing up a sidebar. */
+  private messageForRemote(message: HostMsg): HostMsg {
+    if (message.type !== "initialState") return message;
+    return { ...message, capabilities: capabilitiesForRemote(message.capabilities) };
   }
 
   /** Target one opaque relay clientId. */
@@ -9050,6 +9624,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.postTap?.("local", message);
       const webview = this.view?.webview;
       if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
+      // Active-session identity for the projects rail (highlight + pin home).
+      this.mirrorToProjectsRail(message);
     }
     if (!session.replaying) this.sendRemoteSession(session, message);
   }
@@ -9541,6 +10117,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (!id) return;
     const message: HostMsg = { type: "sessionDot", id, dot: this.dotForId(id) };
     this.view?.webview.postMessage(message);
+    this.mirrorToProjectsRail(message);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const sent = new Set<string>();
     for (const clientId of this.remoteClients.clients()) {
@@ -9969,7 +10546,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     let failure: unknown;
     try {
-      await this.openSessionReserved(id, sessionCwd);
+      // Claim before entering the workspace queue so a duplicate resume cannot
+      // slip through while this transition waits for a repo switch already in
+      // progress. The queued operation calls the exclusive switch primitive
+      // directly; calling switchLocalWorkspaceFolder here would wait on the
+      // same queue and deadlock the resume transition.
+      const open = () => this.openSessionReserved(id, sessionCwd);
+      if (this.host.canSwitchWorkspaceFolder) {
+        await this.localWorkspaceSwitchQueue.run(open);
+      } else {
+        await open();
+      }
     } catch (error) {
       failure = error;
       throw error;
@@ -10021,6 +10608,42 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return out;
   }
 
+  /**
+   * Move only the desktop view to the project represented by a resumed
+   * session. A worktree cwd is authorized for the session but is not itself an
+   * open workspace folder, so the file tree deliberately follows the
+   * worktree's owning project root instead.
+   *
+   * `openSession` already owns localWorkspaceSwitchQueue while this runs. Keep
+   * this on the exclusive path: taking the public queue wrapper here would
+   * deadlock the resume transition.
+   */
+  private async followSessionWorkspace(session: Session): Promise<void> {
+    if (!this.host.canSwitchWorkspaceFolder) return;
+    const intendedTarget = session.worktree?.sourceGitRoot ?? session.cwd;
+    if (!intendedTarget) {
+      this.host.appendLine(
+        "[sessions] skipped active-folder follow (resumed session has no project root)",
+      );
+      return;
+    }
+    // ONE resolution, always from the session's own cwd. A plain session's cwd
+    // is itself an open folder and matches exactly; a worktree's resolves
+    // through ownership, which declines when more than one open folder claims
+    // it. Trying sourceGitRoot first would walk straight past that guard: with
+    // both /repo and /repo/packages/app open, a worktree made from app records
+    // /repo, so the exact match would move the panel — and every subsequent new
+    // session's root — up to /repo without ever noticing the ambiguity.
+    const target = session.cwd ? this.resolveLocalRepoTarget(session.cwd)?.cwd : undefined;
+    if (!target) {
+      this.host.appendLine(
+        `[sessions] skipped active-folder follow (no single open folder owns ${intendedTarget})`,
+      );
+      return;
+    }
+    await this.switchLocalWorkspaceFolderExclusive(target, { warnOnRefusal: false });
+  }
+
   private async openSessionReserved(id: string, sessionCwd?: string): Promise<void> {
     // A session held by a remote tab is not off-limits here: the desk JOINS it
     // — focusSession replays the shared buffer into the webview and already
@@ -10028,6 +10651,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // views from then on.
     for (const s of this.pool) {
       if (s.activeSessionId === id && s.client) {
+        await this.followSessionWorkspace(s);
         this.focusSession(s);
         return;
       }
@@ -10064,6 +10688,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       this.focused = held;
       this.pool.add(this.focused);
+      await this.followSessionWorkspace(this.focused);
       await this.startSession(id);
       this.markRead(this.focused);
       this.postRepoCatalog();
@@ -10118,6 +10743,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         };
       }
     }
+    await this.followSessionWorkspace(this.focused);
     await this.startSession(id);
     this.markRead(this.focused); // opening a cold session clears its unread badge
     this.postRepoCatalog();
@@ -10495,6 +11121,21 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private static readonly DEVICE_TOKEN_SECRET = "grok.remoteControl.deviceToken";
 
+  /**
+   * The relay this build talks to — the production constant, unless a
+   * DEVELOPMENT build names another in `GROK_RELAY_URL` (see resolveRelayUrl).
+   *
+   * Every consumer goes through here, including the two HTTP ones (the web
+   * portal link and device unlink). Half the app on staging and half on
+   * production would fail in a way that looks like a relay bug.
+   */
+  private relayUrl(): string {
+    return resolveRelayUrl({
+      isProduction: this.context.isProduction,
+      env: process.env,
+    });
+  }
+
   /** Start the relay uplink when a device token is stored (from the link flow).
    *  Idempotent. */
   private async maybeStartUplink(): Promise<void> {
@@ -10502,7 +11143,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const token = await this.readDeviceToken();
     if (!token) return; // not linked yet — the link command starts the uplink itself
     const uplink = new RemoteUplink({
-      relayUrl: REMOTE_RELAY_URL,
+      relayUrl: this.relayUrl(),
       token,
       deviceName: deviceDisplayName(os.hostname(), process.platform, os.release()),
       snapshot: (clientId) => this.buildRemoteSnapshot(clientId),
@@ -10630,7 +11271,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  until the relay hands back a long-lived device token, store it in secrets,
    *  connect. Mirrors how a CLI links to a web account. */
   async linkRemoteDevice(): Promise<void> {
-    const base = httpBaseFromRelayUrl(REMOTE_RELAY_URL);
+    const base = httpBaseFromRelayUrl(this.relayUrl());
     try {
       const name = deviceDisplayName(os.hostname(), process.platform, os.release());
       // Already persisted by the time this returns — getOrCreate writes the file
@@ -10696,7 +11337,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const token = await this.readDeviceToken();
     if (token) {
       try {
-        await fetch(`${httpBaseFromRelayUrl(REMOTE_RELAY_URL)}/api/device/unlink`, {
+        await fetch(`${httpBaseFromRelayUrl(this.relayUrl())}/api/device/unlink`, {
           method: "POST",
           headers: { authorization: `Bearer ${token}` },
           signal: AbortSignal.timeout(5000),
@@ -10736,7 +11377,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Catalog is already open-folder-filtered on desktop; still the sole source.
     const entries = this.localRepoCatalogEntries();
     // Never put a closed cwd on the wire (choke point rejects it); empty = unbound.
-    const initial = { ...this.buildInitialStateMsg(), cwd: listCwd ?? "" };
+    const initial = this.messageForRemote({ ...this.buildInitialStateMsg(), cwd: listCwd ?? "" });
     const sessionCwd = this.sessionCwd(session);
     const sessionCwdOk = !!authorizedListCwd(sessionCwd, authorized, pathsEqual);
     const phrase = this.voiceSetting(
@@ -10802,6 +11443,37 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return out;
   }
 
+  /**
+   * HTML for the primary-side-bar projects rail. Self-contained: does not load
+   * chat.js (that would create a second chat client).
+   */
+  private getProjectsRailHtml(webview: HostWebview): string {
+    const nonce = getNonce();
+    const mediaUri = (file: string) =>
+      webview.asWebviewUri(Uri.joinPath(this.context.extensionUri, "media", file));
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} data:; font-src ${webview.cspSource}; script-src 'nonce-${nonce}';" />
+<link rel="stylesheet" href="${mediaUri("projects-rail.css")}" />
+</head>
+<body>
+  <aside id="projects-rail" class="projects-rail" aria-label="Projects">
+    <div class="rail-search-wrap">
+      <span class="rail-search-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      </span>
+      <input id="rail-search" class="rail-search" type="search" placeholder="Filter projects…" autocomplete="off" spellcheck="false" aria-label="Filter projects" />
+    </div>
+    <div id="rail-scroll" class="rail-scroll"></div>
+  </aside>
+  <script nonce="${nonce}" src="${mediaUri("projects-rail.js")}"></script>
+</body>
+</html>`;
+  }
+
   private getHtml(webview: HostWebview): string {
     const nonce = getNonce();
     // Join under extensionUri so remote hosts keep vscode-remote:// (Uri.file
@@ -10813,7 +11485,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
     // Desktop multi-folder: host ships the rail mount. VS Code never does —
     // absence of `#projects-rail` is the property that keeps the extension's
-    // UI single-column even when a `repos` frame arrives for clear-all.
+    // chat column free of an in-panel rail (the projects view is a separate
+    // primary-side-bar webview). A `repos` frame still arrives for clear-all.
     // Chrome mirrors AFK Pilot: brand + panel toggle, search, scroll, footer
     // theme toggle (no account avatar). chat.js only empties #rail-scroll.
     const railMark = this.host.canSwitchWorkspaceFolder
@@ -10877,10 +11550,10 @@ ${openMain}
       <button id="session-name-label" class="session-name-label" type="button"></button>
       <button id="session-name-edit" class="session-name-edit icon-btn" type="button" hidden></button>
     </div>
-    ${this.host.canSwitchWorkspaceFolder ? `<div id="session-head-actions"></div>` : ""}
     <button id="repo-btn" class="repo-chip" type="button" title="Choose repository"></button>
     <button id="remote-btn" class="icon-btn remote-btn" title="Continue remotely" hidden></button>
     <button id="history-btn" class="icon-btn" title="Session history"></button>
+    ${this.host.canSwitchWorkspaceFolder ? `<div id="session-head-actions"></div>` : ""}
     <button id="new-btn" class="icon-btn" title="New session"></button>
     <div id="repo-popover" class="toolbar-popover repo-popover" hidden></div>
     <div id="history-popover" class="toolbar-popover history-popover" hidden></div>

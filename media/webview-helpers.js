@@ -14,10 +14,10 @@
   // copy and test/protocol.test.ts asserts the two are set-equal in both
   // directions (and that chat.js actually handles every host type).
   const HOST_MESSAGE_TYPES = [
-    "initialState", "planModeAvailability", "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "updateAvailable", "initialized",
+    "initialState", "moveViewHint", "planModeAvailability", "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "updateAvailable", "initialized",
     "cliUpdating", "session", "sessionName", "modelChanged", "modeChanged", "modePolicy", "sandboxState", "openModePopover",
     "voiceState", "voiceConfigured", "voicePartial", "voiceSubmit", "voiceTranscript",
-    "voiceError", "chips", "commandsUpdate", "mentionResults", "userMessage", "agentStart", "thoughtChunk",
+    "voiceError", "chips", "commandsUpdate", "mentionResults", "projectDirListing", "projectFileContent", "projectFileWriteResult", "userMessage", "agentStart", "thoughtChunk",
     "messageChunk", "media", "userMessageChunk", "historyReplay", "historyBatch", "permissionHistoryQueue",
     "planHistoryQueue", "toolCall", "toolCallUpdate", "permissionRequest", "permissionOptions",
     "permissionResolved", "exitPlanRequest", "planResolved", "questionRequest", "planNotice", "autoCompactNotice", "planBlocked",
@@ -28,14 +28,14 @@
   ];
   const WEBVIEW_MESSAGE_TYPES = [
     "ready", "remotePreferences", "send", "newSession", "cancel", "pickModel", "setMode", "setSandbox", "removeChip",
-    "toggleChip", "openFile", "openUrl", "openText", "openDiff", "exportExpr", "setEffort",
+    "toggleChip", "openFile", "showInFolder", "openUrl", "openText", "openDiff", "exportExpr", "setEffort",
     "addProjectFolder", "removeProjectFolder",
-    "openGlobalConfig", "openProjectConfig", "runMcpList", "showLogs", "openSettings", "moveView",
+    "openGlobalConfig", "openProjectConfig", "runMcpList", "showLogs", "toggleDevTools", "openSettings", "moveView",
     "setShowThinking", "setAppPurpose", "setExpandCommandOutputs",
     "dropFile", "permissionAnswer", "exitPlanAnswer", "questionAnswer", "questionCancel",
     "setModel", "runInstallCmd", "runGrokLogin", "logout", "checkGrokUpdate", "updateGrok",
-    "recheckConnection", "listSessions", "listRepoSessions", "selectRepo", "toggleRepoPin", "setRepoArchived", "toggleSessionPin", "resumeSession", "renameSession", "deleteSession",
-      "clearAllSessions", "pickFile", "mentionQuery", "addMentionFile", "pasteImage", "uploadFile", "voiceStart", "voiceStop",
+    "recheckConnection", "listSessions", "listRepoSessions", "selectRepo", "toggleRepoPin", "setRepoArchived", "setRepoColor", "toggleSessionPin", "resumeSession", "renameSession", "deleteSession",
+      "clearAllSessions", "pickFile", "mentionQuery", "addMentionFile", "listProjectDir", "readProjectFile", "writeProjectFile", "pasteImage", "uploadFile", "voiceStart", "voiceStop",
       "remoteVoiceStart", "remoteVoiceChunk", "remoteVoiceStop",
     "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "forkSession", "setSteerByDefault",
     "setSoundNotifications", "setProcessingSound", "setReadRepliesAloud", "setSummarizeRepliesAloud", "summarizeSpeech", "requestImageFull", "composerFocus",
@@ -411,6 +411,36 @@
     return "Tool call failed.";
   }
 
+  // MIRROR of `isMediaGenToolCall` in src/acp-dispatch.ts — media-gen titles /
+  // variants for /imagine, /imagine-video, image_edit, reference_to_video. Kept
+  // in the webview so tool-result rendering (incl. remote) can gate failure
+  // hints without a host rewrite or a new message type.
+  // KEEP THE TWO IN STEP: test/media-gen-mirror.test.ts drives one fixture set
+  // through both and fails if either is changed alone.
+  function isMediaGenToolCall(payload) {
+    if (!payload || typeof payload !== "object") return false;
+    const title = String(payload.title ?? "");
+    if (/^imagine(-video|-edit)?:/i.test(title)) return true;
+    if (/^(image_gen|image_edit|video_gen|image_to_video|reference_to_video)\b/i.test(title)) return true;
+    if (/^(image-to-video:|reference-to-video:)/i.test(title)) return true;
+    const ri = payload.rawInput;
+    return !!(ri && typeof ri === "object" && typeof ri.variant === "string" &&
+      /imagegen|imageedit|videogen|imagetovideo|referencetovideo/i.test(ri.variant));
+  }
+
+  // Hint for Zero Data Retention blocking video generation. The API 400 names
+  // output.upload_url (not user-settable); the fix is a Grok CLI privacy setting.
+  // Narrow: only when the failure text carries that specific ZDR + upload_url
+  // signature — not every 400, not every invalid-argument. Caller must already
+  // know the tool is media-gen (isMediaGenToolCall / tracked mediaGenCallIds).
+  // Text only — no host action.
+  function mediaGenZeroRetentionHint(failureText) {
+    if (typeof failureText !== "string" || !failureText) return null;
+    if (!/Zero Data Retention/i.test(failureText)) return null;
+    if (!/upload_url/i.test(failureText)) return null;
+    return "Grok CLI /settings → Privacy → Coding data, retention, and training → Opt in.";
+  }
+
   // Scannable program label for a command tool row: the executable (first token,
   // path-stripped, de-quoted) plus one following BARE word when it isn't a flag —
   // so `git status` / `npm test` stay distinguishable while a long `node -e "…"`
@@ -752,6 +782,140 @@
       .test(String(text || ""));
   }
 
+  /**
+   * Side-panel re-clamp on window resize: skip while any element is full-screen.
+   * Entering full-screen fires resize mid-transition; measuring then captures a
+   * bogus width that sticks after exit. Callers still re-clamp once on
+   * fullscreenchange exit (see wireFullscreenSafeReclamp).
+   */
+  function panelReclampOnResizeAllowed(fullscreenElement) {
+    return !fullscreenElement;
+  }
+
+  /**
+   * When preferred side-panel widths + chat floor exceed the available window,
+   * shrink open panels proportionally (never below each panel's floor). When
+   * there is room, return preferred widths so a drag the user made is honoured
+   * again after the window grows. Closed panels contribute 0.
+   *
+   * @param {{
+   *   available: number,
+   *   chatMin: number,
+   *   panels: Array<{ id: string, preferred: number, min: number, open: boolean }>
+   * }} opts
+   * @returns {Record<string, number>}
+   */
+  function distributeSidePanelWidths(opts) {
+    const available = Math.max(0, Math.round(Number(opts && opts.available) || 0));
+    const chatMin = Math.max(0, Math.round(Number(opts && opts.chatMin) || 0));
+    const panels = opts && Array.isArray(opts.panels) ? opts.panels : [];
+    /** @type {Record<string, number>} */
+    const out = {};
+    /** @type {Array<{ id: string, min: number, preferred: number }>} */
+    const open = [];
+    for (const p of panels) {
+      const id = String((p && p.id) || "");
+      if (!id) continue;
+      const min = Math.max(0, Math.round(Number(p.min) || 0));
+      const preferred = Math.max(min, Math.round(Number(p.preferred) || min));
+      if (!p || !p.open) {
+        out[id] = 0;
+        continue;
+      }
+      open.push({ id, min, preferred });
+    }
+    if (open.length === 0) return out;
+
+    const preferredSum = open.reduce((s, p) => s + p.preferred, 0);
+    const minSum = open.reduce((s, p) => s + p.min, 0);
+    const budget = Math.max(0, available - chatMin);
+
+    if (budget >= preferredSum) {
+      for (const p of open) out[p.id] = p.preferred;
+      return out;
+    }
+    if (budget <= minSum) {
+      for (const p of open) out[p.id] = p.min;
+      return out;
+    }
+
+    // Shrink only the above-floor slack, in proportion to how much each panel
+    // sits above its floor — so a wide rail and a narrow panel both give ground.
+    const slackTotal = preferredSum - minSum;
+    const slackBudget = budget - minSum;
+    let assigned = 0;
+    for (let i = 0; i < open.length; i++) {
+      const p = open[i];
+      const above = p.preferred - p.min;
+      let w;
+      if (i === open.length - 1) {
+        w = budget - assigned; // last absorbs rounding residue
+      } else {
+        const share = slackTotal > 0 ? above / slackTotal : 1 / open.length;
+        w = Math.round(p.min + share * slackBudget);
+      }
+      w = Math.max(p.min, w);
+      out[p.id] = w;
+      assigned += w;
+    }
+    return out;
+  }
+
+  /**
+   * Wire resize re-clamp that ignores full-screen transitions and re-runs once
+   * after full-screen exits (window size may have changed meanwhile).
+   * @param {() => void} reclamp measure + apply (caller owns the math)
+   * @param {{ window?: Window, document?: Document }} [roots] inject for tests
+   * @returns {() => void} dispose
+   */
+  function wireFullscreenSafeReclamp(reclamp, roots) {
+    const win = (roots && roots.window) || (typeof window !== "undefined" ? window : null);
+    const doc = (roots && roots.document) || (typeof document !== "undefined" ? document : null);
+    if (!win || !doc || typeof reclamp !== "function") return function () {};
+    function onResize() {
+      if (!panelReclampOnResizeAllowed(doc.fullscreenElement)) return;
+      reclamp();
+    }
+    function onFullscreenChange() {
+      if (!doc.fullscreenElement) reclamp();
+    }
+    win.addEventListener("resize", onResize);
+    doc.addEventListener("fullscreenchange", onFullscreenChange);
+    return function dispose() {
+      win.removeEventListener("resize", onResize);
+      doc.removeEventListener("fullscreenchange", onFullscreenChange);
+    };
+  }
+
+  /**
+   * Body `--chat-zoom` (CSS zoom). getBoundingClientRect is in visual/client px;
+   * style.top/left/width under a zoomed body are layout px — divide by this.
+   */
+  function chatZoomFactor(doc) {
+    const d = doc || (typeof document !== "undefined" ? document : null);
+    if (!d || !d.body) return 1;
+    let raw = "";
+    try {
+      raw = d.body.style.getPropertyValue("--chat-zoom") || "";
+    } catch (_) { /* */ }
+    if (!raw && typeof getComputedStyle === "function") {
+      try {
+        raw = getComputedStyle(d.body).getPropertyValue("--chat-zoom") || "";
+      } catch (_) { /* */ }
+    }
+    const z = Number(String(raw).trim());
+    return Number.isFinite(z) && z > 0 ? z : 1;
+  }
+
+  /** Visual/client px → layout CSS px under body chat zoom. */
+  function unzoomClientPx(clientPx, zoom) {
+    const z = zoom == null ? 1 : Number(zoom);
+    const n = Number(clientPx);
+    if (!Number.isFinite(n)) return 0;
+    if (!Number.isFinite(z) || z === 0 || z === 1) return n;
+    return n / z;
+  }
+
   function computeLineDiff(oldText, newText, opts) {
     const maxProduct = (opts && opts.maxProduct) || 4000000; // ~2000×2000 line cap
     const norm = (t) => (t == null ? "" : String(t).replace(/\r\n?/g, "\n"));
@@ -802,7 +966,7 @@
     return { lines, added, removed, truncated: false };
   }
 
-  const api = { FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection };
+  const api = { FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;

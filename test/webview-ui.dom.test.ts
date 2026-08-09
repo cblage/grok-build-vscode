@@ -7,7 +7,7 @@
 //   2. Session rows "only clickable on the label" -> whole row resumes; action
 //      buttons stopPropagation so they don't also resume
 //   3. Reasoning traces "no longer expandable" -> header click toggles the body
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { bootWebview, dispatch, click, Posted } from "./webview-harness";
 import { countsAsUserBubble } from "../src/plan-restore";
 import { bracketRemoteSnapshot } from "../src/remote-policy";
@@ -209,6 +209,28 @@ describe("history popover (regression: popover that never closed)", () => {
     window.dispatchEvent(new (window as any).Event("resize"));
 
     expect(pop.style.maxWidth).toBe("228px"); // 240 - 6*2, re-measured without reopening
+  });
+
+  it("places the history popover in layout px when chat zoom is not 1", () => {
+    // getBoundingClientRect is visual; style.top under body zoom is layout.
+    // At 1.5×, a 30px visual bottom edge is 20 layout px — without unzoom the
+    // popover opens too far below the button (and above when zoomed out).
+    const { window, doc } = bootWebview();
+    doc.body.style.setProperty("--chat-zoom", "1.5");
+    const pop = $(doc, "history-popover");
+    const btn = $(doc, "history-btn");
+    const parent = pop.parentElement as HTMLElement;
+    (parent as any).getBoundingClientRect = () =>
+      ({ left: 0, right: 600, top: 0, bottom: 900, width: 600, height: 900 });
+    (btn as any).getBoundingClientRect = () =>
+      ({ left: 540, right: 588, top: 12, bottom: 45, width: 48, height: 33 });
+
+    click(window, btn);
+
+    // (45 - 0) / 1.5 + 4 = 34
+    expect(pop.style.top).toBe("34px");
+    // available layout width = 600/1.5 - 12 = 388 → max 360
+    expect(pop.style.maxWidth).toBe("360px");
   });
 
   it("closes the popover when the view is hidden (switching to another extension/tab)", () => {
@@ -545,6 +567,16 @@ describe("session status dots (Agent Dashboard)", () => {
 });
 
 describe("mode picker (the plan-gate entry path)", () => {
+  it("names the active mode in the button tooltip", () => {
+    const { window, doc } = bootWebview();
+    const modeBtn = $(doc, "mode-btn") as HTMLButtonElement;
+    expect(modeBtn.title).toContain("Agent mode");
+
+    dispatch(window, { type: "modeChanged", modeId: "plan" });
+    expect(modeBtn.title).toContain("Plan mode");
+    expect(modeBtn.title).not.toContain("Agent mode");
+  });
+
   it("offers Agent / Plan / Auto accept and posts setMode with the chosen mode id", () => {
     const { window, posted, doc } = bootWebview();
     const pop = $(doc, "mode-popover");
@@ -564,7 +596,7 @@ describe("mode picker (the plan-gate entry path)", () => {
 
   it("disables only Plan with the host's version reason, then re-enables it", () => {
     const { window, posted, doc } = bootWebview();
-    const reason = "Plan mode requires Grok CLI 0.2.117 or newer.";
+    const reason = "Plan mode requires Grok CLI 0.2.117 or newer; installed version is 0.2.100.";
     dispatch(window, { type: "planModeAvailability", available: false, reason });
 
     const modeBtn = $(doc, "mode-btn") as HTMLButtonElement;
@@ -588,6 +620,29 @@ describe("mode picker (the plan-gate entry path)", () => {
     expect(planItem.className).not.toContain("disabled");
     expect(planItem.querySelector(".mode-item-disabled-note")).toBeNull();
     click(window, planItem);
+    expect(posted).toContainEqual({ type: "setMode", modeId: "plan" });
+  });
+
+  it("keeps Plan clickable when the host marks an unverified probe recheckable (#105)", () => {
+    const { window, posted, doc } = bootWebview();
+    const reason =
+      "Could not verify the installed Grok CLI version, so Plan mode is unavailable. " +
+      "Once verified, Plan requires 0.2.117 or newer.";
+    dispatch(window, {
+      type: "planModeAvailability",
+      available: false,
+      reason,
+      recheckable: true,
+    });
+
+    click(window, $(doc, "mode-btn"));
+    const pop = $(doc, "mode-popover");
+    const planItem = [...pop.querySelectorAll(".mode-popover-item")]
+      .find((el) => el.querySelector(".mode-item-label")!.textContent === "Plan mode") as HTMLElement;
+    expect(planItem.className).not.toContain("disabled");
+    expect(planItem.querySelector(".mode-item-disabled-note")?.textContent).toBe(reason);
+    click(window, planItem);
+    // Click still posts setMode — the host re-probes and may enable Plan on this pick.
     expect(posted).toContainEqual({ type: "setMode", modeId: "plan" });
   });
 
@@ -949,6 +1004,9 @@ describe("context donut (token usage)", () => {
     const { window, doc } = boot();
     dispatch(window, { type: "contextUsage", used: 29088, window: 200000 });
     expect($(doc, "donut-label").textContent).toBe("29K/200K");
+    expect($(doc, "donut").title).toBe(
+      `Context usage — ${(29088).toLocaleString()} / ${(200000).toLocaleString()} tokens`,
+    );
   });
 
   it("contextUsage without a window keeps the model-derived window", () => {
@@ -2532,31 +2590,41 @@ describe("gear entry: Move view (Config & debug)", () => {
       el.textContent!.includes(label),
     ) as HTMLElement | undefined;
 
-  it("offers the three destinations when the host advertises relocateView", () => {
+  it("offers one item, the host's own picker, where the secondary side bar was refused", () => {
+    // Was three destinations naming our own containers. They went because an
+    // editor that refuses our secondary-side-bar container also ignores where
+    // the other two declared they live, so all three landed in the same place —
+    // and an editor that accepts it already has its own Move To on the view's
+    // context menu, which does more than ours could.
     const { window, posted, doc } = bootWebview();
     dispatch(window, {
       type: "initialState",
       useCtrlEnter: false,
-      capabilities: { uploadFile: true, remoteVoice: true, relocateView: true, showOutput: true },
+      capabilities: {
+        uploadFile: true,
+        remoteVoice: true,
+        relocateView: true,
+        secondarySideBar: false,
+        showOutput: true,
+      },
     });
-    const destinations: Array<[string, string]> = [
-      ["To Secondary Side Bar", "auxiliarybar"],
-      ["To Primary Side Bar", "sidebar"],
-      ["To Panel", "panel"],
-    ];
-    for (const [label, location] of destinations) {
-      openConfigDebug(window, doc); // clicking an item closes the popover — reopen each time
-      const item = itemByLabel(doc, label);
-      expect(item, label).toBeTruthy();
-      click(window, item!);
-      expect(posted).toContainEqual({ type: "moveView", location });
-    }
+    openConfigDebug(window, doc);
+    const item = itemByLabel(doc, "Move view…");
+    expect(item).toBeTruthy();
+    click(window, item!);
+    // `pick` maps to no container by design, so the host falls through to its
+    // own picker — the only mover that targets a LOCATION.
+    expect(posted).toContainEqual({ type: "moveView", location: "pick" });
   });
 
-  it("still shows Move view + Show logs when the host sends no capability flags (v3.1.0)", () => {
+  it("still shows Show logs when the host sends no capability flags (v3.1.0)", () => {
     // Compatibility contract: the web client is always new; the extension may
-    // be an older install that never emitted relocateView/showOutput. Those
-    // gear items existed ungated before the flags — absent must mean supported.
+    // be an older install that never emitted relocateView/showOutput. That item
+    // existed ungated before the flags — absent must still mean supported.
+    //
+    // Move view is the deliberate exception, and its polarity is the opposite:
+    // an absent `secondarySideBar` means the editor HAS one, and an editor with
+    // a secondary side bar has its own Move To. So absent means no section.
     const { window, posted, doc } = bootWebview();
     dispatch(window, {
       type: "initialState",
@@ -2566,14 +2634,12 @@ describe("gear entry: Move view (Config & debug)", () => {
     });
     openConfigDebug(window, doc);
     expect(itemByLabel(doc, "Show extension logs")).toBeTruthy();
-    expect(itemByLabel(doc, "To Secondary Side Bar")).toBeTruthy();
-    expect(itemByLabel(doc, "To Primary Side Bar")).toBeTruthy();
-    expect(itemByLabel(doc, "To Panel")).toBeTruthy();
+    expect(itemByLabel(doc, "Move view")).toBeUndefined();
     click(window, itemByLabel(doc, "Show extension logs")!);
     expect(posted).toContainEqual({ type: "showLogs" });
   });
 
-  it("still shows Move view + Show logs when capabilities is omitted entirely", () => {
+  it("still shows Show logs when capabilities is omitted entirely", () => {
     const { window, doc } = bootWebview();
     dispatch(window, {
       type: "initialState",
@@ -2582,7 +2648,7 @@ describe("gear entry: Move view (Config & debug)", () => {
     });
     openConfigDebug(window, doc);
     expect(itemByLabel(doc, "Show extension logs")).toBeTruthy();
-    expect(itemByLabel(doc, "To Secondary Side Bar")).toBeTruthy();
+    expect(itemByLabel(doc, "Move view")).toBeUndefined();
   });
 
   it("hides Move view and Show logs only when the host opts out with false (desktop)", () => {
@@ -2593,9 +2659,7 @@ describe("gear entry: Move view (Config & debug)", () => {
       capabilities: { uploadFile: true, remoteVoice: true, relocateView: false, showOutput: false },
     });
     openConfigDebug(window, doc);
-    expect(itemByLabel(doc, "To Secondary Side Bar")).toBeUndefined();
-    expect(itemByLabel(doc, "To Primary Side Bar")).toBeUndefined();
-    expect(itemByLabel(doc, "To Panel")).toBeUndefined();
+    expect(itemByLabel(doc, "Move view")).toBeUndefined();
     expect(itemByLabel(doc, "Show extension logs")).toBeUndefined();
     // Config paths still work on desktop.
     expect(itemByLabel(doc, "Open global config")).toBeTruthy();
@@ -3024,7 +3088,7 @@ describe("remote tab session reconnect", () => {
         w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify(remembered));
       },
     });
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await vi.waitFor(() => (original.window as any).__grokTabTokenReady);
     const originalToken = original.window.sessionStorage.getItem("grok.remote.tabToken:default");
     const originalOwner = original.window.sessionStorage.getItem("grok.remote.tabOwner:default");
 
@@ -3161,7 +3225,7 @@ describe("remote tab session reconnect", () => {
         w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify(remembered));
       },
     });
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await vi.waitFor(() => (priorPage.window as any).__grokTabTokenReady);
     const token = priorPage.window.sessionStorage.getItem("grok.remote.tabToken:default");
     priorPage.window.dispatchEvent(new priorPage.window.Event("pagehide"));
 
@@ -3173,7 +3237,7 @@ describe("remote tab session reconnect", () => {
         w.sessionStorage.setItem("grok.remote.tabSession:default", JSON.stringify(remembered));
       },
     });
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await vi.waitFor(() => (reloaded.window as any).__grokTabTokenReady);
 
     expect(reloaded.window.sessionStorage.getItem("grok.remote.tabToken:default")).toBe(token);
     dispatch(reloaded.window, { type: "initialState", cwd: "/work/repo-a" });

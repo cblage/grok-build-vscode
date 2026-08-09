@@ -2,7 +2,7 @@
 
 [![License: FSL-1.1-MIT](https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg)](https://github.com/phuryn/grok-build-vscode/blob/main/LICENSE) [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com) [![Cursor](https://badgen.net/badge/Cursor/Extension/007ACC)](https://cursor.com) [![The Product Compass](https://img.shields.io/badge/The%20Product%20Compass-productcompass.pm-FF6B35)](https://www.productcompass.pm)
 
-> **GUI for Grok Build CLI (incl. Grok 4.5)** — not affiliated with or endorsed by xAI. *Grok*, *Grok Build*, and *xAI* are trademarks of xAI; this project uses those names only to describe what it's compatible with.
+> **GUI for Grok Build CLI (incl. Grok 4.5)** — not affiliated with or endorsed by SpaceXAI (formerly xAI). *Grok*, *Grok Build*, and *xAI* are trademarks of xAI; this project uses those names only to describe what it's compatible with.
 
 The GUI for **Grok Build CLI** (incl. **Grok 4.5**), right in your editor — with **Remote Control**: pair **[AFK Pilot](https://afkpilot.com)** once and watch, approve, and steer your agent from your phone or any browser while away from your desk. Drop open files in as `@`-context, run **multiple sessions** at once, keep **resumable chat history**, generate **images & video inline**, and dictate by **voice**. If you'd rather stay in VS Code than a terminal, this brings Grok Build's agent into your sidebar.
 
@@ -202,13 +202,22 @@ Gear → the effort dots next to the model, `none` → `xhigh`. On recent CLIs i
 
 Gear → *Remote Control* → **Sign in (link this device)** pairs this machine with **[AFK Pilot](https://afkpilot.com)**, a companion web client that mirrors this chat in the browser: follow a running turn, approve permissions, answer questions, and send or steer messages from your phone while away from your desk. The extension dials **out** to the service — no inbound port, no port forwarding — and **Sign out** unlinks the device again. The mobile view renders the retained chat window in full fidelity (diffs, images, equations, diagrams) with touch-sized controls; on reconnect, the remote snapshot is capped at the last 10 user messages while the VS Code view keeps the complete buffer. Its own **+** picker attaches a photo or a document (`.md`/`.txt`/`.pdf`/`.csv`/`.xlsx`/`.docx`) straight from your phone. You can **dictate** there too — say *"grok send"* to submit hands-free — give each browser tab its **own conversation and repository**, and pick up the very conversation VS Code has open, live in both.
 
-A **projects rail** lists every repository with Grok history and its newest conversations, with pinned conversations lifted above them across all projects and a search over both. You can start a session in any project without switching to it first, and rename, delete or clear history from the row. Projects you put away — and any left untouched for 30 days — fold into **Archived**, and come back on their own the moment you work in one again. On a phone the rail is a drawer behind the handle in the header.
+A **projects rail** lists every repository with Grok history and its newest conversations, with pinned conversations lifted above them across all projects and a search over both. You can start a session in any project without switching to it first, and rename, delete or clear history from the row — from the ⋯ button or by right-clicking it. Give a project a **colour** and its folder is tinted everywhere the rail appears, including your phone. Projects you put away — and any left untouched for 30 days — fold into **Archived**, and come back on their own the moment you work in one again. On a phone the rail is a drawer behind the handle in the header.
 
 While a device is linked, the extension also **keeps the machine awake** (`caffeinate` on macOS, `SetThreadExecutionState` on Windows, `systemd-inhibit` on Linux) so a turn you kicked off from your phone isn't cut short by idle sleep. The display still sleeps — only system sleep is blocked — and the lock is released the moment you sign out. Turn it off with `grok.remote.keepAwake`. A **closed laptop lid still suspends** on every OS; no application can override that.
 
 ![AFK Pilot — your Grok agent from any browser](https://raw.githubusercontent.com/phuryn/grok-build-vscode/main/docs/screenshots/remote.webp)
 
 </details>
+
+---
+
+## Requirements
+
+- **VS Code** 1.106+ (or a compatible editor on the same base — Cursor 3.x qualifies; Antigravity is still on base 1.104 and keeps the last compatible extension version).
+- **The Grok Build CLI** (`grok`) on macOS, Linux, or Windows. The CLI ships a native Windows build, so the extension runs natively on all three — no WSL required (WSL2 + Remote-WSL still works if you prefer it).
+- **A login:** either a **SuperGrok or X Premium+** subscription (`grok login`) or an xAI API key. Either subscription unlocks **Grok Build**; with an API key you also get the **grok-4.x** models and **grok-imagine**. (Grok's free tier does **not** include the CLI agent.)
+- **Voice control** is optional and works out of the box once you're signed in — it just needs [`ffmpeg`](https://ffmpeg.org) to record. Setup + advanced options: [docs/voice-setup.md](https://github.com/phuryn/grok-build-vscode/blob/main/docs/voice-setup.md).
 
 ---
 
@@ -234,38 +243,6 @@ Grok opens in the **Secondary Side Bar** (right side, next to other AI tools). P
 
 ---
 
-## Requirements
-
-- **VS Code** 1.106+ (or a compatible editor on the same base — Cursor 3.x qualifies; Antigravity is still on base 1.104 and keeps the last compatible extension version).
-- **The Grok Build CLI** (`grok`) on macOS, Linux, or Windows. The CLI ships a native Windows build, so the extension runs natively on all three — no WSL required (WSL2 + Remote-WSL still works if you prefer it).
-- **A login:** either a **SuperGrok or X Premium+** subscription (`grok login`) or an xAI API key. Either subscription unlocks **Grok Build**; with an API key you also get the **grok-4.x** models and **grok-imagine**. (Grok's free tier does **not** include the CLI agent.)
-- **Voice control** is optional and works out of the box once you're signed in — it just needs [`ffmpeg`](https://ffmpeg.org) to record. Setup + advanced options: [docs/voice-setup.md](https://github.com/phuryn/grok-build-vscode/blob/main/docs/voice-setup.md).
-
----
-
-## Install
-
-### VS Code / Cursor extension
-
-**1. Install the extension.** In VS Code or Cursor, open **Extensions** (`Ctrl/Cmd+Shift+X`) and search **"Grok Build for VS Code (Community)"** — or install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=PawelHuryn.grok-vscode-phuryn) / [Open VSX Registry](https://open-vsx.org/extension/PawelHuryn/grok-vscode-phuryn).
-
-**2. Open Grok and sign in.** Press `Ctrl/Cmd+;`. The sidebar **walks you through installing the `grok` CLI and signing in** — one click per step, with your SuperGrok / X Premium+ subscription or an xAI API key. That's the whole setup.
-
-Grok opens in the **Secondary Side Bar** (right side, next to other AI tools). Prefer it elsewhere? Gear → **Config & debug** → **Move view** relocates it to the Panel or Primary Side Bar in one click.
-
-> Prefer the terminal, building from source, or installing into several IDEs at once? See **[docs/INSTALL.md](https://github.com/phuryn/grok-build-vscode/blob/main/docs/INSTALL.md)**.
-
-
-## Quick start
-
-1. **Open** the Grok view (`Ctrl/Cmd+;`, or **Grok: Open** from the command palette) — it lives in the Secondary Side Bar by default.
-2. **Type a prompt** and press **Enter**. Grok streams its answer, showing a *Thinking…* line while it reasons. Want the full reasoning inline? Turn on **Show thinking traces** in the gear menu → *Config & debug*.
-3. **Approve actions.** When Grok wants to write a file or run a command it may raise a permission card — preview an edit in the native **diff editor**, with full-file context focused on the first changed line, then *Allow once / always / Reject*.
-4. **Pick your mode** (Agent / Plan / Auto accept), **model**, and **reasoning effort** from the bottom toolbar and gear menu.
-5. **Resume anytime** — the clock icon lists past sessions for this project.
-
----
-
 ## Configuration
 
 <details>
@@ -276,6 +253,7 @@ Grok opens in the **Secondary Side Bar** (right side, next to other AI tools). P
 | `grok.cliPath` | `""` | Path to the `grok` binary. Empty = auto-discover (`~/.grok/bin/grok` → PATH). |
 | `grok.defaultModel` | `""` | Model ID for new sessions. Empty = CLI default. |
 | `grok.defaultEffort` | `""` | Reasoning effort forwarded as `--reasoning-effort` (`none` / `minimal` / `low` / `medium` / `high` / `xhigh`). Empty = CLI default. Applies live on recent CLIs; older CLIs (and resetting to the model default) restart the session. |
+| `grok.sandboxProfile` | `""` | **macOS only, User-scoped.** Seatbelt profile for ACP filesystem + terminal operations. Empty = `GROK_SANDBOX`, then global `$GROK_HOME/config.toml`; `off` disables it. Repository settings cannot override it. Changing it restarts the session. |
 | `grok.defaultMode` | `""` | Mode for new sessions, remembered automatically from your last Agent / Auto accept switch (Plan is never remembered). Empty = Agent. |
 | `grok.includeActiveFileByDefault` | `true` | Auto-add the active editor as a context chip. Sends the file **path** (not its contents) unless you have text selected, in which case the selected lines are included. Click the chip to toggle it off — that choice is remembered across file switches and restarts. |
 | `grok.mentionIndexLimit` | `5000` | How many workspace files the composer's **@** autocomplete indexes. Raise it (no upper limit) if files are missing from the `@` list in a large repo; applies on the next `@`. Files you have open as tabs are always mentionable regardless of this cap. |
@@ -293,6 +271,46 @@ Grok opens in the **Secondary Side Bar** (right side, next to other AI tools). P
 | `grok.voiceKeyterms` | `[]` | Words or phrases that bias streaming recognition toward code and project vocabulary. Sent to xAI with each streaming connection; up to 100 terms of 50 characters, including the send phrase and `Grok`. |
 | `grok.voiceLanguage` | `""` | Optional language code for streaming text formatting (for example `en`, `fr`, `de`, or `ja`). Empty preserves spoken-form text. |
 | `grok.voiceStreaming` | `true` | Stream transcription live as you speak. `false` = one-shot batch mode. Streaming costs $0.20/hr vs $0.10/hr batch. |
+
+### macOS sandbox profiles
+
+The sandbox button is available on macOS when `/usr/bin/sandbox-exec` exists.
+Its built-ins match Grok's own macOS behavior:
+
+| Profile | Reads | Writes | Child network on macOS |
+|---|---|---|---|
+| `workspace` | Everywhere | Project/CWD, all of `$GROK_HOME`, and temp roots | Allowed |
+| `devbox` | Everywhere | Existing top-level directories except `/data`, `/proc`, `/sys`, and `/dev` | Allowed |
+| `read-only` | Everywhere | All of `$GROK_HOME` and temp roots | Allowed |
+| `strict` | Project/CWD, `$GROK_HOME`, temp, Grok's exact system roots, and broker runtime files | Project/CWD, all of `$GROK_HOME`, and temp roots | Allowed |
+
+`devbox` is reserved and shadows a same-named TOML profile. On macOS,
+`restrict_network` is a documented no-op, including for custom profiles.
+
+Define custom profiles in either location:
+
+- `$GROK_HOME/sandbox.toml` (normally `~/.grok/sandbox.toml`) — user profiles
+- `.grok/sandbox.toml` in the open project — project profiles; a matching name
+  replaces the user definition
+
+Custom profiles may use `extends` with exactly one built-in base: `workspace`,
+`devbox`, `read-only`, or `strict` (omitting it defaults to `workspace`). Grok
+rejects custom-to-custom inheritance and `extends = "off"`. Profile names are
+case-sensitive; only exact lowercase `off` disables sandboxing, so `OFF`,
+`none`, and `false` remain valid custom names. The supported fields are
+`extends`, `restrict_network`, `read_only`, `read_write`, and `deny`. Malformed
+or unknown custom-profile data and custom broker startup failures abort rather
+than silently weakening the selected profile. Built-in application failures
+warn and continue, matching Grok; a live broker failure remains fatal.
+Project `.env` and project `.grok/config.toml` do not control sandbox selection
+or `GROK_HOME`. The broker initializes `TMPDIR`, `TMP`, and `TEMP` to the trusted
+macOS temp root compiled into the policy and filters repository `.env` plus ACP
+terminal environment overrides at ingress. Seatbelt remains the authority if a
+command later mutates its own environment.
+
+See [macOS sandbox architecture](https://github.com/phuryn/grok-build-vscode/blob/main/docs/macos-sandbox-architecture.md) for the
+complete process topology, trust boundary, profile-resolution rules, broker
+protocol, and fail-closed lifecycle.
 
 </details>
 

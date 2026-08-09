@@ -77,6 +77,7 @@ describe("parseRelayFrame", () => {
   const traversalMessages = [
     ["selectRepo cwd", { type: "selectRepo", cwd: "../.." }],
     ["toggleRepoPin cwd", { type: "toggleRepoPin", cwd: "..\\..", pinned: true }],
+    ["setRepoColor cwd", { type: "setRepoColor", cwd: "..\\..", color: "blue" }],
     ["resumeSession id", { type: "resumeSession", id: "../.." }],
     ["resumeSession cwd", { type: "resumeSession", id: "safe-session", cwd: "/work/../escape" }],
     ["renameSession id", { type: "renameSession", id: "..\\..", name: "renamed" }],
@@ -84,6 +85,22 @@ describe("parseRelayFrame", () => {
     ["clearAllSessions cwd", { type: "clearAllSessions", cwd: "../.." }],
     ["addMentionFile relPath", { type: "addMentionFile", relPath: "../../secret.txt" }],
     ["uploadFile name", { type: "uploadFile", name: "../../secret.md", data: "YQ==" }],
+    ["writeProjectFile relPath", {
+      type: "writeProjectFile",
+      cwd: "/work/a",
+      relPath: "../../secret.txt",
+      text: "x",
+      stamp: { mtimeMs: 1, size: 1 },
+      expectedAbsPath: "/work/a/secret.txt",
+    }],
+    ["writeProjectFile expectedAbsPath", {
+      type: "writeProjectFile",
+      cwd: "/work/a",
+      relPath: "a.ts",
+      text: "x",
+      stamp: { mtimeMs: 1, size: 1 },
+      expectedAbsPath: "/work/../escape",
+    }],
   ] as const;
 
   it.each(traversalMessages)(
@@ -258,21 +275,49 @@ describe("parseRelayFrame", () => {
     for (const msg of [
       { type: "selectRepo", cwd: "/work/repo" },
       { type: "toggleRepoPin", cwd: "C:\\work\\repo", pinned: true },
+      { type: "setRepoColor", cwd: "/work/repo", color: "coral" },
+      { type: "setRepoColor", cwd: "/work/repo", color: "" },
       { type: "resumeSession", id: "019f-session_1", cwd: "\\\\server\\share\\repo" },
       { type: "renameSession", id: "019f-session_1", name: "renamed" },
       { type: "deleteSession", id: "019f-session_1" },
       { type: "clearAllSessions", cwd: "/work/repo" },
       { type: "addMentionFile", relPath: "src/file.ts" },
       { type: "uploadFile", name: "Quarterly Notes.pdf", data: "YQ==" },
+      {
+        type: "writeProjectFile",
+        cwd: "/work/repo",
+        relPath: "src/file.ts",
+        text: "hello\n",
+        stamp: { mtimeMs: 1_700_000_000_000, size: 6 },
+        expectedAbsPath: "/work/repo/src/file.ts",
+      },
     ]) {
       expect(parseRelayFrame(wrap(msg)), JSON.stringify(msg)).not.toBeNull();
     }
+    // Missing stamp / non-finite numbers must not pass the wire gate.
+    expect(parseRelayFrame(wrap({
+      type: "writeProjectFile",
+      cwd: "/work/repo",
+      relPath: "a.ts",
+      text: "x",
+      expectedAbsPath: "/work/repo/a.ts",
+    }))).toBeNull();
+    expect(parseRelayFrame(wrap({
+      type: "writeProjectFile",
+      cwd: "/work/repo",
+      relPath: "a.ts",
+      text: "x",
+      stamp: { mtimeMs: NaN, size: 1 },
+      expectedAbsPath: "/work/repo/a.ts",
+    }))).toBeNull();
   });
 
   it("drops malformed filesystem selectors and accepts a valid ready token", () => {
     const wrap = (msg: unknown) => JSON.stringify({ t: "msg", clientId: "c1", msg });
     expect(parseRelayFrame(wrap({ type: "selectRepo", cwd: {} }))).toBeNull();
     expect(parseRelayFrame(wrap({ type: "toggleRepoPin", cwd: "/a", pinned: "yes" }))).toBeNull();
+    expect(parseRelayFrame(wrap({ type: "setRepoColor", cwd: "/a", color: 7 }))).toBeNull();
+    expect(parseRelayFrame(wrap({ type: "setRepoColor", cwd: "..\\..", color: "blue" }))).toBeNull();
     expect(parseRelayFrame(wrap({ type: "resumeSession", id: "s", cwd: [] }))).toBeNull();
     expect(parseRelayFrame(wrap({ type: "clearAllSessions", cwd: 42 }))).toBeNull();
     expect(parseRelayFrame(wrap({ type: "ready", tabToken: "short" }))).toBeNull();

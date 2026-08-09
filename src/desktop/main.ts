@@ -20,16 +20,15 @@ import {
   safeStorage,
   shell,
   type Menu as ElectronMenu,
-  type MenuItemConstructorOptions,
   type ProtocolRequest,
 } from "electron";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
 import { GrokSidebar } from "../sidebar";
 import { Uri } from "../host";
 import type { HostContext, HostDisposable } from "../host";
 import { ConfigStore, SensitiveConfigStore } from "./config-store";
+import { createAppResourceHandler } from "./app-resource-handler";
 import type { DesktopOpenFileContext } from "./desktop-policy";
 import { createElectronHost, ensureWorkspaceRoot, type ElectronRemoteActions } from "./electron-host";
 import {
@@ -66,6 +65,14 @@ import {
   noticeIfUpdateAvailable,
   type GithubReleaseLike,
 } from "./app-update";
+import {
+  desktopAppMenuTemplate,
+  desktopDevToolsAllowed,
+  isDesktopDevToolsShortcut,
+  secondInstanceShouldOpenDevTools,
+  shouldOpenDevToolsAtStartup,
+  type DesktopAppMenuActions,
+} from "./app-menu";
 
 // Electron dies with launch-failed if sandbox is left at the platform default
 // in some setups; we set it explicitly on the BrowserWindow. Also strip the
@@ -162,103 +169,23 @@ function log(line: string): void {
 /**
  * Application menu: no stock Electron Help links; public repo only.
  * File → Add/Close Project Folder drive multi-folder (rail + config store).
+ * Developer Tools only when `!isPackaged` (default: `app.isPackaged`).
  */
-export function buildDesktopAppMenu(actions?: {
-  addProjectFolder?: () => void;
-  removeProjectFolder?: () => void;
-}): ElectronMenu {
-  const isMac = process.platform === "darwin";
-  const template: MenuItemConstructorOptions[] = [
-    ...(isMac
-      ? [
-          {
-            label: DESKTOP_APP_FULL_NAME,
-            submenu: [
-              { role: "about" as const, label: `About ${DESKTOP_APP_FULL_NAME}` },
-              { type: "separator" as const },
-              { role: "services" as const },
-              { type: "separator" as const },
-              { role: "hide" as const },
-              { role: "hideOthers" as const },
-              { role: "unhide" as const },
-              { type: "separator" as const },
-              { role: "quit" as const },
-            ],
-          },
-        ]
-      : []),
-    {
-      label: "File",
-      submenu: [
-        {
-          label: "Add Project Folder…",
-          click: () => {
-            try {
-              actions?.addProjectFolder?.();
-            } catch {
-              /* best-effort */
-            }
-          },
-        },
-        {
-          label: "Close Project Folder",
-          click: () => {
-            try {
-              actions?.removeProjectFolder?.();
-            } catch {
-              /* best-effort */
-            }
-          },
-        },
-        { type: "separator" },
-        isMac ? { role: "close" } : { role: "quit", label: "Quit" },
-      ],
-    },
-    {
-      label: "Edit",
-      submenu: [
-        { role: "undo" },
-        { role: "redo" },
-        { type: "separator" },
-        { role: "cut" },
-        { role: "copy" },
-        { role: "paste" },
-        { role: "selectAll" },
-      ],
-    },
-    {
-      label: "View",
-      submenu: [
-        { role: "reload" },
-        { role: "forceReload" },
-        { role: "toggleDevTools" },
-        { type: "separator" },
-        { role: "resetZoom" },
-        { role: "zoomIn" },
-        { role: "zoomOut" },
-        { type: "separator" },
-        { role: "togglefullscreen" },
-      ],
-    },
-    {
-      label: "Help",
-      submenu: [
-        {
-          label: "GitHub Repository",
-          click: () => {
-            void shell.openExternal(DESKTOP_PUBLIC_REPO_URL);
-          },
-        },
-        {
-          label: `About ${DESKTOP_APP_FULL_NAME}`,
-          click: () => {
-            void shell.openExternal(DESKTOP_PUBLIC_REPO_URL);
-          },
-        },
-      ],
-    },
-  ];
-  return Menu.buildFromTemplate(template);
+export function buildDesktopAppMenu(
+  actions?: DesktopAppMenuActions,
+  opts?: { isPackaged?: boolean },
+): ElectronMenu {
+  const isPackaged = opts?.isPackaged ?? app.isPackaged;
+  return Menu.buildFromTemplate(
+    desktopAppMenuTemplate({
+      isPackaged,
+      platform: process.platform,
+      actions,
+      openPublicRepo: () => {
+        void shell.openExternal(DESKTOP_PUBLIC_REPO_URL);
+      },
+    }),
+  );
 }
 
 let mainWindow: BrowserWindow | null = null;
@@ -267,17 +194,32 @@ let webview: ElectronWebview | null = null;
 
 // One process per profile: a second launch must focus the existing window, not
 // spawn another sidebar / ACP pool / remote uplink on the same device token.
+// A leftover process makes a new launch quit here — looks exactly like
+// "nothing happened" (including --open-devtools). The first instance handles
+// second-instance: focus + open DevTools when the new argv asked for it.
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
-  log("another instance already holds this profile; quitting");
+  log(
+    "another instance already holds this profile; quitting " +
+      "(focus the existing window — re-launch with --open-devtools opens DevTools there)",
+  );
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  app.on("second-instance", (_event, commandLine) => {
     const win = mainWindow;
     if (!win || win.isDestroyed()) return;
     if (win.isMinimized()) win.restore();
     if (!win.isVisible()) win.show();
     win.focus();
+    if (
+      secondInstanceShouldOpenDevTools({
+        isPackaged: app.isPackaged,
+        commandLine,
+      })
+    ) {
+      win.webContents.openDevTools({ mode: "detach" });
+      log("DevTools opened (second-instance --open-devtools)");
+    }
   });
 }
 
@@ -365,6 +307,11 @@ async function createApp(): Promise<void> {
   // Registry + canonical static roots — never free-form ~/.grok path serve.
   // Narrow extra lane: exact APP_DOCUMENT_URL → in-memory HTML (real origin for
   // localStorage). Not a path serve; does not widen static/registry policy.
+  const serveAppResource = createAppResourceHandler({
+    resolveResourceUrl: (resourceUrl) => webview?.resolveResourceUrl(resourceUrl) ?? null,
+    fetchFile: (fileUrl) => net.fetch(fileUrl),
+    log,
+  });
   protocol.handle(APP_RESOURCE_SCHEME, async (request: Request | ProtocolRequest) => {
     const url = typeof request === "object" && "url" in request ? request.url : String(request);
     if (!webview) {
@@ -383,17 +330,7 @@ async function createApp(): Promise<void> {
         },
       });
     }
-    const fsPath = webview.resolveResourceUrl(url);
-    if (!fsPath) {
-      log(`blocked resource: ${url}`);
-      return new Response("Forbidden", { status: 403 });
-    }
-    try {
-      return await net.fetch(pathToFileURL(fsPath).href);
-    } catch (e) {
-      log(`resource fetch failed ${fsPath}: ${(e as Error).message}`);
-      return new Response("Not found", { status: 404 });
-    }
+    return await serveAppResource(request, url);
   });
 
   // Bound after GrokSidebar exists so link/unlink reuse the extension flow.
@@ -418,11 +355,39 @@ async function createApp(): Promise<void> {
 
   sidebar = new GrokSidebar(hostContext, host);
   // Session-aware roots for openFile/openDiff (worktree cwd, not only the
-  // selected project folder). Wired after sidebar exists.
-  authContext.get = () => ({
-    workspaceRoot: config.getWorkspaceRoot(),
-    allowedRoots: sidebar!.desktopAuthRoots(),
-  });
+  // selected project folder). Wired after sidebar exists. grokHome + sessionDir
+  // + sessionCatalogDirs authorize trusted session-generated media
+  // (images|videos) outside the tree — absolute paths against project catalogs
+  // only, relative links against the active session dir.
+  // Media fields are lazy: sessionDirFor / sessionCatalogDirs readdirSync, and
+  // most webview messages are not path-bearing — only openFile/openDiff
+  // consumers read these fields after a workspace candidate has already missed.
+  authContext.get = () => {
+    let mediaCache:
+      | { grokHome?: string; sessionDir?: string; sessionCatalogDirs?: string[] }
+      | undefined;
+    const media = () => {
+      if (!mediaCache) mediaCache = sidebar!.desktopOpenMediaContext();
+      return mediaCache;
+    };
+    return {
+      workspaceRoot: config.getWorkspaceRoot(),
+      allowedRoots: sidebar!.desktopAuthRoots(),
+      get grokHome() {
+        return media().grokHome;
+      },
+      get sessionDir() {
+        return media().sessionDir;
+      },
+      get sessionCatalogDirs() {
+        return media().sessionCatalogDirs;
+      },
+      // Path derivation is cheap, but keep it on the same path-bearing lazy seam.
+      get planReviewSessionRoot() {
+        return sidebar!.desktopPlanReviewSessionRoot();
+      },
+    } satisfies DesktopOpenFileContext;
+  };
   webview.getAuthContext = () => authContext.get!();
   remoteActions.current = {
     link: () => sidebar!.linkRemoteDevice(),
@@ -452,15 +417,19 @@ async function createApp(): Promise<void> {
   // Full product name for About / OS app identity (short name was set early so
   // userData resolved under a branded folder). Window title uses short name.
   app.setName(DESKTOP_APP_FULL_NAME);
+  const isPackaged = app.isPackaged;
   Menu.setApplicationMenu(
-    buildDesktopAppMenu({
-      addProjectFolder: () => {
-        void sidebar?.addProjectFolder();
+    buildDesktopAppMenu(
+      {
+        addProjectFolder: () => {
+          void sidebar?.addProjectFolder();
+        },
+        removeProjectFolder: () => {
+          void sidebar?.removeProjectFolder();
+        },
       },
-      removeProjectFolder: () => {
-        void sidebar?.removeProjectFolder();
-      },
-    }),
+      { isPackaged },
+    ),
   );
 
   // Round icon first — same one the installers use, so a dev run and an
@@ -471,6 +440,10 @@ async function createApp(): Promise<void> {
     ? roundIcon
     : path.join(extensionRoot, "resources", "grok-icon.png");
   const iconOpt = fs.existsSync(iconPath) ? iconPath : undefined;
+
+  // Packaged builds hard-disable DevTools at the webPreferences layer too —
+  // menu-only gating would leave openDevTools() / F12-style hooks reachable.
+  const allowDevTools = desktopDevToolsAllowed(isPackaged);
 
   mainWindow = new BrowserWindow({
     // Wider default so chat + file tree both have room; collapse shrinks the panel.
@@ -493,6 +466,7 @@ async function createApp(): Promise<void> {
       // launch-failed before any page code runs (spike-confirmed).
       sandbox: false,
       spellcheck: false,
+      devTools: allowDevTools,
     },
   });
 
@@ -500,6 +474,30 @@ async function createApp(): Promise<void> {
     log,
     openExternal: (url) => shell.openExternal(url),
   });
+
+  // desktop-dev passes an explicit open signal (not GROK_RELAY_URL). Detached
+  // so the default 720-wide chat stays usable while reading logs.
+  if (
+    shouldOpenDevToolsAtStartup({
+      isPackaged,
+      env: process.env,
+      argv: process.argv,
+    })
+  ) {
+    mainWindow.webContents.openDevTools({ mode: "detach" });
+    log("DevTools opened (non-production build)");
+  }
+
+  // Keyboard DevTools without needing the auto-hidden menu bar (Windows).
+  // Menu accelerator still works; F12 is the discoverable Chromium habit.
+  // Packaged builds keep webPreferences.devTools false so this is a no-op path.
+  if (allowDevTools) {
+    mainWindow.webContents.on("before-input-event", (event, input) => {
+      if (!isDesktopDevToolsShortcut(input)) return;
+      event.preventDefault();
+      mainWindow?.webContents.toggleDevTools();
+    });
+  }
 
   mainWindow.on("closed", () => {
     mainWindow = null;

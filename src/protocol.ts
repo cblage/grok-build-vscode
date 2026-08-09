@@ -75,6 +75,14 @@ export const HOST_CAPABILITIES = {
   // went, so the delete did not stick — and a client that offers the control
   // anyway is offering one that answers with a refusal. Capability, not version.
   deleteActiveSession: true,
+  // Read-only project file browse for AFK Pilot (phone/browser). Field presence
+  // is the gate — never a version check. Local VS Code / desktop webviews
+  // receive the flag but must not draw a second explorer; only IS_REMOTE clients
+  // mount the in-page browser. Older hosts omit the field → nothing advertised.
+  browseProjectFiles: true,
+  // Edit+save existing project files from a remote. Separate from browse so a
+  // host can offer list/read without a write path. OPT-IN field presence.
+  editProjectFiles: true,
 } as const;
 
 /** Host-kind affordances merged into `initialState.capabilities` at post time. */
@@ -83,15 +91,65 @@ export type HostUiCapabilities = {
   remoteVoice: boolean;
   deleteActiveSession?: boolean;
   /**
+   * Read-only project file browse (list dir + read previewable files) for
+   * remote clients. OPT-IN: absent/false = hide. Current hosts set true via
+   * HOST_CAPABILITIES; the webview still only mounts UI when remote.
+   */
+  browseProjectFiles?: boolean;
+  /**
+   * Save edits to existing project text files from a remote client.
+   * OPT-IN and independent of {@link browseProjectFiles}: a host may advertise
+   * browse without edit. Absent/false = no write UI and no write path.
+   * No create/delete/rename in this pass.
+   */
+  editProjectFiles?: boolean;
+  /**
+   * Whether generated media is served with honest byte-range responses. This
+   * is opt-in: hosts without this capability must keep generated videos lazy.
+   */
+  servesMediaRanges?: boolean;
+  /**
    * Gear → Move view. Opt-out: absent/true = show (older VS Code hosts never
    * sent this flag but always supported the control); false = hide (desktop).
    */
   relocateView?: boolean;
   /**
+   * Whether gear → Move view may offer "To Secondary Side Bar". Same opt-out
+   * polarity as relocateView, and for the same reason: every extension built
+   * before Cursor refused that container sends nothing here and had one.
+   * False swaps the two panel destinations for edge-explicit ones.
+   */
+  secondarySideBar?: boolean;
+  /**
+   * Show the empty-state hint pointing at the editor's own move-view picker.
+   * OPT-IN — absent/false = no hint. Decided entirely by the host: it is true
+   * only where the secondary side bar was refused AND the user has not yet
+   * opened that picker from anywhere.
+   */
+  moveViewHint?: boolean;
+  /**
    * Gear → Show extension logs. Same opt-out polarity as relocateView —
    * absent/true = show; false = hide (desktop logs to stdout only).
    */
   showOutput?: boolean;
+  /**
+   * Gear → Toggle Developer Tools. OPT-IN: absent/false = hide. Unpackaged
+   * desktop only — never offered on VS Code or packaged builds.
+   */
+  toggleDevTools?: boolean;
+  /**
+   * Whether a generated-image click opens a host editor tab (`openFile`).
+   * Opt-out: absent/true = yes (older VS Code hosts never sent this flag but
+   * always opened editors); false = no editor — the webview uses the in-app
+   * lightbox instead (desktop). Remote clients force the lightbox regardless
+   * of this flag: the capabilities a phone receives are the desk machine's.
+   */
+  openInEditor?: boolean;
+  /**
+   * Whether generated-video hover actions may reveal the file in the host's
+   * file manager. OPT-IN: absent/false keeps the existing open-file action.
+   */
+  showInFolder?: boolean;
   /**
    * The rail's "add project folder" control. OPT-IN, unlike the two above:
    * absent/false = hide. A host that never sent it cannot open a folder picker,
@@ -102,7 +160,14 @@ export type HostUiCapabilities = {
 
 export type HostMsg =
   | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform; steerByDefault: boolean; soundNotifications: boolean; processingSound: boolean; readRepliesAloud: boolean; /** Global "Use this app for" — absent on older hosts means Knowledge work. */ appPurpose?: "knowledge" | "coding"; capabilities: HostUiCapabilities }
-  | { type: "planModeAvailability"; available: boolean; reason?: string }
+  /** Live retraction of `capabilities.moveViewHint`, sent the moment the user
+   *  opens the host's move-view picker. `initialState` is not re-sent on a
+   *  session swap, so without this the webview keeps a stale true and rebuilds
+   *  the hint the user has already acted on. */
+  | { type: "moveViewHint"; value: boolean }
+  /** Plan picker gate. `recheckable` means the version probe failed (not a
+   *  verified-old CLI) — the row stays clickable so a later pick re-probes. */
+  | { type: "planModeAvailability"; available: boolean; reason?: string; recheckable?: boolean }
   | { type: "showThinking"; value: boolean }
   /** Live update of the global app-purpose preference (Knowledge work / Coding). */
   | { type: "appPurpose"; value: "knowledge" | "coding" }
@@ -149,6 +214,68 @@ export type HostMsg =
   // workspace-relative paths (forward slashes), ranked by src/mention.ts. The
   // echoed `query` lets the webview drop stale replies after further typing.
   | { type: "mentionResults"; query: string; files: string[] }
+  /**
+   * Answer to `listProjectDir` (remote file browse). `cwd` echoes the scoped
+   * root; `relPath` is the listed directory ("" = repo root). No absolute host
+   * paths — only workspace-relative entry paths.
+   */
+  | {
+      type: "projectDirListing";
+      cwd: string;
+      relPath: string;
+      ok: true;
+      entries: Array<{ name: string; kind: "file" | "dir"; relPath: string }>;
+      truncated: boolean;
+    }
+  | { type: "projectDirListing"; cwd: string; relPath: string; ok: false; reason: string }
+  /**
+   * Answer to `readProjectFile`. Preview kinds match desktop `classifyFilePreview`
+   * (markdown/json/image/text); binary / external / oversize fail with `ok:false`.
+   * Caps: {@link FILE_PREVIEW_MAX_BYTES} / {@link FILE_PREVIEW_MAX_IMAGE_BYTES}
+   * in `src/file-tree.ts`.
+   *
+   * When the host advertises `editProjectFiles`, text kinds also carry `stamp`
+   * + `absPath` so a later save can prove identity (same file) and version
+   * (mtime+size). Image previews never include those fields.
+   */
+  | {
+      type: "projectFileContent";
+      cwd: string;
+      relPath: string;
+      ok: true;
+      kind: "markdown" | "json" | "image" | "text";
+      text?: string;
+      dataUrl?: string;
+      pretty?: boolean;
+      /** Present for editable text when host advertises edit — mtime+size. */
+      stamp?: { mtimeMs: number; size: number };
+      /**
+       * Absolute path this content was read at. Sent only with edit capability
+       * so the save can refuse a cross-project relPath collision (see
+       * `writeTreeFile` expectedAbsPath). Round-trip only — never displayed.
+       */
+      absPath?: string;
+    }
+  | { type: "projectFileContent"; cwd: string; relPath: string; ok: false; reason: string }
+  /**
+   * Answer to `writeProjectFile`. Success returns the new stamp so the client
+   * can keep editing without re-reading. Failure reasons mirror `writeTreeFile`
+   * (`changed`, `workspace changed`, containment, etc.).
+   */
+  | {
+      type: "projectFileWriteResult";
+      cwd: string;
+      relPath: string;
+      ok: true;
+      stamp: { mtimeMs: number; size: number };
+    }
+  | {
+      type: "projectFileWriteResult";
+      cwd: string;
+      relPath: string;
+      ok: false;
+      reason: string;
+    }
   /** `steer` marks a mid-turn interjection (#52). It paints a user bubble but is
    *  NOT a prompt and gets no rewind point, so the bubble must not consume a
    *  rewind index — see refreshUserRewindButtons. */
@@ -287,6 +414,7 @@ export type WebviewMsg =
   | { type: "removeChip"; id: string }
   | { type: "toggleChip"; id: string }
   | { type: "openFile"; path: string }
+  | { type: "showInFolder"; path: string }
   | { type: "openUrl"; url: string }
   // `language` is optional on purpose: omitting it hands the untitled document
   // to VS Code's own language detection, which is what a command should get —
@@ -310,9 +438,18 @@ export type WebviewMsg =
   | { type: "openProjectConfig" }
   | { type: "runMcpList" }
   | { type: "showLogs" }
+  /** Unpackaged desktop only — toggle Chromium DevTools (gear / F12). */
+  | { type: "toggleDevTools" }
   /** Open the host settings UI (VS Code: workbench settings focused on grok). */
   | { type: "openSettings"; section?: string }
-  | { type: "moveView"; location: "panel" | "sidebar" | "auxiliarybar" }
+  // `panel-right` / `panel-bottom` dock the panel on that edge before revealing;
+  // plain `panel` leaves the layout alone (view-move.ts § panelPositionFor).
+  //
+  // `pick` maps to no container on purpose, so the host falls through to its own
+  // destination picker. That picker targets a LOCATION rather than a container,
+  // which is the only way into a dock a host renders for itself — in Cursor it
+  // is the difference between reaching the secondary side bar and not.
+  | { type: "moveView"; location: "panel" | "panel-right" | "panel-bottom" | "sidebar" | "auxiliarybar" | "pick" }
   | { type: "setShowThinking"; value: boolean }
   /** Persist the global "Use this app for" preference (Knowledge work / Coding). */
   | { type: "setAppPurpose"; value: "knowledge" | "coding" }
@@ -363,6 +500,12 @@ export type WebviewMsg =
   // from never having said anything (see RepoArchiveChoice). Purely a remote
   // affordance — the VS Code repo picker neither offers it nor reads it.
   | { type: "setRepoArchived"; cwd: string; archived: boolean }
+  // Folder-icon colour for a project in the conversation rail. `color` is one of
+  // the host's palette ids, or "" for none (the default). Host-persisted and
+  // pushed on every `repos` row — same capability pattern as setRepoArchived —
+  // so the choice follows the user to a phone rather than living in browser
+  // localStorage. Purely a rail affordance; the VS Code repo picker ignores it.
+  | { type: "setRepoColor"; cwd: string; color: string }
   // cwd is required to reopen a worktree-isolated session (sessions are keyed
   // by cwd on disk). Omitted → host resolves from meta / workspace root.
   | { type: "resumeSession"; id: string; cwd?: string }
@@ -381,6 +524,37 @@ export type WebviewMsg =
   // (same pipeline as drop / the + picker). The `@rel/path` text stays in the
   // composer, so the prompt carries both the prose reference and the chip.
   | { type: "addMentionFile"; relPath: string }
+  /**
+   * Remote file browse: list one directory under the tab's selected repo
+   * (`cwd` must be that scope — see `resolveRemoteFileRoot`). `relPath`
+   * optional ("" / omit = repo root). Answered by `projectDirListing`.
+   */
+  | { type: "listProjectDir"; cwd: string; relPath?: string }
+  /**
+   * Remote file open: read one previewable file under the tab's selected repo.
+   * Answered by `projectFileContent`. Same fence as list.
+   */
+  | { type: "readProjectFile"; cwd: string; relPath: string }
+  /**
+   * Remote save of an EXISTING text file under the tab's selected repo.
+   * No create / delete / rename in this pass — only rewrite content of a file
+   * that already exists and was read with stamp + absPath.
+   *
+   * Both guards are mandatory (same as desktop `writeTreeFile`):
+   * - `stamp` — "did this file change under me?" (mtime + size from the read)
+   * - `expectedAbsPath` — "is this still the SAME file?" (absolute path at read;
+   *   catches a tab that went stale after the desk switched projects)
+   *
+   * Answered by `projectFileWriteResult`. Capability: `editProjectFiles`.
+   */
+  | {
+      type: "writeProjectFile";
+      cwd: string;
+      relPath: string;
+      text: string;
+      stamp: { mtimeMs: number; size: number };
+      expectedAbsPath: string;
+    }
   | { type: "pasteImage"; mimeType: string; data: string; previewId?: string }
   // Remote browser upload: an untrusted basename plus base64 bytes. The host
   // allowlists/sanitizes/stages it, then routes it through addDroppedFile.
@@ -439,12 +613,12 @@ export type WebviewMsg =
 // error). The runtime arrays are just the keys, so they can never drift from the
 // union without failing the build.
 const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
-  initialState: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true,
+  initialState: true, moveViewHint: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true,
   initialized: true, cliUpdating: true, session: true, sessionName: true, modelChanged: true,
   modeChanged: true, modePolicy: true, sandboxState: true, openModePopover: true,
   voiceState: true, voiceConfigured: true,
   voicePartial: true, voiceSubmit: true, voiceTranscript: true, voiceError: true,
-  chips: true, commandsUpdate: true, mentionResults: true, userMessage: true, agentStart: true,
+  chips: true, commandsUpdate: true, mentionResults: true, projectDirListing: true, projectFileContent: true, projectFileWriteResult: true, userMessage: true, agentStart: true,
   thoughtChunk: true, messageChunk: true, media: true, userMessageChunk: true,
   historyReplay: true, historyBatch: true, permissionHistoryQueue: true, planHistoryQueue: true,
   toolCall: true, toolCallUpdate: true, permissionRequest: true, permissionOptions: true,
@@ -461,19 +635,20 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
 
 const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   ready: true, remotePreferences: true, send: true, newSession: true, cancel: true, pickModel: true,
-  setMode: true, setSandbox: true, removeChip: true, toggleChip: true, openFile: true, openUrl: true,
+  setMode: true, setSandbox: true, removeChip: true, toggleChip: true, openFile: true, showInFolder: true, openUrl: true,
   openText: true, openDiff: true, exportExpr: true, setEffort: true, openGlobalConfig: true,
   addProjectFolder: true, removeProjectFolder: true,
-  openProjectConfig: true, runMcpList: true, showLogs: true, openSettings: true, moveView: true,
+  openProjectConfig: true, runMcpList: true, showLogs: true, toggleDevTools: true, openSettings: true, moveView: true,
   setShowThinking: true, setAppPurpose: true, setExpandCommandOutputs: true, setSteerByDefault: true,
   setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, summarizeSpeech: true, requestImageFull: true, composerFocus: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
   questionCancel: true, setModel: true, runInstallCmd: true, runGrokLogin: true,
   logout: true, checkGrokUpdate: true, updateGrok: true, recheckConnection: true,
   listSessions: true, listRepoSessions: true, selectRepo: true, toggleRepoPin: true, toggleSessionPin: true,
-  setRepoArchived: true,
+  setRepoArchived: true, setRepoColor: true,
   resumeSession: true, renameSession: true, deleteSession: true,
   clearAllSessions: true, pickFile: true, mentionQuery: true, addMentionFile: true,
+  listProjectDir: true, readProjectFile: true, writeProjectFile: true,
   pasteImage: true, uploadFile: true, voiceStart: true,
   voiceStop: true, remoteVoiceStart: true, remoteVoiceChunk: true,
   remoteVoiceStop: true, queueSend: true, dequeueSend: true, clearQueuedSends: true,

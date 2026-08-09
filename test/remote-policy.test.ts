@@ -18,6 +18,8 @@ import {
   MAX_REMOTE_MEDIA_BYTES,
   MAX_REMOTE_THUMBNAIL_BYTES,
   type MediaInlineDeps,
+  capabilitiesForRemote,
+  DESK_ONLY_CAPABILITIES,
 } from "../src/remote-policy";
 import { HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, type HostMsg } from "../src/protocol";
 import { pathsEqual } from "../src/worktree";
@@ -44,6 +46,8 @@ describe("remote-policy classification tables", () => {
     expect(INBOUND_DISPOSITION.send).toBe("propose");
     expect(INBOUND_DISPOSITION.steerSend).toBe("propose");
     expect(INBOUND_DISPOSITION.uploadFile).toBe("propose");
+    // Workspace file mutation — propose (not view); existing files only.
+    expect(INBOUND_DISPOSITION.writeProjectFile).toBe("propose");
     expect(INBOUND_DISPOSITION.permissionAnswer).toBe("full");
     expect(INBOUND_DISPOSITION.exitPlanAnswer).toBe("full");
     expect(INBOUND_DISPOSITION.logout).toBe("full");
@@ -52,8 +56,10 @@ describe("remote-policy classification tables", () => {
     expect(INBOUND_DISPOSITION.listSessions).toBe("view");
     expect(INBOUND_DISPOSITION.selectRepo).toBe("view");
     expect(INBOUND_DISPOSITION.toggleRepoPin).toBe("full");
+    expect(INBOUND_DISPOSITION.setRepoColor).toBe("full");
     // native pickers/editors/mic act on the LOCAL VS Code — never remote-drivable
     expect(INBOUND_DISPOSITION.openFile).toBe("host-local");
+    expect(INBOUND_DISPOSITION.showInFolder).toBe("host-local");
     expect(INBOUND_DISPOSITION.openText).toBe("host-local");
     expect(INBOUND_DISPOSITION.pickFile).toBe("host-local");
     expect(INBOUND_DISPOSITION.voiceStart).toBe("host-local");
@@ -117,14 +123,49 @@ describe("remote repo target gate", () => {
   it("accepts only discovered cwd values for switching, pinning, and explicit resume", () => {
     expect(allowRemoteRepoTarget({ type: "selectRepo", cwd: "/work/a" }, discovered)).toBe(true);
     expect(allowRemoteRepoTarget({ type: "toggleRepoPin", cwd: "/work/b", pinned: true }, discovered)).toBe(true);
+    expect(allowRemoteRepoTarget({ type: "setRepoColor", cwd: "/work/a", color: "blue" }, discovered)).toBe(true);
     expect(allowRemoteRepoTarget({ type: "resumeSession", id: "s", cwd: "/work/a" }, discovered)).toBe(true);
     expect(allowRemoteRepoTarget({ type: "clearAllSessions", cwd: "/work/a" }, discovered)).toBe(true);
     // The rail previews a repo without selecting it — same catalog gate, so it
     // cannot become a way to read history for a path the host never published.
     expect(allowRemoteRepoTarget({ type: "listRepoSessions", cwd: "/work/a" }, discovered)).toBe(true);
     expect(allowRemoteRepoTarget({ type: "listRepoSessions", cwd: "/etc" }, discovered)).toBe(false);
+    // File browse names a cwd — without listing these types here, the default
+    // branch would return true and a remote could claim an arbitrary path.
+    expect(allowRemoteRepoTarget({ type: "listProjectDir", cwd: "/work/a" }, discovered)).toBe(true);
+    expect(allowRemoteRepoTarget({ type: "listProjectDir", cwd: "/etc" }, discovered)).toBe(false);
+    expect(allowRemoteRepoTarget({ type: "readProjectFile", cwd: "/work/a", relPath: "a.ts" }, discovered)).toBe(true);
+    expect(allowRemoteRepoTarget({ type: "readProjectFile", cwd: "/etc", relPath: "passwd" }, discovered)).toBe(false);
+    expect(
+      allowRemoteRepoTarget(
+        {
+          type: "writeProjectFile",
+          cwd: "/work/a",
+          relPath: "a.ts",
+          text: "x",
+          stamp: { mtimeMs: 1, size: 1 },
+          expectedAbsPath: "/work/a/a.ts",
+        },
+        discovered,
+      ),
+    ).toBe(true);
+    expect(
+      allowRemoteRepoTarget(
+        {
+          type: "writeProjectFile",
+          cwd: "/etc",
+          relPath: "passwd",
+          text: "x",
+          stamp: { mtimeMs: 1, size: 1 },
+          expectedAbsPath: "/etc/passwd",
+        },
+        discovered,
+      ),
+    ).toBe(false);
     expect(allowRemoteRepoTarget({ type: "selectRepo", cwd: "/etc" }, discovered)).toBe(false);
     expect(allowRemoteRepoTarget({ type: "toggleRepoPin", cwd: "/etc", pinned: true }, discovered)).toBe(false);
+    // A colour write that names an arbitrary cwd is the same hole as archive/pin.
+    expect(allowRemoteRepoTarget({ type: "setRepoColor", cwd: "/etc", color: "teal" }, discovered)).toBe(false);
     expect(allowRemoteRepoTarget({ type: "resumeSession", id: "s", cwd: "/etc" }, discovered)).toBe(false);
     expect(allowRemoteRepoTarget({ type: "clearAllSessions", cwd: "/etc" }, discovered)).toBe(false);
   });
@@ -440,7 +481,7 @@ describe("allowFromRemote tier gating", () => {
   });
 
   it("host-local and control are never routed, even at full", () => {
-    for (const t of ["openFile", "pickFile", "voiceStart", "moveView", "dropFile", "exportExpr", "ready"] as const) {
+    for (const t of ["openFile", "showInFolder", "pickFile", "voiceStart", "moveView", "dropFile", "exportExpr", "ready"] as const) {
       expect(allowFromRemote(t, "full")).toBe(false);
     }
   });
@@ -845,5 +886,50 @@ describe("remote reconnect snapshot replay", () => {
     const messages = batched(buffer);
     expect(messages[0]).toEqual({ type: "userMessage", text: "only prompt" });
     expect(messages[messages.length - 1]).toEqual({ type: "messageChunk", text: "the newest words" });
+  });
+});
+
+// `messageForRemote` strips capabilities that describe the DESK machine before
+// a phone sees them. Nothing proved it did — and the failure mode is silent:
+// someone adds capability number three, forgets the list, and every existing
+// gate still passes because allowFromRemote refuses those messages anyway.
+// Belt-and-braces, but the belt should be testable.
+describe("capabilities a remote may see", () => {
+  it("removes every desk-only capability and keeps the rest", () => {
+    // Deliberately over-populated: anything NOT on the desk-only list must
+    // survive, which is what catches a strip that got too greedy.
+    const all = {
+      uploadFile: true,
+      remoteVoice: true,
+      deleteActiveSession: true,
+      servesMediaRanges: true,
+      showInFolder: true,
+      browseProjectFiles: true,
+      editProjectFiles: true,
+      relocateView: true,
+      secondarySideBar: true,
+      showOutput: true,
+      toggleDevTools: true,
+    } as unknown as Parameters<typeof capabilitiesForRemote>[0];
+
+    const seen = capabilitiesForRemote(all) as Record<string, unknown>;
+
+    for (const key of DESK_ONLY_CAPABILITIES) {
+      expect(seen, `${key} must not reach a remote`).not.toHaveProperty(key);
+    }
+    // The file browser is the one a remote genuinely needs — a phone has no
+    // editor to fall back on, so stripping it would take the feature away.
+    expect(seen.browseProjectFiles).toBe(true);
+    expect(seen.editProjectFiles).toBe(true);
+    expect(seen.uploadFile).toBe(true);
+    expect(seen.remoteVoice).toBe(true);
+  });
+
+  it("does not mutate the host's own capabilities object", () => {
+    const original = { showInFolder: true, uploadFile: true } as unknown as
+      Parameters<typeof capabilitiesForRemote>[0];
+    capabilitiesForRemote(original);
+    // The host keeps serving its LOCAL webview from this same object.
+    expect(original).toHaveProperty("showInFolder");
   });
 });
