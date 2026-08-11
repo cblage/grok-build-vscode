@@ -864,6 +864,18 @@ export class GrokSidebar {
       return;
     }
     await this.onMessage(msg, "local");
+    // Opening a conversation from the rail is someone saying which conversation
+    // they want to be in, so put them in it. The rail lives in its own activity
+    // bar container, so without this the chat can stay behind another view and
+    // the click looks like it did nothing.
+    //
+    // Only these two, and only from the RAIL: renaming, pinning or deleting a
+    // row is housekeeping done while looking at the list, and yanking the view
+    // out from under that would be the opposite of helpful. This handler is
+    // rail-only, so the chat asking for its own session never lands here.
+    if (msg.type === "resumeSession" || msg.type === "newSession") {
+      await this.host.revealChatView();
+    }
   }
 
   /** Catalog snapshot for a freshly-resolved rail (or its ready handshake). */
@@ -1886,6 +1898,33 @@ Only continue if you trust this code.`,
       [sid]: { ...cur, lastPlanVerdict: verdict, plans },
     };
     void this.state.update(SESSION_META_KEY, next);
+  }
+
+  /**
+   * Mark a conversation as used NOW, and re-push the lists that order by it.
+   *
+   * Called when a message is sent and when a session is created — the two
+   * moments a person would expect their conversation to jump to the top. The
+   * lists order by transcript mtime, and the CLI writes that file about 2.1
+   * seconds after a send (measured), so without this the row sits still through
+   * the whole wait and a brand-new conversation is missing entirely.
+   *
+   * Every project and every session is treated the same; there is no special
+   * case for archived, which is a VS Code presentation concept and has no
+   * business in the activity path.
+   */
+  private noteSessionActivity(session: Session): void {
+    const sid = session.activeSessionId ?? session.client?.sessionId;
+    if (!sid) return;
+    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    void this.state.update(SESSION_META_KEY, {
+      ...overrides,
+      [sid]: { ...(overrides[sid] ?? {}), activeAt: Date.now() },
+    });
+    const cwd = this.sessionCwd(session);
+    this.postSessionsList();
+    if (cwd) this.sendLocalRepoSessionsPreview(cwd);
+    this.refreshRemoteRepoPreview(undefined, cwd);
   }
 
   /** Persist an answered permission card (title + allowed/rejected + position) so
@@ -7085,6 +7124,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // Local VS Code / desktop webviews may receive the capability flag but
         // never mount a second explorer — only remotes post these messages.
         const rel = typeof msg.relPath === "string" ? msg.relPath : "";
+        const correlation = typeof msg.requestId === "string" ? { requestId: msg.requestId } : {};
         const selectedCwd = origin === "remote" && clientId
           ? this.remoteClients.cwd(clientId)
           : this.workspaceRoot();
@@ -7105,15 +7145,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         };
         if (!rootResult.ok) {
           this.host.appendLine(`[remote-files] list rejected: ${rootResult.reason} (${msg.cwd})`);
-          replyList({ type: "projectDirListing", cwd: msg.cwd, relPath: rel, ok: false, reason: rootResult.reason });
+          replyList({ type: "projectDirListing", ...correlation, cwd: msg.cwd, relPath: rel, ok: false, reason: rootResult.reason });
           break;
         }
         const listed = listRemoteProjectDir(rootResult.root, rel);
         if (!listed.ok) {
-          replyList({ type: "projectDirListing", cwd: msg.cwd, relPath: rel, ok: false, reason: listed.reason });
+          replyList({ type: "projectDirListing", ...correlation, cwd: msg.cwd, relPath: rel, ok: false, reason: listed.reason });
         } else {
           replyList({
             type: "projectDirListing",
+            ...correlation,
             cwd: msg.cwd,
             relPath: rel,
             ok: true,
@@ -7127,6 +7168,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // One file, text/image preview caps from file-tree.ts. When the host
         // advertises edit, text kinds also carry stamp + absPath for a save
         // round-trip (see writeProjectFile).
+        const correlation = typeof msg.requestId === "string" ? { requestId: msg.requestId } : {};
         const selectedCwd = origin === "remote" && clientId
           ? this.remoteClients.cwd(clientId)
           : this.workspaceRoot();
@@ -7149,6 +7191,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           this.host.appendLine(`[remote-files] read rejected: ${rootResult.reason} (${msg.cwd})`);
           replyFile({
             type: "projectFileContent",
+            ...correlation,
             cwd: msg.cwd,
             relPath: msg.relPath,
             ok: false,
@@ -7165,6 +7208,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (wire.ok) {
           replyFile({
             type: "projectFileContent",
+            ...correlation,
             cwd: msg.cwd,
             relPath: wire.relPath,
             ok: true,
@@ -7178,6 +7222,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         } else {
           replyFile({
             type: "projectFileContent",
+            ...correlation,
             cwd: msg.cwd,
             relPath: msg.relPath,
             ok: false,
@@ -7192,6 +7237,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // after the desk switched projects is the expectedAbsPath scenario.
         // Capability gate: a host that does not advertise edit refuses here so
         // an older client cannot invent a write path the UI never offered.
+        const correlation = typeof msg.requestId === "string" ? { requestId: msg.requestId } : {};
         const replyWrite = (body: Extract<HostMsg, { type: "projectFileWriteResult" }>) => {
           if (requester) this.sendRemoteRequester(requester, body);
           else this.post(body);
@@ -7199,6 +7245,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (!HOST_CAPABILITIES.editProjectFiles) {
           replyWrite({
             type: "projectFileWriteResult",
+            ...correlation,
             cwd: msg.cwd,
             relPath: msg.relPath,
             ok: false,
@@ -7224,6 +7271,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           this.host.appendLine(`[remote-files] write rejected: ${rootResult.reason} (${msg.cwd})`);
           replyWrite({
             type: "projectFileWriteResult",
+            ...correlation,
             cwd: msg.cwd,
             relPath: msg.relPath,
             ok: false,
@@ -7246,6 +7294,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (written.ok) {
           replyWrite({
             type: "projectFileWriteResult",
+            ...correlation,
             cwd: msg.cwd,
             relPath: written.relPath,
             ok: true,
@@ -7255,6 +7304,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           this.host.appendLine(`[remote-files] write refused: ${written.reason} (${msg.relPath})`);
           replyWrite({
             type: "projectFileWriteResult",
+            ...correlation,
             cwd: msg.cwd,
             relPath: msg.relPath,
             ok: false,
@@ -9805,6 +9855,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // and only whoever holds it may end this one.
     const turn = beginTurn(session);
     this.setStatus(session, "working");
+    // The send IS the activity — the rail should not wait ~2s for the CLI to
+    // write a transcript before admitting you are working in this conversation.
+    this.noteSessionActivity(session);
 
     try {
       // Arm the compact-notification watch BEFORE the prompt: the live
@@ -9829,6 +9882,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       this.emit(session, { type: "agentEnd", meta });
       this.setStatus(session, "done");
+      // Again at the end: by now the transcript really has moved, so this is
+      // the push that makes the row's position true rather than asserted.
+      this.noteSessionActivity(session);
       session.authRecoveryTried = false; // a clean turn re-arms token auto-recovery
       this.maybeGenerateTitle(session);
       this.postSessionName(session);
@@ -10040,6 +10096,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       processingSound: cfg.get("processingSound", false),
       readRepliesAloud: cfg.get("readRepliesAloud", false),
       appPurpose: this.appPurpose() || DEFAULT_APP_PURPOSE,
+      // For a remote's Version & about page. A phone is looking at neither GUI,
+      // so it has to be told which one is on the other end and what the machine
+      // is called. `canSwitchWorkspaceFolder` is the desktop app's defining
+      // capability and is already how every other host-kind decision here is
+      // made. The name is the same string the device list shows, so the two
+      // surfaces cannot disagree about what the machine is called.
+      hostKind: this.host.canSwitchWorkspaceFolder ? "desktop" : "extension",
+      hostName: deviceDisplayName(os.hostname(), process.platform, os.release()),
       // Wire baseline + host-kind UI affordances (gear Move view / Show logs).
       capabilities: {
         ...HOST_CAPABILITIES,
@@ -12796,6 +12860,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       : "";
     const openMain = this.host.canSwitchWorkspaceFolder ? `<div class="app-main">` : "";
     const closeMain = this.host.canSwitchWorkspaceFolder ? `</div>` : "";
+    // The shared file-panel asset is desktop-only in this generated document.
+    // Remote browsers load it from the relay's own web/chat.html; VS Code gets
+    // neither the tag nor the bytes, making the no-file-panel decision structural.
+    const filePanelStyle = this.host.canSwitchWorkspaceFolder
+      ? `<link rel="stylesheet" href="${mediaUri("file-panel.css")}" />`
+      : "";
+    const filePanelScript = this.host.canSwitchWorkspaceFolder
+      ? `<script nonce="${nonce}" src="${mediaUri("file-panel.js")}"></script>`
+      : "";
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -12814,6 +12887,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   .welcome { visibility: hidden; }
 </style>
 <link rel="stylesheet" href="${mediaUri("chat.css")}" />
+${filePanelStyle}
 </head>
 <body class="desk${this.showThinking() ? "" : " thinking-hidden"}" style="--chat-zoom: ${this.chatFontScale()}">
 ${railMount}
@@ -12907,6 +12981,7 @@ ${closeMain}
   <script nonce="${nonce}" src="${mediaUri("mathjax/tex-svg-full.js")}"></script>
   <script nonce="${nonce}" src="${mediaUri("mermaid/mermaid.min.js")}"></script>
   <script nonce="${nonce}" src="${mediaUri("webview-helpers.js")}"></script>
+  ${filePanelScript}
   <script nonce="${nonce}" src="${mediaUri("chat.js")}"></script>
 </body>
 </html>`;

@@ -159,7 +159,17 @@ export type HostUiCapabilities = {
 };
 
 export type HostMsg =
-  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform; steerByDefault: boolean; soundNotifications: boolean; processingSound: boolean; readRepliesAloud: boolean; /** Global "Use this app for" — absent on older hosts means Knowledge work. */ appPurpose?: "knowledge" | "coding"; capabilities: HostUiCapabilities }
+  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; platform: NodeJS.Platform; steerByDefault: boolean; soundNotifications: boolean; processingSound: boolean; readRepliesAloud: boolean; /** Global "Use this app for" — absent on older hosts means Knowledge work. */ appPurpose?: "knowledge" | "coding";
+      /** Which GUI is on the other end. A phone is looking at neither the
+       *  extension nor the desktop app, so it cannot infer this, and its
+       *  Version & about page has to name what it is connected to. Optional and
+       *  additive: absent means an older host, and the page keeps the local
+       *  panel rather than inventing an answer. */
+      hostKind?: "extension" | "desktop";
+      /** The desk machine's display name — the same string the device list
+       *  shows, so "Connected to" names something the user recognises. */
+      hostName?: string;
+      capabilities: HostUiCapabilities }
   /** Live retraction of `capabilities.moveViewHint`, sent the moment the user
    *  opens the host's move-view picker. `initialState` is not re-sent on a
    *  session swap, so without this the webview keeps a stale true and rebuilds
@@ -227,13 +237,14 @@ export type HostMsg =
    */
   | {
       type: "projectDirListing";
+      requestId?: string;
       cwd: string;
       relPath: string;
       ok: true;
       entries: Array<{ name: string; kind: "file" | "dir"; relPath: string }>;
       truncated: boolean;
     }
-  | { type: "projectDirListing"; cwd: string; relPath: string; ok: false; reason: string }
+  | { type: "projectDirListing"; requestId?: string; cwd: string; relPath: string; ok: false; reason: string }
   /**
    * Answer to `readProjectFile`. Preview kinds match desktop `classifyFilePreview`
    * (markdown/json/image/text); binary / external / oversize fail with `ok:false`.
@@ -246,6 +257,7 @@ export type HostMsg =
    */
   | {
       type: "projectFileContent";
+      requestId?: string;
       cwd: string;
       relPath: string;
       ok: true;
@@ -262,7 +274,7 @@ export type HostMsg =
        */
       absPath?: string;
     }
-  | { type: "projectFileContent"; cwd: string; relPath: string; ok: false; reason: string }
+  | { type: "projectFileContent"; requestId?: string; cwd: string; relPath: string; ok: false; reason: string }
   /**
    * Answer to `writeProjectFile`. Success returns the new stamp so the client
    * can keep editing without re-reading. Failure reasons mirror `writeTreeFile`
@@ -270,6 +282,7 @@ export type HostMsg =
    */
   | {
       type: "projectFileWriteResult";
+      requestId?: string;
       cwd: string;
       relPath: string;
       ok: true;
@@ -277,6 +290,7 @@ export type HostMsg =
     }
   | {
       type: "projectFileWriteResult";
+      requestId?: string;
       cwd: string;
       relPath: string;
       ok: false;
@@ -559,12 +573,12 @@ export type WebviewMsg =
    * (`cwd` must be that scope — see `resolveRemoteFileRoot`). `relPath`
    * optional ("" / omit = repo root). Answered by `projectDirListing`.
    */
-  | { type: "listProjectDir"; cwd: string; relPath?: string }
+  | { type: "listProjectDir"; requestId?: string; cwd: string; relPath?: string }
   /**
    * Remote file open: read one previewable file under the tab's selected repo.
    * Answered by `projectFileContent`. Same fence as list.
    */
-  | { type: "readProjectFile"; cwd: string; relPath: string }
+  | { type: "readProjectFile"; requestId?: string; cwd: string; relPath: string }
   /**
    * Remote save of an EXISTING text file under the tab's selected repo.
    * No create / delete / rename in this pass — only rewrite content of a file
@@ -579,6 +593,7 @@ export type WebviewMsg =
    */
   | {
       type: "writeProjectFile";
+      requestId?: string;
       cwd: string;
       relPath: string;
       text: string;
