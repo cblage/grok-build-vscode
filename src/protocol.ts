@@ -194,7 +194,13 @@ export type HostMsg =
   // The focused conversation's display name, using the same precedence as a
   // history row. It is separate from `sessions` because VS Code does not keep
   // that browser-only list populated while the history popover is closed.
-  | { type: "sessionName"; sessionId: string; name: string; cwd: string }
+  // `repoCwd` is the PROJECT this conversation belongs to, which is not always
+  // its `cwd`: a worktree session runs in an isolated checkout that is
+  // deliberately not a catalog row, so a client resolving the label from `cwd`
+  // alone falls back to that directory's leaf — and if the leaf happens to match
+  // another project's name, it presents one project's conversation as another's.
+  // Optional and additive: a client that never sees it keeps its old fallback.
+  | { type: "sessionName"; sessionId: string; name: string; cwd: string; repoCwd?: string }
   | { type: "modelChanged"; modelId: string }
   | { type: "modeChanged"; modeId: string }
   /** YOLO/Auto-accept blocked when config has disable_bypass_permissions_mode. */
@@ -382,7 +388,26 @@ export type HostMsg =
   // no repo-scoped frame can answer it. Entries carry their own `cwd`, which is
   // what lets a row name its repo and reopen in the right checkout.
   | { type: "pinnedSessions"; entries: SessionListEntry[]; dots: Record<string, Dot> }
-  | { type: "repos"; entries: RepoListEntry[]; selectedCwd: string; activeCwd: string }
+  // `canAddProject` is how the VS Code projects rail learns it may offer "Add
+  // project": that view is resolved on its own and gets no `initialState`, so it
+  // has no `capabilities` to read. Optional and additive — a client that never
+  // sees the field paints no control, which is the safe way round.
+  | {
+      type: "repos";
+      entries: RepoListEntry[];
+      selectedCwd: string;
+      activeCwd: string;
+      canAddProject?: boolean;
+      /**
+       * The folder the EDITOR has open, which since history started following
+       * the rail is no longer the same thing as `selectedCwd`. The VS Code rail
+       * marks this one "Your IDE" and pins it to the top: you can be working in
+       * another project while the window stays where it was, and the rail has to
+       * be able to say which is which. Optional and additive — a client that
+       * never sees it falls back to the selection, as it did before.
+       */
+      workspaceCwd?: string;
+    }
   | { type: "sessionDot"; id: string; dot: Dot }
   // Full snapshot of the focused session's host-owned send queue (#37) — the
   // webview renders pending user blocks from this; replay rebuilds them.
@@ -405,7 +430,12 @@ export type WebviewMsg =
   // Browser-owned remote preferences reported for session_start telemetry.
   | { type: "remotePreferences"; fontScale: number; readRepliesAloud: boolean; summarizeRepliesAloud?: boolean; usesTouch: boolean }
   | { type: "send"; text: string; chips?: FileChip[]; bare?: boolean; queuedSendId?: string; submissionId?: string }
-  | { type: "newSession" }
+  // `cwd` names the project to start in, for a client that can SEE which project
+  // it is asking for — the VS Code rail's per-project "+". Optional and additive:
+  // omitted, the host starts in its own scope exactly as before. The host
+  // resolves it through the catalog and ignores anything unknown, and a remote's
+  // value is discarded outright (`newRemoteSession` starts in that tab's repo).
+  | { type: "newSession"; cwd?: string }
   | { type: "cancel" }
   | { type: "pickModel" }
   | { type: "setMode"; modeId: "agent" | "plan" | "yolo" }

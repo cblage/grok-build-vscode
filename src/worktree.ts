@@ -33,6 +33,46 @@ export interface WorktreeRecord {
   createdAt?: number;
 }
 
+/**
+ * How a worktree create ended, as far as the host can tell.
+ *
+ * `silent` and `stalled` both mean "no completion event arrived", and they call
+ * for opposite responses — one is an older CLI that never reports, the other is
+ * a copy that genuinely did not finish. Collapsing them into one "timeout" is
+ * what let a half-copied checkout be accepted.
+ */
+export type WorktreeCreateOutcome = "created" | "failed" | "stalled" | "silent";
+
+/**
+ * Whether a `worktree/status` notification belongs to the create we are
+ * waiting on.
+ *
+ * The CLI's PROGRESS notifications carry no `worktreePath` — only the terminal
+ * one does (research/worktree.md) — so a pathless event can only be attributed
+ * when there is exactly one create it could belong to. That is why creates are
+ * serialised rather than correlated: correlation is impossible for the events
+ * that matter most.
+ */
+export function worktreeStatusIsForCreate(
+  event: { worktreePath?: string } | null | undefined,
+  opts: { target?: string; soleCreateInFlight: boolean; sameCwd?: (a: string, b: string) => boolean },
+): boolean {
+  const named = event?.worktreePath?.trim();
+  if (!named) return opts.soleCreateInFlight;
+  if (!opts.target) return false;
+  return (opts.sameCwd ?? pathsEqual)(named, opts.target);
+}
+
+/** Terminal reading of a `worktree/status` notification, or undefined for progress. */
+export function worktreeStatusVerdict(
+  event: { status?: string } | null | undefined,
+): "created" | "failed" | undefined {
+  const value = String(event?.status ?? "").toLowerCase();
+  if (value === "created" || value === "ready" || value === "done") return "created";
+  if (value === "failed" || value === "error") return "failed";
+  return undefined;
+}
+
 export interface WorktreeCreateResult {
   status: string;
   sessionId?: string;
@@ -373,6 +413,54 @@ export function worktreePathAuthorizedForRepo(opts: {
     if (!ok) return false;
   }
   return true;
+}
+
+/**
+ * Where the CLI records which repository a CLONE-mode worktree came from.
+ *
+ * Not every "worktree" the CLI makes is a `git worktree add`. For some repos it
+ * produces a standalone clone instead — its `.git` is a real directory with its
+ * own object store, so the source repo's `git worktree list` will never mention
+ * it, no matter how long we wait. That is not a lag; it is a different thing.
+ * The CLI leaves this file behind naming the source.
+ */
+export const CLONE_WORKTREE_SOURCE_MARKER = ".git/grok-worktree-source";
+
+/**
+ * Read the clone-mode provenance marker and say whether it names `sourceRepo`.
+ *
+ * This is what makes a clone-mode checkout trustable WITHOUT taking the agent's
+ * word for it: the claim is a file the CLI wrote on local disk, checked by us,
+ * against the repo the user actually asked to branch from. An agent that lied
+ * about a path cannot forge a marker inside a directory it does not control —
+ * and if it could write there, it already had the access.
+ *
+ * Pure over an injected reader so it is testable and so the caller decides what
+ * "read a file" means.
+ */
+export function cloneWorktreeSourceMatches(opts: {
+  worktreePath: string;
+  sourceRepo: string;
+  sourceGitRoot?: string;
+  readMarker: (markerPath: string) => string | undefined;
+  joinPath?: (a: string, b: string) => string;
+  sameCwd?: (a: string, b: string) => boolean;
+}): boolean {
+  const { worktreePath, sourceRepo } = opts;
+  if (!worktreePath || !sourceRepo) return false;
+  const same = opts.sameCwd ?? pathsEqual;
+  const join = opts.joinPath ?? ((a, b) => `${a.replace(/[\\/]+$/, "")}/${b}`);
+  let raw: string | undefined;
+  try {
+    raw = opts.readMarker(join(worktreePath, CLONE_WORKTREE_SOURCE_MARKER));
+  } catch {
+    return false;
+  }
+  const claimed = (raw ?? "").trim();
+  if (!claimed) return false;
+  // A marker naming the worktree itself proves nothing about provenance.
+  if (same(claimed, worktreePath)) return false;
+  return same(claimed, sourceRepo) || (!!opts.sourceGitRoot && same(claimed, opts.sourceGitRoot));
 }
 
 /**

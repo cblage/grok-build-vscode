@@ -85,6 +85,11 @@
     if (!replacement) return;
     remoteTabToken = replacement;
     saveRememberedRemoteSession(null);
+    // Unsaved file edits go with the identity. They are in memory only now, so a
+    // duplicated tab cannot inherit them in the first place — this is here so
+    // the rule survives if they are ever made durable again, which is exactly
+    // how the leak arrived the first time.
+    clearRemoteFileDrafts();
     try {
       sessionStorage.setItem(REMOTE_TAB_TOKEN_KEY, replacement);
     } catch (_) { /* storage unavailable/private mode */ }
@@ -467,6 +472,13 @@
       // edit fields when host advertises editProjectFiles + text kind:
       // stamp, absPath, editing, draft, dirty, saveGen, conflict, notice
       viewer: null,
+      // Unsaved edits parked when the viewer is torn down — see
+      // stashRemoteFileDraft. [{ key: "<cwd> <relPath>", draft }], newest last.
+      drafts: [],
+      // The repo the open viewer's file was read from, captured at read time so
+      // a draft parked DURING a repo switch is keyed to where it came from
+      // rather than to where we just arrived.
+      draftCwd: "",
       listGen: 0,
       readGen: 0,
       writeGen: 0,
@@ -732,8 +744,12 @@
     pencil: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></svg>`,
     folder: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h5l2 3h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/></svg>`,
     // Lucide folder-closed / folder-open — project expand/collapse (replaces chevron).
-    folderClosed: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/><path d="M2 10h20"/></svg>`,
-    folderOpen: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>`,
+    // Solid folder marks supplied by the owner (media/icons/folder-*.svg),
+    // inlined because the rail sets them with innerHTML. `fill:currentColor`
+    // is the change from the originals — it is what lets a project's colour
+    // tint them, and what keeps them legible in a light theme.
+    folderClosed: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 408 408" fill="currentColor" aria-hidden="true"><path d="M372,88.661H206.32l-33-39.24c-0.985-1.184-2.461-1.848-4-1.8H36c-19.956,0.198-36.023,16.443-36,36.4v240c-0.001,19.941,16.06,36.163,36,36.36h336c19.94-0.197,36.001-16.419,36-36.36v-199C408.001,105.08,391.94,88.859,372,88.661z"/></svg>`,
+    folderOpen: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -57 511.99973 511" fill="currentColor" aria-hidden="true"><path d="m506.039062 180.988281c-7.78125-12.546875-21.53125-20.046875-36.78125-20.046875h-339.5625c-16.832031 0-32.140624 9.488282-39.011718 24.179688l-89.8125 188.308594c3.390625 13.789062 16.269531 24.089843 31.609375 24.089843h361.269531c15.445312 0 29.5625-8.734375 36.460938-22.554687l77.628906-155.59375c6.128906-12.3125 5.449218-26.660156-1.800782-38.382813zm0 0"/><path d="m72.402344 156.15625c6.863281-14.6875 22.175781-24.179688 39.011718-24.179688h319.753907v-40.898437c0-16.859375-14.222657-30.578125-31.703125-30.578125h-186.445313c-.273437 0-.460937-.070312-.53125-.121094l-33.371093-46.660156c-5.910157-8.277344-15.671876-13.21875-26.101563-13.21875h-121.304687c-17.488282 0-31.710938 13.71875-31.710938 30.578125v276.875zm0 0"/></svg>`,
     // Palette glyph for "Set color" — stroke-only so it inherits menu icon tint.
     palette: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="13.5" cy="6.5" r="0.5" fill="currentColor"/><circle cx="17.5" cy="10.5" r="0.5" fill="currentColor"/><circle cx="8.5" cy="7.5" r="0.5" fill="currentColor"/><circle cx="6.5" cy="12.5" r="0.5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg>`,
     pin: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="m5 17 2-7V5l-2-2h14l-2 2v5l2 7Z"/></svg>`,
@@ -5104,6 +5120,13 @@
     if (panel) panel.hidden = !on;
     root.hidden = !on;
     document.body.classList.toggle("has-rail", on);
+    // The rail's arrival moves where conversation controls live — `.top-bar` is
+    // hidden from here on — so the file button has to be re-homed with it. It is
+    // usually built long before `repos` lands, i.e. while the top bar was still
+    // the right answer. Re-place only: a full ensure() would re-render the file
+    // panel on every rail rebuild, and a session load produces a burst of those.
+    const filesBtn = document.getElementById("files-browse-btn");
+    if (filesBtn) placeRemoteFilesButton(filesBtn);
     if (!on) { renderSessionHead(); return; }
     wireRailSearch();
     // The rail rebuilds itself wholesale, and a session load produces a burst of
@@ -5313,10 +5336,14 @@
 
   /**
    * "Add project" — capability, not a host flag: only a host that answers
-   * `addProjectFolder` gets the control, and the extension never does because a
-   * VS Code workspace is managed by VS Code. Opening the picker is host-local
-   * (a native dialog on the desk that a phone could not see or answer), so a
+   * `addProjectFolder` gets the control. Opening the picker is host-local (a
+   * native dialog on the desk that a phone could not see or answer), so a
    * remote never shows it either.
+   *
+   * VS Code answers that message now too, but this rail is not where it lands:
+   * `railAvailable()` needs a rail MOUNT and the VS Code chat view has none —
+   * it gets a separate `grok.projects` view (media/projects-rail.js), which
+   * carries its own copy of this control.
    */
   function railAddProjectButton() {
     const btn = document.createElement("button");
@@ -5505,6 +5532,9 @@
       label: labelEl,
       editBtn,
     };
+    // The label is a row of its own now, so editing no longer hides it — this
+    // keeps it correct if the conversation changed under the edit.
+    renderSessionNameRepo();
     setTimeout(() => { inputEl.focus(); inputEl.select(); }, 0);
   }
 
@@ -5615,6 +5645,7 @@
     chip.hidden = !data;
     // Desktop rail hosts: overflow lives in the top-right cluster (after History).
     fillSessionHeadActions();
+    renderSessionNameRepo();
     if (!data || state.sessionNameEditing?.surface === "local") return;
     const name = displayedSessionName(activeSessionRecord());
     label.textContent = name;
@@ -5626,6 +5657,47 @@
     editBtn.innerHTML = ICON.pencil;
     wireSessionNameLabel(label, editBtn, "local");
     editBtn.onclick = (e) => { e.stopPropagation(); beginSessionNameEdit("local", label, editBtn); };
+  }
+
+  /**
+   * The project label beside the conversation name.
+   *
+   * VS Code history used to be pinned to the open folder, so the name alone
+   * always meant "in this workspace". It is multi-workspace now — the rail can
+   * resume a conversation from any discovered project without reloading the
+   * window — and the header stopped saying where you are. Same information the
+   * rail already puts on its cross-project rows.
+   *
+   * Shown only where there is something to disambiguate: one project in the
+   * catalog and the tag is a label repeating what the title bar says. Hidden
+   * while renaming, because the input takes the chip's whole width.
+   */
+  function renderSessionNameRepo() {
+    const el = $("session-name-repo");
+    if (!el) return;
+    // The `sessionName` frame carries the conversation's own cwd, so prefer it:
+    // a conversation resumed from another project may not be in any list this
+    // webview holds, and `state.cwd` is the host's, not the conversation's.
+    const named = activeSessionName();
+    const cwd = named?.cwd || activeSessionRecord()?.cwd || state.cwd || "";
+    // A worktree's cwd is deliberately NOT a catalog row, so resolving the label
+    // from it alone fell back to that directory's leaf — and where the leaf
+    // happened to match another project's name, project A's conversation was
+    // labelled as project B. The host names the owner when the two differ.
+    const projectCwd = named?.repoCwd || cwd;
+    // Only when it is NOT the folder this window has open. There, the window
+    // title already says it and the line is noise; the whole point of the label
+    // is "this conversation is somewhere else".
+    const ide = state.workspaceRepoCwd || "";
+    const elsewhere = !!projectCwd && (!ide || !sameCwd(projectCwd, ide));
+    const label = elsewhere ? railRepoLabelFor(projectCwd) : "";
+    // Stays put while the name is being edited: it is a second ROW now, not
+    // something competing with the input for width.
+    el.hidden = !label;
+    if (el.hidden) return;
+    el.textContent = label;
+    el.title = projectCwd === cwd ? cwd : `${cwd}
+(in ${projectCwd})`;
   }
 
   function renderSessionHead() {
@@ -5645,7 +5717,10 @@
     titleEl.title = name;
 
     const cwd = record?.cwd || state.selectedRepoCwd;
-    subEl.textContent = cwd ? railRepoLabelFor(cwd) : "";
+    // Same worktree rule as the desk header: label the owning project, not the
+    // isolated checkout the conversation happens to run in.
+    const headProjectCwd = (activeSessionName()?.repoCwd) || cwd;
+    subEl.textContent = headProjectCwd ? railRepoLabelFor(headProjectCwd) : "";
     subEl.hidden = !cwd;
     // The name has its own tooltip on the title element; leave the header's to
     // the full path, which the truncated repo line below cannot show.
@@ -10680,6 +10755,37 @@
   window.addEventListener("pagehide", teardownBrowserMic);
   window.addEventListener("beforeunload", teardownBrowserMic);
 
+  /**
+   * Ask before a reload or a closed tab takes unsaved file edits with it.
+   *
+   * The drafts the file editor parks live in memory and nowhere else — nothing
+   * about them is persisted, on this side of the wire or the other — so a
+   * refresh really is a discard. That was the one remaining path where typed
+   * work disappeared without anyone being asked, and it is the easiest one to
+   * hit: a phone reloads a backgrounded tab on its own.
+   *
+   * Conditional on purpose. An unconditional handler puts the browser's "Leave
+   * site?" dialog in front of every ordinary reload, and a prompt that always
+   * fires is a prompt nobody reads. Composer text is deliberately NOT counted:
+   * it survives a reload through the outbox, so there is nothing to warn about.
+   */
+  function remoteFileEditsPending() {
+    if (!IS_REMOTE) return false;
+    if (state.filesBrowse.drafts.length) return true;
+    const v = state.filesBrowse.viewer;
+    return !!(v && v.dirty);
+  }
+
+  window.addEventListener("beforeunload", (e) => {
+    if (!remoteFileEditsPending()) return;
+    // Both spellings: the returnValue assignment is what older browsers honour,
+    // preventDefault() is what the current spec asks for. The string itself is
+    // ignored — every browser shows its own wording.
+    e.preventDefault();
+    e.returnValue = "";
+    return "";
+  });
+
   // Append a transcript to whatever's typed (batch mode — one-shot result).
   function insertTranscript(text) {
     const t = (text || "").trim();
@@ -11285,6 +11391,10 @@
           sessionId: msg.sessionId,
           name: String(msg.name || "New session"),
           cwd: String(msg.cwd || ""),
+          // Present only when the conversation's cwd is not itself a project —
+          // a worktree. Absent from an older host, which is why the label below
+          // still has a fallback rather than depending on this.
+          repoCwd: typeof msg.repoCwd === "string" ? msg.repoCwd : "",
         };
         // Host-confirmed identity only. Optimistic rail clicks never write here.
         state.activeSessionId = msg.sessionId;
@@ -12294,6 +12404,9 @@
         const wasSelected = state.selectedRepoCwd;
         state.selectedRepoCwd = msg.selectedCwd || "";
         state.activeRepoCwd = msg.activeCwd || "";
+        // The folder the EDITOR has open — not the selection. The header names
+        // the conversation's project only when it differs from this one.
+        state.workspaceRepoCwd = msg.workspaceCwd || "";
         // A repo we just left keeps stale cached rows; drop them so its section
         // re-reads rather than showing the list from before the switch. The repo
         // we arrived in reads the live `sessions` list, so its cache is dead weight.
@@ -12350,15 +12463,35 @@
           noteRailTransitionRepos(msg);
         }
         renderRepoChip();
+        // The catalog is what decides whether the conversation's project label
+        // is worth showing at all (one project — nothing to disambiguate) and
+        // what it reads. It usually lands after the name.
+        renderSessionName();
         if (!repoPopover.hidden) renderRepoPopover();
         renderRail();
         requestRailPreviews();
         // Selected repo is the file-browse root — a switch must not leave the
         // panel listing another project's paths under the new name.
-        if (state.filesBrowse.open && remoteFilesBrowseAvailable()) {
+        //
+        // Unconditionally, NOT only while the panel is open. A closed panel kept
+        // its viewer, and reopening skips the directory request whenever a
+        // viewer exists — so close the panel in project A, switch to B, reopen,
+        // and A's file was sitting there under B's heading.
+        if (remoteFilesBrowseAvailable()) {
+          // Park anything unsaved under the repo it belongs to BEFORE the root
+          // moves — a switch is a navigation, not a decision to throw the text
+          // away, and the draft must not follow us into the other project.
+          stashRemoteFileDraft();
           state.filesBrowse.relPath = "";
           state.filesBrowse.viewer = null;
-          requestRemoteDir("");
+          // Requests made in the repo we are leaving are no longer ours to
+          // answer. remoteFileAnswerIsCurrent already refuses them; dropping the
+          // correlation too means a late answer cannot match anything at all.
+          state.filesBrowse._pendingRead = null;
+          state.filesBrowse._pendingWrite = null;
+          state.filesBrowse.entries = [];
+          if (state.filesBrowse.open) requestRemoteDir("");
+          else ensureRemoteFilesBrowser();
         } else {
           ensureRemoteFilesBrowser();
         }
@@ -12466,6 +12599,175 @@
     return kind === "markdown" || kind === "json" || kind === "text";
   }
 
+  /**
+   * Unsaved edits survive leaving the file.
+   *
+   * Tearing the viewer down used to drop the draft on the floor: "Back to files"
+   * did it, and so did a repo switch, both without asking. The editor already has
+   * an explicit **Cancel** — that is the discard action, and it should be the
+   * only one. Navigating away is not a decision about the text you typed.
+   *
+   * Keyed by repo AND path, so a draft can never surface in another project.
+   * Held in memory only: nothing here is persisted, on this side of the wire or
+   * the other, and a reload is still a discard.
+   */
+  /**
+   * Nothing is evicted. Two attempts at a bound were both worse than none:
+   *
+   *   - a count cap dropped the ninth file's draft without a word — the same
+   *     silent discard this mechanism exists to remove, moved somewhere harder
+   *     to notice;
+   *   - a size cap announced the loss AFTER destroying the text, and did not
+   *     even bound anything, since the newest draft was exempt and so a single
+   *     large one could exceed the limit on its own.
+   *
+   * A resource limit that deletes unsaved work is not a limit, it is the bug
+   * with a budget. The growth is already bounded by the things that produce it:
+   * each draft is at most FILE_PREVIEW_MAX_BYTES (2 MiB, `src/file-tree.ts`),
+   * re-editing one file replaces its entry rather than adding one, and drafts
+   * are dropped on Cancel and on a successful save. What is left is one entry
+   * per file a person edited and walked away from without saving, in one tab,
+   * in one session — and every one of those is text they typed and would want
+   * back. If this ever needs a ceiling, the shape is to REFUSE the next park and
+   * say so, never to discard silently after the fact.
+   */
+
+  function remoteDraftKey(cwd, relPath) {
+    return String(cwd || "") + " " + String(relPath || "");
+  }
+  /**
+   * Parked drafts are held in memory only, for the life of this page.
+   *
+   * There WAS a sessionStorage layer here so a draft could survive a mobile
+   * browser discarding the backgrounded tab. It was removed deliberately. Across
+   * seven consecutive independent review rounds it produced a high-severity
+   * finding every single time — quota shedding that dropped the very drafts it
+   * existed to protect, a throttled write with no flush when the page was
+   * suspended, cloned drafts leaking into a duplicated tab, a key not scoped to
+   * the linked device, a baseline copy that doubled every payload, restore
+   * ordering. Each fix was correct and each one opened the next door, because
+   * durable storage of half-finished edits is a much bigger problem than the one
+   * being solved.
+   *
+   * What is promised now is narrow and true: unsaved text survives navigating
+   * away from the file, switching project and closing the panel, and a reload or
+   * tab close is stopped by a confirmation. It does NOT survive the operating
+   * system killing a backgrounded tab. That is the same contract as any ordinary
+   * web editor, and the fallback — Save — is one tap away and always was.
+   */
+
+  /** Park the open viewer's unsaved text before something replaces it. */
+  function stashRemoteFileDraft() {
+    const v = state.filesBrowse.viewer;
+    if (!v || typeof v.relPath !== "string") return;
+    // A viewer that is still loading holds no text of the user's — it is a
+    // placeholder. It must neither park anything nor, by looking "clean", drop
+    // a parked draft that belongs to a file nobody has opened yet.
+    if (v.loading) return;
+    const cwdNow = state.filesBrowse.draftCwd || remoteFilesRepoCwd();
+    if (!v.dirty || typeof v.draft !== "string") {
+      // Back to what is on disk (or never edited). Any parked copy is stale and
+      // must go, or reopening would resurrect text the user has already undone —
+      // the drafts are non-consuming now, so nothing else would clear it.
+      dropRemoteFileDraft(cwdNow, v.relPath);
+      return;
+    }
+    const key = remoteDraftKey(cwdNow, v.relPath);
+    const drafts = state.filesBrowse.drafts;
+    const at = drafts.findIndex((d) => d.key === key);
+    if (at >= 0) drafts.splice(at, 1);
+    // The BASELINE travels with the draft: the version the user was editing
+    // against (stamp) and what the file said at the time (text). Restoring the
+    // draft onto whatever stamp the next read happens to return would hand the
+    // save fence a fresh ticket for a stale edit — a desk-side change made while
+    // the draft sat parked would then be overwritten without a word, which is
+    // precisely what mtime+size exists to prevent.
+    drafts.push({
+      key,
+      draft: v.draft,
+      relPath: v.relPath,
+      stamp: v.stamp,
+      absPath: v.absPath,
+    });
+  }
+
+  /**
+   * Read a parked draft WITHOUT consuming it.
+   *
+   * Consuming on restore looked tidy and lost work: two reads of the same file
+   * can both be in flight (open it, press Back, open it again — answers are
+   * matched on cwd+path, and the request generation is not echoed by the host),
+   * and the first answer restored the draft and deleted it, so the second
+   * replaced the editor with the disk version and there was nothing left to
+   * recover. The parked copy stays until something actually resolves it: a save,
+   * a Cancel, or the text being typed back to what is on disk.
+   */
+  function peekRemoteFileDraft(cwd, relPath) {
+    const key = remoteDraftKey(cwd, relPath);
+    return state.filesBrowse.drafts.find((d) => d.key === key);
+  }
+
+  /** Forget every parked draft — memory and the parked copy alike. */
+  function clearRemoteFileDrafts() {
+    state.filesBrowse.drafts = [];
+    if (state.filesBrowse.viewer) {
+      state.filesBrowse.viewer.dirty = false;
+      state.filesBrowse.viewer.editing = false;
+    }
+  }
+
+  function dropRemoteFileDraft(cwd, relPath) {
+    const key = remoteDraftKey(cwd, relPath);
+    const drafts = state.filesBrowse.drafts;
+    const at = drafts.findIndex((d) => d.key === key);
+    if (at < 0) return;
+    drafts.splice(at, 1);
+  }
+
+  /**
+   * Where the Project files button belongs — which is NOT always `.top-bar`.
+   *
+   * A rail host hides the app-wide bar outright (`body.has-rail .top-bar {
+   * display: none }` on the browser client) and carries the conversation's own
+   * controls in `#session-head` instead. Building the button into the top bar
+   * there put it inside a hidden element: it showed for the one frame before the
+   * repo catalog landed and `has-rail` went on, then disappeared for good — so
+   * the file browser was unreachable on every browser wide enough to get a rail.
+   *
+   * Chosen by presence, which is the same capability rule the rest of this file
+   * follows, and re-checked on every ensure() because `has-rail` arrives with
+   * `repos`, long after the button is first built.
+   *
+   * LAST in the bar, behind a separator — the same shape the desktop panel's
+   * own toggle uses. It sat between History and
+   * the overflow ⋯ to begin with, which read as one more conversation action
+   * rather than as a panel toggle. The separator is a sibling and not a border
+   * on the button, for the reason the desktop one learned: a border boxes the
+   * button in and pushes its glyph off centre.
+   */
+  function remoteFilesButtonHost() {
+    if (document.body.classList.contains("has-rail")) {
+      const head = document.getElementById("session-head");
+      if (head) return head;
+    }
+    return document.querySelector(".top-bar");
+  }
+
+  function placeRemoteFilesButton(btn) {
+    const host = remoteFilesButtonHost();
+    if (!host) return;
+    let sep = document.getElementById("files-browse-sep");
+    if (!sep) {
+      sep = document.createElement("span");
+      sep.id = "files-browse-sep";
+      sep.className = "files-browse-sep";
+      sep.setAttribute("aria-hidden", "true");
+    }
+    if (host.lastElementChild === btn && sep.nextElementSibling === btn) return;
+    host.appendChild(sep);
+    host.appendChild(btn);
+  }
+
   function ensureRemoteFilesBrowser() {
     const on = remoteFilesBrowseAvailable();
     let btn = document.getElementById("files-browse-btn");
@@ -12478,29 +12780,26 @@
       }
       return;
     }
-    const topBar = document.querySelector(".top-bar");
-    if (!btn && topBar) {
+    if (!btn && remoteFilesButtonHost()) {
       btn = document.createElement("button");
       btn.type = "button";
       btn.id = "files-browse-btn";
       btn.className = "icon-btn";
-      btn.title = "Project files";
-      btn.setAttribute("aria-label", "Project files");
+      btn.title = "Show file panel";
+      btn.setAttribute("aria-label", "Toggle file panel");
       btn.setAttribute("aria-expanded", "false");
-      btn.innerHTML = ICON.listTree;
-      // After history so the remote chrome order stays: remote · history · files · …
-      const history = document.getElementById("history-btn");
-      if (history && history.parentNode === topBar) {
-        topBar.insertBefore(btn, history.nextSibling);
-      } else {
-        topBar.appendChild(btn);
-      }
+      // The desktop panel's glyph, not a tree icon — this is a panel toggle and
+      // should read as one wherever it appears.
+      btn.innerHTML = ICON.panelRight;
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         toggleRemoteFilesBrowser();
       });
     }
-    if (btn) btn.hidden = false;
+    if (btn) {
+      placeRemoteFilesButton(btn);
+      btn.hidden = false;
+    }
 
     if (!panel) {
       panel = document.createElement("div");
@@ -12509,13 +12808,20 @@
       panel.hidden = true;
       panel.setAttribute("role", "dialog");
       panel.setAttribute("aria-label", "Project files");
+      // Project name, then the file's own row below it. Deliberately NOT a tab
+      // bar: this panel opens one file at a time, and a single tab that can
+      // never become two advertises switching that does not exist — the same
+      // dishonesty as a tree glyph on a panel toggle. Tabs arrive when they mean
+      // something (see the one-file-panel extraction in the backlog).
       panel.innerHTML =
         `<div class="files-browse-head">` +
-          `<button type="button" class="icon-btn files-browse-back" title="Up" aria-label="Parent folder" hidden>${ICON.chevronRight}</button>` +
           `<div class="files-browse-title"></div>` +
           `<button type="button" class="icon-btn files-browse-close" title="Close" aria-label="Close">${ICON.x}</button>` +
         `</div>` +
-        `<div class="files-browse-path" aria-live="polite"></div>` +
+        `<div class="files-browse-path" aria-live="polite">` +
+          `<button type="button" class="icon-btn files-browse-back" title="Parent folder" aria-label="Parent folder" hidden>${ICON.chevronRight}</button>` +
+          `<span class="files-browse-path-text"></span>` +
+        `</div>` +
         `<div class="files-browse-body"></div>` +
         `<div class="files-browse-viewer" hidden></div>`;
       // Sibling of the chat column so it can overlay on a phone without
@@ -12523,6 +12829,19 @@
       const host = document.querySelector(".app-main") || document.body;
       host.appendChild(panel);
       panel.querySelector(".files-browse-close").addEventListener("click", () => {
+        setRemoteFilesOpen(false);
+      });
+      // A second way out. The panel is a full-bleed overlay on a phone, so it
+      // covers the top-bar toggle that opened it — miss the X and there is no
+      // other exit. Escape is free on anything with a keyboard; it does not
+      // help a phone, which is why the X itself was made unmissable rather
+      // than this being the fix.
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape" || !state.filesBrowse.open) return;
+        // An open editor owns Escape first — it has its own unsaved-work
+        // question and closing the panel out from under it would skip it.
+        if (state.filesBrowse.viewer) return;
+        e.preventDefault();
         setRemoteFilesOpen(false);
       });
       panel.querySelector(".files-browse-back").addEventListener("click", () => {
@@ -12576,6 +12895,9 @@
     state.filesBrowse.relPath = relPath || "";
     state.filesBrowse.loading = true;
     state.filesBrowse.error = "";
+    // Any directory navigation replaces the viewer too, so it is the same
+    // discard path as Back and gets the same treatment.
+    stashRemoteFileDraft();
     state.filesBrowse.viewer = null;
     renderRemoteFilesChrome();
     // Host does not echo gen — accept the next listing that matches this path/cwd.
@@ -12595,12 +12917,35 @@
     state.filesBrowse.loading = true;
     state.filesBrowse.error = "";
     state.filesBrowse.viewer = { relPath, loading: true };
+    // The draft key follows the request, not the last successful read. The
+    // placeholder above carries a relPath and no content, so stashRemoteFileDraft
+    // reads it as "clean" and drops the parked draft at (draftCwd, relPath) — and
+    // draftCwd still named the PREVIOUS project. Opening B's `notes.md` and
+    // pressing Back before it loaded therefore deleted A's parked `notes.md`.
+    state.filesBrowse.draftCwd = cwd;
     state.filesBrowse._pendingRead = { gen, cwd, relPath };
     renderRemoteFilesChrome();
     vscode.postMessage({ type: "readProjectFile", cwd, relPath });
   }
 
+  /**
+   * Whether a file-browser answer is for the project the panel is showing NOW.
+   *
+   * The per-request `_pending*` correlation is not enough on its own: it matches
+   * an answer against the repo the REQUEST was made in, so an in-flight response
+   * from project A still matched after a switch to B. A's file then rendered
+   * under B's heading, and — worse — A's save result marked B's unsaved draft
+   * clean and said "Saved", so navigating away discarded text that was never
+   * written anywhere. The host's `expectedAbsPath` fence stops the cross-project
+   * WRITE; it cannot stop a cross-project answer being believed by the client.
+   */
+  function remoteFileAnswerIsCurrent(msg) {
+    const cwd = remoteFilesRepoCwd();
+    return !!cwd && !!msg && msg.cwd === cwd;
+  }
+
   function handleProjectDirListing(msg) {
+    if (!remoteFileAnswerIsCurrent(msg)) return;
     const pending = state.filesBrowse._pendingList;
     if (pending && (msg.cwd !== pending.cwd || (msg.relPath || "") !== (pending.relPath || ""))) {
       // Stale answer for a previous path — ignore.
@@ -12621,11 +12966,22 @@
   }
 
   function handleProjectFileContent(msg) {
+    if (!remoteFileAnswerIsCurrent(msg)) return;
     const pending = state.filesBrowse._pendingRead;
-    if (pending && (msg.cwd !== pending.cwd || msg.relPath !== pending.relPath)) return;
+    if (!pending || msg.cwd !== pending.cwd || msg.relPath !== pending.relPath) {
+      // Same rule as the write result, and for the same reason: reads are
+      // correlated by cwd+path with no generation echoed by the host, so two
+      // reads of ONE file are indistinguishable. Open a file, press Back while
+      // it loads, open it again — the first answer renders, the user starts
+      // typing, and the second answer matched too and replaced the live editor
+      // with disk content that had never been parked. One request, one answer.
+      return;
+    }
+    // Consumed. A duplicate or superseded answer now has nothing to match.
+    state.filesBrowse._pendingRead = null;
     // A re-read for overwrite must not clobber the user's draft if it races a
     // normal open of a different path (pending already gates cwd/relPath).
-    const keepDraft = pending && pending.forOverwrite && state.filesBrowse.viewer;
+    const keepDraft = pending.forOverwrite && state.filesBrowse.viewer;
     state.filesBrowse.loading = false;
     if (!msg.ok) {
       if (keepDraft) {
@@ -12665,23 +13021,82 @@
         conflict: false,
         notice: "",
       };
+      // Reclaim what the user typed before they navigated away, together with
+      // the version it was written against.
+      //
+      // The parked STAMP is restored, not the fresh one. If nothing changed the
+      // two are identical and the save proceeds as normal; if the file moved on
+      // the desk while the draft sat here, the stale stamp is exactly what makes
+      // the save stop and offer Reload / Overwrite instead of quietly replacing
+      // work that arrived in the meantime. Adopting the fresh stamp handed the
+      // fence a valid ticket for an edit based on content that no longer existed.
+      const cwd = remoteFilesRepoCwd();
+      const parked = peekRemoteFileDraft(cwd, msg.relPath);
+      state.filesBrowse.draftCwd = cwd;
+      if (parked && remoteFileIsEditableKind(msg.kind)) {
+        const v = state.filesBrowse.viewer;
+        const onDisk = typeof msg.text === "string" ? msg.text : "";
+        v.draft = parked.draft;
+        v.dirty = parked.draft !== onDisk;
+        v.editing = v.dirty;
+        if (parked.stamp) v.stamp = parked.stamp;
+        if (parked.absPath) v.absPath = parked.absPath;
+          // "Has the file moved since?" is the STAMP's question, not a text
+        // comparison — mtime+size is the same signal the save fence uses, and
+        // it means the parked entry no longer has to carry a second full copy
+        // of the file. Storing the baseline doubled every draft in
+        // sessionStorage, which is what made the quota shedding reachable at
+        // all, and it put host file contents in storage for no other purpose.
+        const movedUnderUs = !!parked.stamp && !!msg.stamp
+          && (parked.stamp.mtimeMs !== msg.stamp.mtimeMs || parked.stamp.size !== msg.stamp.size);
+        if (v.dirty) {
+          v.notice = movedUnderUs
+            ? "Unsaved changes from before you left — and the file has changed since. Saving will ask first."
+            : "Unsaved changes from before you left this file.";
+        }
+      }
     }
     renderRemoteFilesChrome();
   }
 
   function handleProjectFileWriteResult(msg) {
+    if (!remoteFileAnswerIsCurrent(msg)) return;
     const pending = state.filesBrowse._pendingWrite;
-    if (pending && (msg.cwd !== pending.cwd || msg.relPath !== pending.relPath)) return;
+    if (!pending || msg.cwd !== pending.cwd || msg.relPath !== pending.relPath) {
+      // No correlation, no conclusion. The result carries no request id, so an
+      // answer arriving after its `_pendingWrite` was cleared — Back clears it,
+      // and so does a repo switch — cannot be shown to be about the text now in
+      // the editor. It used to fall through and take the live draft as "what was
+      // written": save, Back, reopen, type more, and the late result marked the
+      // NEWER text clean and dropped its parked copy, while the disk held only
+      // the earlier save. Ignoring it costs a "Saved." notice; believing it costs
+      // the user's work.
+      return;
+    }
     const v = state.filesBrowse.viewer;
     if (!v || v.relPath !== msg.relPath) return;
     v.saving = false;
     if (msg.ok) {
-      v.text = typeof v.draft === "string" ? v.draft : v.text;
+      // What is on disk is what was SENT, not whatever the textarea holds now.
+      // Typing does not stop while "Saving…" is up, and taking the live draft
+      // here marked those later keystrokes saved — the UI said "Saved.", the
+      // host had never seen them, and leaving the file then discarded them as
+      // if they were safe.
+      // `pending` is guaranteed above; there is no live-draft fallback here on
+      // purpose, because that fallback WAS the bug.
+      const written = typeof pending.text === "string" ? pending.text : v.text;
+      v.text = written;
       v.stamp = msg.stamp;
-      v.dirty = false;
-      v.editing = false;
+      v.dirty = typeof v.draft === "string" && v.draft !== written;
+      // Still typing? Stay in the editor with Save live again, rather than
+      // dropping them out of edit mode on top of unsaved text.
+      v.editing = v.dirty;
       v.conflict = false;
-      v.notice = "Saved.";
+      v.notice = v.dirty ? "Saved — you have typed more since." : "Saved.";
+      // On disk now — a parked copy would only come back as a phantom edit.
+      // Still dirty means they typed on during the save, so the parked copy is
+      // left in place: it is the newer text, and it is what Back must preserve.
+      if (!v.dirty) dropRemoteFileDraft(state.filesBrowse.draftCwd || remoteFilesRepoCwd(), v.relPath);
       state.filesBrowse._pendingWrite = null;
       renderRemoteFilesChrome();
       return;
@@ -12713,6 +13128,11 @@
       gen: state.filesBrowse.writeGen,
       cwd,
       relPath: viewer.relPath,
+      // What was actually SENT. The textarea stays editable while the save is in
+      // flight, so by the time the result lands `viewer.draft` may have moved on
+      // — and believing it is what reached the disk is how "Saved." was shown
+      // over text the host never received.
+      text,
     };
     renderRemoteFilesChrome();
     vscode.postMessage({
@@ -12768,11 +13188,16 @@
     const repo = remoteFilesRepoCwd();
     const leaf = cwdLeaf(repo) || "Project";
     title.textContent = leaf;
+    title.title = repo || "Show file tree";
     const rel = state.filesBrowse.relPath || "";
-    pathEl.textContent = rel ? rel.replace(/\\/g, "/") : "/";
+    const pathText = pathEl.querySelector(".files-browse-path-text");
+    if (pathText) pathText.textContent = rel ? rel.replace(/\\/g, "/") : "/";
     back.hidden = !rel;
     // Chevron points right in the icon set; flip for "up/back".
     back.style.transform = "rotate(180deg)";
+    // The breadcrumb belongs to the tree; the open file names itself in the
+    // row below.
+    pathEl.hidden = !!state.filesBrowse.viewer;
 
     const v = state.filesBrowse.viewer;
     if (v) {
@@ -12789,8 +13214,12 @@
       backToList.innerHTML = ICON.chevronRight;
       backToList.style.transform = "rotate(180deg)";
       backToList.addEventListener("click", () => {
-        // Discard in-progress edit when leaving — no silent write.
+        // Leaving is not saving — but it is not discarding either. The draft is
+        // parked and comes back when this file is reopened. Cancel is the
+        // discard, and Cancel is where the question gets asked.
+        stashRemoteFileDraft();
         state.filesBrowse.viewer = null;
+        state.filesBrowse._pendingRead = null;
         state.filesBrowse._pendingWrite = null;
         renderRemoteFilesChrome();
       });
@@ -12798,6 +13227,7 @@
       vName.className = "files-browse-viewer-name";
       vName.textContent = (v.relPath || "").split(/[\\/]/).pop() || v.relPath || "File";
       if (v.dirty) vName.textContent += " •";
+      vName.title = v.relPath || "";
       vHead.appendChild(backToList);
       vHead.appendChild(vName);
       // Edit/Save only when the host advertised edit AND we have stamp+absPath
@@ -12817,11 +13247,27 @@
           cancelBtn.textContent = "Cancel";
           cancelBtn.disabled = !!v.saving;
           cancelBtn.addEventListener("click", () => {
+            // The ONE discard in this panel, so the one place that asks — the
+            // desktop panel asks here too (`cancelChanges`), in these words.
+            // Leaving the file parks the text and needs no question; throwing it
+            // away does.
+            if (
+              v.dirty
+              && !window.confirm(
+                "Cancel changes?\n\nThis discards your unsaved edits and restores the last loaded version.",
+              )
+            ) {
+              return;
+            }
+            // Clean the VIEWER before dropping the parked copy: the parked set is
+            // refreshed from the live dirty editor, so dropping while it still
+            // read as dirty put the cancelled text straight back.
             v.editing = false;
             v.draft = typeof v.text === "string" ? v.text : "";
             v.dirty = false;
             v.conflict = false;
             v.notice = "";
+            dropRemoteFileDraft(state.filesBrowse.draftCwd || remoteFilesRepoCwd(), v.relPath);
             renderRemoteFilesChrome();
           });
           const saveBtn = document.createElement("button");
@@ -12854,6 +13300,10 @@
         }
       }
       viewer.appendChild(vHead);
+      // Said out loud, on the file it applies to. Storage refused this draft, so
+      // it is held in this page only and an OS tab discard takes it — the very
+      // event the parked copy exists to survive. Silently shedding it and hoping
+      // is what every other finding in this area has been about.
       if (v.notice) {
         const notice = document.createElement("div");
         notice.className = "files-browse-notice" + (v.conflict || (v.notice && v.notice !== "Saved.") ? " files-browse-notice-warn" : "");
@@ -12867,7 +13317,16 @@
           reloadBtn.className = "files-browse-action";
           reloadBtn.textContent = "Reload";
           reloadBtn.addEventListener("click", () => {
-            // Drop draft; re-open the host's version.
+            // Take the host's version — which means dropping the draft FIRST.
+            // Parked drafts stopped being consumed on read, so the re-read found
+            // this one and put it straight back: the one control that promises
+            // to discard could not discard. The viewer's dirty state has to go
+            // with it, or the parked copy would be re-added on the way past.
+            v.editing = false;
+            v.dirty = false;
+            v.conflict = false;
+            v.draft = typeof v.text === "string" ? v.text : "";
+            dropRemoteFileDraft(state.filesBrowse.draftCwd || remoteFilesRepoCwd(), v.relPath);
             requestRemoteFile(v.relPath);
           });
           const overwriteBtn = document.createElement("button");
@@ -13146,10 +13605,27 @@
     closePopovers();
     const a = e.target.closest("a[href]");
     if (!a) return;
+    // The browser client is a real web page with real navigation in its chrome:
+    // the AFK Pilot brand in the top bar, the same brand in the rail, and the
+    // "Pick another device" link in a connection notice. All of them point at
+    // `/`, and this handler swallowed every one — preventDefault, then an
+    // openFile for a path named "/" that the host correctly refused. Clicking
+    // the logo did nothing and logged a policy drop.
+    //
+    // The page marks those anchors. Deliberately an explicit opt-out rather
+    // than a rule about what the href looks like: a plan link is `/home/…` and
+    // resolves same-origin exactly like `/` does, so any positional or
+    // origin-based guess turns real file references into navigation away from
+    // the conversation, which is worse than the bug.
+    if (a.closest("[data-native-link]")) return;
     e.preventDefault();
     const href = a.getAttribute("href") || "";
     if (/^https?:\/\//i.test(href)) {
-      vscode.postMessage({ type: "openUrl", url: href });
+      // A remote has no host to route through: openUrl is host-local and is
+      // dropped there, which is why the gear's repository link already opens
+      // its own window. Same rule for a link in the transcript.
+      if (IS_REMOTE) window.open(href, "_blank", "noopener");
+      else vscode.postMessage({ type: "openUrl", url: href });
     } else if (/^[a-zA-Z]:[\\/]/.test(href) || href.startsWith("\\\\") || !/^[a-z][a-z0-9+.-]*:/i.test(href)) {
       vscode.postMessage({ type: "openFile", path: href });
     }

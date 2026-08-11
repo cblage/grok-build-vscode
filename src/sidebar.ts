@@ -8,6 +8,7 @@ import type {
   HostWebviewView,
 } from "./host";
 import { Uri, disposeAll, formatRemoteInstallId, shouldRehydrateOnWebviewReady } from "./host";
+import { isCanonicallyInsideRoot } from "./file-tree";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -191,6 +192,7 @@ import {
   normalizeRepoPath,
   orderedResumeCwdCandidates,
   readContextUsage,
+  relativePathWithin,
   readSessionEntries,
   resolveGrokHome,
   sessionCatalogDirs,
@@ -212,6 +214,8 @@ import {
   type FfmpegResolution,
 } from "./ffmpeg-locate";
 import {
+  CLONE_WORKTREE_SOURCE_MARKER,
+  cloneWorktreeSourceMatches,
   filterWorktreesForSourceRepo,
   gitRootForPath,
   isGitRepo,
@@ -221,6 +225,9 @@ import {
   normalizeFsPath,
   pathsEqual,
   sanitizeWorktreeLabel,
+  type WorktreeCreateOutcome,
+  worktreeStatusIsForCreate,
+  worktreeStatusVerdict,
   worktreePathAuthorizedForRepo,
   type WorktreeParentRef,
   type WorktreeRecord,
@@ -290,6 +297,54 @@ const REPO_ARCHIVES_KEY = "grok.repoArchives";
  *  and VS Code host this (unlike archives, which desktop strips because open/
  *  close already owns the curated list). */
 const REPO_COLORS_KEY = "grok.repoColors";
+/**
+ * Folders the user added to the rail by hand, on a host that cannot open them.
+ *
+ * Desktop "Add project" changes the app's OWN workspace, so it needs no list —
+ * `workspaceFolders()` is the list. VS Code's workspace belongs to VS Code, and
+ * adding a folder to it converts a single-folder window into a multi-root one
+ * and reloads the extension host, which is a violent answer to "show me this
+ * project in the rail". So VS Code records the folder here instead: it joins
+ * `trustedCwds` and appears as an ordinary catalog row, VS Code's own Explorer
+ * is untouched, and nothing reloads.
+ *
+ * **It does grant reach, and that is the point.** An earlier version of this
+ * comment claimed otherwise on the grounds that `localTrustedSessionCwds`
+ * already trusts the whole discovered catalog — true, but the folder this
+ * feature adds is precisely the one Grok has NEVER run in, so it was not in
+ * that catalog and is now. It becomes selectable, and through the phone,
+ * browsable and editable like any other project. That is what the user asked
+ * for by picking it. What it must therefore also be is REVOCABLE — see
+ * {@link GrokSidebar.forgetExtraProjectFolder}, reachable from the rail's ⋯
+ * menu on exactly the rows that came from here.
+ *
+ * Absent from `DISK_KEYS`, so it lives in `globalState` rather than the shared
+ * `~/.grok/client-state` that pins and colours use. Deliberate: pins and colours
+ * are curation you want to follow you to the phone, this is a workaround for one
+ * editor's inability to show a folder it has not opened. Desktop filters it out
+ * anyway (`localRepoCatalogEntries` keeps only open folders there), so sharing
+ * it would move bytes around for no effect.
+ */
+const EXTRA_PROJECT_FOLDERS_KEY = "grok.extraProjectFolders";
+/**
+ * Folders the user has explicitly REMOVED from the rail, which stay removed.
+ *
+ * Dropping the added-folder record was not enough to make "Hide project" mean
+ * anything. VS Code's catalog is discovered from Grok's own session history, so
+ * the moment anything ran in that folder the row came back on its own — and a
+ * phone selecting the project is enough to create that history, because
+ * `selectRemoteRepo` opens or starts a session there. So a remote could make its
+ * own access permanent by selecting a newly added project before the user
+ * thought better of it, and the returning row carried no `added` marker, so the
+ * rail no longer offered to remove it.
+ *
+ * A tombstone is the only thing that survives that. Nothing on disk is touched
+ * and no conversation is deleted — the project is simply not listed, and
+ * therefore not trusted, until the user adds the folder again, which clears it.
+ * VS Code-local like its counterpart: absent from `DISK_KEYS`, so it lives in
+ * `globalState` rather than the shared client-state.
+ */
+const REMOVED_PROJECT_FOLDERS_KEY = "grok.removedProjectFolders";
 /** Shared client-state key for the anonymous per-install telemetry GUID (survives
  *  updates and identifies this machine across clients).
  *
@@ -840,7 +895,26 @@ export class GrokSidebar {
       }
       return;
     }
-    const relPath = this.host.asRelativePath(pathUri);
+    // Same fence as the implicit chip, and for the same reason: the attachment
+    // has to belong to the CONVERSATION, not to the window. Once the rail could
+    // put a project-B conversation on screen inside a window opened on A, "Add
+    // Selection to Grok" on an A file handed A's source to B — and with a
+    // selection the prompt builder reads that absolute path and embeds the text
+    // under an innocuous A-relative name like `src/foo.ts`.
+    //
+    // Also where the relative path comes from. `asRelativePath` resolves against
+    // VS Code's workspace folders, and a project reached through the rail is
+    // deliberately not one of them, so it would have labelled an ordinary file
+    // with its full absolute path.
+    const sessionRoot = this.sessionCwd(this.focused);
+    const relPath = this.conversationRelPath(absPath);
+    if (relPath === undefined) {
+      void this.host.showWarningMessage(
+        `That file is outside ${path.basename(sessionRoot) || "this project"}, which is where ` +
+          "this conversation is running. Open a conversation in its project first.",
+      );
+      return;
+    }
     let selStart: number | undefined;
     let selEnd: number | undefined;
     if (opts?.selection && editor && !editor.selection.isEmpty) {
@@ -2417,12 +2491,54 @@ Only continue if you trust this code.`,
         "You're already in a worktree. Start a new worktree from a normal session — worktrees don't nest.",
       );
     }
-    const sourcePath = this.workspaceRoot();
+    // The CONVERSATION's repository — not the open folder, and not the rail's
+    // selection either.
+    //
+    // Not the open folder, because a project-B conversation can be on screen in
+    // a window opened on A: that made an A worktree out of a B conversation, and
+    // Apply Worktree would later merge it into A. Not the selection, because
+    // selecting a project in the rail changes the history scope and leaves the
+    // focused conversation exactly where it was — "Continue in a worktree" is an
+    // id-less action about the conversation in front of you, so a selection made
+    // since would have branched from a checkout you never mentioned.
+    //
+    // One rule for every caller: a worktree is cut from the conversation it
+    // continues. The Command Palette lands here too, and `focused` is the
+    // conversation open there as well.
+    const sourcePath = this.sessionCwd(this.focused);
     if (!isGitRepo(sourcePath, fs)) {
       return void this.host.showWarningMessage(
         "Worktree sessions need a git repository. Open a folder that is a git checkout (or run git init).",
       );
     }
+    // One at a time. Creation reuses whatever live client the project already
+    // has, and the CLI's progress notifications carry no worktree path — only
+    // the terminal one does — so two overlapping creates on one client produce
+    // events that cannot be told apart. Serialising is the honest fix; trying
+    // to correlate uncorrelatable events is not. Nothing legitimate wants two
+    // at once: this is a deliberate action, and only the desk can start it
+    // (remote-policy keeps `newWorktreeSession` host-local).
+    if (this.worktreeCreateInFlight) {
+      return void this.host.showWarningMessage(
+        "A worktree is already being created. Wait for it to finish before starting another.",
+      );
+    }
+    this.worktreeCreateInFlight = true;
+    try {
+      await this.createWorktreeSession(sourcePath, opts);
+    } finally {
+      this.worktreeCreateInFlight = false;
+    }
+  }
+
+  /** Guards {@link newWorktreeSession} against overlapping creates. */
+  private worktreeCreateInFlight = false;
+
+  /** The body of {@link newWorktreeSession}, run under its single-flight guard. */
+  private async createWorktreeSession(
+    sourcePath: string,
+    opts?: { fromRemote?: boolean },
+  ): Promise<void> {
     // Remote origin: skip the host input box (invisible to the phone). Local
     // and Command Palette still prompt for an optional label.
     let label = "";
@@ -2448,114 +2564,433 @@ Only continue if you trust this code.`,
             return void this.host.showErrorMessage("Could not start Grok to create a worktree.");
           }
           const { client, disposeAfter } = creator;
+          // Disposed after the LAST validation query, not here and not at the
+          // end. Not here, because validation asks this same client for its
+          // worktree list and killing it first made that call reject every time
+          // — invisible for a linked worktree, which local git lists anyway,
+          // and fatal for a clone-mode one, which only the ACP list mentions.
+          // Not at the end either: a temporary `grok.exe` still running while
+          // the new session starts holds the executable's file lock on Windows,
+          // and the first session after an extension upgrade is when the silent
+          // CLI updater runs — it would fail, and then record the version
+          // anyway, so the update would be skipped for the whole release.
           let created;
-          try {
-            created = await client.createWorktree({
-              sourcePath,
-              label: label || undefined,
-            });
-          } finally {
-            if (disposeAfter) await client.dispose();
-          }
-          if (created === "unsupported") {
-            return void this.host.showWarningMessage(
-              "Worktrees need a newer Grok Build CLI. Update via the gear menu → Version & about.",
-            );
-          }
-          const wtPath = created.worktreePath;
-          const wtLabel = label || path.basename(wtPath);
-          this.host.appendLine(`[worktree] created ${wtPath} (label=${wtLabel})`);
-
-          // create is ASYNC — the RPC returns "creating" before git writes the
-          // checkout (its dir + `.git` pointer appear a beat later). Spawning a
-          // session in a not-yet-existing cwd hangs the whole flow, so wait for
-          // the checkout to land before validating or starting the session.
-          const ready = await this.waitForWorktreeReady(wtPath, 30000);
-          if (!ready) {
-            return void this.host.showErrorMessage(
-              `Worktree "${wtLabel}" was created but its checkout never appeared on disk — the session wasn't started. Try again, or check \`git worktree list\`.`,
-            );
-          }
-
-          // Validate against an authoritative worktree list before cache /
-          // overrides / auth roots. A compromised or malformed ACP path must
-          // not become a trusted session cwd.
-          const sourceGitRoot =
-            created.sourceGitRoot || gitRootForPath(sourcePath, defaultFs) || sourcePath;
-          const listedPaths = await this.listAuthoritativeWorktreePaths(
-            client,
-            sourcePath,
-            sourceGitRoot,
-          );
-          if (
-            !worktreePathAuthorizedForRepo({
-              worktreePath: wtPath,
-              sourceRepo: sourcePath,
-              listedWorktreePaths: listedPaths,
-              claimedSourceGitRoot: created.sourceGitRoot || undefined,
-              sourceGitRoot,
-            })
-          ) {
-            this.host.appendLine(
-              `[worktree] refused unlisted/unauthorized path from create: ${wtPath}`,
-            );
-            return void this.host.showErrorMessage(
-              `Worktree path was not accepted as part of this repository (not in git worktree list). Session not started.`,
-            );
-          }
-
-          // Refresh cache only after validation.
-          this.worktreeCache = this.worktreeCache.filter((w) => !pathsEqual(w.path, wtPath));
-          this.worktreeCache.push({
-            id: wtLabel,
-            path: wtPath,
-            sourceRepo: sourcePath,
-            repoName: path.basename(sourcePath),
-            kind: "session",
-            creationMode: "linked",
-            gitRef: "HEAD",
-            headCommit: "",
-            status: "alive",
-            label: wtLabel,
-            userProvidedLabel: !!label,
-          });
-
-          // Open a brand-new session whose process cwd is the worktree.
-          this.parkFocused();
-          this.focused = this.newLocalSession();
-          this.pool.add(this.focused);
-          this.focused.cwd = wtPath;
-          this.focused.worktree = {
-            path: wtPath,
-            label: wtLabel,
-            sourceGitRoot,
+          let creatorDisposed = false;
+          const releaseCreator = async () => {
+            if (creatorDisposed || !disposeAfter) return;
+            creatorDisposed = true;
+            await client.dispose();
           };
-          await this.startSession();
-          const id = this.focused.activeSessionId;
-          if (id) {
-            const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
-            await this.state.update(SESSION_META_KEY, {
-              ...overrides,
-              [id]: {
-                ...(overrides[id] ?? {}),
-                customName: worktreeDisplayName(wtLabel),
-                worktreePath: wtPath,
-                worktreeLabel: wtLabel,
+          try {
+            // The authoritative set BEFORE creating anything. Without it,
+            // "is this path a worktree of this repo" is the only question the
+            // validator can answer — and an existing SIBLING worktree passes
+            // it. A response naming one would have been cached, opened,
+            // persisted, made remotely targetable, and later applied or
+            // removed as though we had just made it.
+            const preExisting = await this.listAuthoritativeWorktreePaths(
+              client,
+              sourcePath,
+              gitRootForPath(sourcePath, defaultFs) || sourcePath,
+            );
+            // Watch BEFORE the RPC. `createWorktree` returns while the status
+            // is still "creating" and completion rides an event, so a small
+            // repo can finish before the call even resolves — a listener
+            // attached afterwards waits for something that already happened.
+            const watch = this.watchWorktreeCreate(client);
+            try {
+              created = await client.createWorktree({
+                sourcePath,
+                label: label || undefined,
+              });
+            } catch (createErr) {
+              watch.cancel();
+              throw createErr;
+            }
+            if (created === "unsupported") {
+              watch.cancel();
+              return void this.host.showWarningMessage(
+                "Worktrees need a newer Grok Build CLI. Update via the gear menu → Version & about.",
+              );
+            }
+            const wtPath = created.worktreePath;
+            const wtLabel = label || path.basename(wtPath);
+            this.host.appendLine(`[worktree] created ${wtPath} (label=${wtLabel})`);
+
+            // Wait for the CLI to say it is DONE, not merely for the checkout
+            // to exist. Registration happens before the files are copied, so
+            // `.git` on disk and a `git worktree list` entry both appear while
+            // the copy is still running — and the temporary creator we are
+            // about to dispose is the process doing the copying. Killing it
+            // then leaves a partial checkout that every later check calls
+            // valid, with staged or untracked work silently absent.
+            //
+            // Bounded, and a timeout falls through to the disk checks rather
+            // than failing: an older CLI may not emit the event at all, and
+            // refusing a good worktree over a missing notification would be a
+            // worse trade than the race it protects against.
+            const outcome = await watch.settled(wtPath);
+            if (outcome === "failed") {
+              return void this.host.showErrorMessage(
+                `Worktree "${wtLabel}" was not created: the Grok CLI reported it failed.`,
+              );
+            }
+            if (outcome === "stalled") {
+              // It reported progress and then stopped. That is an unfinished
+              // copy, not an old CLI — and the checks below cannot tell the
+              // difference, because registration lands before the files do.
+              this.host.appendLine(`[worktree] create reported progress then stalled: ${wtPath}`);
+              return void this.host.showErrorMessage(
+                `Worktree "${wtLabel}" never finished being created, so no session was started. The partial checkout was left at ${wtPath}.`,
+              );
+            }
+            if (outcome === "silent") {
+              // Nothing at all was said about this create, so the CLI predates
+              // the status event. The checks below are how this worked before
+              // it existed — an unchanged risk rather than a new one.
+              this.host.appendLine(`[worktree] no status reported for ${wtPath}; using disk checks`);
+            }
+            // create is ASYNC — the RPC returns "creating" before git writes the
+            // checkout (its dir + `.git` pointer appear a beat later). Spawning a
+            // session in a not-yet-existing cwd hangs the whole flow, so wait for
+            // the checkout to land before validating or starting the session.
+            const ready = await this.waitForWorktreeReady(wtPath, 30000);
+            if (!ready) {
+              return void this.host.showErrorMessage(
+                `Worktree "${wtLabel}" was created but its checkout never appeared on disk — the session wasn't started. Try again, or check \`git worktree list\`.`,
+              );
+            }
+
+            // Validate against an authoritative worktree list before cache /
+            // overrides / auth roots. A compromised or malformed ACP path must
+            // not become a trusted session cwd.
+            //
+            // The root we QUERY is derived locally from the folder the user
+            // actually asked to branch — never from the response. Taking
+            // `created.sourceGitRoot` first (as this did) made the check answer
+            // itself: the same value arrived as both the claim and the thing the
+            // claim was compared against, so it always matched. A response naming
+            // repository B could then hand back a genuine worktree OF B, have git
+            // truthfully list it, and be filed under A.
+            const sourceGitRoot = gitRootForPath(sourcePath, defaultFs) || sourcePath;
+            const claimedGitRoot = created.sourceGitRoot?.trim() || undefined;
+            if (claimedGitRoot && !pathsEqual(claimedGitRoot, sourceGitRoot) && !pathsEqual(claimedGitRoot, sourcePath)) {
+              this.host.appendLine(
+                `[worktree] refused: create claims source ${claimedGitRoot}, but ${sourcePath} is in ${sourceGitRoot}`,
+              );
+              return void this.host.showErrorMessage(
+                `Worktree "${wtLabel}" came back attributed to a different repository, so no session was started.`,
+              );
+            }
+            // Ask more than once. The create RPC returns as soon as git is asked,
+            // and `waitForWorktreeReady` only proves the DIRECTORY exists — the
+            // worktree can still be missing from `git worktree list` for a beat
+            // after that. Validating on the first answer refused a perfectly good
+            // checkout roughly 14ms after creating it: "not in git worktree list".
+            //
+            // This weakens nothing. The path must still appear in an authoritative
+            // list; it is only given the moment it needs to get there.
+            let listedPaths = await this.listAuthoritativeWorktreePaths(
+              client,
+              sourcePath,
+              sourceGitRoot,
+            );
+            for (let attempt = 0; attempt < 6; attempt++) {
+              if (listedPaths.some((p) => pathsEqual(p, wtPath))) break;
+              await new Promise((r) => setTimeout(r, 250));
+              listedPaths = await this.listAuthoritativeWorktreePaths(
+                client,
+                sourcePath,
                 sourceGitRoot,
-              },
+              );
+            }
+            if (
+              !worktreePathAuthorizedForRepo({
+                worktreePath: wtPath,
+                sourceRepo: sourcePath,
+                listedWorktreePaths: listedPaths,
+                claimedSourceGitRoot: claimedGitRoot,
+                sourceGitRoot,
+              })
+            ) {
+              this.host.appendLine(
+                `[worktree] refused unlisted/unauthorized path from create: ${wtPath}`,
+              );
+              // The CLI already wrote a checkout there — for a clone-mode repo, a
+              // full copy of it. Refusing without saying so left the directory
+              // behind silently, so the next attempt with the same label got a
+              // "-2" suffix and the owner accumulated orphans they had no way to
+              // see. We do not delete it: it is real work on disk and this path
+              // is reached precisely when we could NOT establish what it is.
+              return void this.host.showErrorMessage(
+                `Worktree "${wtLabel}" could not be confirmed as part of this repository, so no session was started. The checkout was left at ${wtPath} — remove it yourself if you don't want it.`,
+              );
+            }
+            // "A worktree of this repo" is not the same claim as "the worktree
+            // I just asked you to make". Every sibling passes the first test,
+            // so a response naming one would take over a checkout somebody else
+            // is working in — and Apply and Remove would then act on it.
+            if (preExisting.some((p) => pathsEqual(p, wtPath))) {
+              this.host.appendLine(
+                `[worktree] refused: ${wtPath} already existed before this create`,
+              );
+              return void this.host.showErrorMessage(
+                `Worktree "${wtLabel}" already existed before this request, so no session was started. Open it from the conversation list instead.`,
+              );
+            }
+
+            // Every question that needed the creator has been asked. Let it go
+            // BEFORE the session starts — see the note where it was obtained.
+            await releaseCreator();
+
+            // Refresh cache only after validation.
+            this.worktreeCache = this.worktreeCache.filter((w) => !pathsEqual(w.path, wtPath));
+            this.worktreeCache.push({
+              id: wtLabel,
+              path: wtPath,
+              sourceRepo: sourcePath,
+              repoName: path.basename(sourcePath),
+              kind: "session",
+              creationMode: "linked",
+              gitRef: "HEAD",
+              headCommit: "",
+              status: "alive",
+              label: wtLabel,
+              userProvidedLabel: !!label,
             });
-            this.sessionCache.delete(id);
+
+            // Open a brand-new session whose process cwd is the worktree.
+            this.parkFocused();
+            // Held as an OBJECT across the await, never re-read from
+            // `this.focused`. Focus is free to move while startup runs — the
+            // user can click another conversation — and reading it back
+            // afterwards wrote this worktree's name, path and source root onto
+            // whatever session happened to be focused by then. A cold restore
+            // later treats that saved binding as authoritative, so the wrong
+            // conversation comes back believing it lives in the worktree.
+            const wtSession = this.newLocalSession();
+            this.focused = wtSession;
+            this.pool.add(wtSession);
+            wtSession.cwd = wtPath;
+            wtSession.worktree = {
+              path: wtPath,
+              label: wtLabel,
+              sourceGitRoot,
+            };
+            await this.startSession(undefined, wtSession);
+            const id = wtSession.activeSessionId;
+            if (id) {
+              const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+              await this.state.update(SESSION_META_KEY, {
+                ...overrides,
+                [id]: {
+                  ...(overrides[id] ?? {}),
+                  customName: worktreeDisplayName(wtLabel),
+                  worktreePath: wtPath,
+                  worktreeLabel: wtLabel,
+                  sourceGitRoot,
+                },
+              });
+              this.sessionCache.delete(id);
+            }
+              this.postSessionsList();
+              void this.host.showInformationMessage(
+                `Worktree session ready: ${wtLabel}. Edits stay isolated until you Apply worktree.`,
+              );
+          } finally {
+            // Belt: every early return above lands here too.
+            await releaseCreator();
           }
-          this.postSessionsList();
-          void this.host.showInformationMessage(
-            `Worktree session ready: ${wtLabel}. Edits stay isolated until you Apply worktree.`,
-          );
         } catch (e: any) {
           void this.host.showErrorMessage(`Create worktree failed: ${e?.message ?? e}`);
         }
       },
     );
   }
+
+  /**
+   * Watch one worktree create through to completion.
+   *
+   * Started BEFORE the RPC, because the CLI can finish a small repo before the
+   * call resolves — so events are BUFFERED until the path is known and then
+   * replayed. The path arrives from the RPC's own answer, which is why this is
+   * two steps rather than one call.
+   *
+   * Correlation is the point. Creation reuses whatever live client the project
+   * already has, so two creates on one client interleave their notifications;
+   * accepting the first terminal event on the client let one create's
+   * completion release another's wait, and that other flow would then start in
+   * a checkout still being copied. An event with a `worktreePath` must name
+   * OURS. An event without one is only trusted while a single create is in
+   * flight on that client, which is the ordinary case and the one older CLIs
+   * produce.
+   *
+   * The timeout distinguishes two situations that look identical from here:
+   *
+   *  - the CLI never said ANYTHING about this create → it does not speak the
+   *    status protocol. Fall through to the disk and git checks, which is how
+   *    this worked before the event existed.
+   *  - the CLI DID report progress and then went quiet → it speaks the
+   *    protocol and the copy is genuinely unfinished. Registration happens
+   *    before the files are copied, so the disk checks would call a partial
+   *    checkout valid. Refuse instead.
+   */
+  private watchWorktreeCreate(client: AcpClient, timeoutMs = 120000) {
+    const events: Array<{ status?: string; worktreePath?: string }> = [];
+    let target: string | undefined;
+    let settleNow: ((o: WorktreeCreateOutcome) => void) | undefined;
+    // Whether this CLI has said ANYTHING about our create. It is what separates
+    // "does not speak the protocol" from "spoke, then stopped", and it is only
+    // trustworthy because creates are serialised: progress notifications carry
+    // no worktree path, so attributing one depends on there being exactly one
+    // create it could belong to.
+    let spoke = false;
+
+    const mine = (e: { worktreePath?: string }) =>
+      worktreeStatusIsForCreate(e, {
+        target,
+        soleCreateInFlight: this.worktreeCreatesInFlight.get(client) === 1,
+      });
+    const verdict = worktreeStatusVerdict;
+    // Arrow, so `this` is the sidebar: the object returned below has methods
+    // of its own and would shadow it.
+    const clientReportsStatus = () => this.worktreeStatusCapableClients.has(client);
+    let onActivity: (() => void) | undefined;
+    const onStatus = (status: { status?: string; worktreePath?: string }) => {
+      // ANY event on this client — ours or not — proves the CLI emits status
+      // notifications. That fact outlives a single create, and it is the thing
+      // that makes "we heard nothing, so this must be an old build" a safe
+      // inference or a false one.
+      this.worktreeStatusCapableClients.add(client);
+      events.push(status || {});
+      if (!settleNow || !target) return; // buffered; replayed once we know ours
+      if (!mine(status)) return;
+      // Any matched event counts, progress included — that is the whole point
+      // of the flag. Only a terminal one settles the wait.
+      spoke = true;
+      onActivity?.();
+      const outcome = verdict(status);
+      if (outcome) settleNow(outcome);
+    };
+
+    this.worktreeCreatesInFlight.set(client, (this.worktreeCreatesInFlight.get(client) ?? 0) + 1);
+    try {
+      client.on("worktreeStatus", onStatus);
+    } catch {
+      /* a client that cannot subscribe simply never reports */
+    }
+
+    const detach = (opts?: { keepSlot?: boolean }) => {
+      try {
+        client.off?.("worktreeStatus", onStatus);
+      } catch {
+        /* best effort — a disposed client has nothing to detach from */
+      }
+      if (opts?.keepSlot) {
+        // Only a RETAINED slot needs an owner to outlive this call, so only
+        // then is a listener worth registering. Attaching one per watch left a
+        // callback behind on every ordinary create too — a reused workspace
+        // client accumulates them until it exits, and eventually warns about
+        // it. `exit` is what AcpClient emits when its child goes.
+        try {
+          client.once?.("exit", () => this.worktreeCreatesInFlight.delete(client));
+        } catch {
+          /* the slot is bounded by the client's own lifetime regardless */
+        }
+        return;
+      }
+      const left = (this.worktreeCreatesInFlight.get(client) ?? 1) - 1;
+      if (left > 0) this.worktreeCreatesInFlight.set(client, left);
+      else this.worktreeCreatesInFlight.delete(client);
+    };
+
+    return {
+      /** Abandon the watch without waiting (the RPC failed or was unsupported). */
+      cancel: () => detach(),
+      /** Wait for OUR create to finish, now that the RPC has named its path. */
+      settled(worktreePath: string): Promise<WorktreeCreateOutcome> {
+        target = worktreePath;
+        return new Promise<WorktreeCreateOutcome>((resolve) => {
+          let done = false;
+          const timers: Array<ReturnType<typeof setTimeout>> = [];
+          const finish = (outcome: WorktreeCreateOutcome) => {
+            if (done) return;
+            done = true;
+            for (const t of timers) clearTimeout(t);
+            // A stalled create is one we STOPPED WAITING FOR, not one that
+            // ended: the CLI may still be copying. Releasing its slot would let
+            // the next create believe it is the only one in flight and trust
+            // pathless progress events that belong to this one. The listener is
+            // dropped either way; only the count is held, and only until the
+            // client goes.
+            detach({ keepSlot: outcome === "stalled" });
+            resolve(outcome);
+          };
+          settleNow = finish;
+          // ONE clock, and a long one.
+          //
+          // A short "has it said anything yet" window was tried and was worse
+          // than the problem: a create-capable CLI whose first notification is
+          // slow, or whose copy simply takes longer, was classified as a build
+          // that never reports and admitted through the disk checks — which
+          // approve a half-copied checkout, because registration lands before
+          // the files do. That widened the unsafe window from "copies over two
+          // minutes" to "copies over five seconds".
+          //
+          // What running out MEANS still depends on whether it ever spoke.
+          // Deleting that distinction along with the short clock was the
+          // over-correction: a CLI that reported progress and then stopped is
+          // an unfinished copy, and letting it fall through hands the disk
+          // checks the partial checkout they are guaranteed to approve.
+          //
+          // IDLE, not elapsed. A fixed deadline calls a copy stopped for taking
+          // long, which for a big repository it legitimately does — and the
+          // protocol emits progress while copying, so quiet is the signal, not
+          // duration. Every matched event restarts the clock; only silence
+          // running out ends the wait.
+          //
+          // "Silent" is a claim about the CLI, not about this create, so it is
+          // only safe while nothing has ever proved otherwise. A retry after a
+          // stall cannot attribute its own progress — the abandoned create's
+          // slot is still held, so pathless events are ambiguous by design —
+          // and reading that as "old build, fall through to the disk checks"
+          // would be provably wrong: the retained slot exists BECAUSE this
+          // client reports. Fail closed there.
+          const capable = () => spoke || clientReportsStatus();
+          let idle: ReturnType<typeof setTimeout>;
+          const arm = () => {
+            clearTimeout(idle);
+            idle = setTimeout(() => finish(capable() ? "stalled" : "silent"), timeoutMs);
+            timers.push(idle);
+          };
+          onActivity = arm;
+          arm();
+          // Replay what arrived before the path was known.
+          for (const e of events) {
+            if (!mine(e)) continue;
+            spoke = true;
+            const outcome = verdict(e);
+            if (outcome) return finish(outcome);
+          }
+        });
+      },
+    };
+  }
+
+  /**
+   * Live creates per client, so an event with no `worktreePath` can be trusted
+   * only when there is exactly one create it could belong to.
+   */
+  private worktreeCreatesInFlight = new Map<AcpClient, number>();
+
+  /**
+   * Clients observed emitting `worktree/status` at least once.
+   *
+   * Kept per client rather than per create because it is a fact about the
+   * BUILD, and it is what stops "we heard nothing" from being read as "this
+   * CLI is too old" in a case where we already know better.
+   */
+  private worktreeStatusCapableClients = new WeakSet<AcpClient>();
 
   /** Poll until a freshly-created worktree's checkout exists on disk (its `.git`
    *  pointer file, which `git worktree add` writes). create is async — the RPC
@@ -2570,7 +3005,11 @@ Only continue if you trust this code.`,
       } catch { /* keep polling */ }
       await new Promise((r) => setTimeout(r, 200));
     }
-    try { return fs.existsSync(worktreePath); } catch { return false; }
+    // The timeout fallback used to accept the bare directory. A directory with
+    // no `.git` is not a checkout — it is what is left when creation failed
+    // halfway — and calling it ready is how grok came to be spawned in an empty
+    // folder and exit 1. If the loop above never saw a `.git`, there isn't one.
+    return false;
   }
 
   /**
@@ -2695,7 +3134,34 @@ Only continue if you trust this code.`,
       }
       let r;
       try {
-        r = await client.removeWorktree(wt.path);
+        try {
+          r = await client.removeWorktree(wt.path);
+        } catch (rpcErr: any) {
+          // The CLI refuses ("Internal error") for a checkout git does not
+          // recognise as a worktree — which is exactly the clone-mode case,
+          // where `git worktree remove` has nothing to remove. That left the
+          // user with a directory they explicitly asked to delete, an error
+          // they could do nothing about, and a row still in the rail.
+          //
+          // We delete it ourselves, but only where we can prove all three:
+          // it lives under the grok worktrees root, it carries the marker
+          // naming this repo, and it is not the repo itself. Anything less
+          // and the error stands.
+          const detail = rpcErr?.message ?? String(rpcErr);
+          const refusal = this.canSelfRemoveWorktree(wt);
+          if (refusal) {
+            this.host.appendLine(`[worktree] self-remove refused: ${refusal}`);
+            void this.host.showErrorMessage(
+              `Remove worktree failed: ${detail}. The checkout at ${wt.path} was left alone because ${refusal}.`,
+            );
+            return;
+          }
+          this.host.appendLine(
+            `[worktree] CLI remove failed (${detail}); removing the checkout directly`,
+          );
+          fs.rmSync(wt.path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+          r = { removed: true };
+        }
       } finally {
         if (disposeAfter) await client.dispose();
       }
@@ -2704,6 +3170,16 @@ Only continue if you trust this code.`,
           "Remove worktree needs a newer Grok Build CLI. Update via the gear menu → Version & about.",
         );
       }
+      // WHO OWNED IT — captured before the records that answer that are erased.
+      // `resolveLocalRepoTarget` finds the owning project by walking session
+      // ownership, and the next few lines drop the worktree from the cache and
+      // strip its bindings from session meta, after which the lookup returns
+      // nothing and the fallback lands on the git ROOT. For a nested project
+      // (`/repo/packages/app` inside a `/repo` checkout) that is one level up,
+      // free to touch sibling packages — and on desktop, where `/repo` is not an
+      // open folder, startSession refuses it and the promised replacement
+      // conversation never appears at all.
+      const worktreeOwnerCwd = this.resolveLocalRepoTarget(wt.path)?.cwd;
       this.worktreeCache = this.worktreeCache.filter((w) => !pathsEqual(w.path, wt.path));
       this.host.appendLine(`[worktree] removed ${wt.path} (removed=${r.removed})`);
       // Clear worktree binding on meta for sessions that pointed here.
@@ -2719,11 +3195,18 @@ Only continue if you trust this code.`,
       }
       if (changed) await this.state.update(SESSION_META_KEY, next);
       this.focused.worktree = undefined;
-      // Leave the chat; start a normal workspace session so the user isn't stuck.
+      // Leave the chat; start a normal session so the user isn't stuck — in the
+      // repository this worktree was cut FROM, which is where the work goes back
+      // to. The open folder was right only while conversations were pinned to
+      // it; the rail can put you in another project entirely, and landing in the
+      // window's folder then dropped you somewhere you had not been working.
       this.parkFocused();
       this.focused = this.newLocalSession();
       this.pool.add(this.focused);
-      this.focused.cwd = this.workspaceRoot();
+      // The catalog PROJECT that owned the worktree (captured above), not its
+      // git root — that is the relationship the rail draws, and where the work
+      // goes back to.
+      this.focused.cwd = worktreeOwnerCwd || wt.sourceGitRoot || this.historyCwdFor("local");
       await this.startSession();
       this.postSessionsList();
       // Re-home the remote tabs that were on the removed worktree: a fresh
@@ -2780,31 +3263,137 @@ Only continue if you trust this code.`,
     sourcePath: string,
     sourceGitRoot: string,
   ): Promise<string[]> {
+    // git first, and ALWAYS — it is the only party here that cannot be wrong
+    // about its own worktrees, and it is a local process that answers in
+    // milliseconds. What used to happen: an ACP list with any attributed row
+    // was returned as-is and git was consulted only when that list came back
+    // empty. So a path the agent named, and nothing else could confirm, passed
+    // a check whose whole job was to confirm it — which is how an EMPTY
+    // DIRECTORY became a session cwd and grok exited 1 inside it.
+    const gitPaths = await listGitWorktreePaths(sourceGitRoot || sourcePath, {
+      log: (m) => this.host.appendLine(m),
+    });
+    const authorized = [...gitPaths];
+    const add = (p: string) => {
+      if (p && !authorized.some((existing) => pathsEqual(existing, p))) authorized.push(p);
+    };
     try {
       const list = await client.listWorktrees({});
       if (list !== "unsupported" && Array.isArray(list)) {
-        const trusted = filterWorktreesForSourceRepo(list, sourcePath, { sourceGitRoot });
-        const paths = trusted.map((r) => r.path);
-        // list may omit sourceRepo on some builds — also accept raw paths that
-        // git itself reports for this checkout.
-        if (paths.length) return paths;
-        const allListed = list.map((r) => r.path).filter(Boolean);
-        if (allListed.length) {
-          // Cross-check with git so we do not trust unattributed ACP rows alone.
-          const gitPaths = await listGitWorktreePaths(sourceGitRoot || sourcePath, {
-            log: (m) => this.host.appendLine(m),
-          });
-          return allListed.filter((p) =>
-            gitPaths.some((g) => pathsEqual(g, p)),
-          );
+        // ACP rows still need corroboration, but a CLONE-mode checkout has a
+        // second kind of proof available: the marker the CLI writes inside it.
+        // Those never appear in the source repo's `git worktree list` — they
+        // are separate repositories — so before this they were refused outright
+        // and the feature simply did not work for any repo the CLI clones.
+        for (const row of filterWorktreesForSourceRepo(list, sourcePath, { sourceGitRoot })) {
+          // git already vouched for it — asking for a clone marker as well would
+          // fail every LINKED worktree and log an alarming line about a checkout
+          // that is perfectly valid.
+          if (authorized.some((p) => pathsEqual(p, row.path))) continue;
+          if (this.cloneWorktreeBelongsTo(row.path, sourcePath, sourceGitRoot)) add(row.path);
         }
       }
     } catch (e: any) {
       this.host.appendLine(`[worktree] listWorktrees for validate failed: ${e?.message ?? e}`);
     }
-    return listGitWorktreePaths(sourceGitRoot || sourcePath, {
-      log: (m) => this.host.appendLine(m),
+    return authorized;
+  }
+
+  /**
+   * Whether we may delete this checkout ourselves after the CLI refused to.
+   *
+   * A recursive delete is the most destructive thing in this file, so the fence
+   * is deliberately narrow — the user's confirmation already said "this deletes
+   * the isolated checkout", and this decides only whether the thing in front of
+   * us IS an isolated checkout. Location is necessary but never sufficient; on
+   * top of it we need ONE of two positive answers:
+   *
+   *  - **nothing to lose** — the directory is gone or empty. This is the common
+   *    case in practice, and the one that kept the owner stuck: the CLI deletes
+   *    the contents and THEN fails to deregister, so by the time it reports
+   *    "Internal error" the checkout is already an empty folder with no marker,
+   *    no `.git`, and nothing left to prove anything with. Refusing there is
+   *    refusing to delete an empty directory the user asked us to delete.
+   *  - **provenance** — the clone marker names the repo it claims to come from,
+   *    for a checkout that still has contents worth being careful about.
+   *
+   * Returns the reason on refusal so the error the user sees can say it.
+   */
+  private canSelfRemoveWorktree(wt: { path: string; sourceGitRoot?: string }): string | undefined {
+    const target = wt?.path;
+    // The session's own binding carries only the git root; the cache has the
+    // full record when we have one. Either way this is the repo the MARKER has
+    // to name — get it wrong and the check fails closed, which is the point.
+    const cached = this.worktreeCache.find((w) => pathsEqual(w.path, target));
+    const source = cached?.sourceRepo || wt?.sourceGitRoot || this.workspaceRoot();
+    if (!target || !path.isAbsolute(target)) return "no absolute path to remove";
+    const root = path.join(resolveGrokHome(), "worktrees");
+    if (!relativePathWithin(root, target)) return `it is outside ${root}`;
+    if (pathsEqual(target, root)) return "it is the worktrees root itself";
+    if (source && pathsEqual(target, source)) return "it is the source repository";
+    for (const folder of this.openWorkspaceFolders()) {
+      if (pathsEqual(target, folder)) return "it is an open folder";
+    }
+    let contents: string[] | undefined;
+    try {
+      contents = fs.readdirSync(target);
+    } catch {
+      // Already gone — the CLI removed it and then failed on the bookkeeping.
+      return undefined;
+    }
+    if (!contents.length) return undefined;
+    if (!source) return "the source repository is unknown";
+    if (this.cloneWorktreeBelongsTo(target, source, gitRootForPath(source, defaultFs) || source)) {
+      return undefined;
+    }
+    return `it has contents but no ${CLONE_WORKTREE_SOURCE_MARKER} naming ${source}`;
+  }
+
+  /**
+   * Whether `worktreePath` carries an on-disk marker naming `sourceRepo`.
+   *
+   * The I/O wrapper around {@link cloneWorktreeSourceMatches} — kept here so the
+   * decision itself stays pure and testable, and so every refusal says why in
+   * the log rather than leaving the owner with "not in git worktree list" for a
+   * checkout that was never going to be in one.
+   */
+  private cloneWorktreeBelongsTo(
+    worktreePath: string,
+    sourceRepo: string,
+    sourceGitRoot: string,
+  ): boolean {
+    // LOCATION FIRST, and it is not optional. A marker is a file, and a file is
+    // something whoever proposed the path can write — so on its own it proves
+    // only that the proposer touched that directory, not that we made it. Grok
+    // creates clone-mode worktrees under its own root and nowhere else, so
+    // anything outside that root is not one of ours whatever it contains.
+    // Canonical, because a symlink planted inside the root and pointing
+    // somewhere else entirely would satisfy a textual prefix check.
+    //
+    // The DELETE path already demanded this. Authorization is the more
+    // dangerous of the two: it ends with a Grok process running in that
+    // directory, the path persisted on the session, and the path in the
+    // trusted-cwd set a linked remote is allowed to target.
+    const root = path.join(resolveGrokHome(), "worktrees");
+    if (!isCanonicallyInsideRoot(root, worktreePath)) {
+      this.host.appendLine(
+        `[worktree] refused clone provenance for ${worktreePath}: outside ${root}`,
+      );
+      return false;
+    }
+    const ok = cloneWorktreeSourceMatches({
+      worktreePath,
+      sourceRepo,
+      sourceGitRoot,
+      readMarker: (markerPath) => fs.readFileSync(markerPath, "utf8"),
+      joinPath: (a, b) => path.join(a, ...b.split("/")),
     });
+    if (!ok) {
+      this.host.appendLine(
+        `[worktree] no clone provenance for ${worktreePath} (expected ${CLONE_WORKTREE_SOURCE_MARKER} naming ${sourceRepo})`,
+      );
+    }
+    return ok;
   }
 
   /** Every open workspace folder root (desktop multi-folder, or VS Code folders). */
@@ -2819,6 +3408,47 @@ Only continue if you trust this code.`,
     return root ? [root] : [];
   }
 
+  /**
+   * Hand-added project folders (VS Code only — see EXTRA_PROJECT_FOLDERS_KEY).
+   *
+   * Not filtered for existence here: `discoverRepos` stats every trusted cwd and
+   * drops the ones that are gone, so a deleted folder disappears from the rail
+   * on its own without this having to police the stored list.
+   */
+  private extraProjectFolders(): string[] {
+    const raw = this.state.get<string[]>(EXTRA_PROJECT_FOLDERS_KEY, []);
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((c): c is string => typeof c === "string" && !!c && path.isAbsolute(c));
+  }
+
+  /** Normalised keys of folders the user removed — see REMOVED_PROJECT_FOLDERS_KEY. */
+  private removedProjectFolderKeys(): Set<string> {
+    const raw = this.state.get<string[]>(REMOVED_PROJECT_FOLDERS_KEY, []);
+    if (!Array.isArray(raw)) return new Set();
+    return new Set(
+      raw.filter((c): c is string => typeof c === "string" && !!c).map((c) => normalizeRepoPath(c)),
+    );
+  }
+
+  /**
+   * Whether this host offers "Add project" at all.
+   *
+   * Two different meanings behind one control: desktop opens the folder for
+   * real, VS Code records it for the rail ({@link EXTRA_PROJECT_FOLDERS_KEY}).
+   * Every local host can do one or the other, so this is flat true — it exists
+   * as a method because the two call sites read better for it and because the
+   * next host that cannot will want one place to say so.
+   *
+   * Deliberately NOT `canSwitchWorkspaceFolder`, which is what it used to be:
+   * that flag means "this host owns its own workspace", which VS Code does not
+   * and must not start claiming. Remotes are excluded twice over — the message
+   * is `host-local` at the policy gate, and the client never paints a control
+   * that opens a native dialog the phone could not see.
+   */
+  private canAddProjectFolder(): boolean {
+    return true;
+  }
+
   private repoCatalog() {
     const pins = this.state.get<RepoPins>(REPO_PINS_KEY, {});
     const worktreeLabels = new Map<string, string>();
@@ -2830,7 +3460,7 @@ Only continue if you trust this code.`,
     for (const wt of this.worktreeCache) {
       worktreeLabels.set(normalizeRepoPath(wt.path), wt.label);
     }
-    return discoverRepos({
+    const discovered = discoverRepos({
       fs: defaultFs,
       grokHome: resolveGrokHome(process.env),
       pins,
@@ -2846,10 +3476,30 @@ Only continue if you trust this code.`,
       tmpDir: os.tmpdir(),
       // Open folders remain selectable before Grok creates a catalog row (and
       // bypass managed-worktree exclusion when the user opened a worktree).
-      trustedCwds: this.openWorkspaceFolders(),
+      // Hand-added folders join them: on VS Code that is the only thing keeping
+      // a never-used project in the rail, since it has no session history to be
+      // discovered from.
+      trustedCwds: [...this.openWorkspaceFolders(), ...this.extraProjectFolders()],
       worktreeLabels,
       log: (m) => this.host.appendLine(m),
     });
+    // Tombstoned folders are dropped HERE, at the single source, not in the
+    // display list. `localTrustedSessionCwds` reads this catalog directly on VS
+    // Code, so filtering only what the rail draws would have left a removed
+    // project invisible but still authorized — the row would be gone while the
+    // phone carried on browsing and editing it.
+    const removed = this.removedProjectFolderKeys();
+    if (!removed.size) return discovered;
+    // A folder VS Code actually has OPEN outranks its own tombstone. Removal
+    // refuses to tombstone the open folder, but one written while the folder was
+    // CLOSED still applied when it was opened later: the project vanished from
+    // the rail, `postRepoCatalog` silently selected a different one, so History
+    // and New Session pointed somewhere other than the Explorer — while the root
+    // stayed authorized for remotes the whole time, invisibly. Opening a folder
+    // is a louder statement of intent than having once removed its row.
+    for (const open of this.openWorkspaceFolders()) removed.delete(normalizeRepoPath(open));
+    if (!removed.size) return discovered;
+    return discovered.filter((r) => !removed.has(normalizeRepoPath(r.cwd)));
   }
 
   /**
@@ -2863,7 +3513,14 @@ Only continue if you trust this code.`,
     const full = this.repoCatalog();
     let entries: RepoListEntry[];
     if (!this.host.canSwitchWorkspaceFolder) {
-      entries = full;
+      // Hand-added rows are marked so the rail can offer to take them back out.
+      // A folder added by hand is the one kind of catalog row the user cannot
+      // otherwise revoke: everything else is here because Grok has run there,
+      // and stops being listed when that stops being true.
+      const added = new Set(this.extraProjectFolders().map((c) => normalizeRepoPath(c)));
+      entries = added.size
+        ? full.map((r) => (added.has(normalizeRepoPath(r.cwd)) ? { ...r, added: true } : r))
+        : full;
     } else {
       const open = this.openWorkspaceFolders();
       // Empty open set → empty rail (user may Add Project Folder). Never fall
@@ -3004,21 +3661,35 @@ Only continue if you trust this code.`,
       const root = this.host.workspaceRoot();
       this.selectedRepoCwd = root && inLocal(root) ? root : (localEntries[0]?.cwd ?? "");
     }
-    // Same split as the history list: remote clients see (and drive) the global
-    // selection, the VS Code webview always reads its own workspace. The chip is
-    // hidden locally, but this frame still feeds Clear-all's target and the name
-    // in its confirm dialog — so pointing it at a remotely-selected repo would
-    // aim a destructive action somewhere the user cannot see.
-    // Desktop multi-folder: selectedCwd tracks the open folder the user chose
-    // (may equal active session cwd once switch settles).
-    const localSelected = this.host.canSwitchWorkspaceFolder
-      ? (this.selectedRepoCwd || this.host.workspaceRoot() || "")
-      : this.workspaceRoot();
+    // Both hosts follow the selection the LOCAL user made. VS Code used to be
+    // pinned to its own workspace root — a rule from when remote showed one
+    // project at a time and VS Code had no rail. Now that both have one,
+    // history stuck on the open folder while the chat shows another project's
+    // conversation is simply wrong: the user picked that conversation.
+    //
+    // A remote still cannot drag this view. `selectRepo` routes by origin —
+    // `selectRemoteRepo` per client for remotes — so `selectedRepoCwd` is
+    // written by LOCAL selection only. That is what keeps the destructive
+    // actions this frame feeds (Clear-all's target, and the project name in its
+    // confirm dialog) aimed somewhere the user can actually see.
+    //
+    // Desktop multi-folder already worked this way: selectedCwd tracks the open
+    // folder the user chose, and may equal the active session cwd once a switch
+    // settles.
+    const localSelected = this.selectedRepoCwd || this.workspaceRoot() || "";
     this.postLocal({
       type: "repos",
       entries: localEntries,
       selectedCwd: localSelected,
       activeCwd,
+      // Local only. The remote frame below deliberately omits it: adding a
+      // project opens a native folder dialog on the desk, which a phone can
+      // neither see nor answer (remote-policy: `addProjectFolder` is host-local).
+      canAddProject: this.canAddProjectFolder(),
+      // What the EDITOR has open, sent alongside the selection rather than
+      // instead of it — the rail needs both to say "you are working here, your
+      // window is there".
+      workspaceCwd: this.workspaceRoot() || "",
     });
     for (const clientId of this.remoteClients.clients()) {
       this.sendRemoteClient(clientId, this.buildRemoteReposMsg(clientId, localEntries));
@@ -3317,7 +3988,7 @@ Only continue if you trust this code.`,
    * Picks a directory when `cwd` is omitted.
    */
   async addProjectFolder(cwd?: string): Promise<void> {
-    if (!this.host.canSwitchWorkspaceFolder) return;
+    if (!this.canAddProjectFolder()) return;
     let folder = cwd;
     if (!folder) {
       const picked = await this.host.showOpenDialog({
@@ -3329,12 +4000,165 @@ Only continue if you trust this code.`,
       folder = picked?.[0];
     }
     if (!folder) return;
+    const resolved = path.resolve(folder);
+    if (!this.host.canSwitchWorkspaceFolder) {
+      // VS Code. The workspace is VS Code's, and `updateWorkspaceFolders` on a
+      // single-folder window converts it to multi-root and restarts the
+      // extension host — conversations included. So the folder joins the rail's
+      // catalog and nothing else moves: the Explorer, the open folder and every
+      // running session stay exactly where they were.
+      await this.rememberExtraProjectFolder(resolved);
+      return;
+    }
     if (!this.host.addWorkspaceFolder(folder)) {
       void this.host.showWarningMessage(`Could not open folder:\n${folder}`);
       return;
     }
     this.authEpoch++;
-    await this.switchLocalWorkspaceFolder(path.resolve(folder));
+    await this.switchLocalWorkspaceFolder(resolved);
+  }
+
+  /**
+   * Record a hand-added folder and show it, without touching the workspace.
+   *
+   * Selecting it afterwards is the half that makes the button feel like the
+   * desktop's: there, adding a project switches to it. Here "switch" is only
+   * the rail's own selection — `selectedRepoCwd`, which `postRepoCatalog` reads
+   * — so the rail lands on the project you just added, expanded and ready, while
+   * VS Code itself has not moved.
+   */
+  private async rememberExtraProjectFolder(resolved: string): Promise<void> {
+    let ok = false;
+    try {
+      ok = fs.statSync(resolved).isDirectory();
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      void this.host.showWarningMessage(`Not a folder:\n${resolved}`);
+      return;
+    }
+    const key = normalizeRepoPath(resolved);
+    // Already here on its own — the open workspace folder, or a project Grok has
+    // run in. Recording it as hand-added would be a lie with consequences: the
+    // row would gain a Remove action, and removing it tombstones a project that
+    // has other reasons to exist. Worst of all for the OPEN folder, whose access
+    // cannot be revoked at all (`localTrustedSessionCwds` adds `workspaceRoot()`
+    // unconditionally, and every remote gate reads that set) — the row would
+    // vanish while the phone carried on reading and writing it. Just go there.
+    const alreadyListed =
+      !!this.resolveLocalRepoTarget(resolved) ||
+      pathsEqual(resolved, this.workspaceRoot() || "");
+    if (alreadyListed) {
+      await this.selectRepo(resolved);
+      return;
+    }
+    // Adding a folder is the undo for having removed it. Without this the
+    // tombstone would outlive the decision and the picker would appear to do
+    // nothing at all.
+    const tombstones = this.state.get<string[]>(REMOVED_PROJECT_FOLDERS_KEY, []);
+    if (Array.isArray(tombstones) && tombstones.some((c) => normalizeRepoPath(c) === key)) {
+      await this.state.update(
+        REMOVED_PROJECT_FOLDERS_KEY,
+        tombstones.filter((c) => normalizeRepoPath(c) !== key),
+      );
+    }
+    const stored = this.extraProjectFolders();
+    if (!stored.some((c) => normalizeRepoPath(c) === key)) {
+      await this.state.update(EXTRA_PROJECT_FOLDERS_KEY, [...stored, resolved]);
+    }
+    // Already in the catalog by other means (open folder, or Grok has run there)
+    // is not a failure — the user still gets taken to it.
+    await this.selectRepo(resolved);
+  }
+
+  /**
+   * Take a hand-added folder back out of the rail's catalog (VS Code).
+   *
+   * Deliberately NOT the desktop's revocation: nothing is disposed and no
+   * process is killed, because adding the folder started nothing. It removes
+   * the one reason this folder was listed. If Grok has since run there the row
+   * survives on its own history — same as every other project, and the
+   * conversations are still yours; archive is the way to hide those.
+   */
+  private async forgetExtraProjectFolder(cwd?: string): Promise<void> {
+    if (!cwd) return;
+    // Removal is a REVOCATION here too, not a catalog filter. Tombstoning the
+    // row stopped new remote frames but left any agent already running in that
+    // folder executing commands and writing files — while the confirmation said
+    // "Nothing on disk is touched". Same warning and same disposal the desktop
+    // close performs, for the same reason: the user is being asked to end work
+    // they may not know is in flight.
+    const working = this.sessionsBoundToFolder(cwd).filter(sessionHasWorkInFlight);
+    if (working.length) {
+      const many = working.length > 1;
+      const ok = await this.host.showWarningMessage(
+        `Hide "${path.basename(cwd)}"?\n\n` +
+          `${many ? `${working.length} conversations are` : "A conversation is"} still working. ` +
+          `Hiding it ends ${many ? "them" : "it"} and discards the turn in progress.`,
+        { modal: true },
+        "Hide anyway",
+      );
+      if (ok !== "Hide anyway") return;
+    }
+    // Never the open workspace folder. Its authorization does not come from the
+    // catalog — `localTrustedSessionCwds` adds `workspaceRoot()` on its own — so
+    // a tombstone would hide the row while every remote gate kept saying yes.
+    // A revocation that does not revoke is worse than no button at all.
+    if (pathsEqual(cwd, this.workspaceRoot() || "")) {
+      void this.host.showWarningMessage(
+        "This is the folder VS Code has open, so it cannot be removed from the list. " +
+          "Close the folder in VS Code instead.",
+      );
+      return;
+    }
+    const key = normalizeRepoPath(cwd);
+    const stored = this.extraProjectFolders();
+    const next = stored.filter((c) => normalizeRepoPath(c) !== key);
+    if (next.length === stored.length) return;
+    await this.state.update(EXTRA_PROJECT_FOLDERS_KEY, next);
+    // …and the PIN, or this removes nothing.
+    //
+    // `discoverRepos` keeps a pinned cwd in the catalog on its own — "a pin is
+    // durable intent" — and a phone can pin any project it can see. So: add a
+    // folder, pin it from the phone, remove it at the desk, and it came back as
+    // an ordinary catalog row that VS Code trusts, still browsable and editable
+    // from the phone, and now WITHOUT the `added` marker, so the rail no longer
+    // offered to remove it. A revocation that a remote can pre-empt is not one.
+    //
+    // A pin on a folder being removed is not intent to keep it; it is the pin of
+    // a project that is going away.
+    const pins = this.state.get<RepoPins>(REPO_PINS_KEY, {});
+    if (pins[key]) {
+      const nextPins = { ...pins };
+      delete nextPins[key];
+      await this.state.update(REPO_PINS_KEY, nextPins);
+    }
+    // …and a tombstone, or the folder simply comes back. VS Code's catalog is
+    // discovered from Grok's own session history, so anything that has run there
+    // re-adds the row — and a phone can manufacture exactly that by selecting
+    // the project, which starts a session in it. Removal has to outrank
+    // discovery or it is not removal.
+    const tombstones = this.state.get<string[]>(REMOVED_PROJECT_FOLDERS_KEY, []);
+    const list = Array.isArray(tombstones) ? tombstones : [];
+    if (!list.some((c) => normalizeRepoPath(c) === key)) {
+      await this.state.update(REMOVED_PROJECT_FOLDERS_KEY, [...list, cwd]);
+    }
+    // Now that the tombstone is written — so `isAuthorizedCwd` already says no —
+    // end everything that folder still owns: agent processes disposed, remote
+    // ownership on that cwd released, image handles dropped, authEpoch bumped.
+    // Order matters the same way it does on desktop: revoke only once the folder
+    // has left the authorized set, or a concurrent remote send could still route
+    // into a doomed session.
+    this.revokeClosedProjectFolder(cwd);
+    if (!this.pool.has(this.focused) && !this.focused.client) {
+      this.focused = this.newLocalSession();
+      this.emit(this.focused, { type: "clearMessages" });
+    }
+    // The selection may have been pointing at it. postRepoCatalog re-validates
+    // against the catalog it is about to send and moves it if the row is gone.
+    this.postRepoCatalog();
+    this.postSessionsList();
   }
 
   /**
@@ -3344,7 +4168,15 @@ Only continue if you trust this code.`,
    * dropped. Closing the last folder leaves an empty rail (no re-seed).
    */
   async removeProjectFolder(cwd?: string): Promise<void> {
-    if (!this.host.canSwitchWorkspaceFolder) return;
+    if (!this.host.canSwitchWorkspaceFolder) {
+      // VS Code: the only thing there is to remove is a folder the user ADDED
+      // by hand. Everything else in the catalog is there because Grok has run
+      // in it, and no button here would change that. Without this the added
+      // folder was permanent — a mistaken or sensitive directory stayed
+      // selectable, and remotely browsable and editable, for ever.
+      await this.forgetExtraProjectFolder(cwd);
+      return;
+    }
     const target = cwd || this.host.workspaceRoot();
     if (!target) return;
     // Closing is a revocation: every session in the folder is disposed and its
@@ -4009,6 +4841,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   dispose(): void {
     void this.host.setContext("grok.composerFocus", false);
     if (this.reaper) { clearInterval(this.reaper); this.reaper = undefined; }
+    for (const timer of this.turnOrderTimers) clearTimeout(timer);
+    this.turnOrderTimers.clear();
     this.uplink?.dispose();
     this.uplink = undefined;
     try { this.keepAwake.stop(); } catch { /* the pid watcher reaps it anyway */ }
@@ -4054,6 +4888,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.cliUpdateChecked = true;
     const current = this.context.extensionVersion;
     const lastSeen = this.state.get<string>(CLI_UPDATE_VERSION_KEY);
+    let updateFailed = false;
     try {
       if (!extensionWasUpgraded(lastSeen, current)) return;
       const policy = grokUpdatePolicy(await this.readGrokVersion(cliPath), process.platform);
@@ -4073,10 +4908,22 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (stdout?.trim()) this.host.appendLine(stdout.trim());
         if (stderr?.trim()) this.host.appendLine(stderr.trim());
       } catch (e) {
+        // A FAILED update must not count as having happened. Recording the
+        // version regardless suppressed every retry for the rest of the
+        // release — and the likeliest reason to fail is transient: on Windows
+        // another grok.exe still holds the binary's lock, which is exactly the
+        // state a worktree create leaves for a moment. Leaving the marker
+        // unwritten means the next window tries again.
+        //
+        // A `return` here would not do it: `finally` runs on the way out.
+        updateFailed = true;
         this.host.appendLine(`grok update failed (continuing with current binary): ${(e as Error).message}`);
       }
     } finally {
-      void this.state.update(CLI_UPDATE_VERSION_KEY, current);
+      // Every path except a failed update: nothing to do, policy declined, or
+      // it succeeded. `cliUpdateChecked` still caps this at one attempt per
+      // window, so a failure retries on the next one rather than in a loop.
+      if (!updateFailed) void this.state.update(CLI_UPDATE_VERSION_KEY, current);
     }
   }
 
@@ -5489,8 +6336,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         break;
       case "newSession":
+        // A remote's cwd is deliberately not forwarded: newRemoteSession starts
+        // in that tab's own repo, which is the only project it is entitled to.
         if (origin === "remote" && clientId) await this.newRemoteSession(clientId);
-        else await this.newFocusedSession(origin);
+        else await this.newFocusedSession(origin, msg.cwd);
         break;
       case "cancel": {
         const cancelled = session.turnToken;
@@ -6288,7 +7137,34 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * Remote callers bypass this legacy audience helper and resolve their own cwd
    * through RemoteClientState.
    */
+  /**
+   * Which repository the LOCAL surfaces are scoped to — the history list, New
+   * Session, and the last-resort cwd a delete falls back to.
+   *
+   * This used to be the open workspace folder unconditionally
+   * (`repoScopeFor`'s local branch), and the reason was sound at the time: VS
+   * Code hid the repo switcher, so a selection the local user could not see
+   * must not decide where Grok writes files. A phone that switched repos hours
+   * ago would otherwise have been aiming the desk's New Session at another
+   * checkout.
+   *
+   * Two things changed. VS Code has a projects rail now, so the selection is
+   * visible and deliberate. And the selection is provably not the phone's:
+   * `selectRepo` routes by origin — remotes go to `selectRemoteRepo`, which
+   * writes a per-client cwd — and every writer of `selectedRepoCwd` is a local
+   * path (selectRepo, postRepoCatalog's normalisation, the desktop folder
+   * switch, openSession's follow). What the old rule produces now is simply the
+   * wrong answer: a conversation from project B on screen with A's history
+   * beside it, and New Session starting in A.
+   *
+   * Desktop is unaffected in steady state — there `selectedRepoCwd` tracks the
+   * active folder, so the two agree.
+   *
+   * Remote scope is untouched and still goes through {@link repoScopeFor},
+   * which is where per-tab isolation lives.
+   */
   private historyCwdFor(origin: MsgOrigin): string {
+    if (origin === "local") return this.selectedHistoryCwd() || this.workspaceRoot();
     return repoScopeFor(origin, {
       selectedCwd: this.selectedHistoryCwd(),
       workspaceRoot: this.workspaceRoot(),
@@ -6520,11 +7396,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private postSessionName(session: Session, name = this.sessionDisplayName(session)): void {
     const id = session.activeSessionId;
     if (!id) return;
+    const cwd = this.sessionCwd(session);
+    // The owning PROJECT, resolved the same way the rail groups worktrees under
+    // their parent. Only when it differs from the cwd — an ordinary session is
+    // its own project and the field would be noise.
+    const owner = this.resolveLocalRepoTarget(cwd)?.cwd;
     const message: HostMsg = {
       type: "sessionName",
       sessionId: id,
       name,
-      cwd: this.sessionCwd(session),
+      cwd,
+      ...(owner && !pathsEqual(owner, cwd) ? { repoCwd: owner } : {}),
     };
     if (session === this.focused) this.postLocal(message);
     this.sendRemoteSession(session, message);
@@ -6752,6 +7634,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Recompute rather than echoing `trimmed`: an empty rename DROPS the custom
     // name, and the view then has to be told the title it falls back to.
     if (live) this.postSessionName(live);
+    // The renamed row's OWN project, not just the selected one. `postSessionsList`
+    // refreshes the selected project's list and the rail draws every other
+    // project from its `repoSessions` preview — so renaming a conversation in
+    // project B while A is selected left B's rows showing the old name, and the
+    // cache entry that would have corrected them was just dropped.
+    const localCwd = origin === "local" ? requestedCwd : undefined;
+    if (localCwd) this.sendLocalRepoSessionsPreview(localCwd);
     this.refreshRemoteRepoPreview(clientId, authorizedCwd);
   }
 
@@ -6873,11 +7762,27 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Last-resort cwd — and this one deletes files, so it resolves in the
     // ASKER's scope. A delete from VS Code must never fall back to a repo that
     // some remote client happens to have selected.
+    //
+    // A LOCAL row may name its own project, validated through the catalog. The
+    // rail lists other projects' conversations now, and their rows carry a cwd
+    // that this chain ignored: rename a cold conversation in project B (which
+    // drops its cache entry), then Delete the same row, and it resolved to the
+    // SELECTED project instead — deleting nothing under A, reporting nothing
+    // wrong, and leaving the conversation in B under its old name. Resolved
+    // rather than trusted: an unknown path falls through to the chain below.
+    const localNamedCwd =
+      origin === "local" && requestedCwd
+        ? this.resolveLocalRepoTarget(requestedCwd)?.cwd
+          ?? (this.localTrustedSessionCwds(overridesNow).some((c) => pathsEqual(c, requestedCwd))
+            ? requestedCwd
+            : undefined)
+        : undefined;
     const cwd =
       authorizedRemoteCwd ||
       live?.cwd ||
       overridesNow[id]?.worktreePath ||
       this.sessionCache.get(id)?.entry.cwd ||
+      localNamedCwd ||
       this.historyCwdFor(origin);
     // Tear the CLI down BEFORE touching the disk, not after. The live process
     // owns this conversation and re-persists it: delete the directory first and
@@ -6912,6 +7817,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // rather than once per watcher.
     if (wasFocused) {
       this.focused = this.newLocalSession();
+      // …and so does the local view. Without this the replacement starts in the
+      // VS Code workspace folder while history and the rail stay on the project
+      // the deleted conversation belonged to — the exact split this repo scope
+      // exists to prevent, except now the user is typing into it. Same rule as
+      // newFocusedSession: the local scope IS the selection.
+      this.setSessionCwd(this.focused, this.historyCwdFor("local"), this.workspaceRoot());
       await this.startSession();
     }
     for (const watcher of watchers) await this.newRemoteSession(watcher, false);
@@ -8987,7 +9898,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // Only a host that owns its own folder set can add one. VS Code's
         // workspace is VS Code's to manage, so the extension never advertises
         // this and the rail never draws the control — capability, not a flag.
-        addProjectFolder: this.host.canSwitchWorkspaceFolder,
+        addProjectFolder: this.canAddProjectFolder(),
       },
     };
   }
@@ -9020,6 +9931,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Re-post the session list after start so a live empty "New session" row and
     // any id assigned by session/new land on the selected project's rail (ready
     // already pushed the disk list before the agent was up).
+    // The pristine session has no cwd, and `startSession`'s fallback is the
+    // WORKSPACE ROOT — so a project chosen in the rail before the chat view was
+    // ever revealed was ignored by the very first conversation. The rail and
+    // history said B while the agent ran in A, and the first prompt could read
+    // or write A. Every other entry point sets this (newFocusedSession, resume,
+    // the delete replacement); the one that starts by itself did not.
+    if (!this.focused.cwd) {
+      this.setSessionCwd(this.focused, this.historyCwdFor("local"), this.workspaceRoot());
+    }
     void this.startSession().then(() => {
       this.postSessionsList();
       this.sweepEmptySessions();
@@ -9180,6 +10100,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     "clearAllSessions",
     "setRepoArchived",
     "setRepoColor",
+    // Host-local by construction: it opens a native folder dialog. Reachable
+    // from the rail because that is where the project list lives; a remote
+    // cannot send it (remote-policy classifies it `host-local`).
+    "addProjectFolder",
+    // The way back out. Same host-local classification — on VS Code it forgets
+    // a hand-added folder, which is the only revocation that surface has.
+    "removeProjectFolder",
   ]);
   private post(message: HostMsg): void {
     if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
@@ -9811,6 +10738,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // message (that's what made creating/leaving a worktree replace the current
     // one). It's removed only via Remove worktree.
     if (cur.hasHistory || busy || cur.chips.length > 0 || cur.worktree) return; // real/active work — keep it parked & alive
+    // Still starting: `hasHistory` is the flag that says "this conversation is
+    // real, do not delete it", and on a RESUME it is set at the very end of
+    // startSession — after the client has already reported the session id and
+    // after the default-model await. In that window a resumed conversation looks
+    // exactly like an untouched new one, and the two lines below would delete the
+    // stored conversation off disk. Reachable by clicking a second rail row while
+    // the first is still opening, which the rail does not prevent because loads
+    // are reserved per session id, not globally.
+    if (cur.priming) return;
     // Co-attached: a remote tab still shows this session — not ours to tear down.
     if (this.remoteClients.clientsForActiveValue(cur).length > 0) return;
     // Empty session being left behind (New Session, or switching to
@@ -10099,7 +11035,42 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.pushDot(session);
     // Wake lock: a turn starting or ending can change turnInFlight.
     this.refreshKeepAwake();
+    if (status === "done" || status === "error") this.refreshSessionOrderAfterTurn(session);
   }
+
+  /**
+   * Re-push the project preview a finished turn just reordered.
+   *
+   * The rail's Recent group ranks by `updatedAt`, which is the session FILE's
+   * mtime — and the extension is not what writes that file, the agent process
+   * is. So rename and delete refresh (we do those) while sending a message did
+   * not: nothing in here knew the row had moved. Recent stayed on whatever
+   * order it was built with until something unrelated happened to redraw it.
+   *
+   * The turn ending is the closest signal we own. The agent writes the
+   * transcript around the same moment, not necessarily before, so this reads a
+   * beat later — and once more after that, because a single delay is a guess
+   * about someone else's disk write. Two cheap directory scans, only when a
+   * turn actually ended.
+   */
+  private refreshSessionOrderAfterTurn(session: Session): void {
+    const cwd = this.sessionCwd(session);
+    if (!cwd) return;
+    for (const delay of [400, 1600]) {
+      const timer = setTimeout(() => {
+        this.turnOrderTimers.delete(timer);
+        try {
+          this.sendLocalRepoSessionsPreview(cwd);
+        } catch {
+          /* a preview refresh is never worth failing a turn over */
+        }
+      }, delay);
+      this.turnOrderTimers.add(timer);
+    }
+  }
+
+  /** Pending {@link refreshSessionOrderAfterTurn} timers, so dispose can clear them. */
+  private turnOrderTimers = new Set<ReturnType<typeof setTimeout>>();
 
   /** True when any live pool member is mid-turn or waiting on the user. */
   private anyTurnInFlight(): boolean {
@@ -10260,14 +11231,36 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   /** Start a brand-new session, keeping the current one alive in the background. */
-  private async newFocusedSession(origin: MsgOrigin): Promise<void> {
+  private async newFocusedSession(origin: MsgOrigin, requestedCwd?: string): Promise<void> {
     // Repo selection only changes history scope; New Session is the deliberate
     // second action that starts Grok in the selected cwd — deliberate only for
-    // the client that can SEE the selection. From VS Code, where the switcher
-    // is hidden, this always means the open workspace: otherwise a phone that
-    // switched repos hours ago would silently point the local New-session
-    // button at another checkout, and Grok would write files there.
-    const targetCwd = this.historyCwdFor(origin);
+    // the client that can SEE the selection. That used to exclude VS Code,
+    // whose switcher was hidden; the projects rail is that switcher, so it no
+    // longer does. The phone half of the old worry is handled where it always
+    // was: a remote's selection is per-client and never reaches
+    // `selectedRepoCwd` (see historyCwdFor).
+    //
+    // An explicitly named project (the rail's per-project "+") is honoured, and
+    // it MOVES the selection rather than starting somewhere the rest of the view
+    // is not looking. Resolved through the catalog, so an unknown path falls back
+    // to the scope instead of becoming a cwd nobody vouched for — the caller may
+    // be a webview, and a "+" on a row is not a licence to name a directory.
+    const named = requestedCwd ? this.resolveLocalRepoTarget(requestedCwd) : undefined;
+    if (requestedCwd && !named) {
+      // A specific project was asked for and it is not there any more — the rail
+      // was drawn before the folder was unmounted or deleted. Falling through to
+      // the scope would start Grok in whatever happens to be selected while the
+      // click plainly named another project, and the agent would then write
+      // there. Refuse, and refresh so the dead row goes away.
+      void this.host.showWarningMessage(`That project is no longer available:\n${requestedCwd}`);
+      this.postRepoCatalog();
+      this.postSessionsList();
+      return;
+    }
+    if (named && !pathsEqual(named.cwd, this.selectedRepoCwd || "")) {
+      this.selectedRepoCwd = named.cwd;
+    }
+    const targetCwd = named?.cwd ?? this.historyCwdFor(origin);
     this.parkFocused();
     this.focused = this.newLocalSession();
     this.setSessionCwd(this.focused, targetCwd, this.workspaceRoot());
@@ -10567,6 +11560,26 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // this repo's history — and the moment the session they just left became
     // abandonable. Only on success: a load that threw has told us nothing.
     this.sweepEmptySessions(this.sessionCwd(this.focused));
+    // The history list follows the conversation the LOCAL user just opened.
+    // With a rail in VS Code you can open one from another project, and leaving
+    // the list on the old project meant reading a conversation from B while the
+    // history beside it offered A's. Resolved through the catalog rather than
+    // taken raw, because a worktree session's cwd is the worktree and the row
+    // that owns it is the parent project.
+    //
+    // VS Code only. On desktop the selection and the ACTIVE FOLDER are one
+    // thing — the file tree, New Session and the rail all read it — so moving
+    // the selection without switching the folder would split them, and opening
+    // a conversation is not a request to change which project you are in.
+    // Desktop's own selectRepo does the whole switch; this is the half VS Code
+    // needs because it has no folder to switch.
+    if (this.host.canSwitchWorkspaceFolder) return;
+    const openedIn = this.resolveLocalRepoTarget(this.sessionCwd(this.focused));
+    if (openedIn && !pathsEqual(openedIn.cwd, this.selectedRepoCwd || "")) {
+      this.selectedRepoCwd = openedIn.cwd;
+      this.postRepoCatalog();
+      this.postSessionsList();
+    }
   }
 
   /**
@@ -10783,6 +11796,39 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  selection compares equal to the previous empty one, so nothing is posted.
    *  `forcePost` is for a fresh webview, which needs the current state even
    *  when it hasn't changed. */
+  /**
+   * The focused conversation's relative path for a file, or undefined when the
+   * file does not really belong to it.
+   *
+   * Lexical containment first ({@link relativePathWithin}), then CANONICAL.
+   * A symlink — or a Windows junction — inside project B pointing at project A
+   * passes the lexical test as `linked/secret.ts`, because it genuinely is at
+   * that path inside B. But `buildPrompt` opens the absolute path and reads
+   * whatever is on the other end, so A's source would be embedded in B's
+   * conversation under a name that looks like B's own. The remote file browser
+   * has always resolved canonically for exactly this reason
+   * (`resolveTreePath` in `file-tree.ts`); this fence has to as well.
+   *
+   * Unprovable means refused: if either side cannot be resolved (deleted,
+   * permissions), there is no containment to demonstrate, and a chip is not
+   * worth guessing about.
+   */
+  private conversationRelPath(absPath: string): string | undefined {
+    const root = this.sessionCwd(this.focused);
+    const lexical = relativePathWithin(root, absPath);
+    if (lexical === undefined) return undefined;
+    try {
+      if (relativePathWithin(fs.realpathSync(root), fs.realpathSync(absPath)) === undefined) {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+    // The LEXICAL path is the label: it is where the user sees the file, and
+    // rewriting it to the link target would name a project they did not open.
+    return lexical;
+  }
+
   private refreshImplicitChip(forcePost = false): void {
     const includeActive = this.host.getConfiguration("grok")
       .get<boolean>("includeActiveFileByDefault", true);
@@ -10798,7 +11844,26 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
 
     const absPath = editor.document.uri.fsPath;
-    const relPath = this.host.asRelativePath(editor.document.uri);
+    // The chip must belong to the CONVERSATION, not to the window.
+    //
+    // While VS Code history was pinned to the open folder these were the same
+    // thing, so taking the active editor unconditionally was safe. It is not any
+    // more: the rail can put a project-B conversation on screen while VS Code
+    // still shows a project-A file. Sending then attached A's file — and for a
+    // SELECTION, `buildPrompt` reads that absolute path and embeds A's source
+    // text under an A-relative name — into B's prompt. Content crossing projects
+    // is exactly the class this scope work exists to close.
+    //
+    // Also the source of the relative path now. `asRelativePath` resolves
+    // against VS Code's workspace folders, and a project reached through the
+    // rail is deliberately not one of them, so it would have handed back an
+    // absolute path for a file that is perfectly ordinary inside its own repo.
+    const relPath = this.conversationRelPath(absPath);
+    if (relPath === undefined) {
+      this.chips = clearImplicitChips(this.chips);
+      if (prev || forcePost) this.postChips();
+      return;
+    }
     let selStart: number | undefined;
     let selEnd: number | undefined;
     if (!editor.selection.isEmpty) {
@@ -11548,6 +12613,11 @@ ${openMain}
   <header class="top-bar">
     <div id="session-name-chip" class="session-name-chip" hidden>
       <button id="session-name-label" class="session-name-label" type="button"></button>
+      <!-- Which project this conversation belongs to. History went
+           multi-workspace, so the open conversation is no longer necessarily
+           from the folder VS Code has open, and the name alone stopped saying
+           where you are. Same treatment the rail gives its cross-project rows. -->
+      <span id="session-name-repo" class="session-name-repo" hidden></span>
       <button id="session-name-edit" class="session-name-edit icon-btn" type="button" hidden></button>
     </div>
     <button id="repo-btn" class="repo-chip" type="button" title="Choose repository"></button>

@@ -887,7 +887,9 @@ a:hover {
 
 .top-bar {
   display: flex;
-  align-items: center;
+  /* Top, not centre: the name chip becomes two lines when it carries a project,
+     and centring would drag History and New Session down with it. */
+  align-items: flex-start;
   justify-content: flex-end;
   padding: 2px 4px;
   border-bottom: 1px solid var(--vscode-editorWidget-border);
@@ -895,17 +897,28 @@ a:hover {
   position: relative;
 }
 .top-bar > .icon-btn { flex: none; }
+/* Two rows: the conversation's name, and under it the project it belongs to.
+   A grid rather than a wrapping flex row so the project line sits beneath the
+   NAME and not beneath the rename pencil, and so it holds its place while the
+   name is being edited. */
 .session-name-chip {
   min-width: 0;
   max-width: min(52%, 280px);
   flex: 0 1 auto;
   margin-right: auto;
-  display: inline-flex;
+  display: grid;
+  grid-template-columns: minmax(0, auto) auto;
   align-items: center;
-  gap: 2px;
+  gap: 0 2px;
   padding: 1px 2px 1px 6px;
   border-radius: 5px;
 }
+/* Both cells are placed EXPLICITLY. Auto-placement puts the project line on
+   row 2 (it spans both columns), which moves the placement cursor past row 1 —
+   and the rename pencil, placing itself, then landed on a third row underneath
+   the project instead of beside the name. */
+.session-name-chip > .session-name-repo { grid-column: 1 / -1; grid-row: 2; }
+.session-name-chip > .session-name-edit { grid-column: 2; grid-row: 1; }
 .session-name-chip[hidden] { display: none; }
 .session-name-label {
   min-width: 0;
@@ -922,6 +935,23 @@ a:hover {
   text-align: left;
   cursor: pointer;
 }
+/* Which project the open conversation belongs to. Subordinate to the name and
+   allowed to shrink first: the name is what the user reads, the project is what
+   they check. Mirrors .rail-session-repo, which says the same thing on the
+   rail's cross-project rows. */
+.session-name-repo {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 2px 1px 3px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 10px;
+  letter-spacing: .02em;
+  opacity: .85;
+}
+.session-name-repo[hidden] { display: none; }
 .session-name-label:hover,
 .session-name-label:focus-visible,
 .session-name-chip:hover { color: var(--vscode-foreground); }
@@ -2335,6 +2365,20 @@ body.vscode-light {
   padding: 4px 6px;
   border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.35));
 }
+/* The one way out, so it is drawn like one.
+   This panel is a full-bleed overlay on a phone, which means it covers the
+   top-bar toggle that would otherwise close it — the X is not one of two
+   options, it is the only one. Rendered in descriptionForeground at 12px it
+   was a grey glyph in a corner that the person who built the app could not
+   find. Full foreground colour, and a 40px target on touch. */
+.files-browse-close {
+  color: var(--vscode-foreground);
+}
+.files-browse-close svg { width: 18px; height: 18px; }
+@media (hover: none) and (pointer: coarse) {
+  .files-browse-close { width: 40px; height: 40px; }
+  .files-browse-close svg { width: 20px; height: 20px; }
+}
 .files-browse-title {
   flex: 1 1 auto;
   min-width: 0;
@@ -2345,14 +2389,32 @@ body.vscode-light {
   white-space: nowrap;
 }
 .files-browse-path {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   flex-shrink: 0;
   padding: 4px 12px 6px;
   font-size: 11px;
   color: var(--vscode-descriptionForeground);
+  border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.2));
+}
+.files-browse-path[hidden] { display: none; }
+.files-browse-path-text {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.2));
+}
+/* Panel-toggle separator in the bar. A sibling, not a border on the button —
+   see the note on desk-ft-top-sep: a border boxes the button and shifts its
+   glyph off centre. */
+.files-browse-sep {
+  flex: none;
+  align-self: center;
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.35));
 }
 .files-browse-body {
   flex: 1 1 auto;
@@ -2424,6 +2486,7 @@ body.vscode-light {
   padding: 2px 6px;
   border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.25));
 }
+/* The file's path, muted — its NAME is on the tab above. */
 .files-browse-viewer-name {
   flex: 1 1 auto;
   min-width: 0;
