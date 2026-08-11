@@ -126,6 +126,127 @@ export interface RepoArchiveChoice {
 export type RepoArchives = Record<string, RepoArchiveChoice>;
 
 /**
+ * A cwd a remote may be allowed to name, and the project it belongs to.
+ *
+ * Provenance travels with the cwd because the alternative is re-deriving it in
+ * the fence, and the fence runs on every inbound AND outbound remote message.
+ * The trusted-set builder already knows which project each cwd came from — it
+ * expanded the project to get there — so carrying the answer out costs nothing
+ * and turns the archive check into a map lookup.
+ */
+export interface TrustedSessionCwd {
+  cwd: string;
+  /** The project this cwd belongs to: itself, or the project owning a worktree. */
+  repoCwd: string;
+}
+
+/**
+ * Archive choices that newer work has already made moot.
+ *
+ * `RepoArchiveChoice` has always said a choice holds "only until the project is
+ * worked in again", and the renderer implemented that as a timestamp comparison
+ * re-derived on every paint. Once the host began fencing remotes on the stored
+ * flag, the two sides could disagree about the same project: the desk showed it
+ * in Projects while the phone could not reach it, and no refresh helped.
+ *
+ * Resolving the expiry in the STORE — rather than at every read — is what keeps
+ * the fence itself a cheap lookup, and what makes both sides read one answer.
+ *
+ * ## The part that took four review rounds
+ *
+ * Two earlier attempts deleted the choice from a session lifecycle event, and
+ * both handed a remote back a project the user had archived. Session start
+ * includes a reconnecting phone's recovery restart, which bypasses inbound
+ * authorization by design; "a completed turn" was no better, because a plain
+ * CLI exit reports `error` down the same status path.
+ *
+ * Fixing the trigger was the wrong instinct. What made those reachable was the
+ * EVIDENCE: session-directory mtimes move when a conversation is merely loaded,
+ * so a remote could manufacture the proof. `newestActivityAt` must therefore be
+ * the TRANSCRIPT and nothing else — see {@link newestTranscriptMtime}, which
+ * deliberately does not fall back to `summary.json` the way `indexSessions`
+ * does. A remote cannot move a transcript without running a turn, and it cannot
+ * run a turn in a project it is fenced out of. With evidence that cannot be
+ * forged, it stops mattering which event asks the question.
+ */
+export function expiredArchiveChoiceKeys(opts: {
+  archives: RepoArchives;
+  /** Newest TRANSCRIPT mtime across the project and its worktrees, ms. */
+  newestActivityAt: (repoCwd: string) => number;
+  platform?: NodeJS.Platform;
+}): string[] {
+  const platform = opts.platform ?? process.platform;
+  const out: string[] = [];
+  for (const [storedKey, choice] of Object.entries(opts.archives ?? {})) {
+    // `archived: false` is a real stored answer — "keep showing me this one" —
+    // and expires the same way, so both are considered.
+    if (!choice?.cwd) continue;
+    const newest = opts.newestActivityAt(choice.cwd) || 0;
+    if (newest > 0 && newest > choice.at) {
+      out.push(storedKey || normalizeRepoPath(choice.cwd, platform));
+    }
+  }
+  return out;
+}
+
+/**
+ * Projects that are archived, as normalised keys.
+ *
+ * Assumes {@link expiredArchiveChoiceKeys} has already retired the stale ones,
+ * which is what lets this stay a plain read of the store on a hot path.
+ *
+ * A project the host has OPEN is never archived here, matching the rail's own
+ * rule. Opening a project does not clear its flag, and fencing one the desk is
+ * working in would blind the phone to the conversation on screen.
+ */
+export function archivedProjectKeys(opts: {
+  archives: RepoArchives;
+  openCwds: readonly string[];
+  platform?: NodeJS.Platform;
+}): Set<string> {
+  const platform = opts.platform ?? process.platform;
+  const key = (c: string) => normalizeRepoPath(c, platform);
+  const open = new Set(opts.openCwds.filter(Boolean).map(key));
+  const out = new Set<string>();
+  for (const choice of Object.values(opts.archives ?? {})) {
+    if (!choice?.archived || !choice.cwd) continue;
+    const k = key(choice.cwd);
+    if (k && !open.has(k)) out.add(k);
+  }
+  return out;
+}
+
+/**
+ * The host's trusted cwds, minus everything belonging to an archived project.
+ *
+ * A REMOTE-only narrowing. On the desk, archiving means "fold this away" — the
+ * project is one keystroke from being worked in — so subtracting it locally
+ * would break the thing archiving is for. From a phone it should mean what it
+ * looks like: out of reach.
+ *
+ * Filters by each cwd's OWNING PROJECT, not by the cwd itself. A worktree is
+ * not something you archive separately, and matching only exact cwds let a
+ * worktree the host learned about after the fence was built walk straight
+ * through it — the project is the unit, so the project is what is checked.
+ *
+ * Note what `archived` does NOT include: a project the rail merely hides for
+ * being 30 days idle is still reachable here. That rule lives in the renderer
+ * and moves on its own, so binding a capability to it would revoke a phone's
+ * access with nobody having done anything, mid-conversation included.
+ */
+export function remoteAuthorizedCwds(opts: {
+  trusted: readonly TrustedSessionCwd[];
+  archivedProjects: ReadonlySet<string>;
+  platform?: NodeJS.Platform;
+}): string[] {
+  if (!opts.archivedProjects.size) return opts.trusted.map((t) => t.cwd);
+  const platform = opts.platform ?? process.platform;
+  return opts.trusted
+    .filter((t) => !opts.archivedProjects.has(normalizeRepoPath(t.repoCwd, platform)))
+    .map((t) => t.cwd);
+}
+
+/**
  * Project-folder colour ids the rail understands. Empty string is "none"
  * (default): the host still puts `color: ""` on every catalog row so the client
  * can tell "no colour" from "this host cannot colour" without a version check.
@@ -877,6 +998,47 @@ export function indexSessions(deps: IndexDeps): SessionIndexEntry[] {
   const out: SessionIndexEntry[] = [...byId.entries()].map(([id, mtimeMs]) => ({ id, mtimeMs }));
   out.sort((a, b) => b.mtimeMs - a.mtimeMs);
   return out;
+}
+
+/**
+ * Newest TRANSCRIPT mtime under `cwd`'s session catalogs, or 0.
+ *
+ * Deliberately NOT `indexSessions`, which falls back to `summary.json` when a
+ * session has no transcript yet. That fallback is right for ordering a list —
+ * a brand-new conversation should still appear — and wrong for anything that
+ * decides authorization, because grok rewrites `summary.json` when a session is
+ * merely LOADED. A remote could therefore manufacture "this project was worked
+ * in" by getting an empty session reloaded, which is exactly how the archive
+ * fence was bypassed twice.
+ *
+ * `events.jsonl` only moves when a turn actually runs. That is evidence a remote
+ * cannot produce without already being allowed in.
+ */
+export function newestTranscriptMtime(deps: IndexDeps): number {
+  const { fs, grokHome, cwd, log } = deps;
+  const platform = deps.platform ?? process.platform;
+  let newest = 0;
+  for (const dir of sessionCatalogDirs({ fs, grokHome, cwd, platform })) {
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir);
+    } catch (e) {
+      log?.(`[sessions] failed to read ${dir}: ${(e as Error).message}`);
+      continue;
+    }
+    for (const name of names) {
+      if (!isValidSessionId(name)) continue;
+      const sessionDir = path.join(dir, name);
+      if (!isSessionDirChild(dir, sessionDir, platform)) continue;
+      try {
+        const st = fs.statSync(path.join(sessionDir, "events.jsonl"));
+        if (st.mtimeMs > newest) newest = st.mtimeMs;
+      } catch {
+        // No transcript: never spoken to, so it says nothing about activity.
+      }
+    }
+  }
+  return newest;
 }
 
 /**

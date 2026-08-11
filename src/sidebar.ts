@@ -71,6 +71,7 @@ import {
   GROK_REQUIRED_VERSION,
   GROK_STDIO_DOWNGRADE_TARGET,
 } from "./cli-locator";
+import { OpenClock } from "./open-timing";
 import {
   TerminalManager,
   grokShellEnvValue,
@@ -194,6 +195,11 @@ import {
   readContextUsage,
   relativePathWithin,
   readSessionEntries,
+  remoteAuthorizedCwds,
+  archivedProjectKeys,
+  expiredArchiveChoiceKeys,
+  newestTranscriptMtime,
+  type TrustedSessionCwd,
   resolveGrokHome,
   sessionCatalogDirs,
   sessionDirFor,
@@ -225,6 +231,7 @@ import {
   normalizeFsPath,
   pathsEqual,
   sanitizeWorktreeLabel,
+  WorktreeCreateSlots,
   type WorktreeCreateOutcome,
   worktreeStatusIsForCreate,
   worktreeStatusVerdict,
@@ -2849,7 +2856,7 @@ Only continue if you trust this code.`,
     const mine = (e: { worktreePath?: string }) =>
       worktreeStatusIsForCreate(e, {
         target,
-        soleCreateInFlight: this.worktreeCreatesInFlight.get(client) === 1,
+        soleCreateInFlight: this.worktreeCreatesInFlight.sole(client),
       });
     const verdict = worktreeStatusVerdict;
     // Arrow, so `this` is the sidebar: the object returned below has methods
@@ -2873,7 +2880,12 @@ Only continue if you trust this code.`,
       if (outcome) settleNow(outcome);
     };
 
-    this.worktreeCreatesInFlight.set(client, (this.worktreeCreatesInFlight.get(client) ?? 0) + 1);
+    // Taking the slot also registers the listener that releases it when the CLI
+    // dies — at watch START, which is the whole point. `exit` is one-shot, so
+    // registering it later (as this used to, only once a stall decided to hold
+    // the slot) attaches to an event a crashed CLI has already emitted.
+    // See WorktreeCreateSlots for the two properties and why they are there.
+    const releaseSlot = this.worktreeCreatesInFlight.take(client);
     try {
       client.on("worktreeStatus", onStatus);
     } catch {
@@ -2886,22 +2898,7 @@ Only continue if you trust this code.`,
       } catch {
         /* best effort — a disposed client has nothing to detach from */
       }
-      if (opts?.keepSlot) {
-        // Only a RETAINED slot needs an owner to outlive this call, so only
-        // then is a listener worth registering. Attaching one per watch left a
-        // callback behind on every ordinary create too — a reused workspace
-        // client accumulates them until it exits, and eventually warns about
-        // it. `exit` is what AcpClient emits when its child goes.
-        try {
-          client.once?.("exit", () => this.worktreeCreatesInFlight.delete(client));
-        } catch {
-          /* the slot is bounded by the client's own lifetime regardless */
-        }
-        return;
-      }
-      const left = (this.worktreeCreatesInFlight.get(client) ?? 1) - 1;
-      if (left > 0) this.worktreeCreatesInFlight.set(client, left);
-      else this.worktreeCreatesInFlight.delete(client);
+      releaseSlot({ keep: opts?.keepSlot });
     };
 
     return {
@@ -2979,9 +2976,10 @@ Only continue if you trust this code.`,
 
   /**
    * Live creates per client, so an event with no `worktreePath` can be trusted
-   * only when there is exactly one create it could belong to.
+   * only when there is exactly one create it could belong to. Lifetime rules
+   * and their reasons live on {@link WorktreeCreateSlots}.
    */
-  private worktreeCreatesInFlight = new Map<AcpClient, number>();
+  private worktreeCreatesInFlight = new WorktreeCreateSlots();
 
   /**
    * Clients observed emitting `worktree/status` at least once.
@@ -3633,14 +3631,122 @@ Only continue if you trust this code.`,
   }
 
   /**
+   * Cwds a REMOTE client may name: the trusted set, minus everything belonging
+   * to an archived project.
+   *
+   * A narrowing, and deliberately remote-only. Archiving on the desk means "fold
+   * this away" — the project stays one keystroke from being worked in, so
+   * subtracting it from the LOCAL set would break the thing archiving is for.
+   * From a phone it should mean what it looks like: gone.
+   *
+   * Cheap on purpose: this runs on every inbound AND outbound remote message.
+   * The stored choices are read as they are, because expired ones have already
+   * been retired from the store ({@link normalizeArchiveChoices}), and the
+   * filter is by each cwd's owning project, which the trusted-set builder
+   * recorded on the way past.
+   *
+   * Nothing to subtract on a host that cannot archive: desktop ignores stored
+   * choices entirely, and its remote set is already just the open folders.
+   */
+  private remoteAuthorizedSessionCwds(): string[] {
+    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const trusted = this.localTrustedSessionEntries(overrides);
+    if (!this.host.canArchiveRepos) return trusted.map((t) => t.cwd);
+    // First use in this window: retire stale choices before trusting them, so a
+    // project worked in before the extension started is not fenced on a flag
+    // that expired long ago.
+    if (!this.archiveChoicesNormalized) this.normalizeArchiveChoices();
+    return remoteAuthorizedCwds({
+      trusted,
+      archivedProjects: archivedProjectKeys({
+        archives: this.state.get<RepoArchives>(REPO_ARCHIVES_KEY, {}),
+        openCwds: [...this.openWorkspaceFolders(), this.workspaceRoot()],
+      }),
+    });
+  }
+
+  /** Whether stale archive choices have been retired since this window opened. */
+  private archiveChoicesNormalized = false;
+
+  /**
+   * Retire archive choices that newer work has already made moot, in the store.
+   *
+   * Called from ONE place — building the catalog — and deliberately from
+   * nowhere else.
+   *
+   * ## Why it is not wired into the session lifecycle
+   *
+   * Earlier versions hung this off session start, then turn completion, then a
+   * prompt commit point, each time to make the phone's view agree with the
+   * rail's the instant the desk worked in a project. Every one of those was a
+   * hole, because every one inferred "work happened after the archive" from a
+   * proxy — an event, a pool membership, a queued-vs-ordinary flag — and each
+   * proxy turned out to be reachable or ambiguous.
+   *
+   * The reason those were treated as holes at all was a framing mistake worth
+   * recording: a remote here is the OWNER'S OWN authenticated device, and the
+   * worst outcome of a stale answer is that they see a project they had tidied
+   * away. Archiving is a decluttering gesture — the rail even applies it
+   * automatically after 30 days idle, which nothing that gates a capability
+   * could ever do. Building race-free machinery for it put complexity into the
+   * path that decides whether a prompt runs, in exchange for preventing
+   * something nobody is harmed by.
+   *
+   * So: correct in the steady state, and lagging by at most one catalog build.
+   * A project worked in at the desk stays out of the phone's view until the
+   * next session open, project switch or pin — all of which post a catalog.
+   * Erring toward withholding is the safe direction and it self-heals.
+   *
+   * The evidence is still the TRANSCRIPT and not the session directory
+   * ({@link newestTranscriptMtime}), because that part cost nothing and a
+   * signal that moves when a conversation is merely loaded is simply wrong.
+   * Activity in a WORKTREE counts for its project, since the rail merges those
+   * catalogs when it answers the same question.
+   */
+  private normalizeArchiveChoices(): void {
+    if (!this.host.canArchiveRepos) return;
+    const archives = this.state.get<RepoArchives>(REPO_ARCHIVES_KEY, {});
+    if (!Object.keys(archives).length) {
+      this.archiveChoicesNormalized = true;
+      return;
+    }
+    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const grokHome = resolveGrokHome(process.env);
+    const expired = expiredArchiveChoiceKeys({
+      archives,
+      newestActivityAt: (cwd: string) => {
+        let newest = 0;
+        for (const c of this.sessionCwdsForRepo(cwd, overrides)) {
+          const at = newestTranscriptMtime({ fs: defaultFs, grokHome, cwd: c });
+          if (at > newest) newest = at;
+        }
+        return newest;
+      },
+    });
+    this.archiveChoicesNormalized = true;
+    if (!expired.length) return;
+    const next: RepoArchives = { ...archives };
+    for (const key of expired) {
+      this.host.appendLine(`[archive] ${next[key]?.cwd ?? key} has been worked in since — its archive choice no longer applies`);
+      delete next[key];
+    }
+    void this.state.update(REPO_ARCHIVES_KEY, next);
+  }
+
+  /**
    * Every cwd a remote client may legitimately name. Delegates to the shared
-   * authorization query — never a separate recomputation of the open set.
+   * authorization query, narrowed by {@link remoteAuthorizedSessionCwds} —
+   * never a separate recomputation of the open set.
    */
   private remoteTargetableCwd(cwd: string): boolean {
-    return this.isAuthorizedCwd(cwd);
+    if (!cwd) return false;
+    return cwdIsAuthorized(cwd, this.remoteAuthorizedSessionCwds(), pathsEqual);
   }
 
   private postRepoCatalog(): void {
+    // The catalog changing is exactly when "which projects are archived" can
+    // change, so it is recomputed here and read cheaply everywhere else.
+    this.normalizeArchiveChoices();
     // Both local and remote attached clients see the host's catalog: curated
     // open folders on desktop, full discovery on VS Code. Archive fields only
     // when canArchiveRepos (already applied inside localRepoCatalogEntries).
@@ -3705,7 +3811,7 @@ Only continue if you trust this code.`,
     clientId: string,
     entries: RepoListEntry[] = this.localRepoCatalogEntries(),
   ): HostMsg {
-    const authorized = this.authorizedSessionCwds();
+    const authorized = this.remoteAuthorizedSessionCwds();
     const selectedCwd =
       authorizedListCwd(this.remoteClients.cwd(clientId), authorized, pathsEqual) ?? "";
     const active = this.remoteClients.active(clientId);
@@ -3714,10 +3820,18 @@ Only continue if you trust this code.`,
       const sc = this.sessionCwd(active);
       if (authorizedListCwd(sc, authorized, pathsEqual)) activeCwd = sc;
     }
+    // Archived projects are dropped from the ROWS, not merely refused when
+    // named. A row a phone cannot open is a dead affordance, and the catalog is
+    // also what the client builds its own Archive group from — leaving them in
+    // would put a section on screen whose every row fails.
+    // Against the set already computed above — `remoteTargetableCwd` would
+    // rebuild it per row, and on VS Code building it re-runs project discovery,
+    // so a per-row call turns one catalog post into one disk walk per project.
+    const reachable = entries.filter((r) => cwdIsAuthorized(r.cwd, authorized, pathsEqual));
     return {
       type: "repos",
-      // Same catalog as local — remote follows the host's open/discovered set.
-      entries,
+      // Same catalog as local, less what a remote may not reach.
+      entries: reachable,
       selectedCwd,
       activeCwd,
     };
@@ -3767,10 +3881,16 @@ Only continue if you trust this code.`,
     cwd: string,
     limit: number | undefined,
     activeId: string | null | undefined,
-    _scope: "local" | "remote" = "local",
+    scope: "local" | "remote" = "local",
   ): HostMsg | undefined {
     const hit = this.resolveLocalRepoTarget(cwd);
     if (!hit || !hit.available) return undefined;
+    // `listRepoSessions` is already gated on remoteTargetableCwd at the inbound
+    // choke point, so an archived repo never gets this far from a phone. Said
+    // again here because this method resolves through the CATALOG, which is the
+    // wider set — a future caller reaching it another way would otherwise get
+    // rows the fence exists to withhold.
+    if (scope === "remote" && !this.remoteTargetableCwd(hit.cwd)) return undefined;
     // Clamp: the rail wants a handful, and an unbounded limit would make every
     // repo row a full history read.
     const size = Math.max(1, Math.min(20, Math.trunc(Number(limit)) || REPO_PREVIEW_SIZE));
@@ -3778,6 +3898,7 @@ Only continue if you trust this code.`,
       hit.cwd,
       { offset: 0, limit: size },
       activeId,
+      scope,
     );
     if (list.type !== "sessions") return undefined;
     return {
@@ -4390,6 +4511,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Same catalog the client was sent (open folders on desktop, full on VS Code).
     const hit = this.localRepoCatalogEntries().find((r) => pathsEqual(r.cwd, cwd));
     if (!hit || !hit.available) return;
+    // The catalog is the WIDER set. `selectRepo` is already gated on
+    // remoteTargetableCwd at the inbound choke point, so this is belt — but it
+    // is the belt that matters, because selecting is how a tab acquires the cwd
+    // every later message is judged against.
+    if (!this.remoteTargetableCwd(hit.cwd)) {
+      this.host.appendLine(`[remote] refused selectRepo (archived project): ${hit.cwd}`);
+      return;
+    }
     if (this.remoteVoice.has(clientId)) void this.handleRemoteVoiceStop(clientId, true);
     this.parkRemoteSession(clientId);
     this.remoteClients.select(clientId, hit.cwd);
@@ -4543,10 +4672,18 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Every pinned conversation across every repo, newest pin first. Reads are
    *  grouped by the stored home cwd so this costs one index scan per repo that
    *  actually holds a pin — not one per repo in the catalog. */
-  private buildPinnedSessions(): { entries: SessionListEntry[]; dots: Record<string, Dot> } {
+  private buildPinnedSessions(
+    /** Whose pins these are. Remote gets the archive-narrowed set — and it has
+     *  to be applied HERE, not at delivery: `pinnedSessions` is authorized as a
+     *  whole (every entry or nothing), so one pin in an archived project would
+     *  otherwise refuse the entire frame and take every other pin off the phone
+     *  with it. Defaults to the stricter answer. */
+    scope: "local" | "remote" = "remote",
+  ): { entries: SessionListEntry[]; dots: Record<string, Dot> } {
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     // Enforce authorization at build time — never trust pin metadata alone.
-    const authorized = this.authorizedSessionCwds();
+    const authorized =
+      scope === "remote" ? this.remoteAuthorizedSessionCwds() : this.authorizedSessionCwds();
     const grokHome = resolveGrokHome(process.env);
     const log = (m: string) => this.host.appendLine(m);
     const byCwd = new Map<string, { cwd: string; ids: string[] }>();
@@ -4587,15 +4724,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Desktop multi-folder rail OR the VS Code primary-side-bar projects view.
     const hasLocalRail = this.host.canSwitchWorkspaceFolder || !!this.projectsRail;
     if (!clientId && !hasRemote && !hasLocalRail) return;
-    // Built against the live authorized set for every recipient (same open set
-    // on desktop; full catalog on VS Code).
-    const msg: HostMsg = { type: "pinnedSessions", ...this.buildPinnedSessions() };
+    // Built PER AUDIENCE, not once and fanned out: the desk keeps its pins in
+    // archived projects (archiving folds a project away, it does not put it out
+    // of your own reach), while a remote must not receive them at all.
     if (clientId) {
-      this.sendRemoteClient(clientId, msg);
+      this.sendRemoteClient(clientId, { type: "pinnedSessions", ...this.buildPinnedSessions("remote") });
       return;
     }
-    if (hasLocalRail) this.postLocal(msg);
-    for (const id of this.remoteClients.clients()) this.sendRemoteClient(id, msg);
+    if (hasLocalRail) {
+      this.postLocal({ type: "pinnedSessions", ...this.buildPinnedSessions("local") });
+    }
+    const remotes = this.remoteClients.clients();
+    if (!remotes.length) return;
+    const forRemote: HostMsg = { type: "pinnedSessions", ...this.buildPinnedSessions("remote") };
+    for (const id of remotes) this.sendRemoteClient(id, forRemote);
   }
 
   private annotateWorktreeLabels(
@@ -5318,6 +5460,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Step D passes a pool member. Its handlers close over `session`/`gen` so a
     // backgrounded session's events stay bound to it even after focus moves.
     const session = target;
+    // Timed from here, before anything is torn down — see src/open-timing.ts
+    // for why: four of the five costs in an open are invisible from outside,
+    // and "sometimes it takes ages" is not something anyone can act on.
+    const clock = new OpenClock();
     const replacedClient = session.client;
     if (replacedClient) {
       this.queueInFlightPlanCommentsOnExit(session, replacedClient, session.gen);
@@ -5350,6 +5496,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // process has actually exited.
     if (replacedClient) {
       await replacedClient.dispose();
+      clock.mark("dispose");
       if (gen !== session.gen) return undefined;
     }
     // A brand-new session starts in the remembered mode (#25) immediately, so the
@@ -5429,10 +5576,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const compatibility = await this.planModeCompatibility(cliPath);
     if (gen !== session.gen) return undefined;
     this.applyPlanModeCompatibility(session, compatibility);
+    // Every open spawns `grok --version` at least once (twice on the first open
+    // of a window, and the update check can be far more than that).
+    clock.mark("probe");
 
     // Worktree sessions pin cwd at creation/open; everyone else uses the workspace root.
     const cwd = session.cwd || this.workspaceRoot();
     session.cwd = cwd;
+    // Note there is deliberately nothing here about archiving. Whether a
+    // project counts as archived is DERIVED when the catalog is built, never
+    // written from a lifecycle event like this one — see
+    // effectiveArchivedRepoKeys for the two attempts that taught us why.
     // Re-bind worktree meta from override when resuming (cold open may only have cwd).
     if (!session.worktree && resumeId) {
       const o = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[resumeId];
@@ -5989,6 +6143,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
     try {
       await client.start();
+      clock.mark("spawn");
       if (gen !== session.gen) { client.dispose(); return undefined; }
       const defaultModel = cfg.get<string>("defaultModel", "");
       if (resumeId) {
@@ -6060,6 +6215,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             );
           }
         });
+        // The CLI's own work — rereading the transcript and rebuilding the
+        // prompt context, which indexes the repository — plus replaying it all
+        // into the webview. Expected to dominate, and the reason a project you
+        // have not touched in weeks feels slower than the one you are in.
+        clock.mark("load+replay");
         session.activeSessionId = resumeId;
         session.titleGenerated = true; // existing session, name already in storage
         session.hasHistory = true;
@@ -6092,9 +6252,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.restoreUsage(session);
       } else {
         await client.newSession(defaultModel || undefined);
+        clock.mark("new-session");
         session.activeSessionId = client.sessionId;
       }
       if (gen !== session.gen) { client.dispose(); session.client = undefined; return undefined; }
+      this.host.appendLine(clock.summary(resumeId ? "resume" : "new", cwd));
       this.postSessionName(session);
 
       if (defaultModel && client.currentModelId && client.currentModelId !== defaultModel) {
@@ -6292,7 +6454,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (!source) break;
         // Revalidate against the current open set — a handle minted while a
         // folder was open must not survive closing that folder.
-        if (!this.isImagePathAuthorizedNow(source)) {
+        if (!this.isImagePathAuthorizedNow(source, "remote")) {
           this.host.appendLine(`[remote] refused imageFull (path no longer authorized)`);
           break;
         }
@@ -7174,7 +7336,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Refresh local history plus each connected remote tab. */
   private postSessionsList(opts?: { offset?: number; limit?: number; query?: string }): void {
     const localCwd = this.historyCwdFor("local");
-    const local = this.buildSessionsList(localCwd, opts);
+    const local = this.buildSessionsList(localCwd, opts, undefined, "local");
     this.postLocal(local);
     this.postSessionName(this.focused);
     if (opts) return;
@@ -7200,13 +7362,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     cwd: string,
     opts?: { offset?: number; limit?: number; query?: string },
     activeId: string | null | undefined = this.focused.activeSessionId,
+    /** Whose list this is. Remote gets the narrower set — see
+     *  {@link remoteAuthorizedSessionCwds}. Defaults to the stricter answer so a
+     *  new caller that forgets to say is wrong in the safe direction. */
+    scope: "local" | "remote" = "remote",
   ): HostMsg {
     const offset = Math.max(0, opts?.offset ?? 0);
     const limit = opts?.limit ?? SESSION_PAGE_SIZE;
     const query = (opts?.query ?? "").trim().toLowerCase();
     // Authorization at the point of build: stale per-tab / selected cwd must not
-    // scan a closed project's session catalog (round 12).
-    const listCwd = authorizedListCwd(cwd, this.authorizedSessionCwds(), pathsEqual);
+    // scan a closed project's session catalog (round 12), and a remote must not
+    // list an archived one at all.
+    const authorized =
+      scope === "remote" ? this.remoteAuthorizedSessionCwds() : this.authorizedSessionCwds();
+    const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
     if (!listCwd) {
       return {
         type: "sessions",
@@ -10156,7 +10325,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     scopeCwd?: string,
   ): void {
     if (clientIds.length === 0) return;
-    const authorized = this.authorizedSessionCwds();
+    const authorized = this.remoteAuthorizedSessionCwds();
     if (!mayDeliverRemoteHostMsg(message, authorized, scopeCwd, pathsEqual)) {
       this.host.appendLine(
         `[remote] dropped ${message.type} (project scope not authorized: ${scopeCwd ?? "<none>"})`,
@@ -10207,7 +10376,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const scope = this.sessionCwd(session);
     // Belt: refuse before iterating so a disposed/closed-folder session cannot
     // drip transcript to any remaining holder.
-    if (!mayDeliverRemoteHostMsg(message, this.authorizedSessionCwds(), scope, pathsEqual)) {
+    if (!mayDeliverRemoteHostMsg(message, this.remoteAuthorizedSessionCwds(), scope, pathsEqual)) {
       this.host.appendLine(
         `[remote] dropped ${message.type} for session (cwd not authorized: ${scope})`,
       );
@@ -11056,6 +11225,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private refreshSessionOrderAfterTurn(session: Session): void {
     const cwd = this.sessionCwd(session);
     if (!cwd) return;
+    // Deliberately no archive bookkeeping here. Expiry is resolved when the
+    // catalog is built and nowhere else — see normalizeArchiveChoices for why
+    // hanging it off the session lifecycle kept producing holes, and why the
+    // lag it leaves instead is the right trade.
     for (const delay of [400, 1600]) {
       const timer = setTimeout(() => {
         this.turnOrderTimers.delete(timer);
@@ -11595,28 +11768,42 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * checkout under grok home). That is the v3.1.0 behaviour and must not regress.
    */
   private localTrustedSessionCwds(overrides: SessionMetaOverrides): string[] {
-    const out: string[] = [];
+    return this.localTrustedSessionEntries(overrides).map((e) => e.cwd);
+  }
+
+  /**
+   * The same set, each cwd carrying the PROJECT it came from.
+   *
+   * Provenance is recorded here because here is where it is known — every cwd
+   * below arrives by expanding a project — and re-deriving it later means
+   * resolving a worktree back to its owner on a path that runs for every remote
+   * message. It is also what lets the archive fence check the project rather
+   * than the exact cwd: matching cwds let a worktree the host learned about
+   * after the fence was built pass straight through it.
+   */
+  private localTrustedSessionEntries(overrides: SessionMetaOverrides): TrustedSessionCwd[] {
+    const out: TrustedSessionCwd[] = [];
     const seen = new Set<string>();
-    const add = (cwd: string | undefined) => {
+    const add = (cwd: string | undefined, repoCwd: string | undefined) => {
       if (!cwd) return;
       const key = normalizeRepoPath(cwd);
       if (!key || seen.has(key)) return;
       seen.add(key);
-      out.push(cwd);
+      out.push({ cwd, repoCwd: repoCwd || cwd });
     };
     if (this.host.canSwitchWorkspaceFolder) {
       for (const repoCwd of this.openWorkspaceFolders()) {
-        for (const c of this.sessionCwdsForRepo(repoCwd, overrides)) add(c);
+        for (const c of this.sessionCwdsForRepo(repoCwd, overrides)) add(c, repoCwd);
       }
       // Active root as a backstop if the folders list is empty mid-init.
-      add(this.workspaceRoot());
+      add(this.workspaceRoot(), this.workspaceRoot());
       return out;
     }
     // VS Code: full historical catalog.
-    add(this.workspaceRoot());
-    if (this.selectedRepoCwd) add(this.selectedRepoCwd);
+    add(this.workspaceRoot(), this.workspaceRoot());
+    if (this.selectedRepoCwd) add(this.selectedRepoCwd, this.selectedRepoCwd);
     for (const repo of this.repoCatalog()) {
-      for (const c of this.sessionCwdsForRepo(repo.cwd, overrides)) add(c);
+      for (const c of this.sessionCwdsForRepo(repo.cwd, overrides)) add(c, repo.cwd);
     }
     return out;
   }
@@ -11989,8 +12176,18 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   /** Fetch-time revalidation for remote image handles (open-set + session media). */
-  private isImagePathAuthorizedNow(imagePath: string): boolean {
-    const authorized = this.authorizedSessionCwds();
+  private isImagePathAuthorizedNow(
+    imagePath: string,
+    /** Whose request this is. A remote gets the archive-narrowed set: an image
+     *  handle minted before the project was archived must not outlive it, the
+     *  same way one minted before a folder was closed does not. Handles are
+     *  opaque and long-lived, so this is the only place that can say no —
+     *  the outbound gate scopes the reply to the client's CURRENT project,
+     *  which by then is an allowed one. Defaults to the stricter answer. */
+    scope: "local" | "remote" = "remote",
+  ): boolean {
+    const authorized =
+      scope === "remote" ? this.remoteAuthorizedSessionCwds() : this.authorizedSessionCwds();
     let home: string | undefined;
     try {
       home = resolveGrokHome(process.env);
@@ -12090,14 +12287,21 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // it has a client cwd (after ready), that cwd must remain authorized.
         if (
           boundCwd !== undefined &&
-          !remoteBoundCwdStillAuthorized(boundCwd, this.authorizedSessionCwds(), pathsEqual)
+          !remoteBoundCwdStillAuthorized(boundCwd, this.remoteAuthorizedSessionCwds(), pathsEqual)
         ) {
           this.host.appendLine(
             `[remote] dropped ${m.type} (bound cwd no longer authorized: ${boundCwd})`,
           );
+          // Two different things end up here and they deserve different words.
+          // Archiving is something the user just DID and can undo; a closed
+          // folder is a state of the desk. Telling someone their project is
+          // closed when they archived it sends them looking for the wrong fix.
+          const archived = this.isAuthorizedCwd(boundCwd);
           this.sendRemoteClient(clientId, {
             type: "error",
-            text: "That project folder is no longer open on the desktop. Select another project to continue.",
+            text: archived
+              ? "That project is archived, so it is not available from here. Un-archive it on the desktop to carry on."
+              : "That project folder is no longer open on the desktop. Select another project to continue.",
           });
           return;
         }
@@ -12215,7 +12419,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // Socket-level project gate — also covers the catch-up snapshot path,
       // which never enters deliverRemote.
       auth: {
-        authorizedCwds: () => this.authorizedSessionCwds(),
+        // The narrowed set on purpose: this is the socket-level gate, and it is
+        // the last thing standing between an archived project and the wire.
+        authorizedCwds: () => this.remoteAuthorizedSessionCwds(),
         scopeCwdForClient: (clientId) => {
           const active = this.remoteClients.active(clientId);
           if (active) return this.sessionCwd(active);
@@ -12436,7 +12642,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private buildRemoteSnapshot(clientId: string): HostMsg[] {
     const cwd = this.remoteClients.cwd(clientId);
     // Live authorized set for this host — not "whatever the tab last selected".
-    const authorized = this.authorizedSessionCwds();
+    // Remote-narrowed, so a tab reconnecting into a project archived while it
+    // was away comes back unbound rather than resuming inside it.
+    const authorized = this.remoteAuthorizedSessionCwds();
     const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
     const session = this.remoteSessionFor(clientId);
     // Catalog is already open-folder-filtered on desktop; still the sole source.
@@ -12499,7 +12707,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // remote is answered HERE and never reaches onMessage's switch, so anything
     // pushed from there would simply never arrive on a fresh tab or a reconnect.
     // buildPinnedSessions filters to the live authorized set.
-    snap.push({ type: "pinnedSessions", ...this.buildPinnedSessions() });
+    snap.push({ type: "pinnedSessions", ...this.buildPinnedSessions("remote") });
     const out: HostMsg[] = [];
     for (const m of snap) {
       const t = transformHostMsgForRemote(m, this.remoteMediaDeps);
