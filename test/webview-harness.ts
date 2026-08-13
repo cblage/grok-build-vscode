@@ -80,6 +80,7 @@ export interface Harness {
 export function bootWebview(opts: {
   ready?: boolean;
   remote?: boolean;
+  vscode?: boolean;
   beforeScripts?: (window: Window) => void;
 } = {}): Harness {
   const window = new Window({ url: "https://localhost/" });
@@ -91,6 +92,13 @@ export function bootWebview(opts: {
   });
   const doc = (window as any).document as Document;
   doc.body.innerHTML = BODY;
+  if (opts.vscode) {
+    doc.getElementById("session-head-actions")?.remove();
+    const slot = doc.createElement("div");
+    slot.id = "vscode-session-actions";
+    const newBtn = doc.getElementById("new-btn");
+    newBtn?.parentElement?.insertBefore(slot, newBtn.nextSibling);
+  }
   // What the relay's chat.html sets before loading chat.js. Gates the remote-only
   // affordances (repo switcher) and suppresses the host-only ones.
   if (opts.remote) (window as any).grokRemoteClient = true;

@@ -19,6 +19,7 @@ tsconfig.json
 node_modules/**
 !node_modules/ws/**
 !node_modules/jpeg-js/**
+!node_modules/@agentclientprotocol/codex-acp/**
 .git/**
 **/*.map
 **/*.ts
