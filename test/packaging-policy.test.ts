@@ -110,6 +110,7 @@ describe("VSIX excludes desktop app", () => {
     expect(vscodeignore).toMatch(/^\s*scripts\/run-desktop\.cjs\s*$/m);
     expect(vscodeignore).toMatch(/^\s*vitest\.desktop\.config\.ts\s*$/m);
     expect(vscodeignore).toMatch(/^\s*electron-builder\.yml\s*$/m);
+    expect(vscodeignore).toMatch(/^\s*docs\/desktop-update-spec\.md\s*$/m);
     expect(vscodeignore).toMatch(/^\s*dist-desktop\/\*\*/m);
     // Both readmes excluded as files; vsce embeds marketplace content only.
     expect(vscodeignore).toMatch(/^\s*README\.marketplace\.md\s*$/m);
@@ -149,11 +150,58 @@ describe("VSIX excludes desktop app", () => {
     expect(pkg.scripts.package).toMatch(/\bvsce package\b/);
   });
 
+  it("generates updater yml without publishing from electron-builder", () => {
+    const builder = read("electron-builder.yml");
+    const workflow = read(".github/workflows/desktop-release.yml");
+    const full = JSON.parse(read("package.json")) as {
+      dependencies?: Record<string, string>;
+      scripts: Record<string, string>;
+    };
+    // Publish config is required so latest.yml / latest-mac.yml exist; upload
+    // stays in the workflow. A GitHub provider would stall on vsix-only tags.
+    expect(builder).not.toMatch(/^publish:\s*null\s*$/m);
+    expect(builder).toMatch(/provider:\s*generic/);
+    expect(builder).toMatch(/afkpilot\.com\/update\/win/);
+    expect(builder).toMatch(/afkpilot\.com\/update\/mac/);
+    expect(builder).toMatch(/verifyUpdateCodeSignature:\s*false/);
+    expect(builder).not.toMatch(/publisherName:/);
+    for (const s of ["dist", "dist:mac", "dist:win"]) {
+      expect(full.scripts[s]).toMatch(/--publish never/);
+    }
+    expect(full.dependencies?.["electron-updater"]).toBeTruthy();
+    // Must not enter the vsix — desktop main is excluded; do not allowlist it.
+    expect(read(".vscodeignore")).not.toMatch(/!node_modules\/electron-updater/);
+    expect(workflow).toMatch(/dist-desktop\/latest\.yml/);
+    expect(workflow).toMatch(/dist-desktop\/latest-mac\.yml/);
+    expect(workflow).toMatch(/mac-arm64\.zip/);
+    expect(workflow).toMatch(/mac-x64\.zip/);
+    // Line-end so a yml that only lists the .exe.blockmap fails the gate.
+    expect(workflow).toMatch(/grep -Eq 'win-x64\\.exe\\r\?\$'/);
+    // One mac invocation, both arches — splitting jobs races latest-mac.yml.
+    expect(full.scripts["dist:mac"]).toMatch(/electron-builder --mac/);
+    expect(full.scripts["dist:mac"]).not.toMatch(/--arm64/);
+    expect(full.scripts["dist:mac"]).not.toMatch(/--x64/);
+  });
+
   it("packages the pinned Codex ACP runtime in the desktop artifact", () => {
     const builder = read("electron-builder.yml");
     const full = JSON.parse(read("package.json")) as { dependencies?: Record<string, string> };
     expect(full.dependencies?.["@agentclientprotocol/codex-acp"]).toBe("1.1.14");
-    expect(builder).toMatch(/node_modules\/@agentclientprotocol\/codex-acp\/\*\*\/\*/);
+    // The adapter's asar payload is package.json / dist / LICENSE only; the
+    // broad `codex-acp/**/*` include is banned so nobody reverts to shipping
+    // the whole package directory.
+    expect(builder).toMatch(/node_modules\/@agentclientprotocol\/codex-acp\/package\.json/);
+    expect(builder).toMatch(/node_modules\/@agentclientprotocol\/codex-acp\/dist\/\*\*\/\*/);
+    expect(builder).not.toMatch(/node_modules\/@agentclientprotocol\/codex-acp\/\*\*\/\*/);
+    // LOAD-BEARING excludes: electron-builder packs the full hoisted
+    // production tree of every direct dep (the built asar carries zod,
+    // vscode-jsonrpc, open's helpers), so without these lines the ~350 MB
+    // @openai/codex platform binary and the adapter's nested conflict copies
+    // enter app.asar. Only negative patterns reach the node_modules matcher.
+    expect(builder).toMatch(/^\s*- "!node_modules\/@openai\/\*\*"\s*$/m);
+    expect(builder).toMatch(
+      /^\s*- "!node_modules\/@agentclientprotocol\/codex-acp\/node_modules\/\*\*"\s*$/m,
+    );
     expect(fs.existsSync(path.join(
       root,
       "node_modules",
@@ -162,6 +210,39 @@ describe("VSIX excludes desktop app", () => {
       "dist",
       "index.js",
     ))).toBe(true);
+  });
+
+  it("lockfile records the adapter's declared dependency tree", () => {
+    // vsce runs `npm list --production`. A lockfile leaf (tarball, no
+    // dependencies field) lets `npm ci` succeed and then fails that list
+    // against the installed package.json.
+    const lock = JSON.parse(read("package-lock.json")) as {
+      packages: Record<string, { dependencies?: Record<string, string> }>;
+    };
+    expect(lock.packages["node_modules/@agentclientprotocol/codex-acp"]?.dependencies).toEqual({
+      "@agentclientprotocol/sdk": "^1.3.0",
+      "@openai/codex": "^0.147.0",
+      diff: "^9.0.0",
+      open: "^11.0.0",
+      "vscode-jsonrpc": "^9.0.1",
+      zod: "^4.0.0",
+    });
+    expect(lock.packages["node_modules/@openai/codex"]).toBeTruthy();
+  });
+
+  it("does not re-include the adapter's nested node_modules in the vsix", () => {
+    const vscodeignore = read(".vscodeignore");
+    expect(vscodeignore).toMatch(
+      /^\s*!node_modules\/@agentclientprotocol\/codex-acp\/package\.json\s*$/m,
+    );
+    expect(vscodeignore).toMatch(
+      /^\s*!node_modules\/@agentclientprotocol\/codex-acp\/dist\/\*\*\s*$/m,
+    );
+    // vsce: a later exclude cannot undo a negate, so the broad form packs
+    // nested node_modules once npm installs the declared tree.
+    expect(vscodeignore).not.toMatch(
+      /^\s*!node_modules\/@agentclientprotocol\/codex-acp\/\*\*\s*$/m,
+    );
   });
 });
 

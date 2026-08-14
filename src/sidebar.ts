@@ -73,6 +73,7 @@ import {
   buildSessionStartEvent,
   osNameFromPlatform,
   postEvent,
+  sessionStartHostKind,
   sessionStartSurface,
   shouldSendTelemetry,
   OFFICIAL_EXTENSION_ID,
@@ -668,6 +669,16 @@ export class GrokSidebar {
    *  same as disconnected: the CLI is installed and the user meant to use it,
    *  so the answer is a sign-in action, not hiding the agent. */
   private providerNeedsLogin: Partial<Record<AcpProvider, boolean>> = {};
+  /** Last `providerState` refresh. `reportSessionStart` reads these flags; it
+   *  never rediscovers CLIs on the first-send path. Null until the first
+   *  refresh so an unsnapshotted send OMITS the flags instead of reporting a
+   *  constructor default as a measurement. */
+  private lastProviderConnected: { grok: boolean; codex: boolean } | null = null;
+  /** Last `postVoiceConfigured` result per normalized cwd. Same send-path
+   *  rule: a cwd with no entry is unknown and the field is omitted, never
+   *  coerced to false. Rebuilt on each refresh so removed keys cannot serve
+   *  stale `true` forever. */
+  private lastVoiceConfiguredByCwd = new Map<string, boolean>();
   private readonly loginReprobeTimers = new Map<AcpProvider, ReturnType<typeof setTimeout>>();
   private grokVersionProbe?: Promise<string>;
   private codexVersionProbe?: Promise<string>;
@@ -955,6 +966,7 @@ export class GrokSidebar {
     const needsLogin = this.providerNeedsLogin ?? {};
     const grokConnected = connected.grok === true && located.grok === true;
     const codexConnected = connected.codex === true && located.codex === true;
+    this.lastProviderConnected = { grok: grokConnected, codex: codexConnected };
     return {
       type: "providerState",
       providers: [
@@ -5029,8 +5041,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           return !session || session.hasHistory;
         }))
       : undefined;
-    if (newest) await this.openRemoteSession(clientId, newest.id, newest.cwd, false);
-    else await this.newRemoteSession(clientId, false);
+    if (newest) {
+      const liveSession = live.get(newest.id);
+      const ownedByOther = !!liveSession && this.remoteClients.clients().some((ownerId) =>
+        ownerId !== clientId && this.remoteClients.active(ownerId)?.activeSessionId === newest.id
+      );
+      // Re-selecting a repo whose conversation is already live must replay its
+      // buffer. focusRemoteSession needs no CLI; openRemoteSession would mint
+      // onboarding over a clientless live member. Another tab's live session
+      // still goes through openRemoteSession, which refuses the steal.
+      if (liveSession && !ownedByOther) this.focusRemoteSession(clientId, liveSession, false);
+      else await this.openRemoteSession(clientId, newest.id, newest.cwd, false);
+    } else {
+      await this.newRemoteSession(clientId, false);
+    }
     this.sendRemoteRepoCatalog(clientId);
   }
 
@@ -5561,9 +5585,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       await this.finishProviderLogout("codex");
       return;
     }
-    const cliPath = this.cliPath || locateGrokCli(
-      this.host.getConfiguration("grok").get<string>("cliPath", ""),
-    );
+    const cliPath = this.locateProvider("grok");
     if (!cliPath) {
       this.post({ type: "onboarding", state: "missing-cli", platform: process.platform, provider: "grok" });
       return;
@@ -6368,6 +6390,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       return undefined;
     }
     if (!this.connectedProviders().includes(target.provider)) {
+      const testDelay = this.testSessionStartDelay;
+      if (testDelay && testDelay.resumeId === resumeId) {
+        this.testSessionStartDelay = undefined;
+        testDelay.started();
+        await testDelay.wait;
+      }
       target.priming = false;
       this.emit(target, { type: "setBusy", value: false });
       this.postProviderState();
@@ -7388,22 +7416,31 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? this.remoteClients.cwd(clientId)
       : this.workspaceRoot();
     switch (msg.type) {
-      case "ready":
+      case "ready": {
+        // Decide BEFORE postInitialState runs: its cold-start branch calls
+        // startSession(), which can create this.focused.client before this
+        // handler resumes (synchronously for Codex; Grok assigns behind
+        // consent/version awaits — the pre-evaluation is right either way).
+        // Re-evaluating afterwards read that self-inflicted "live client" as
+        // "a reload rehydrate will post the catalog" and skips it, so a cold
+        // desktop boot that auto-restores a session never grew a rail (the
+        // race the owner hit as "no left menu"; reload cured it because a
+        // real rehydrate runs then). VS Code is immune — its flag is false.
+        const rehydrating = shouldRehydrateOnWebviewReady(
+          this.host.webviewReloadsUnderLiveSession,
+          !!this.focused.client,
+        );
         this.postInitialState();
         // Rehydrate already posts catalog + sessions. Cold start needs an early
         // disk list so the rail is not empty while startSession runs — but the
         // catalog scan is deferred so ready returns and the UI paints first
         // (large histories must not block activation).
-        if (
-          !shouldRehydrateOnWebviewReady(
-            this.host.webviewReloadsUnderLiveSession,
-            !!this.focused.client,
-          )
-        ) {
+        if (!rehydrating) {
           this.postRepoCatalog();
           setImmediate(() => this.postSessionsList());
         }
         break;
+      }
       case "remotePreferences":
         if (origin === "remote" && clientId) {
           if (
@@ -7685,6 +7722,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       case "openUrl":
       case "openUpdateRelease":
         void this.host.openExternal(msg.url);
+        break;
+      case "restartToUpdate":
+        this.host.installAppUpdate?.();
         break;
       case "openText": {
         // Basename only — a renderer-supplied path must not choose the directory.
@@ -8485,18 +8525,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     cwd = listCwd;
     const providers = this.connectedProviders();
     if (providers.includes("codex")) this.scheduleCodexHistoryRefresh(cwd);
-    if (providers.length === 1 && providers[0] === "grok") {
+    // Grok rows are files under GROK_HOME/sessions (plus live-pool synthesis) —
+    // listing is disk/buffer-truth and must not wait for a located grok binary.
+    // Codex rows come from the adapter's session/list RPC, so they legitimately
+    // require the Codex CLI.
+    if (!providers.includes("codex")) {
       return this.buildGrokSessionsList(cwd, opts, activeId, scope);
     }
 
     const query = opts?.query ?? "";
     const limit = opts?.limit ?? SESSION_PAGE_SIZE;
     const providerCursor = opts?.providerCursor ?? { grokOffset: offset };
-    const grok = providers.includes("grok")
-      ? this.buildGrokSessionsList(cwd, query
+    const grok = this.buildGrokSessionsList(cwd, query
           ? { offset: 0, limit: Number.MAX_SAFE_INTEGER, query }
-          : { offset: providerCursor.grokOffset, limit, query }, activeId, scope)
-      : undefined;
+          : { offset: providerCursor.grokOffset, limit, query }, activeId, scope);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const codex = providers.includes("codex")
       ? [...(this.codexSessionCache.get(projectProviderKey(cwd)) ?? [])]
@@ -8511,7 +8553,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? mergeProviderSessionEntries(grok?.entries ?? [], codex, providers, query)
       : undefined;
     const combinedPage = query ? undefined : mergeProviderHistoryPage(
-      grok && providers.includes("grok") ? grok : undefined,
+      grok,
       providers.includes("codex") ? codex : [],
       providerCursor,
       limit,
@@ -9655,9 +9697,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Fire the single `session_start` telemetry event for the first real user
    *  message of `session` (callers gate on isFirstSend, so empty sessions
    *  never reach here). Respects VS Code's global telemetry setting + our own
-   *  `grok.telemetry.enabled`; fully fire-and-forget. */
+   *  `grok.telemetry.enabled`; fully fire-and-forget. Must not rediscover
+   *  providers or resolve credentials — those flags come from the last
+   *  providerState / voiceConfigured refresh. */
   private reportSessionStart(session: Session, origin: MsgOrigin): void {
     // Telemetry must NEVER affect the user's turn. Build the event synchronously
+    // from already-cached session + settings + the last connection/voice snapshot
     // (so it captures THIS session's mode/model/effort — focus could move during
     // the turn's awaits), then fire it asynchronously off the send path and
     // swallow any error silently. The PROD project always (dev host / local
@@ -9677,14 +9722,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       const remotePreferences = remoteClientId
         ? this.remoteClients.metadata(remoteClientId)
         : undefined;
+      const cwd = this.sessionCwd(session);
       const event = buildSessionStartEvent(
         {
           installId: this.installId(),
           mode: this.displayMode(session),
           model: session.client?.currentModelId || cfg.get<string>("defaultModel", "") || "",
-          effort: cfg.get<string>("defaultEffort", ""),
-          // The three feature flags + the host app. Config values only — the same
-          // class of anonymous property as mode/model/effort, never content.
+          effort: session.client?.currentReasoningEffort || cfg.get<string>("defaultEffort", "") || "",
+          // Feature flags + host kind + connection snapshot. Config/enum values
+          // only — the same class of anonymous property as mode/model/effort,
+          // never content, paths, or free text. The builder allowlists every key.
           showThinking: cfg.get<boolean>("showThinking", false),
           expandToolDetails: cfg.get<boolean>("expandCommandOutputs", false),
           steerByDefault: cfg.get<boolean>("steerByDefault", false),
@@ -9695,6 +9742,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           remoteReadRepliesAloud: remotePreferences?.readRepliesAloud,
           ...sessionStartSurface(origin, remotePreferences?.usesTouch),
           host: this.host.appName || undefined,
+          hostKind: sessionStartHostKind(this.host.canSwitchWorkspaceFolder),
+          appPurpose: this.appPurpose(),
+          voiceConfigured: this.lastVoiceConfiguredByCwd.get(normalizeRepoPath(cwd)),
+          voiceStreaming: cfg.get<boolean>("voiceStreaming", true),
+          voiceLanguageSet: !!String(this.voiceSetting(cwd, "voiceLanguage", "") || "").trim(),
+          grokConnected: this.lastProviderConnected?.grok,
+          codexConnected: this.lastProviderConnected?.codex,
         },
         {
           appVersion,
@@ -9713,20 +9767,32 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
   }
 
+  private rememberVoiceConfigured(cwd: string, value: boolean): void {
+    this.lastVoiceConfiguredByCwd.set(normalizeRepoPath(cwd), value);
+  }
+
   private postVoiceConfigured(): void {
     const cwd = this.sessionCwd(this.focused);
+    const configured = !!this.resolveVoiceApiKey(cwd);
+    // Refresh = rebuild: only the cwds this pass actually resolved stay in the
+    // map. Point-writes between refreshes (voice-start failure paths) are
+    // fresh by definition; accumulation is what made stale `true` immortal.
+    this.lastVoiceConfiguredByCwd.clear();
+    this.rememberVoiceConfigured(cwd, configured);
     this.postLocal({
       type: "voiceConfigured",
-      value: !!this.resolveVoiceApiKey(cwd),
+      value: configured,
       sendPhrase: this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE),
     });
     for (const clientId of this.remoteClients.clients()) {
       // Scope = the project whose config we resolved. Classification is "scope"
       // so a closed/re-homed tab cannot receive the prior project's prefs.
       const remoteCwd = this.sessionCwd(this.remoteSessionFor(clientId));
+      const remoteConfigured = !!this.resolveVoiceApiKey(remoteCwd);
+      this.rememberVoiceConfigured(remoteCwd, remoteConfigured);
       this.sendRemoteClient(clientId, {
         type: "voiceConfigured",
-        value: !!this.resolveVoiceApiKey(remoteCwd),
+        value: remoteConfigured,
         sendPhrase: this.voiceSetting(remoteCwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE),
       }, remoteCwd);
     }
@@ -10233,6 +10299,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private async handleRemoteVoiceStart(clientId: string, session: Session): Promise<void> {
     const credentialCwd = this.sessionCwd(session);
     if (!this.resolveVoiceApiKey(credentialCwd)) {
+      this.rememberVoiceConfigured(credentialCwd, false);
       this.sendRemoteClient(clientId, { type: "voiceConfigured", value: false }, credentialCwd);
       this.sendRemoteClient(clientId, { type: "voiceError" });
       this.sendRemoteClient(clientId, { type: "error", text: "Voice control needs an xAI Speech-to-Text key on the host." });
@@ -14245,9 +14312,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (sessionCwdOk && session.queuedSendDispatch) {
       snap.push({ type: "submitQueuedSend", ...session.queuedSendDispatch });
     }
+    const voiceCwd = sessionCwdOk ? sessionCwd : this.workspaceRoot();
+    const voiceConfigured = !!this.resolveVoiceApiKey(voiceCwd);
+    this.rememberVoiceConfigured(voiceCwd, voiceConfigured);
     snap.push({
       type: "voiceConfigured",
-      value: !!this.resolveVoiceApiKey(sessionCwdOk ? sessionCwd : this.workspaceRoot()),
+      value: voiceConfigured,
       sendPhrase: phrase,
     });
     const activeVoice = this.remoteVoice.get(clientId);

@@ -566,6 +566,19 @@ describe("createSafeStorageSecrets", () => {
 });
 
 describe("desktop main wiring (source gates)", () => {
+  it("re-delivers the live pendingUpdate after the reload delay, not a pre-timeout snapshot", () => {
+    const main = fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "desktop", "main.ts"),
+      "utf8",
+    );
+    // A snapshot taken before setTimeout re-posts a stale notice over a
+    // notice→ready transition that lands in the 500 ms window.
+    expect(main).not.toMatch(/const n = pendingUpdate;\s*setTimeout/);
+    expect(main).toMatch(
+      /setTimeout\(\(\) => \{\s*const live = pendingUpdate;[\s\S]*?live\.kind === "ready"[\s\S]*?\}, 500\)/,
+    );
+  });
+
   it("stores device credentials via safeStorage, not plaintext createFileSecrets", () => {
     const main = fs.readFileSync(
       path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "desktop", "main.ts"),
@@ -1170,6 +1183,9 @@ describe("webview message schema validation", () => {
       .toBe("runGrokLogin");
     expect(parseWebviewMsg({ type: "installCodex" })?.type).toBe("installCodex");
     expect(parseWebviewMsg({ type: "cancelCodexInstall" })?.type).toBe("cancelCodexInstall");
+    expect(parseWebviewMsg({ type: "restartToUpdate" })).toEqual({ type: "restartToUpdate" });
+    expect(parseWebviewMsg({ type: "openUpdateRelease", url: "https://afkpilot.com/desktop-update" })?.type)
+      .toBe("openUpdateRelease");
   });
 
   it("drops unknown types and malformed payloads", () => {
@@ -1565,6 +1581,36 @@ describe("desktop DevTools gate (non-production only)", () => {
     expect(viewRoles(false)).toContain("toggleDevTools");
   });
 
+  it("View zoom items call CSS font-scale actions, not Chromium zoom roles", () => {
+    const seen: string[] = [];
+    const template = desktopAppMenuTemplate({
+      isPackaged: true,
+      platform: "win32",
+      actions: {
+        zoomIn: () => seen.push("in"),
+        zoomOut: () => seen.push("out"),
+        resetZoom: () => seen.push("reset"),
+      },
+    });
+    const view = template.find((item) => item.label === "View");
+    const submenu = view!.submenu as Array<{
+      role?: string;
+      label?: string;
+      click?: () => void;
+    }>;
+    expect(submenu.map((item) => item.role)).not.toEqual(
+      expect.arrayContaining(["zoomIn", "zoomOut", "resetZoom"]),
+    );
+    expect(submenu.some((item) => item.role === "zoomIn")).toBe(false);
+    expect(submenu.some((item) => item.role === "zoomOut")).toBe(false);
+    expect(submenu.some((item) => item.role === "resetZoom")).toBe(false);
+    const byLabel = (label: string) => submenu.find((item) => item.label === label);
+    byLabel("Zoom In")!.click!();
+    byLabel("Zoom Out")!.click!();
+    byLabel("Actual Size")!.click!();
+    expect(seen).toEqual(["in", "out", "reset"]);
+  });
+
   it("omits toggleDevTools from View when packaged", () => {
     expect(viewRoles(true)).not.toContain("toggleDevTools");
   });
@@ -1809,6 +1855,30 @@ describe("desktop branding and menu", () => {
     expect(main).not.toContain("desk-theme:get");
   });
 
+  it("holds the window until ready-to-show and pins Chromium zoomFactor at 1", () => {
+    const main = fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "desktop", "main.ts"),
+      "utf8",
+    );
+    expect(main).toMatch(/show:\s*false/);
+    expect(main).toContain("ready-to-show");
+    expect(main).toContain("setVisualZoomLevelLimits(1, 1)");
+    expect(main).toContain("setZoomFactor(1)");
+    expect(main).toContain("pinAppDocumentZoom");
+    expect(main).toContain("did-finish-load");
+    expect(main).toContain("__grokFontScale");
+    const chatCss = fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "media", "chat.css"),
+      "utf8",
+    );
+    // Scoped to desk hosts only: the phone client never sets body.desk and
+    // must keep its document scroller (URL-bar hide, keyboard pans).
+    expect(chatCss).toMatch(/html:has\(body\.desk\)\s*\{[^}]*overflow:\s*hidden/s);
+    expect(chatCss).not.toMatch(/^html\s*\{[^}]*overflow:\s*hidden/ms);
+    expect(chatCss).toContain("calc(100% / var(--chat-zoom, 1))");
+    expect(chatCss).not.toContain("calc(100vh / var(--chat-zoom, 1))");
+  });
+
   it("main document loads via APP_DOCUMENT_URL (source gate)", () => {
     const webview = fs.readFileSync(
       path.join(
@@ -2016,6 +2086,7 @@ describe("file-tree panel assets", () => {
     expect(boot).toContain('getElementById("desk-rail-toggle")');
     expect(boot).toContain("__grokRegisterSidePanel");
     expect(boot).toContain("__grokReclampSidePanels");
+    expect(boot).toContain("__grokResetDocumentScroll");
 
     // Seti assets are fetched lazily from the desktop media scheme, not baked
     // into executeJavaScript, and the adapter never joins the host message bus.
@@ -2035,6 +2106,7 @@ describe("desktop chrome boot (scroll fade + spacing shell)", () => {
     expect(src).toContain("--fade-top-op");
     expect(src).toContain("--fade-bot-op");
     expect(src).toContain("scrollTop");
+    expect(src).toContain("__grokResetDocumentScroll");
     // Does not touch shared chat.js / Host messaging.
     expect(src).not.toContain("acquireVsCodeApi");
     expect(src).not.toContain("postMessage");

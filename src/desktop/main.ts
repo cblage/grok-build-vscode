@@ -60,10 +60,11 @@ import {
   installWindowSecurityLocks,
   isTrustedMainFrameIpc,
 } from "./window-security";
+import { autoUpdater } from "electron-updater";
 import {
   DESKTOP_RELEASES_API_URL,
   DESKTOP_UPDATE_CHECK_INTERVAL_MS,
-  desktopUpdatePageUrl,
+  attachDesktopAutoUpdate,
   noticeIfUpdateAvailable,
   type GithubReleaseLike,
 } from "./app-update";
@@ -169,6 +170,27 @@ function log(line: string): void {
 }
 
 /**
+ * Chromium per-origin zoomFactor must stay 1. Chat scale is CSS `--chat-zoom`
+ * only; stacking the two is the boot-layout overflow. Re-pin on every
+ * app-document load (including reload) because a leftover origin zoom survives.
+ */
+function pinAppDocumentZoom(win: BrowserWindow | null): void {
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return;
+  const url = win.webContents.getURL();
+  if (url && url !== "about:blank" && !isAppDocumentUrl(url)) return;
+  try {
+    void win.webContents.setVisualZoomLevelLimits(1, 1);
+  } catch {
+    /* older Electron */
+  }
+  try {
+    win.webContents.setZoomFactor(1);
+  } catch {
+    /* zoomFactor unavailable */
+  }
+}
+
+/**
  * Application menu: no stock Electron Help links; public repo only.
  * File → Add/Close Project Folder drive multi-folder (rail + config store).
  * Developer Tools only when `!isPackaged` (default: `app.isPackaged`).
@@ -191,8 +213,25 @@ export function buildDesktopAppMenu(
 }
 
 let mainWindow: BrowserWindow | null = null;
+// Set on ready-to-show (or did-fail-load): gates every other show() path.
+let mainWindowReadyToShow = false;
 let sidebar: GrokSidebar | null = null;
 let webview: ElectronWebview | null = null;
+
+/** View-menu zoom → renderer `window.__grokFontScale` (CSS path). */
+function applyDesktopCssZoom(kind: "in" | "out" | "reset"): void {
+  const win = mainWindow;
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return;
+  const src =
+    kind === "reset"
+      ? `(function(){var a=window.__grokFontScale;if(a&&typeof a.set==="function")a.set(1);})()`
+      : kind === "in"
+        ? `(function(){var a=window.__grokFontScale;if(a&&typeof a.set==="function"&&typeof a.step==="function")a.set(a.step(a.get(),a.stepSize));})()`
+        : `(function(){var a=window.__grokFontScale;if(a&&typeof a.set==="function"&&typeof a.step==="function")a.set(a.step(a.get(),-a.stepSize));})()`;
+  void win.webContents.executeJavaScript(src, true).catch(() => {
+    /* renderer not ready */
+  });
+}
 
 // One process per profile: a second launch must focus the existing window, not
 // spawn another sidebar / ACP pool / remote uplink on the same device token.
@@ -213,7 +252,9 @@ if (!gotSingleInstanceLock) {
     const win = mainWindow;
     if (!win || win.isDestroyed()) return;
     if (win.isMinimized()) win.restore();
-    if (!win.isVisible()) win.show();
+    // Never surface a window that has not reached ready-to-show — a double
+    // launch during boot must not paint the unsettled frame show:false hides.
+    if (!win.isVisible() && mainWindowReadyToShow) win.show();
     win.focus();
     if (
       secondInstanceShouldOpenDevTools({
@@ -341,12 +382,14 @@ async function createApp(): Promise<void> {
   const remoteActions: { current?: ElectronRemoteActions } = {};
   // Same auth context for message-gate (webview) and use-time openFsPath (host).
   const authContext: { get?: () => DesktopOpenFileContext } = {};
+  const updateActions: { install?: () => void } = {};
   const host = createElectronHost({
     config,
     getWindow: () => mainWindow,
     log,
     remoteActions,
     getAuthContext: () => authContext.get?.(),
+    installAppUpdate: () => updateActions.install?.(),
     onWorkspaceRootChanged: (root) => {
       // File-tree panel boots once against api.root(); rebind so the visible
       // tree matches the active project (otherwise reads resolve against B
@@ -431,6 +474,9 @@ async function createApp(): Promise<void> {
         removeProjectFolder: () => {
           void sidebar?.removeProjectFolder();
         },
+        zoomIn: () => applyDesktopCssZoom("in"),
+        zoomOut: () => applyDesktopCssZoom("out"),
+        resetZoom: () => applyDesktopCssZoom("reset"),
       },
       { isPackaged },
     ),
@@ -461,6 +507,10 @@ async function createApp(): Promise<void> {
     // Windows draws a light system menu strip over a dark app otherwise. Hide
     // it by default; Alt reveals the File/Edit/View/Help menus when needed.
     autoHideMenuBar: true,
+    // Hold the first paint until Chromium has a settled frame. Showing on
+    // construct (NSIS --force-run relaunch is the sharp case) lays the
+    // document out against an unsettled viewport; boot focus then sticks it.
+    show: false,
     icon: iconOpt,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -472,6 +522,16 @@ async function createApp(): Promise<void> {
       spellcheck: false,
       devTools: allowDevTools,
     },
+  });
+
+  pinAppDocumentZoom(mainWindow);
+  mainWindow.once("ready-to-show", () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    // Re-pin right before first show: a leftover per-origin zoom applied
+    // between construct and first paint would resurrect the stacked-zoom bug.
+    pinAppDocumentZoom(mainWindow);
+    mainWindowReadyToShow = true;
+    mainWindow.show();
   });
 
   installWindowSecurityLocks(mainWindow, {
@@ -536,6 +596,7 @@ async function createApp(): Promise<void> {
   // remounts without touching getHtml() / chat.js. Chrome fades run after the
   // panel so #messages is in its final parent.
   mainWindow.webContents.on("did-finish-load", () => {
+    pinAppDocumentZoom(mainWindow);
     void (async () => {
       await injectFileTreePanelLogged(mainWindow, log);
       if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
@@ -554,18 +615,26 @@ async function createApp(): Promise<void> {
     },
   });
 
-  // Update *notice* only — no auto-download. Failure is silence (offline,
-  // rate-limit, malformed). Re-check every 12h while the app stays open.
-  // In-memory only — no disk; re-post on reload so the rail button survives
-  // a document refresh without another network round-trip.
+  // In-app updater on packaged win32/darwin; GitHub notice is the fallback
+  // (and the only path when unpackaged / Linux / check-or-download fails).
+  // Failure is silence. Re-check every 12h. In-memory pending frame only —
+  // re-post on reload so the rail button survives a document refresh.
   const appVersion = app.getVersion() || pkg.version;
-  let pendingUpdate: { version: string; url: string } | null = null;
+  let pendingUpdate:
+    | { kind: "notice"; version: string; url: string }
+    | { kind: "ready"; version: string }
+    | null = null;
   const postUpdateNotice = (version: string, url: string): void => {
-    pendingUpdate = { version, url };
+    pendingUpdate = { kind: "notice", version, url };
     if (!webview) return;
     void webview.postMessage({ type: "updateAvailable", version, url });
   };
-  const checkForDesktopUpdate = async (): Promise<void> => {
+  const postUpdateReady = (version: string): void => {
+    pendingUpdate = { kind: "ready", version };
+    if (!webview) return;
+    void webview.postMessage({ type: "updateReady", version });
+  };
+  const fetchGithubDesktopNotice = async () => {
     try {
       const res = await net.fetch(DESKTOP_RELEASES_API_URL, {
         headers: {
@@ -573,33 +642,45 @@ async function createApp(): Promise<void> {
           "User-Agent": `Grok-Build-Desktop/${appVersion}`,
         },
       });
-      if (!res.ok) return;
+      if (!res.ok) return null;
       const body = (await res.json()) as unknown;
-      if (!Array.isArray(body)) return;
-      const notice = noticeIfUpdateAvailable(
-        appVersion,
-        body as GithubReleaseLike[],
-      );
-      // The notice's own url is the GitHub release page. Send people to the
-      // update page instead — same release, one button, no .blockmap files.
-      if (notice) postUpdateNotice(notice.version, desktopUpdatePageUrl(appVersion));
+      if (!Array.isArray(body)) return null;
+      return noticeIfUpdateAvailable(appVersion, body as GithubReleaseLike[]);
     } catch {
-      /* offline / parse / network — stay silent */
+      return null;
     }
   };
-  // After first paint so a slow API never races the webview boot.
+  const desktopUpdate = attachDesktopAutoUpdate({
+    updater: autoUpdater,
+    platform: process.platform,
+    currentVersion: appVersion,
+    packaged: app.isPackaged,
+    forceDev: process.env.GROK_DESKTOP_UPDATE_DEV === "1",
+    ui: {
+      postNotice: postUpdateNotice,
+      postReady: postUpdateReady,
+      log,
+      fetchNotice: fetchGithubDesktopNotice,
+    },
+  });
+  updateActions.install = () => desktopUpdate.install();
+  // After first paint so a slow check never races the webview boot.
   setTimeout(() => {
-    void checkForDesktopUpdate();
+    void desktopUpdate.check();
   }, 4_000);
   setInterval(() => {
-    void checkForDesktopUpdate();
+    void desktopUpdate.check();
   }, DESKTOP_UPDATE_CHECK_INTERVAL_MS);
-  // Re-deliver an already-known notice after inject (reload wipes the button).
+  // Re-deliver an already-known notice/ready after inject (reload wipes the button).
+  // Read the live binding inside the delay — a notice→ready transition in that
+  // window must not re-post the stale notice over a staged update.
   mainWindow.webContents.on("did-finish-load", () => {
     if (!pendingUpdate) return;
-    const n = pendingUpdate;
     setTimeout(() => {
-      if (pendingUpdate) postUpdateNotice(n.version, n.url);
+      const live = pendingUpdate;
+      if (!live) return;
+      if (live.kind === "ready") postUpdateReady(live.version);
+      else postUpdateNotice(live.version, live.url);
     }, 500);
   });
 
@@ -612,6 +693,12 @@ async function createApp(): Promise<void> {
 
   mainWindow.webContents.on("did-fail-load", (_e, code, desc, url) => {
     log(`did-fail-load ${code} ${desc} url=${url}`);
+    // The app document failed: show the (blank) window rather than hanging
+    // invisibly behind ready-to-show that will never fire.
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+      mainWindowReadyToShow = true;
+      mainWindow.show();
+    }
   });
 }
 
