@@ -102,6 +102,8 @@ describe("ACP integration (real subprocess, fake CLI)", () => {
         FAKE_PLAN_PATH: planPath,
       },
       log: () => {},
+      grokVersion: "1.0.4",
+      grokVersionVerified: true,
     });
     client.on("stderr", (t: string) => captured.push(t));
 
@@ -138,8 +140,41 @@ describe("ACP integration (real subprocess, fake CLI)", () => {
 
   it("lifecycle: spawn → initialize → session/new succeeds and a basic prompt round-trips", async () => {
     expect(client.sessionId).toBe("fake-session-1");
+    await waitForStderr(stderr, /INITIALIZE_CAPS:/);
+    const capsLine = stderr.find((t) => t.includes("INITIALIZE_CAPS:"));
+    const capsJson = capsLine!.slice(capsLine!.indexOf("INITIALIZE_CAPS:") + "INITIALIZE_CAPS:".length);
+    expect(JSON.parse(capsJson)).toEqual({ fs: { writeTextFile: true }, terminal: true });
     const meta = await client.prompt("hello");
     expect(meta).toMatchObject({ totalTokens: 10 });
+  });
+
+  it("advertises the delegated handshake on grok 0.2.117", async () => {
+    const captured: string[] = [];
+    const legacy = new AcpClient({
+      cliPath: fixtureCli(),
+      cwd: workspace,
+      env: {
+        ...process.env,
+        GROK_HOME: path.join(planHome, ".grok"),
+        FAKE_WORKSPACE_ROOT: workspace,
+      },
+      log: () => {},
+      grokVersion: "0.2.117",
+    });
+    legacy.on("stderr", (t: string) => captured.push(t));
+    try {
+      await legacy.start();
+      await waitForStderr(captured, /INITIALIZE_CAPS:/);
+      const capsLine = captured.find((t) => t.includes("INITIALIZE_CAPS:"));
+      const capsJson = capsLine!.slice(capsLine!.indexOf("INITIALIZE_CAPS:") + "INITIALIZE_CAPS:".length);
+      expect(JSON.parse(capsJson)).toEqual({
+        fs: { readTextFile: true, writeTextFile: true },
+        terminal: true,
+      });
+    } finally {
+      try { legacy.removeAllListeners(); } catch { /* */ }
+      try { await legacy.dispose(); } catch { /* */ }
+    }
   });
 
   it("dispatches a final interject ACK before exposing immediate process exit", async () => {
@@ -387,6 +422,44 @@ describe("ACP integration (real subprocess, fake CLI)", () => {
     expect(client.respondPermission(1, "opt-1")).toBe(false);
     expect(client.respondExitPlan(2, "rejected")).toBe(false);
     await expect(client.cancel()).resolves.toBe(false);
+  });
+
+  it("session/load replays chat_history.jsonl from GROK_HOME before resolving", async () => {
+    const resumeId = "stored-resume-1";
+    const dir = path.join(planHome, ".grok", "sessions", encodeURIComponent(workspace), resumeId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "summary.json"), JSON.stringify({ session_id: resumeId }));
+    fs.writeFileSync(
+      path.join(dir, "chat_history.jsonl"),
+      [
+        JSON.stringify({ type: "user", content: "<user_query>stored question</user_query>" }),
+        JSON.stringify({ type: "assistant", content: "stored answer" }),
+      ].join("\n"),
+    );
+
+    const resumeClient = new AcpClient({
+      cliPath: fixtureCli(),
+      cwd: workspace,
+      env: {
+        ...process.env,
+        GROK_HOME: path.join(planHome, ".grok"),
+        FAKE_WORKSPACE_ROOT: workspace,
+      },
+      log: () => {},
+    });
+    const users: string[] = [];
+    const agents: string[] = [];
+    resumeClient.on("userMessageChunk", (t: string) => users.push(t));
+    resumeClient.on("messageChunk", (t: string) => agents.push(t));
+    try {
+      await resumeClient.start();
+      const loaded = await resumeClient.loadSession(resumeId);
+      expect(loaded.sessionId).toBe(resumeId);
+      expect(users.join("")).toContain("stored question");
+      expect(agents.join("")).toContain("stored answer");
+    } finally {
+      resumeClient.dispose();
+    }
   });
 
   it("a write to a non-writable stdin is skipped, not attempted", () => {

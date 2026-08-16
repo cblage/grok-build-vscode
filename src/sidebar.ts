@@ -457,6 +457,12 @@ interface CliCompatibilityResult {
   planModeVersionVerified: boolean;
   /** True when Plan availability came from `grok.cliVersionCache`, not a live `--version`. */
   usedCache?: boolean;
+  /**
+   * Parseable `X.Y.Z` from this probe (live or cache). Absent when unknown.
+   * Display / Plan only — initialize must not see this unless
+   * `planModeVersionVerified` is true.
+   */
+  cliVersion?: string;
 }
 
 interface SessionsListOptions {
@@ -663,6 +669,12 @@ export class GrokSidebar {
     started: () => void;
     wait: Promise<void>;
   };
+  /**
+   * Test-only latch. When set, Grok discovery stops after an explicit cached
+   * path (provisionFakeGrok). Config and PATH are not searched, so a developer
+   * box cannot silently pick up a real CLI. Production never sets this.
+   */
+  private testForceMissingGrokCli = false;
   /** First full boot pass — repo catalog AND the deferred session-list — finished. */
   private firstBootScanStarted = false;
   private firstBootScanCompleted = false;
@@ -818,6 +830,10 @@ export class GrokSidebar {
   private locateProvider(provider: AcpProvider): string | undefined {
     const cached = provider === "grok" ? this.cliPath : this.codexCliPath;
     if (cached && fs.existsSync(cached)) return cached;
+    if (provider === "grok" && this.testForceMissingGrokCli) {
+      this.cliPath = undefined;
+      return undefined;
+    }
     const cfg = this.host.getConfiguration("grok");
     const located = provider === "grok"
       ? locateGrokCli(cfg.get<string>("cliPath", "")) || undefined
@@ -940,6 +956,7 @@ export class GrokSidebar {
       cwd: this.workspaceRoot(),
       env: this.buildEnv(this.workspaceRoot()),
       log: (message) => this.host.appendLine(message),
+      grokVersion: this.providerCliVersions.grok,
     });
     try {
       await client.start();
@@ -3579,14 +3596,14 @@ Only continue if you trust this code.`,
       return { client: this.focused.client, disposeAfter: false };
     }
     // Temporary client: initialize + session/new, caller disposes after create.
-    const cfg = this.host.getConfiguration("grok");
-    const cliPath = locateGrokCli(cfg.get<string>("cliPath", ""));
+    const cliPath = this.locateProvider("grok");
     if (!cliPath) return undefined;
     const client = new AcpClient({
       cliPath,
       cwd: sourcePath,
       env: this.buildEnv(sourcePath),
       log: (msg) => this.host.appendLine(msg),
+      grokVersion: this.providerCliVersions.grok,
     });
     // Minimal handlers so the handshake doesn't hang on server requests.
     client.fsRead = async (p) => fs.readFileSync(p, "utf8");
@@ -6060,8 +6077,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * parseable below-floor banner sticks for the session. Retries once on
    * empty/unparseable output, then falls back to the last verified banner for
    * this binary when the file identity still matches. A cache hit keeps that
-   * availability and is never treated as verified. Performs no update or pool
-   * orchestration.
+   * availability and is never treated as verified — initialize must not use
+   * `cliVersion` unless `planModeVersionVerified` is true. Performs no update
+   * or pool orchestration.
    */
   private async planModeCompatibility(
     cliPath: string,
@@ -6069,18 +6087,21 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   ): Promise<CliCompatibilityResult> {
     const notify = opts.notify !== false;
     const cache = this.state.get<CliVersionCache>(CLI_VERSION_CACHE_KEY, {});
-    const { decision, nextCache, usedCache } = await resolvePlanModeAvailability({
+    const { decision, nextCache, usedCache, versionOutput } = await resolvePlanModeAvailability({
       readOnce: () => this.readGrokVersion(cliPath),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       identity: readCliBinaryIdentity(cliPath),
       cache,
     });
     if (nextCache) void this.state.update(CLI_VERSION_CACHE_KEY, nextCache);
+    const parsed = parseGrokVersion(versionOutput);
+    const cliVersion = parsed ? parsed.join(".") : undefined;
+    if (cliVersion) this.providerCliVersions.grok = cliVersion;
     if (decision.available) {
       if (usedCache) {
         this.host.appendLine("grok --version failed; using last verified version for Plan mode.");
       }
-      return { planModeAvailable: true, planModeVersionVerified: decision.verified, usedCache };
+      return { planModeAvailable: true, planModeVersionVerified: decision.verified, usedCache, cliVersion };
     }
     if (decision.verified) {
       const message =
@@ -6093,6 +6114,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         planModeVersionVerified: true,
         planModeUnavailableReason: decision.reason,
         usedCache,
+        cliVersion,
       };
     }
     // Unverified: log + optional toast once at session start; a later Plan pick
@@ -6113,6 +6135,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       planModeVersionVerified: false,
       planModeUnavailableReason: decision.reason,
       usedCache,
+      cliVersion,
     };
   }
 
@@ -6135,9 +6158,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    */
   private async recheckPlanModeAvailability(session: Session): Promise<boolean> {
     const gen = session.gen;
-    const cliPath = this.cliPath || locateGrokCli(
-      this.host.getConfiguration("grok").get<string>("cliPath", ""),
-    );
+    const cliPath = this.locateProvider("grok");
     if (!cliPath) return false;
     this.host.appendLine("Re-checking Grok CLI version for Plan mode…");
     // Silent: the initial session-start probe already notified; a second toast
@@ -6205,9 +6226,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const connected = this.connectedProviders();
     if (connected.includes("codex")) void this.probeCodexVersion();
     if (!connected.includes("grok")) return;
-    const cliPath = this.cliPath || locateGrokCli(
-      this.host.getConfiguration("grok").get<string>("cliPath", ""),
-    );
+    const cliPath = this.locateProvider("grok");
     if (!cliPath) {
       this.postGrokUpdateStatus({ type: "grokUpdateStatus", error: "grok CLI not found" });
       return;
@@ -6244,9 +6263,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * Connected · v<new>) shows progress.
    */
   private async updateGrokCliOnDemand(): Promise<void> {
-    const cliPath = this.cliPath || locateGrokCli(
-      this.host.getConfiguration("grok").get<string>("cliPath", ""),
-    );
+    const cliPath = this.locateProvider("grok");
     if (!cliPath) {
       this.post({ type: "onboarding", state: "missing-cli", platform: process.platform, provider: "grok" });
       return;
@@ -6591,9 +6608,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
 
     // Keep the established once-per-extension-upgrade update trigger, then read
-    // the resulting version solely to decide whether Plan is safe to expose.
+    // the resulting version solely to decide whether Plan is safe to expose
+    // and which initialize handshake to advertise.
     const versionAt = clock.now();
     let versionNote: string | undefined;
+    let grokHandshakeVersion: string | undefined;
+    let grokVersionVerified = false;
     if (session.provider === "grok") {
       await this.maybeUpdateCliOnUpgrade(cliPath);
       if (gen !== session.gen) return undefined;
@@ -6602,6 +6622,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       const compatibility = await this.planModeCompatibility(cliPath);
       if (gen !== session.gen) return undefined;
       if (compatibility.usedCache) versionNote = "cached";
+      // initialize cannot be renegotiated; only a live probe may change the fs handshake.
+      grokVersionVerified = compatibility.planModeVersionVerified;
+      grokHandshakeVersion = grokVersionVerified
+        ? compatibility.cliVersion
+        : undefined;
       this.applyPlanModeCompatibility(session, compatibility);
     } else {
       session.planModeAvailable = true;
@@ -6702,12 +6727,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       effort,
       sandbox,
       log: (msg) => this.host.appendLine(msg),
-      ...(session.provider === "codex" ? { backend: new CodexBackend() } : {}),
+      ...(session.provider === "codex"
+        ? { backend: new CodexBackend() }
+        : { grokVersion: grokHandshakeVersion, grokVersionVerified }),
     });
     brokerClient = client;
     session.client = client;
 
-    // fs handlers (mandatory — the agent calls these to read/write files)
+    // fs handlers. Still wired on every session: 0.2.x, unverified, and Codex
+    // advertise readTextFile and will call them. A live-verified grok >= 1.0.4
+    // currently will not (withheld read → no client fs at all) but a later CLI
+    // may honour writeTextFile independently.
     if (broker) {
       // The sandboxed broker owns both ACP filesystem calls and every shell
       // child. There is deliberately no extension-host fallback on errors.
@@ -6949,7 +6979,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("plan", (u) => {
       if (gen !== session.gen) return;
-      // Stash plan text — x.ai/exit_plan_mode params are typically empty
+      // Fallback stash. Current CLIs send exit_plan_mode with planContent
+      // populated; postExitPlanRequest prefers req.plan over lastPlanText.
       session.lastPlanText =
         (typeof u?.plan === "string" ? u.plan : "") ||
         (typeof u?.planText === "string" ? u.planText : "") ||
@@ -8065,9 +8096,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // string literal and errors "Unexpected token". Launching the binary
         // directly sidesteps shell quoting entirely and behaves the same on
         // PowerShell, cmd, and POSIX shells.
-        const mcpCli = this.cliPath || locateGrokCli(
-          this.host.getConfiguration("grok").get<string>("cliPath", ""),
-        );
+        const mcpCli = this.locateProvider("grok");
         const mcpCwd = this.sessionCwd(session);
         const term = mcpCli
           ? this.host.createTerminal({ name: "Grok MCP", shellPath: mcpCli, shellArgs: ["mcp", "list"], cwd: mcpCwd })
@@ -12169,7 +12198,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   installTestHooks(): {
     onPost(fn: (dest: MsgOrigin, message: HostMsg, clientIds?: string[]) => void): void;
     fromRemote(message: WebviewMsg, clientId?: string): void;
-    fromLocal(message: WebviewMsg): void;
+    fromLocal(message: WebviewMsg): Promise<void>;
     fromRelayFrame(raw: string): void;
     emitRemote(clientId: string, message: HostMsg): void;
     replayRemote(clientId: string, messages: HostMsg[], during?: () => void, fail?: boolean): Promise<void>;
@@ -12238,7 +12267,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       lastRemovePath(): string | undefined;
       restore(): void;
     };
+
     hasLiveSession(id: string): boolean;
+    /**
+     * Latch Grok discovery to the missing-CLI path. `locateProvider("grok")`
+     * will not search config or PATH; an explicit `provisionFakeGrok` path
+     * still wins because it is cached first. In-memory only — does not
+     * rewrite persisted account state.
+     */
+    isolateFromInstalledGrok(): void;
+    /** Current Grok resolution after the isolate / provision latches. */
+    locatedGrokCli(): string | undefined;
+    /**
+     * Point this host at a test-only ACP CLI and mark Grok connected so
+     * startSession/loadSession spawn it instead of taking the missing-CLI
+     * onboarding path. Does not start a session. The returned restore
+     * function puts the previous CLI path and connection flag back.
+     */
+    provisionFakeGrok(cliPath: string): () => void;
     remoteClientLeft(clientId: string): void;
     remoteClientRoster(clientIds: string[]): void;
     sweepEmptySessions(cwd: string): void;
@@ -12249,7 +12295,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.postTap = fn;
       },
       fromRemote: (message, clientId = "test-client") => this.handleRemoteMessage(clientId, message),
-      fromLocal: (message) => { void this.onMessage(message, "local"); },
+      fromLocal: (message) => this.onMessage(message, "local"),
       fromRelayFrame: (raw) => {
         const frame = parseRelayFrame(raw);
         if (frame?.t !== "client-ready") return;
@@ -12482,12 +12528,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       activeRemoteWorktree: (clientId) => this.remoteClients.active(clientId)?.worktree,
       focusedSessionId: () => this.focused.activeSessionId,
       seedFocusedWorktreeSession: (id, worktree) => {
-        const prev = {
-          id: this.focused.activeSessionId,
-          cwd: this.focused.cwd,
-          worktree: this.focused.worktree,
-          client: this.focused.client,
-        };
+        // Tear down a leftover live/in-flight client first. startSession writes
+        // session.client with no gen check, so a stub seeded onto that same
+        // Session is overwritten and apply/remove never reach this probe.
+        const prev = this.focused;
+        this.detachClient(prev)?.dispose();
+        this.focused = this.newLocalSession();
         this.focused.activeSessionId = id;
         this.focused.cwd = worktree.sourceGitRoot;
         this.focused.worktree = worktree;
@@ -12515,16 +12561,31 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           lastApplyPath: () => lastApplyPath,
           lastRemovePath: () => lastRemovePath,
           restore: () => {
-            this.focused.activeSessionId = prev.id;
-            this.focused.cwd = prev.cwd;
-            this.focused.worktree = prev.worktree;
-            this.focused.client = prev.client;
+            this.focused = prev;
           },
         };
       },
       hasLiveSession: (id) => [...this.pool].some((session) =>
         session.activeSessionId === id && !!session.client
       ),
+      isolateFromInstalledGrok: () => {
+        this.testForceMissingGrokCli = true;
+        this.cliPath = undefined;
+        this.setProviderConnectedInMemory("grok", false);
+      },
+      locatedGrokCli: () => this.locateProvider("grok"),
+      provisionFakeGrok: (cliPath) => {
+        const previous = {
+          cliPath: this.cliPath,
+          connected: this.providerConnections().grok === true,
+        };
+        this.cliPath = cliPath;
+        this.setProviderConnectedInMemory("grok", true);
+        return () => {
+          this.cliPath = previous.cliPath;
+          this.setProviderConnectedInMemory("grok", previous.connected);
+        };
+      },
       remoteClientLeft: (clientId) => this.releaseRemoteClient(clientId),
       remoteClientRoster: (clientIds) => this.retainRemoteClients(clientIds),
       sweepEmptySessions: (cwd) => this.sweepEmptySessions(cwd),
