@@ -1681,6 +1681,27 @@ describe("effort picker uses the model's advertised levels (not a hardcoded set)
     ]);
   });
 
+  it("uses the session's effective effort instead of the global spawn preference", () => {
+    const h = bootWebview();
+    dispatch(h.window, {
+      type: "initialState", effort: "medium", cwd: "/w", useCtrlEnter: false,
+      extVersion: "0", showThinking: false, expandCommandOutputs: false,
+      platform: "darwin", steerByDefault: false, soundNotifications: false,
+      processingSound: false, readRepliesAloud: false, capabilities: {},
+    });
+    dispatch(h.window, {
+      type: "session", sessionId: "s1", currentModelId: "grok-4.6", effort: "xhigh",
+      models: [{
+        modelId: "grok-4.6", name: "Grok 4.6",
+        reasoningEfforts: ["low", "medium", "high", "xhigh"],
+      }],
+    });
+
+    const dots = openEffortDots(h);
+    expect(dots).toHaveLength(4);
+    expect(dots.every((dot) => dot.classList.contains("active"))).toBe(true);
+  });
+
   it("falls back to the full ladder when the model advertises no efforts", () => {
     const h = bootWebview();
     dispatch(h.window, {

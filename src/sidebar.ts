@@ -6822,6 +6822,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         sessionId: res.sessionId,
         models: this.modelsForSession(session, client.availableModels, client.currentModelId, !resumeId),
         currentModelId: client.currentModelId,
+        effort: client.currentReasoningEffort,
         worktree: !!session.worktree,
         provider: session.provider,
       });
@@ -11353,6 +11354,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           sessionId: session.client.sessionId,
           models: this.modelsForSession(session, session.client.availableModels, session.client.currentModelId, false),
           currentModelId: session.client.currentModelId,
+          effort: session.client.currentReasoningEffort,
           worktree: !!session.worktree,
           provider: session.provider,
         });

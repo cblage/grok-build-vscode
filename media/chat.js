@@ -12073,6 +12073,11 @@
       }
       case "session": {
         state.currentModelId = msg.currentModelId;
+        // The session handshake/load response carries the effective effort Grok
+        // actually resolved. It is authoritative over the global spawn setting:
+        // a project-level .grok/config.toml may select xhigh while
+        // grok.defaultEffort is intentionally empty ("CLI default").
+        if (typeof msg.effort === "string") state.effort = msg.effort;
         state.activeProvider = msg.provider === "codex" ? "codex" : "grok";
         syncProviderVoice();
         if (state.railTransition?.kind === "new") renderRail();

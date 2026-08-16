@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.9.1-sandbox.2 — 2026-08-16
+
+### Fixed
+
+- **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
+
+---
+
 ## 3.9.1-sandbox.1 — 2026-08-14
 
 ### Added

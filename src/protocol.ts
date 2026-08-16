@@ -230,7 +230,7 @@ export type HostMsg =
   | { type: "initialized"; info: { cliPath: string; cwd: string; version: string | null; provider?: "grok" | "codex"; init: { protocolVersion?: unknown } } }
   | { type: "cliUpdating" }
   // `worktree` gates the gear's Apply/Remove worktree items to worktree sessions.
-  | { type: "session"; sessionId: string; models: ModelInfo[]; currentModelId: string | undefined; worktree?: boolean; provider?: "grok" | "codex" }
+  | { type: "session"; sessionId: string; models: ModelInfo[]; currentModelId: string | undefined; effort?: string; worktree?: boolean; provider?: "grok" | "codex" }
   // The focused conversation's display name, using the same precedence as a
   // history row. It is separate from `sessions` because VS Code does not keep
   // that browser-only list populated while the history popover is closed.
