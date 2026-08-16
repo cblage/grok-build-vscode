@@ -71,6 +71,19 @@ describe("Seti icon assets", () => {
     expect(filePanelCss).toContain("--rail-row-min-height");
   });
 
+  it("title strip and file tabs reuse renderFileIcon, not a second mapping", () => {
+    expect(filePanelJs).toContain('renderFileIcon(icon, label, "dir")');
+    expect(filePanelJs).toContain("gfp-title-icon");
+    expect(filePanelJs).toContain("gfp-tab-icon");
+    expect(filePanelJs).toContain('renderFileIcon(icon, fileName(relPath), tab.kind === "dir" ? "dir" : "file")');
+    expect(filePanelCss).toMatch(/\.gfp-title-icon[\s\S]*?width:\s*16px/);
+    expect(filePanelCss).toMatch(/\.gfp-tab-icon[\s\S]*?width:\s*16px/);
+    expect(filePanelCss).not.toMatch(/\.gfp-title\s*\{[^}]*text-transform:\s*uppercase/s);
+    expect(filePanelCss).not.toMatch(/\.gfp-title\s*\{[^}]*font-weight:\s*700/s);
+    expect(filePanelCss).toMatch(/\.gfp-tab\[hidden\][\s\S]*?display:\s*none\s*!important/);
+    expect(filePanelCss).not.toMatch(/\.gfp-tabs\s*\{[^}]*overflow-x:\s*auto/s);
+  });
+
   it("directory rows use a disclosure chevron and no folder Seti glyph", () => {
     expect(filePanelJs).toContain('lead.innerHTML = ICON.chevronRight');
     expect(filePanelJs).toContain('else renderFileIcon(lead, entry.name, entry.kind)');
@@ -87,7 +100,7 @@ describe("Seti icon assets", () => {
     expect(filePanelJs).toContain('lead.className = "gfp-lead desk-ft-lead files-browse-row-icon"');
     expect(filePanelCss).toContain("calc(6px + var(--gfp-depth, 0) * 12px)");
     expect(filePanelCss).toMatch(/\.gfp-lead\s*\{[^}]*width:\s*16px/s);
-    expect(filePanelCss).toMatch(/\.gfp-row\s*\{[^}]*min-height:\s*var\(--rail-row-min-height,\s*30px\)/s);
+    expect(filePanelCss).toMatch(/\.gfp-row\s*\{[^}]*min-height:\s*var\(--rail-row-min-height,\s*24px\)/s);
   });
 });
 

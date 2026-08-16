@@ -379,7 +379,9 @@ export type HostMsg =
   | { type: "sessionContext" }
   | { type: "clearMessages" }
   | { type: "onboarding"; state: "connect-agent" | "missing-cli" | "auth-required" | "missing-codex" | "codex-login"; platform?: string; reason?: string; provider?: "grok" | "codex" }
-  | { type: "error"; text: string }
+  // resumeFailed is additive: a remote resume refusal names the requested id so
+  // the browser outbox can fail closed. Older clients ignore the extra field.
+  | { type: "error"; text: string; resumeFailed?: { id: string } }
   | { type: "hostNotice"; level: "info" | "warning"; text: string }
   | { type: "xaiNotification"; update?: unknown }
   // Persisted xAI lifecycle (method _x.ai/session/update): subagent spawn/finish
@@ -685,11 +687,13 @@ export type WebviewMsg =
   // prompt itself, so a -32601 fallback can re-queue the text without losing it.
   | { type: "steerSend"; text: string }
   // Fork (#48): branch this session's conversation into a new one and focus it.
-  | { type: "forkSession" }
+  // `sessionId` is additive: old clients omit it and keep today's path; a
+  // present id that is not the dispatch-resolved session is refused.
+  | { type: "forkSession"; sessionId?: string }
   // Worktree UI (P2-8): new isolated session / merge back / remove worktree.
   | { type: "newWorktreeSession" }
-  | { type: "applyWorktree" }
-  | { type: "removeWorktree" }
+  | { type: "applyWorktree"; sessionId?: string }
+  | { type: "removeWorktree"; sessionId?: string }
   // Rewind UI (P2-9): truncate chat + restore files.
   // `userBubbleIndex` (0-based among visible user bubbles) comes from the
   // per-message Rewind button; omit it for the gear QuickPick path.

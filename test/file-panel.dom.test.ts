@@ -8,6 +8,10 @@ import {
   createFilePanel,
   resolveMarkdownLink,
   makeTab,
+  stripShrinkState,
+  planStrip,
+  STRIP_COMPACT_MAX,
+  STRIP_EXTREME_MAX,
 } from "../media/file-panel.js";
 
 type Scope = { id: string; label: string; title?: string };
@@ -28,6 +32,9 @@ function harness(options?: {
   read?: (scopeId: string, relPath: string) => Promise<unknown>;
   list?: (scopeId: string, relPath: string) => Promise<unknown>;
   confirm?: (request: { title: string }) => Promise<string>;
+  mount?: Record<string, unknown>;
+  fileIcons?: { baseUrl: string };
+  onMaximizedChanged?: (max: boolean) => void;
 }) {
   const window = new Window({ url: "https://example.test/" });
   const document = window.document;
@@ -43,6 +50,8 @@ function harness(options?: {
     "scope-a": {
       "notes.md": { text: "one", stamp: { mtimeMs: 1, size: 3 }, absPath: "/work/app/notes.md" },
       "src/a.ts": { text: "a", stamp: { mtimeMs: 1, size: 1 }, absPath: "/work/app/src/a.ts" },
+      "src/b.ts": { text: "b", stamp: { mtimeMs: 1, size: 1 }, absPath: "/work/app/src/b.ts" },
+      "readme.md": { text: "hi", stamp: { mtimeMs: 1, size: 2 }, absPath: "/work/app/readme.md" },
     },
     "scope-b": {
       "notes.md": { text: "other", stamp: { mtimeMs: 1, size: 5 }, absPath: "/work/relay/notes.md" },
@@ -91,11 +100,13 @@ function harness(options?: {
     access,
     document,
     window,
-    mount: { panelHost: document.body, toggleHost: document.body, presentation: "overlay" },
+    mount: { panelHost: document.body, toggleHost: document.body, presentation: "overlay", ...options?.mount },
     ui: {
       confirm: options?.confirm || (async () => "discard"),
       renderMarkdown: (source: string) => `<p>${source}</p>`,
+      fileIcons: options?.fileIcons,
     },
+    onMaximizedChanged: options?.onMaximizedChanged,
   });
   return {
     window,
@@ -195,6 +206,41 @@ describe("shared file-panel component", () => {
     await h.switchScope(h.scopes.a);
     expect((h.document.querySelector(".gfp-editor") as HTMLTextAreaElement).value).toBe("draft from app");
     expect(h.panel.hasDirty()).toBe(true);
+  });
+
+  it("a Discard dialog left open across a scope switch closes its OWN scope's tab", async () => {
+    // closeTab awaits the confirm; switching projects meanwhile swaps
+    // currentState, and the same relPath exists in both scopes. Confirming
+    // must discard scope A's draft, never scope B's. (Review find 2026-08-14 —
+    // the identifier-stale-after-await class.)
+    let resolveConfirm: ((answer: string) => void) | null = null;
+    const h = harness({
+      confirm: () => new Promise<string>((resolve) => { resolveConfirm = resolve; }),
+    });
+    await settle();
+    await openAndEdit(h, "notes.md", "draft from app");
+
+    // Close A's dirty tab — the Discard dialog is now pending.
+    click(h.window, h.document.querySelector(".gfp-tab-close"));
+    await settle();
+    expect(resolveConfirm).toBeTruthy();
+
+    // Swap to scope B and give it its own dirty notes.md.
+    await h.switchScope(h.scopes.b);
+    await h.panel.openPath("notes.md", true);
+    click(h.window, h.document.querySelector(".gfp-edit"));
+    type(h.window, h.document, "draft from relay");
+
+    resolveConfirm!("discard");
+    await settle();
+
+    // B's tab and draft survive untouched.
+    expect([...h.document.querySelectorAll(".gfp-tab-name")].map((n) => n.textContent)).toEqual(["notes.md"]);
+    expect((h.document.querySelector(".gfp-editor") as HTMLTextAreaElement).value).toBe("draft from relay");
+
+    // A's tab is the one that closed.
+    await h.switchScope(h.scopes.a);
+    expect([...h.document.querySelectorAll(".gfp-tab-name")]).toEqual([]);
   });
 
   it("hides without confirming or discarding", async () => {
@@ -571,25 +617,29 @@ describe("shared file-panel component", () => {
     expect(h.document.querySelector(".gfp-editor")).toBe(editorBefore);
   });
 
-  it("gives Markdown the desktop's two-icon mode pair, with the current one marked", async () => {
-    // Markdown had become the only file type with a WORDED toggle while every
-    // other text file got a pencil, which is what made the toolbar read as
-    // inconsistent. The desktop reference has always shown Preview and Edit
-    // source as an icon pair with the active mode marked.
+  it("gives Markdown a segmented mode control, with exactly one segment selected", async () => {
+    // Modes are a grouped segmented control, not bar-icons with an underline.
+    // The group, the on-class, and moving the selection are the contract.
     const h = harness();
     await settle();
     await h.panel.openPath("notes.md");
 
+    const group = h.document.querySelector(".gfp-viewer .gfp-seg");
+    expect(group, "markdown must render a .gfp-seg group").toBeTruthy();
     const modes = [...h.document.querySelectorAll(".gfp-mode")];
     expect(modes.map((m) => m.getAttribute("title"))).toEqual(["Preview", "Edit source"]);
     expect(modes.every((m) => !m.textContent?.trim())).toBe(true);
-    expect(modes[0].classList.contains("gfp-active")).toBe(true);
-    expect(modes[1].classList.contains("gfp-active")).toBe(false);
+    expect(modes.every((m) => m.classList.contains("gfp-seg-btn"))).toBe(true);
+    expect(group!.querySelectorAll(".gfp-seg-on")).toHaveLength(1);
+    expect(modes[0].classList.contains("gfp-seg-on")).toBe(true);
+    expect(modes[1].classList.contains("gfp-seg-on")).toBe(false);
 
     click(h.window, modes[1]);
     await settle();
     const after = [...h.document.querySelectorAll(".gfp-mode")];
-    expect(after[1].classList.contains("gfp-active")).toBe(true);
+    expect(h.document.querySelectorAll(".gfp-seg-on")).toHaveLength(1);
+    expect(after[1].classList.contains("gfp-seg-on")).toBe(true);
+    expect(after[0].classList.contains("gfp-seg-on")).toBe(false);
     expect(h.document.querySelector(".gfp-editor")).toBeTruthy();
   });
 
@@ -986,6 +1036,24 @@ describe("the overflow menu opens from every button that offers it", () => {
     await settle();
     expect(h.document.querySelector(".gfp-menu")).toBeNull();
   });
+
+  it("toggles closed on a second click of the same More-actions button", async () => {
+    // Capture-phase outside-click used to null the menu BEFORE the button's
+    // own handler ran, so the same click reopened it. A true toggle must
+    // leave the menu gone.
+    const h = withOsAccess();
+    (h.access as any).openExternal = async () => ({ ok: true });
+    await settle();
+    await h.panel.openPath("src/a.ts");
+    const more = h.document.querySelector(".gfp-viewer .gfp-more");
+    click(h.window, more);
+    await settle();
+    expect(h.document.querySelector(".gfp-menu")).toBeTruthy();
+
+    click(h.window, h.document.querySelector(".gfp-viewer .gfp-more"));
+    await settle();
+    expect(h.document.querySelector(".gfp-menu")).toBeNull();
+  });
 });
 
 // A non-previewable file used to be handed straight to the OS on the desktop,
@@ -1063,5 +1131,321 @@ describe("the error tab's action row appears only when it has actions", () => {
     await h.panel.openPath("app.bin");
     expect(h.document.querySelector(".gfp-viewer-head")).toBeTruthy();
     expect(h.document.querySelector(".gfp-more")).toBeTruthy();
+  });
+});
+
+describe("title strip is a folder label plus file-type tabs", () => {
+  it("renders the project root as a folder icon and a normal-weight name", async () => {
+    const h = harness();
+    await settle();
+    const title = h.document.querySelector(".gfp-title");
+    expect(title).toBeTruthy();
+    expect(title!.querySelector(".gfp-title-icon")).toBeTruthy();
+    expect(title!.querySelector(".gfp-title-icon svg, .gfp-title-icon img, .gfp-title-icon .gfp-file-icon-mono")).toBeTruthy();
+    expect(title!.querySelector(".gfp-title-label")?.textContent).toBe("app");
+    expect(title!.classList.contains("gfp-tab-active")).toBe(false);
+    expect(title!.classList.contains("gfp-title-selected")).toBe(true);
+  });
+
+  it("puts a file-type icon on every tab via the shared fileIcons path", async () => {
+    const h = harness({ fileIcons: { baseUrl: "https://icons.test/file-icons/" } });
+    await settle();
+    await h.panel.openPath("src/a.ts");
+    await h.panel.openPath("notes.md");
+    const tabs = [...h.document.querySelectorAll(".gfp-tab")];
+    expect(tabs).toHaveLength(2);
+    const srcs = tabs.map((tab) => {
+      const img = tab.querySelector(".gfp-tab-icon img") as HTMLImageElement | null;
+      const mono = tab.querySelector(".gfp-tab-icon .gfp-file-icon-mono") as HTMLElement | null;
+      return img?.src || mono?.style.getPropertyValue("--gfp-icon-url") || "";
+    });
+    expect(srcs[0]).toMatch(/typescript\.svg/);
+    expect(srcs[1]).toMatch(/markdown\.svg/);
+    expect(h.document.querySelector(".gfp-title-icon img, .gfp-title-icon .gfp-file-icon-mono")).toBeTruthy();
+  });
+
+  it("stripShrinkState is compact at the default split and extreme near min width", () => {
+    expect(STRIP_COMPACT_MAX).toBe(360);
+    expect(STRIP_EXTREME_MAX).toBe(240);
+    expect(stripShrinkState(280, 0)).toEqual({ compact: false, extreme: false });
+    expect(stripShrinkState(280, 1)).toEqual({ compact: true, extreme: false });
+    expect(stripShrinkState(361, 2)).toEqual({ compact: false, extreme: false });
+    expect(stripShrinkState(360, 2)).toEqual({ compact: true, extreme: false });
+    expect(stripShrinkState(240, 1)).toEqual({ compact: true, extreme: true });
+    expect(stripShrinkState(0, 3)).toEqual({ compact: false, extreme: false });
+  });
+
+  it("stamps gfp-strip-compact and gfp-strip-extreme from the panel width", async () => {
+    const h = harness();
+    await settle();
+    await h.panel.openPath("notes.md");
+    const el = h.panel.element as HTMLElement & { getBoundingClientRect: () => DOMRect };
+    el.getBoundingClientRect = () => ({ width: 280, height: 40, top: 0, left: 0, right: 280, bottom: 40, x: 0, y: 0, toJSON() { return {}; } }) as DOMRect;
+    h.panel._applyStripShrink();
+    expect(el.classList.contains("gfp-strip-compact")).toBe(true);
+    expect(el.classList.contains("gfp-strip-extreme")).toBe(false);
+    el.getBoundingClientRect = () => ({ width: 220, height: 40, top: 0, left: 0, right: 220, bottom: 40, x: 0, y: 0, toJSON() { return {}; } }) as DOMRect;
+    h.panel._applyStripShrink();
+    expect(el.classList.contains("gfp-strip-compact")).toBe(true);
+    expect(el.classList.contains("gfp-strip-extreme")).toBe(true);
+    el.getBoundingClientRect = () => ({ width: 480, height: 40, top: 0, left: 0, right: 480, bottom: 40, x: 0, y: 0, toJSON() { return {}; } }) as DOMRect;
+    h.panel._applyStripShrink();
+    expect(el.classList.contains("gfp-strip-compact")).toBe(false);
+    expect(el.classList.contains("gfp-strip-extreme")).toBe(false);
+  });
+});
+
+describe("desktop maximize is opt-in on the mount", () => {
+  it("does not render the control unless the mount asks for it", async () => {
+    const h = harness();
+    await settle();
+    expect(h.document.querySelector(".gfp-maximize")).toBeNull();
+    expect(h.panel.isMaximized()).toBe(false);
+    expect(h.panel.setMaximized(true)).toBe(false);
+  });
+
+  it("toggles the maximized class and restores on Escape", async () => {
+    const seen: boolean[] = [];
+    const h = harness({
+      mount: { maximize: true },
+      onMaximizedChanged: (max) => { seen.push(max); },
+    });
+    await settle();
+    h.panel.setOpen(true);
+    const btn = h.document.querySelector(".gfp-maximize") as HTMLButtonElement | null;
+    expect(btn).toBeTruthy();
+    expect(btn!.getAttribute("aria-label")).toBe("Maximize file panel");
+    click(h.window, btn);
+    expect(h.panel.isMaximized()).toBe(true);
+    expect(h.panel.element.classList.contains("gfp-maximized")).toBe(true);
+    expect(btn!.getAttribute("aria-pressed")).toBe("true");
+    expect(btn!.getAttribute("aria-label")).toBe("Restore file panel");
+    expect(seen).toEqual([true]);
+
+    h.window.dispatchEvent(new h.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(h.panel.isMaximized()).toBe(false);
+    expect(h.panel.element.classList.contains("gfp-maximized")).toBe(false);
+    expect(seen).toEqual([true, false]);
+  });
+
+  it("closing the panel drops maximize so the next open is the split", async () => {
+    const h = harness({ mount: { maximize: true } });
+    await settle();
+    h.panel.setOpen(true);
+    h.panel.setMaximized(true);
+    expect(h.panel.isMaximized()).toBe(true);
+    h.panel.setOpen(false);
+    expect(h.panel.isMaximized()).toBe(false);
+    h.panel.setOpen(true);
+    expect(h.panel.isMaximized()).toBe(false);
+    expect(h.panel.element.classList.contains("gfp-maximized")).toBe(false);
+  });
+});
+
+describe("planStrip three-state layout", () => {
+  const widths = (n: number, full: number, icon: number) => ({
+    tabFullWidths: Array.from({ length: n }, () => full),
+    tabIconWidths: Array.from({ length: n }, () => icon),
+  });
+
+  it("picks A when named tabs plus the title fit", () => {
+    const plan = planStrip({
+      stripWidth: 500,
+      titleWidth: 80,
+      titleIconWidth: 24,
+      trailingWidth: 32,
+      tabCount: 2,
+      activeIndex: 0,
+      ...widths(2, 120, 32),
+      chipWidth: 36,
+    });
+    expect(plan.state).toBe("a");
+    expect(plan.title).toBe("full");
+    expect(plan.visible).toEqual([0, 1]);
+    expect(plan.overflow).toEqual([]);
+    expect(plan.tabModes).toEqual(["full", "full"]);
+  });
+
+  it("demotes inactive tabs to icon-only (B) before overflowing (C)", () => {
+    const base = {
+      titleWidth: 80,
+      titleIconWidth: 24,
+      trailingWidth: 32,
+      tabCount: 3,
+      activeIndex: 1,
+      ...widths(3, 120, 32),
+      chipWidth: 36,
+    };
+    // 80 + 3*120 = 440 > 330-32=298 → not A
+    // 80 + 32 + 120 + 32 = 264 <= 298 → B, title kept; leftover 34 < gain 88
+    // so no idle earns its name back — all-icon B.
+    const tight = planStrip({ ...base, stripWidth: 330 });
+    expect(tight.state).toBe("b");
+    expect(tight.title).toBe("full");
+    expect(tight.visible).toEqual([0, 1, 2]);
+    expect(tight.overflow).toEqual([]);
+    expect(tight.tabModes).toEqual(["icon", "full", "icon"]);
+
+    // At 400 the leftover (368-264=104) covers one idle's gain (120-32=88):
+    // the MOST RECENT idle gets its name back first (owner: with room, show
+    // 2-3 names including the current one; icons for the rest).
+    const roomy = planStrip({ ...base, stripWidth: 400 });
+    expect(roomy.state).toBe("b");
+    expect(roomy.tabModes).toEqual(["icon", "full", "full"]);
+
+    // Title name no longer fits: 80 + 264-80 wait, bTabs=184, title 80 → 264
+    // avail = 220-32 = 188. 80+184=264 > 188; 24+184=208 > 188 → C
+    const squeezed = planStrip({ ...base, stripWidth: 220 });
+    expect(squeezed.state).toBe("c");
+    expect(squeezed.title).toBe("icon");
+    expect(squeezed.visible).toEqual([1]);
+    expect(squeezed.overflow).toEqual([0, 2]);
+    expect(squeezed.tabModes).toEqual(["icon", "full", "icon"]);
+  });
+
+  it("keeps the active tab visible when overflowing and updates membership as it changes", () => {
+    const input = {
+      stripWidth: 160,
+      titleWidth: 80,
+      titleIconWidth: 24,
+      trailingWidth: 32,
+      tabCount: 4,
+      ...widths(4, 130, 36),
+      chipWidth: 36,
+    };
+    const first = planStrip({ ...input, activeIndex: 0 });
+    expect(first.state).toBe("c");
+    expect(first.visible).toEqual([0]);
+    expect(first.overflow).toEqual([1, 2, 3]);
+
+    const last = planStrip({ ...input, activeIndex: 3 });
+    expect(last.state).toBe("c");
+    expect(last.visible).toEqual([3]);
+    expect(last.overflow).toEqual([0, 1, 2]);
+
+    const tree = planStrip({ ...input, activeIndex: -1 });
+    expect(tree.state).toBe("c");
+    expect(tree.visible).toEqual([]);
+    expect(tree.overflow).toEqual([0, 1, 2, 3]);
+  });
+
+  it("honors slack so a barely-fitting A becomes B", () => {
+    const input = {
+      stripWidth: 300,
+      titleWidth: 80,
+      titleIconWidth: 24,
+      trailingWidth: 20,
+      tabCount: 1,
+      activeIndex: 0,
+      tabFullWidths: [200],
+      tabIconWidths: [32],
+      chipWidth: 36,
+    };
+    expect(planStrip(input).state).toBe("a");
+    expect(planStrip({ ...input, slack: 1 }).state).toBe("b");
+  });
+
+  it("stays on A when there is no layout (happy-dom zeros) so DOM tests still see names", () => {
+    const plan = planStrip({
+      stripWidth: 0,
+      titleWidth: 0,
+      titleIconWidth: 0,
+      trailingWidth: 0,
+      tabCount: 5,
+      activeIndex: 2,
+      ...widths(5, 0, 0),
+      chipWidth: 36,
+    });
+    expect(plan.state).toBe("a");
+    expect(plan.visible).toEqual([0, 1, 2, 3, 4]);
+    expect(plan.overflow).toEqual([]);
+  });
+});
+
+describe("tab strip structure follows the overflow design", () => {
+  it("renders a close button only on the active tab", async () => {
+    const h = harness();
+    await settle();
+    await h.panel.openPath("src/a.ts");
+    await h.panel.openPath("notes.md");
+    const tabs = [...h.document.querySelectorAll(".gfp-tab")];
+    expect(tabs).toHaveLength(2);
+    expect(tabs[0].classList.contains("gfp-tab-active")).toBe(false);
+    expect(tabs[0].querySelector(".gfp-tab-close")).toBeNull();
+    expect(tabs[1].classList.contains("gfp-tab-active")).toBe(true);
+    expect(tabs[1].querySelector(".gfp-tab-close")).toBeTruthy();
+    expect(tabs.every((tab) => tab.querySelector(".gfp-tab-icon"))).toBe(true);
+  });
+
+  it("a forced C plan paints the chip, lists the other tabs, and activates on click", async () => {
+    const h = harness({ fileIcons: { baseUrl: "https://icons.test/file-icons/" } });
+    await settle();
+    await openAndEdit(h, "notes.md", "draft");
+    await h.panel.openPath("src/a.ts");
+    await h.panel.openPath("src/b.ts");
+    const tabs = [...h.document.querySelectorAll(".gfp-tab")];
+    expect(tabs).toHaveLength(3);
+    const activeIndex = tabs.findIndex((tab) => tab.classList.contains("gfp-tab-active"));
+    expect(activeIndex).toBe(2);
+
+    h.panel._forceStripPlan(planStrip({
+      stripWidth: 80,
+      titleWidth: 80,
+      titleIconWidth: 24,
+      trailingWidth: 0,
+      tabCount: 3,
+      activeIndex,
+      tabFullWidths: [120, 120, 120],
+      tabIconWidths: [32, 32, 32],
+      chipWidth: 36,
+    }));
+
+    const chip = h.document.querySelector(".gfp-overflow-chip") as HTMLButtonElement | null;
+    expect(chip).toBeTruthy();
+    expect(chip!.textContent).toBe("…");
+    expect(chip!.title).toContain("notes.md");
+    expect(chip!.title).toContain("a.ts");
+    expect(chip!.title).not.toContain("b.ts");
+
+    const visible = [...h.document.querySelectorAll(".gfp-tab")].filter((tab) => !(tab as HTMLElement).hidden);
+    expect(visible).toHaveLength(1);
+    expect(visible[0].querySelector(".gfp-tab-icon")).toBeTruthy();
+    expect(visible[0].querySelector(".gfp-tab-close")).toBeTruthy();
+    const hiddenTabs = [...h.document.querySelectorAll(".gfp-tab")].filter((tab) => (tab as HTMLElement).hidden);
+    expect(hiddenTabs).toHaveLength(2);
+
+    click(h.window, chip);
+    await settle();
+    const menu = h.document.querySelector(".gfp-overflow-menu");
+    expect(menu).toBeTruthy();
+    click(h.window, h.document.querySelector(".gfp-overflow-chip"));
+    await settle();
+    expect(h.document.querySelector(".gfp-overflow-menu")).toBeNull();
+    click(h.window, h.document.querySelector(".gfp-overflow-chip"));
+    await settle();
+    const reopened = h.document.querySelector(".gfp-overflow-menu");
+    expect(reopened).toBeTruthy();
+    const rows = [...reopened!.querySelectorAll(".gfp-overflow-item")];
+    expect(rows.map((row) => row.querySelector(".gfp-overflow-name")?.textContent)).toEqual(["notes.md", "a.ts"]);
+    expect(rows.every((row) => row.querySelector(".gfp-tab-icon"))).toBe(true);
+    expect(rows[0].querySelector(".gfp-overflow-dirty")?.textContent).toBe("•");
+    expect(rows[1].querySelector(".gfp-overflow-dirty")).toBeNull();
+
+    click(h.window, rows[0]);
+    await settle();
+    expect(h.document.querySelector(".gfp-tab-active .gfp-tab-name")?.textContent).toBe("notes.md");
+    expect((h.document.querySelector(".gfp-editor") as HTMLTextAreaElement).value).toBe("draft");
+  });
+
+  it("marks the title as selected in treeMode and not while a file is showing", async () => {
+    const h = harness();
+    await settle();
+    const title = h.document.querySelector(".gfp-title")!;
+    expect(title.classList.contains("gfp-title-selected")).toBe(true);
+    await h.panel.openPath("notes.md");
+    expect(title.classList.contains("gfp-title-selected")).toBe(false);
+    title.dispatchEvent(new h.window.MouseEvent("click", { bubbles: true }));
+    await settle();
+    expect(title.classList.contains("gfp-title-selected")).toBe(true);
   });
 });

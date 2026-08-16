@@ -1,4 +1,5 @@
 import * as assert from "node:assert";
+import * as cp from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -79,6 +80,21 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
   let repoB = "";
   let grokHome = "";
   const prevGrokHome = process.env.GROK_HOME;
+
+  // A few tests below start a REAL session (a resume or a worktree apply
+  // through the live provider), which needs an installed grok CLI — dev boxes
+  // have one, the CI runner does not. Without it those flows dead-end in the
+  // missing-CLI onboarding with no error posted and time out (first caught
+  // 2026-08-15, the tests' first run on Linux). Skip them loudly there; the
+  // proper fix is a fake ACP CLI provisioned by this fixture, so the flows
+  // run everywhere.
+  const grokCliAvailable = (() => {
+    try {
+      cp.execSync(process.platform === "win32" ? "where grok" : "which grok", { stdio: "ignore" });
+      return true;
+    } catch { return false; }
+  })();
+  const liveSessionTest = grokCliAvailable ? test : test.skip;
 
   const storedSessionDirFor = (cwd: string, id: string) =>
     path.join(grokHome, "sessions", encodeURIComponent(cwd), id);
@@ -869,6 +885,133 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     ).pop()?.msg;
     assert.ok(catalog, "the tab must learn that its selection moved");
     assert.strictEqual(norm(catalog.selectedCwd), norm(repoB));
+  });
+
+  liveSessionTest("a remote resume waits for the first catalog build before refusing a still-warming session", async () => {
+    // RED without the warmup retry: findSessionCatalogCwd misses, the host
+    // immediately sends the permanent-sounding "may have been deleted" error,
+    // and writing the session afterward cannot restore it.
+    const id = `warmup-${Date.now()}`;
+    const clientId = `warmup-tab-${Date.now()}`;
+    const delay = hooks.delayFirstCatalogBuild();
+    const posts: Array<{ msg: any; clientIds?: string[] }> = [];
+    hooks.onPost((_dest: string, msg: any, clientIds?: string[]) => posts.push({ msg, clientIds }));
+    try {
+      hooks.fromRemote({ type: "resumeSession", id, cwd: repoB }, clientId);
+      const began = await Promise.race([
+        delay.started.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2000)),
+      ]);
+      writeStoredSession(id);
+      delay.release();
+      assert.ok(began, "the resume must defer the not-found refuse until catalog warmup");
+
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline && hooks.activeRemoteSessionId(clientId) !== id) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.strictEqual(
+        hooks.activeRemoteSessionId(clientId),
+        id,
+        `the session must restore after the catalog warmup: ${JSON.stringify(posts.filter((p) => p.msg?.type === "error"))}`,
+      );
+      assert.ok(!posts.some((p) =>
+        p.clientIds?.includes(clientId) &&
+        p.msg?.type === "error" &&
+        /may have been deleted/.test(p.msg.text)
+      ), JSON.stringify(posts.filter((p) => p.msg?.type === "error")));
+    } finally {
+      delay.release();
+    }
+  });
+
+  liveSessionTest("a remote resume waits for the deferred session-list, not just the catalog post", async () => {
+    // RED if "warmed" is the start/end of postRepoCatalog: the catalog half has
+    // already run, the wait is skipped, and writing the session afterward cannot
+    // restore it. GREEN only when firstBootScanCompleted waits for the deferred
+    // session-list as well.
+    const id = `warmup-list-${Date.now()}`;
+    const clientId = `warmup-list-tab-${Date.now()}`;
+    const delay = hooks.delayFirstCatalogBuild();
+    const posts: Array<{ msg: any; clientIds?: string[] }> = [];
+    hooks.onPost((_dest: string, msg: any, clientIds?: string[]) => posts.push({ msg, clientIds }));
+    try {
+      delay.beginDeferred();
+      const catalogPosted = await Promise.race([
+        delay.started.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2000)),
+      ]);
+      assert.ok(catalogPosted, "the deferred first-boot pass must reach catalog-done / session-list-held");
+
+      hooks.fromRemote({ type: "resumeSession", id, cwd: repoB }, clientId);
+      // The resume is async. Give the first lookup a chance to miss (session is
+      // not on disk yet) and either refuse (old warmed-at-catalog) or wait.
+      await new Promise((r) => setTimeout(r, 150));
+      writeStoredSession(id);
+      delay.release();
+
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline && hooks.activeRemoteSessionId(clientId) !== id) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.strictEqual(
+        hooks.activeRemoteSessionId(clientId),
+        id,
+        `the session must restore after the deferred session-list: ${JSON.stringify(posts.filter((p) => p.msg?.type === "error"))}`,
+      );
+      assert.ok(!posts.some((p) =>
+        p.clientIds?.includes(clientId) &&
+        p.msg?.type === "error" &&
+        /may have been deleted/.test(p.msg.text)
+      ), JSON.stringify(posts.filter((p) => p.msg?.type === "error")));
+    } finally {
+      delay.release();
+    }
+  });
+
+  test("a genuinely missing remote resume carries resumeFailed with the requested id", async () => {
+    // RED without the machine-readable field: the error is human text only.
+    const id = `gone-${Date.now()}`;
+    const clientId = `missing-field-${Date.now()}`;
+    const posts: Array<{ msg: any; clientIds?: string[] }> = [];
+    hooks.onPost((_dest: string, msg: any, clientIds?: string[]) => posts.push({ msg, clientIds }));
+    hooks.fromRemote({ type: "selectRepo", cwd: repoB }, clientId);
+    hooks.fromRemote({ type: "resumeSession", id, cwd: repoB }, clientId);
+
+    const deadline = Date.now() + 15000;
+    const missing = () => posts.find((p) =>
+      p.clientIds?.includes(clientId) &&
+      p.msg?.type === "error" &&
+      /may have been deleted/.test(p.msg.text)
+    );
+    while (Date.now() < deadline && !missing()) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const err = missing();
+    assert.ok(err, "a missing session id must surface Could not restore");
+    assert.deepStrictEqual(err!.msg.resumeFailed, { id });
+  });
+
+  test("the already-open-in-another-tab refusal carries resumeFailed", async () => {
+    // RED without the field on the theft refuse.
+    hooks.seedRemoteSession("tab-a", "session-a", repoB, [], true);
+    hooks.seedRemoteSession("tab-b", "session-b", repoB, [], true);
+    const posts: Array<{ msg: any; clientIds?: string[] }> = [];
+    hooks.onPost((_dest: string, msg: any, clientIds?: string[]) => posts.push({ msg, clientIds }));
+    hooks.fromRemote({ type: "resumeSession", id: "session-a", cwd: repoB }, "tab-b");
+
+    const deadline = Date.now() + 15000;
+    const theft = () => posts.find((p) =>
+      p.clientIds?.includes("tab-b") &&
+      p.msg?.type === "error" &&
+      /already open/.test(p.msg.text)
+    );
+    while (Date.now() < deadline && !theft()) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const err = theft();
+    assert.ok(err, "tab-b must be refused when the session is live in another tab");
+    assert.deepStrictEqual(err!.msg.resumeFailed, { id: "session-a" });
   });
 
   test("resume never steals another tab's live session or silently blank-starts a missing one", async () => {
@@ -1804,6 +1947,114 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     ));
     const provoked = posts.filter((p) => p.msg?.type === "hostNotice" || p.msg?.type === "error");
     assert.ok(!provoked.some((p) => p.dest === "local"));
+  });
+
+  test("forkSession with a matching sessionId proceeds for that tab", async () => {
+    hooks.seedRemoteSession("fork-match", "fork-match-session", repoB);
+    const posts: Array<{ dest: string; msg: any; clientIds?: string[] }> = [];
+    hooks.onPost((dest: string, msg: any, clientIds?: string[]) => posts.push({ dest, msg, clientIds }));
+
+    hooks.fromRemote({ type: "forkSession", sessionId: "fork-match-session" }, "fork-match");
+    await new Promise((r) => setTimeout(r, 100));
+
+    assert.ok(posts.some((p) =>
+      p.msg?.type === "hostNotice" &&
+      /Nothing to fork/.test(p.msg.text) &&
+      p.clientIds?.length === 1 &&
+      p.clientIds[0] === "fork-match"
+    ));
+    assert.ok(!posts.some((p) =>
+      p.msg?.type === "hostNotice" && /no longer focused/.test(p.msg.text)
+    ));
+  });
+
+  test("forkSession with a different sessionId is refused for that tab only", async () => {
+    hooks.seedRemoteSession("fork-stale", "fork-stale-session", repoB);
+    const posts: Array<{ dest: string; msg: any; clientIds?: string[] }> = [];
+    hooks.onPost((dest: string, msg: any, clientIds?: string[]) => posts.push({ dest, msg, clientIds }));
+
+    hooks.fromRemote({ type: "forkSession", sessionId: "some-other-session" }, "fork-stale");
+    await new Promise((r) => setTimeout(r, 100));
+
+    assert.ok(posts.some((p) =>
+      p.msg?.type === "hostNotice" &&
+      p.msg.text === "That conversation is no longer focused — nothing was changed." &&
+      p.clientIds?.length === 1 &&
+      p.clientIds[0] === "fork-stale"
+    ));
+    assert.ok(!posts.some((p) =>
+      p.msg?.type === "hostNotice" && /Nothing to fork/.test(p.msg.text)
+    ));
+    assert.ok(!posts.some((p) => p.dest === "local"));
+  });
+
+  test("forkSession without a sessionId still proceeds (old client)", async () => {
+    hooks.seedRemoteSession("fork-legacy", "fork-legacy-session", repoB);
+    const posts: Array<{ dest: string; msg: any; clientIds?: string[] }> = [];
+    hooks.onPost((dest: string, msg: any, clientIds?: string[]) => posts.push({ dest, msg, clientIds }));
+
+    hooks.fromRemote({ type: "forkSession" }, "fork-legacy");
+    await new Promise((r) => setTimeout(r, 100));
+
+    assert.ok(posts.some((p) =>
+      p.msg?.type === "hostNotice" &&
+      /Nothing to fork/.test(p.msg.text) &&
+      p.clientIds?.length === 1 &&
+      p.clientIds[0] === "fork-legacy"
+    ));
+    assert.ok(!posts.some((p) =>
+      p.msg?.type === "hostNotice" && /no longer focused/.test(p.msg.text)
+    ));
+  });
+
+  test("local applyWorktree/removeWorktree with a stale sessionId are refused", async () => {
+    const worktree = path.join(hooks.workspaceRoot(), ".int-stale-wt");
+    const probe = hooks.seedFocusedWorktreeSession("focused-wt", {
+      path: worktree,
+      label: "Stale fixture",
+      sourceGitRoot: hooks.workspaceRoot(),
+    });
+    const posts: Array<{ dest: string; msg: any; clientIds?: string[] }> = [];
+    hooks.onPost((dest: string, msg: any, clientIds?: string[]) => posts.push({ dest, msg, clientIds }));
+
+    hooks.fromLocal({ type: "applyWorktree", sessionId: "not-the-focused-session" });
+    hooks.fromLocal({ type: "removeWorktree", sessionId: "not-the-focused-session" });
+    await new Promise((r) => setTimeout(r, 100));
+
+    const refusals = posts.filter((p) =>
+      p.dest === "local" &&
+      p.msg?.type === "hostNotice" &&
+      p.msg.text === "That conversation is no longer focused — nothing was changed."
+    );
+    assert.strictEqual(refusals.length, 2);
+    assert.ok(!posts.some((p) => p.dest === "remote"));
+    assert.strictEqual(probe.applyCount(), 0);
+    assert.strictEqual(probe.removeCount(), 0);
+    probe.restore();
+  });
+
+  liveSessionTest("local applyWorktree/removeWorktree with a matching sessionId run on the focused session", async () => {
+    const worktree = path.join(hooks.workspaceRoot(), ".int-match-wt");
+    const probe = hooks.seedFocusedWorktreeSession("focused-wt-match", {
+      path: worktree,
+      label: "Match fixture",
+      sourceGitRoot: hooks.workspaceRoot(),
+    });
+    const posts: Array<{ dest: string; msg: any }> = [];
+    hooks.onPost((dest: string, msg: any) => posts.push({ dest, msg }));
+
+    hooks.fromLocal({ type: "applyWorktree", sessionId: "focused-wt-match" });
+    hooks.fromLocal({ type: "removeWorktree", sessionId: "focused-wt-match" });
+    await new Promise((r) => setTimeout(r, 100));
+
+    assert.ok(!posts.some((p) =>
+      p.msg?.type === "hostNotice" && /no longer focused/.test(p.msg.text)
+    ));
+    assert.strictEqual(probe.applyCount(), 1);
+    assert.strictEqual(probe.lastApplyPath(), worktree);
+    assert.strictEqual(probe.removeCount(), 1);
+    assert.strictEqual(probe.lastRemovePath(), worktree);
+    probe.restore();
   });
 
   test("a remote New session immediately carries its selected worktree binding", async () => {

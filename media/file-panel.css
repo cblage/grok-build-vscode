@@ -63,23 +63,11 @@ body.desk-rail-collapsed #projects-rail,
 body.desk-rail-collapsed #rail-resizer { display: none !important; }
 body.desk-rail-collapsed.has-rail { flex-direction: column; }
 body.desk-rail-collapsed.has-rail > .app-main { width: 100%; }
+/* Show/hide only — box, glyph, and hover come from .icon-btn (bar-icon primitive). */
 .desk-rail-open-btn {
   display: none;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
   margin-right: 4px;
-  padding: 0;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--vscode-descriptionForeground, #999);
-  cursor: pointer;
 }
-.desk-rail-open-btn svg { width: 16px; height: 16px; }
-.desk-rail-open-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.14)); }
 body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
 
 .gfp-panel {
@@ -144,62 +132,170 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   display: flex;
   flex: 0 0 auto;
   align-items: stretch;
-  min-height: 38px;
-  border-bottom: 1px solid var(--gfp-border);
+  min-width: 0;
+  /* 44px everywhere - small tap targets hurt, not only on phones. The
+     overlay bumps this to match the central header's scale (asserted). */
+  min-height: 44px;
+  overflow: hidden;
+  /* The strip is its own surface so the ACTIVE tab can read as attached to
+     the content below by wearing the content's background (see .gfp-tab-active).
+     editorWidget-background is the header tone in both stock palettes; the
+     color-mix fallback tints toward foreground for pages defining neither. */
+  background: var(--vscode-editorGroupHeader-tabsBackground,
+    var(--vscode-editorWidget-background,
+      color-mix(in oklab, var(--vscode-foreground) 4%, var(--vscode-sideBar-background, #1e1e1e))));
+  /* The divider is an INSET line, not a border: children stretch over it, so
+     the opaque active tab covers its own segment and joins the content below
+     seamlessly — a border (or an escaping shadow) would be clipped by this
+     element's overflow:hidden and always show through. */
+  box-shadow: inset 0 -1px 0 var(--gfp-border);
 }
 
+/* Project root: a folder glyph + the repo name at the same weight the rail
+   uses for project rows. Not a heading — no uppercase, no 700, no letter-
+   spacing shout. Idle tabs mix toward descriptionForeground; the title and
+   the active tab keep the inherited foreground token. Theme tokens only. */
 .gfp-title {
+  display: flex;
   flex: 0 1 auto;
-  min-width: 68px;
+  align-items: center;
+  gap: 6px;
+  min-width: 24px;
   overflow: hidden;
-  padding: 0 10px;
+  padding: 0 12px;
   border: 0;
   background: transparent;
   color: inherit;
   font: inherit;
-  font-weight: 600;
+  font-weight: var(--rail-repo-font-weight, 600);
   text-align: start;
-  text-overflow: ellipsis;
+  text-transform: none;
+  letter-spacing: normal;
   white-space: nowrap;
   cursor: pointer;
+}
+.gfp-title-icon,
+.gfp-tab-icon {
+  display: inline-flex;
+  flex: 0 0 16px;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+}
+.gfp-title-icon img,
+.gfp-title-icon svg,
+.gfp-title-icon .gfp-file-icon-mono,
+.gfp-tab-icon img,
+.gfp-tab-icon svg,
+.gfp-tab-icon .gfp-file-icon-mono {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+.gfp-title-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* Only share the strip when there is something to share it WITH. The cap was
    unconditional, so a project name was truncated to 42% of the panel even with
    no tabs open and the whole width free — `grok-build-vsc…` beside an empty
-   strip. */
-.gfp-header:has(.gfp-tabs > *) .gfp-title { max-width: 42%; }
+   strip. Compact/extreme (stamped by stripShrinkState) then yield the TITLE
+   further; tab demotion is planStrip's job, not a min-width floor. */
+.gfp-header:has(.gfp-tabs > *) .gfp-title { max-width: 46%; }
+.gfp-panel.gfp-strip-compact .gfp-title { max-width: 36%; }
+.gfp-panel.gfp-strip-extreme .gfp-title { max-width: 28%; min-width: 24px; }
+.gfp-title.gfp-title-icon-only {
+  flex: 0 0 auto;
+  max-width: none;
+  min-width: 24px;
+  padding-inline: 12px;
+}
+.gfp-title.gfp-title-icon-only .gfp-title-label { display: none; }
+/* Tree showing: the folder is the selected "tab" — content background, no
+   blue top accent. A file tab takes that treatment (with the accent) instead. */
+.gfp-title.gfp-title-selected {
+  background: var(--vscode-tab-activeBackground,
+    var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e)));
+}
 
 .gfp-tabs {
   display: flex;
   flex: 1 1 auto;
   min-width: 0;
-  overflow-x: auto;
-  scrollbar-width: none;
+  /* Never scrolls. Overflowed files live in the … chip menu, not past a fold.
+     padding-right is the gap floor so a full row cannot sit flush against
+     the maximize control; collectStripMeasurements reads it as trailing. */
+  padding-right: 6px;
+  overflow: hidden;
 }
 .gfp-tabs:empty { display: none; }
-.gfp-tabs::-webkit-scrollbar { display: none; }
+/* Class `display:flex` beats the UA `[hidden] { display:none }` (same
+   specificity, later wins) — without this, overflowed tabs stay in the row
+   and State C paints icons AND the chip. */
+.gfp-tab[hidden],
+.gfp-overflow-chip[hidden] { display: none !important; }
+/* Close the run: tabs draw a left edge, so the last item also needs a right
+   one or the last tab dissolves into the empty strip. */
+.gfp-tabs > :last-child { border-right: 1px solid var(--gfp-border); }
+/* No files open: the folder "tab" closes its own right edge — with tabs
+   present the first tab's left border draws that line instead (owner:
+   a borderless folder-only strip read as inconsistent). */
+.gfp-header:not(:has(.gfp-tabs > *)) .gfp-title { border-right: 1px solid var(--gfp-border); }
 
 .gfp-tab {
   position: relative;
   display: flex;
-  flex: 0 1 150px;
+  flex: 0 1 auto;
   align-items: center;
-  min-width: 72px;
+  gap: 5px;
+  /* max-content, NOT auto: Chromium computes a nested-flex tab's intrinsic
+     width using the name's breakable min-content ("CLAUDE." for "CLAUDE.md"),
+     which shaved names beside free space — the owner's CLAUDE…/TESTS… report.
+     max-content sizes the tab to the FULL name; flex-shrink still yields
+     under real pressure, and planStrip decides when that pressure exists. */
+  width: max-content;
+  /* min-width stays `auto` (min-content = icon + X/dot + padding). A numeric
+     floor was the old scroll model's way to stop shrinking — it forced the
+     strip to overflow. Icon and close are flex-none so they survive first. */
   max-width: 170px;
-  padding: 0 3px 0 9px;
+  padding: 0 6px 0 10px;
   border-left: 1px solid var(--gfp-border);
   color: var(--vscode-descriptionForeground, #999);
   cursor: pointer;
 }
 .gfp-tab:hover { background: var(--gfp-hover); color: inherit; }
-.gfp-tab-active { color: inherit; background: var(--vscode-tab-activeBackground, rgba(128, 128, 128, 0.08)); }
-.gfp-tab-active::after {
-  content: "";
-  position: absolute;
-  inset: auto 0 0;
-  height: 1px;
-  background: var(--vscode-focusBorder, #007acc);
+.gfp-tab-active {
+  flex: 0 1 auto;
+  /* Icon + X + padding/gaps. The name may ellipsize to nothing; these two
+     must survive. Not the old 96px scroll-model floor. */
+  min-width: calc(16px + 22px + 16px);
+  /* No fixed ceiling: with space free the FULL name (extension included)
+     shows — the planner and the strip's real width are the only bounds, and
+     ellipsis appears only when flex genuinely has nothing left to give.
+     Icon and X survive regardless (min-width floor + flex-none children). */
+  max-width: none;
+  color: inherit;
+  /* Selection reads as CONTINUITY with the content, not as a fill: the active
+     tab wears the panel content's own background (owner, 2026-08-14 — the old
+     foreground-mix fallback painted it DARKER than the strip in light themes,
+     which reads as unselected; raised elements are the lighter ones). The
+     accent moved to the TOP edge, and the 1px drop-shadow below covers the
+     header's border so tab and content join seamlessly — the editor-tab
+     pattern, polarity-correct in both themes by construction. */
+  background: var(--vscode-tab-activeBackground,
+    var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e)));
+  box-shadow: inset 0 1px 0 var(--vscode-focusBorder, #007acc);
 }
+/* No name cap in B/C: ~10ch is the planner's MINIMUM guarantee, never a
+   ceiling — planStrip budgets the active tab at its full width, and capping
+   here truncated CLAUDE.md beside free space (uppercase runs wider than ch).
+   The active max-width above is the only bound; ellipsis is the last resort. */
+.gfp-tab-icon,
+.gfp-tab-close { flex-shrink: 0; }
 .gfp-tab-name {
   flex: 1 1 auto;
   min-width: 0;
@@ -208,6 +304,57 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   white-space: nowrap;
 }
 .gfp-tab-dirty { flex: 0 0 10px; text-align: center; }
+.gfp-tab-icon-only {
+  flex: 0 0 auto;
+  max-width: none;
+  padding: 0 8px;
+}
+.gfp-tab-icon-only .gfp-tab-name { display: none; }
+.gfp-tab-icon-only .gfp-tab-dirty:empty { display: none; }
+/* Fingers need a wider target than a 16px glyph + padding gives (the relay's
+   touch gate floors tappables at 36px). The planner measures the DOM, so the
+   wider tabs feed straight back into the A/B/C decision on touch. */
+@media (pointer: coarse) {
+  .gfp-tab-icon-only { justify-content: center; min-width: 40px; }
+  .gfp-overflow-chip { min-width: 40px; }
+}
+
+/* The chip IS a tab (owner): same cell chrome as an idle tab — full height,
+   both edges, idle-tab tone, hover — holding "…" where a name would sit. */
+.gfp-overflow-chip {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  min-width: 40px;
+  padding: 0 10px;
+  border: 0;
+  border-left: 1px solid var(--gfp-border);
+  border-right: 1px solid var(--gfp-border);
+  background: transparent;
+  color: var(--vscode-descriptionForeground, #999);
+  font: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+.gfp-overflow-chip:hover { background: var(--gfp-hover); color: inherit; }
+.gfp-overflow-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.gfp-overflow-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gfp-overflow-dirty { flex: 0 0 auto; }
 .gfp-tab-close,
 .gfp-close,
 .gfp-icon-button,
@@ -216,27 +363,76 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
   padding: 0;
   border: 0;
-  border-radius: 5px;
   background: transparent;
   color: var(--vscode-descriptionForeground, #999);
   cursor: pointer;
 }
-.gfp-tab-close { width: 22px; height: 22px; }
-.gfp-tab-close:hover,
+/* Exception: in-tab close is a tab-cell affordance one step under bar scale.
+   Glyph 14 (15 on coarse); not the 20px bar-icon primitive. */
+.gfp-tab-close { width: 22px; height: 22px; border-radius: 5px; }
+.gfp-tab-close svg { width: 14px; height: 14px; }
+.gfp-tab-close:hover { background: var(--gfp-hover); color: inherit; }
+/* Bar-icon primitive (same recipe as chat.css .icon-btn): 20×20 glyph,
+   invisible 28×28 hit box, hover is color only. The box never paints. */
+.gfp-close,
+.gfp-icon-button,
+.gfp-toggle {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  border-radius: 8px;
+}
+.gfp-close svg,
+.gfp-icon-button svg,
+.gfp-toggle svg { width: 20px; height: 20px; }
 .gfp-close:hover,
 .gfp-icon-button:hover,
-.gfp-toggle:hover { background: var(--gfp-hover); color: inherit; }
-.gfp-tab-close svg { width: 12px; height: 12px; }
-.gfp-close svg { width: 18px; height: 18px; }
-.gfp-icon-button svg,
-.gfp-toggle svg { width: 16px; height: 16px; }
+.gfp-toggle:hover {
+  color: var(--vscode-foreground, inherit);
+  background: transparent;
+}
+.gfp-close:active,
+.gfp-icon-button:active,
+.gfp-toggle:active { opacity: 0.82; }
+.gfp-close:focus-visible,
+.gfp-icon-button:focus-visible,
+.gfp-toggle:focus-visible {
+  color: var(--vscode-foreground, inherit);
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: -2px;
+}
 
-.gfp-close { align-self: center; margin: 0 6px 0 2px; color: inherit; }
+.gfp-close { align-self: center; margin: 0 8px 0 auto; }
 .gfp-close[hidden] { display: none !important; }
+
+/* Bar-icon primitive via .gfp-icon-button. Desktop mount opts in via
+   mount.maximize; the control is absent on remote/phone. */
+.gfp-maximize {
+  align-self: center;
+  /* Pinned to the strip's RIGHT edge (owner): margin-left auto keeps it there
+     even when the tabs container is empty/display:none and nothing grows. */
+  margin: 0 4px 0 auto;
+}
+.gfp-maximize[hidden] { display: none !important; }
+
+/* Maximized is a layout class, never a persisted width. --gfp-width stays the
+   restore size; this just lets the panel eat the content row. */
+.gfp-panel.gfp-maximized {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+body.desk-ft-maximized .desk-ft-chat { display: none !important; }
+body.desk-ft-maximized .gfp-resizer,
+body.desk-ft-maximized #desk-ft-resizer { display: none !important; }
+body.desk-ft-maximized .gfp-panel {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
 
 .gfp-filter {
   flex: 0 0 auto;
@@ -273,7 +469,7 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   gap: 6px;
   box-sizing: border-box;
   width: 100%;
-  min-height: var(--rail-row-min-height, 30px);
+  min-height: var(--rail-row-min-height, 24px);
   padding: 3px 6px 3px calc(6px + var(--gfp-depth, 0) * 12px);
   border-radius: var(--rail-row-radius, 5px);
   cursor: pointer;
@@ -352,6 +548,14 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   padding: 2px 6px;
   border-bottom: 1px solid var(--gfp-border);
 }
+/* Parks Cancel / Save / ⋯ at the trailing edge. Modes stay on the left. */
+.gfp-viewer-end {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
 .gfp-back svg { transform: rotate(180deg); }
 .gfp-viewer-name {
   flex: 1 1 auto;
@@ -408,6 +612,8 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
    hiding the underlay entirely — a browser-only failure that no DOM test can
    see, caught by `npm run e2e:screens`. Specificity, not order, so moving these
    rules cannot silently break it again. */
+/* Touch exception: stay 12px (code columns over point size). The two layers
+   must always change together — alignment is the feature. */
 .gfp-viewer-body pre.gfp-code-underlay,
 .gfp-editor.gfp-editor-overlaid {
   box-sizing: border-box;
@@ -539,12 +745,9 @@ body.vscode-light {
   font-size: 12px;
   cursor: pointer;
 }
-/* An action button's icon needs an explicit size, like every other icon holder
-   in this panel. These SVGs carry only a viewBox — the desktop originals baked
-   width/height into each string, and the extraction rewrote them without it, so
-   an icon-only action rendered as an EMPTY BOX. 15px is the desktop's number.
-   Not caught by any test: the DOM suite runs in happy-dom, which has no layout,
-   so a zero-sized icon satisfies every assertion about titles and classes. */
+/* Textual .gfp-action icons (if any) keep a compact glyph. Icon-only viewer
+   actions override to the 20px bar-icon primitive below. SVGs carry only a
+   viewBox, so a size here is load-bearing — without it the button is empty. */
 .gfp-action svg { width: 15px; height: 15px; flex: 0 0 auto; }
 .gfp-action:disabled { opacity: 0.5; cursor: default; }
 .gfp-action-primary { border-color: transparent; background: var(--vscode-button-background, #0e639c); color: var(--vscode-button-foreground, #fff); }
@@ -562,7 +765,11 @@ body.vscode-light {
 
 .gfp-menu {
   position: fixed;
-  z-index: 1000;
+  /* Above the phone's full-screen panel overlay (1200) and the rail (1100):
+     these menus mount on document.body, and at 1000 the chip's dropdown and
+     the viewer's More-actions opened UNDERNEATH the overlay — tapping "…"
+     on mobile presented nothing (owner-caught, 2026-08-15). */
+  z-index: 1300;
   display: flex;
   min-width: 190px;
   flex-direction: column;
@@ -595,12 +802,77 @@ body.vscode-light {
 .gfp-menu-item:disabled { opacity: .4; cursor: default; }
 .gfp-menu-item.danger { color: var(--vscode-errorForeground); }
 
-/* The current Markdown mode. Same treatment the desktop panel gave
-   `.desk-ft-active`, which is why the element carries both class names. */
-.gfp-action.gfp-active {
-  border-color: var(--vscode-focusBorder, #007acc);
-  background: var(--vscode-list-activeSelectionBackground, var(--gfp-hover));
-  color: var(--vscode-list-activeSelectionForeground, inherit);
+/* Viewer toolbar — three primitives, not one:
+   1. .gfp-seg / .gfp-seg-on  — mode segments (Preview / Source). Grouped,
+      1px border, selected fill. Never a bar-icon.
+   2. .gfp-viewer .gfp-action.gfp-icon-only — bare bar-icon actions
+      (Edit file, More). Invisible box, color-only hover.
+   3. .gfp-action — text buttons (Cancel, Save, conflict).
+   Modes are never bar-icons; actions are never segments. */
+.gfp-seg {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: stretch;
+  overflow: hidden;
+  border: 1px solid var(--gfp-border);
+  border-radius: 6px;
+}
+.gfp-seg-btn {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  min-width: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--vscode-descriptionForeground, #999);
+  cursor: pointer;
+}
+.gfp-seg-btn svg { width: 16px; height: 16px; flex: 0 0 auto; }
+.gfp-seg-btn:hover:not(:disabled):not(.gfp-seg-on) {
+  color: var(--vscode-foreground, inherit);
+  background: transparent;
+}
+.gfp-seg-btn:focus-visible {
+  color: var(--vscode-foreground, inherit);
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: -2px;
+}
+.gfp-seg-on {
+  background: var(--vscode-list-activeSelectionBackground, rgba(0, 122, 204, 0.28));
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground, #fff));
+}
+.gfp-seg-on:hover:not(:disabled) {
+  background: var(--vscode-list-activeSelectionBackground, rgba(0, 122, 204, 0.28));
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground, #fff));
+}
+
+.gfp-viewer .gfp-action.gfp-icon-only {
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--vscode-descriptionForeground, #999);
+}
+.gfp-viewer .gfp-action.gfp-icon-only svg { width: 20px; height: 20px; }
+.gfp-viewer .gfp-action.gfp-icon-only:hover:not(:disabled) {
+  color: var(--vscode-foreground, inherit);
+  background: transparent;
+}
+.gfp-viewer .gfp-action.gfp-icon-only:active:not(:disabled) { opacity: 0.82; }
+.gfp-viewer .gfp-action.gfp-icon-only:focus-visible {
+  color: var(--vscode-foreground, inherit);
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: -2px;
 }
 
 /* The filter searches the TREE. With a file open there is no tree to filter, so
@@ -635,16 +907,49 @@ body.vscode-light {
     /* Above the rail (1100), so whichever was opened last is the one you see. */
     z-index: 1200;
   }
-  /* Closing a FILE is not a thing you do here — you leave the panel. Every tab
-     carrying its own X put a 20px target next to a 20px target and made the
-     project tab look closable, which it is not. */
-  .gfp-tab-close { display: none; }
+  .gfp-panel.gfp-overlay .gfp-header { min-height: 51px; }
+  /* The per-tab X used to be hidden here ("you leave the panel, you don't
+     close files") — that rationale died with the overflow strip: only the
+     ACTIVE tab carries an X now, so there is exactly one, and the owner's
+     invariant is that the active tab's X is always visible, phone included.
+     The header's own ✕ still closes the PANEL. */
 }
 
 @media (hover: none) and (pointer: coarse) {
-  .gfp-close { width: 40px; height: 40px; }
-  .gfp-close svg { width: 20px; height: 20px; }
+  .gfp-panel { font-size: 15px; }
+  .gfp-viewer-name { font-size: 14px; }
+  /* Reader prose — 12px on a phone was the worst text in the app. 1.55 matches .desk-ft-md. */
+  .gfp-markdown { font-size: 15px; line-height: 1.55; }
+  /* Mirrors --rail-row-min-height for any mount that loads this file without chat.css. */
+  .gfp-row { min-height: 36px; }
+  /* iOS Safari force-zooms the page when a focused input is under 16px. */
+  .gfp-filter { font-size: 16px; }
+  /* The 36px segments fill the toolbar's 36px min-height edge to edge on
+     touch; give the row air. Desktop keeps 2px — its 28px controls already
+     breathe inside the same min-height. */
+  .gfp-viewer-head { padding-block: 6px; }
+  .gfp-close,
+  .gfp-icon-button,
+  .gfp-toggle,
+  .gfp-viewer .gfp-action.gfp-icon-only,
+  .gfp-seg-btn {
+    width: 36px;
+    height: 36px;
+    min-width: 36px;
+    min-height: 36px;
+  }
+  /* Finger-sized close on the active tab (the relay's tap floor is 36px).
+     Glyph stays 15 — in-tab affordance, not the 20px bar scale. */
+  .gfp-tab-close { width: 36px; height: 36px; }
+  .gfp-tab-close svg { width: 15px; height: 15px; }
   .gfp-row-actions { display: flex; }
+  /* 36px buttons + 1px inset overflow a 36px row; cap to the inset box. */
+  .gfp-row-actions .gfp-icon-button {
+    width: 34px;
+    height: 34px;
+    min-width: 34px;
+    min-height: 34px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -57,6 +57,80 @@ const BLANK_ICONS = `() => {
   return bad;
 }`;
 
+/** Bar-icon primitive: every visible icon-only chrome member is 20×20 with
+ *  an unpainted box (no border, transparent background). Pencil stays 16;
+ *  the in-tab X stays 14 (15 on coarse). Overflow … is a tab, not a member. */
+const BAR_ICONS = `() => {
+  const isTransparent = (c) => {
+    if (!c || c === "transparent") return true;
+    const m = String(c).match(/^rgba?\\((\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)(?:\\s*,\\s*([\\d.]+))?\\)$/);
+    return !!(m && m[1] === "0" && m[2] === "0" && m[3] === "0" && (m[4] === undefined || Number(m[4]) === 0));
+  };
+  const isVisible = (el) => {
+    if (!el || el.hidden) return false;
+    const s = getComputedStyle(el);
+    if (s.display === "none" || s.visibility === "hidden") return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && (el.offsetParent !== null || s.position === "fixed");
+  };
+  const paintedSvg = (el) => [...el.querySelectorAll("svg")].find((n) => getComputedStyle(n).display !== "none");
+  const glyphW = (el) => {
+    const svg = paintedSvg(el);
+    return svg ? Math.round(svg.getBoundingClientRect().width) : 0;
+  };
+  const noPaintedBox = (el) => {
+    const s = getComputedStyle(el);
+    const sides = ["Top", "Right", "Bottom", "Left"];
+    const borderNone = sides.every((side) => s["border" + side + "Style"] === "none" || parseFloat(s["border" + side + "Width"]) === 0);
+    return { borderNone, bgClear: isTransparent(s.backgroundColor), bg: s.backgroundColor, border: s.borderTopStyle };
+  };
+  const labelOf = (el) => el.id || el.getAttribute("aria-label") || el.title || String(el.className || "").trim().split(/\\s+/)[0] || "?";
+  const SEL = [
+    ".icon-btn:not(.session-name-edit):not(#session-head-edit)",
+    ".rail-icon-btn",
+    ".desk-rail-open-btn",
+    ".gfp-toggle",
+    ".gfp-icon-button",
+    ".gfp-close",
+    ".gfp-viewer .gfp-action.gfp-icon-only",
+    "#session-head .rail-action-btn",
+    "#session-head-actions .rail-action-btn",
+    "#vscode-session-actions .rail-action-btn",
+  ].join(",");
+  const bad = [];
+  const seen = [];
+  const members = [];
+  for (const el of document.querySelectorAll(SEL)) {
+    if (seen.includes(el) || !isVisible(el)) continue;
+    seen.push(el);
+    const g = glyphW(el);
+    const box = noPaintedBox(el);
+    const what = labelOf(el);
+    members.push({ what, glyph: g, bg: box.bg, border: box.border });
+    if (Math.abs(g - 20) > 1) bad.push(what + " glyph " + g + "px (want 20)");
+    if (!box.borderNone) bad.push(what + " border-style " + box.border);
+    if (!box.bgClear) bad.push(what + " background " + box.bg);
+  }
+  const pencil = document.querySelector("#session-head-edit, button.session-name-edit");
+  if (pencil && isVisible(pencil)) {
+    const g = glyphW(pencil);
+    const box = noPaintedBox(pencil);
+    members.push({ what: "pencil", glyph: g, exempt: true });
+    if (Math.abs(g - 16) > 1) bad.push("pencil glyph " + g + "px (want 16)");
+    if (!box.borderNone) bad.push("pencil border-style " + box.border);
+    if (!box.bgClear) bad.push("pencil background " + box.bg);
+  }
+  const tabX = document.querySelector(".gfp-tab-active:not([hidden]) .gfp-tab-close");
+  if (tabX && isVisible(tabX)) {
+    const g = glyphW(tabX);
+    const coarse = matchMedia("(hover: none) and (pointer: coarse)").matches;
+    const want = coarse ? 15 : 14;
+    members.push({ what: "tab-X", glyph: g, exempt: true });
+    if (Math.abs(g - want) > 1) bad.push("tab-X glyph " + g + "px (want " + want + ")");
+  }
+  return { bad, members };
+}`;
+
 // GROK_HOME is the supported override for the session store (`resolveGrokHome`),
 // so the app reads the fixture's history instead of this machine's.
 const env = { ...process.env, GROK_HOME: qa.grokHome };
@@ -88,6 +162,50 @@ try {
     const blank = await page.evaluate(`(${BLANK_ICONS})()`);
     assert.deepEqual(blank, [], `${where}: icons rendered with no size — ${JSON.stringify(blank)}`);
   };
+  const assertBarIcons = async (where) => {
+    const { bad, members } = await page.evaluate(`(${BAR_ICONS})()`);
+    assert.ok(members.length > 0, `${where}: bar-icon gate measured nothing`);
+    assert.deepEqual(bad, [], `${where}: bar-icon primitive — ${JSON.stringify(bad)} (saw ${JSON.stringify(members)})`);
+    const selected = await page.evaluate(() => {
+      const group = document.querySelector(".gfp-viewer .gfp-seg");
+      if (!group || group.offsetParent === null) return null;
+      const gs = getComputedStyle(group);
+      const on = group.querySelector(".gfp-seg-on");
+      const os = on ? getComputedStyle(on) : null;
+      return {
+        groupBorder: gs.borderTopStyle,
+        groupBorderW: gs.borderTopWidth,
+        onTitle: on?.title || "",
+        onBg: os?.backgroundColor || "",
+        onCount: group.querySelectorAll(".gfp-seg-on").length,
+      };
+    });
+    if (selected) {
+      assert.ok(
+        selected.groupBorder !== "none" && parseFloat(selected.groupBorderW) > 0,
+        `${where}: .gfp-seg must paint a group border (style ${selected.groupBorder}, width ${selected.groupBorderW})`,
+      );
+      assert.equal(selected.onCount, 1, `${where}: segmented control must have exactly one .gfp-seg-on`);
+      const clear = !selected.onBg || selected.onBg === "transparent" || /^rgba\(\s*0,\s*0,\s*0,\s*0\s*\)$/.test(selected.onBg);
+      assert.ok(!clear, `${where}: selected "${selected.onTitle}" must have a filled background (${selected.onBg})`);
+    }
+  };
+
+  const assertToolbarEnd = async (where) => {
+    const info = await page.evaluate(() => {
+      const bar = document.querySelector(".gfp-viewer-head");
+      const end = document.querySelector(".gfp-viewer-end");
+      if (!bar || !end || end.offsetParent === null) return null;
+      const b = bar.getBoundingClientRect();
+      const e = end.getBoundingClientRect();
+      return { barRight: b.right, endRight: e.right, gap: Math.round(b.right - e.right) };
+    });
+    if (!info) return;
+    assert.ok(
+      info.gap >= -2 && info.gap <= 12,
+      `${where}: toolbar end (Cancel/Save/⋯) must sit at the bar's right edge (gap ${info.gap}px) — ${JSON.stringify(info)}`,
+    );
+  };
 
   await page.waitForSelector("#input", { timeout: 45000 });
   await page.waitForSelector("#desk-ft-top-toggle", { timeout: 25000 });
@@ -109,6 +227,7 @@ try {
   assert.equal(bootLayout.left, 0, `desk: documentElement.scrollLeft must stay 0 after boot (got ${bootLayout.left})`);
   await shot("desk-1-chat");
   await assertNoBlankIcons("desk chat");
+  await assertBarIcons("desk chat");
   // Proves the host actually READ the fixture store. Without this the check
   // passes just as happily against an empty rail, which is exactly what a wrong
   // session-directory encoding produces — silently.
@@ -141,28 +260,36 @@ try {
   await page.waitForTimeout(400);
   await shot("desk-2-tree");
   await assertNoBlankIcons("desk tree");
+  await assertBarIcons("desk tree");
 
   await page.locator(".gfp-row", { hasText: "README.md" }).first().click();
   await page.waitForSelector(".gfp-viewer:not([hidden])", { timeout: 25000 });
   await page.waitForTimeout(500);
   await shot("desk-3-file");
   await assertNoBlankIcons("desk file open");
+  await assertBarIcons("desk file open");
   assert.equal(
     await page.evaluate(() => { const f = document.querySelector(".gfp-filter"); return !!f && getComputedStyle(f).display !== "none"; }),
     false,
     "desk: the tree filter must hide once a file is open — it has no tree to search",
   );
   assert.deepEqual(
-    await page.evaluate(() => [...document.querySelectorAll(".gfp-viewer .gfp-action")].map((b) => b.title)),
+    // Modes live in .gfp-seg now; titles still paint in this order because
+    // Preview / Edit source stay first in the toolbar and ⋯ is in the
+    // right-end group. Query by [title] so text buttons (no title) drop out.
+    await page.evaluate(() => [...document.querySelectorAll(".gfp-viewer-head [title]")].map((b) => b.title)),
     ["Preview", "Edit source", "More actions"],
     "desk: Markdown shows the mode pair, plus the host-local actions menu",
   );
+  await assertToolbarEnd("desk file open");
 
-  await page.locator(".gfp-viewer .gfp-action[title='Edit source']").click();
+  await page.locator(".gfp-viewer [title='Edit source']").click();
   await page.waitForSelector(".gfp-editor", { timeout: 25000 });
   await page.waitForTimeout(400);
   await shot("desk-4-edit");
   await assertNoBlankIcons("desk editing");
+  await assertBarIcons("desk editing");
+  await assertToolbarEnd("desk editing");
 
   const geometry = await page.evaluate(() => {
     const panel = document.querySelector(".gfp-panel");
@@ -188,6 +315,277 @@ try {
     geometry.docWidth <= geometry.viewportWidth + 1,
     `desk: the window must not scroll horizontally (${geometry.docWidth} > ${geometry.viewportWidth})`,
   );
+
+  const measureStrip = () =>
+    page.evaluate(() => {
+      const strip = document.querySelector(".gfp-header");
+      const tabs = document.querySelector(".gfp-tabs");
+      const panel = document.querySelector(".gfp-panel");
+      const sr = strip?.getBoundingClientRect();
+      const visibleTabs = [...(tabs?.querySelectorAll(".gfp-tab:not([hidden])") || [])];
+      const iconOf = (root, sel) => [...(root?.querySelectorAll(sel) || [])].map((el) => {
+        const r = el.getBoundingClientRect();
+        return { tag: el.tagName.toLowerCase(), w: Math.round(r.width), h: Math.round(r.height) };
+      });
+      const close = document.querySelector(".gfp-tab-active:not([hidden]) .gfp-tab-close");
+      const cr = close?.getBoundingClientRect();
+      const cs = close ? getComputedStyle(close) : null;
+      return {
+        state: panel?.dataset.stripState || "",
+        titleIcons: iconOf(strip, ".gfp-title-icon img, .gfp-title-icon .gfp-file-icon-mono, .gfp-title-icon svg"),
+        tabIcons: visibleTabs.flatMap((tab) => iconOf(tab, ".gfp-tab-icon img, .gfp-tab-icon .gfp-file-icon-mono, .gfp-tab-icon svg")),
+        tabCount: visibleTabs.length,
+        overflow: strip ? strip.scrollWidth > strip.clientWidth + 1 : true,
+        scrollW: strip ? strip.scrollWidth : 0,
+        clientW: strip ? strip.clientWidth : 0,
+        tabsScroll: tabs ? tabs.scrollWidth > tabs.clientWidth + 1 : true,
+        tabsOverflowX: tabs ? getComputedStyle(tabs).overflowX : "",
+        closeVisible: !!close && !!cs && cs.display !== "none" && cs.visibility !== "hidden",
+        closeLeft: cr ? cr.left : null,
+        closeRight: cr ? cr.right : null,
+        stripLeft: sr ? sr.left : null,
+        stripRight: sr ? sr.right : null,
+        chip: !!document.querySelector(".gfp-overflow-chip"),
+      };
+    });
+
+  const assertStripGeometry = async (where, opts = {}) => {
+    const strip = await measureStrip();
+    assert.ok(strip.titleIcons.length >= 1, `${where}: title strip must paint a folder icon — ${JSON.stringify(strip)}`);
+    if (strip.tabCount > 0) {
+      assert.equal(strip.tabIcons.length, strip.tabCount, `${where}: every rendered tab must have an icon — ${JSON.stringify(strip)}`);
+    }
+    const blank = [...strip.titleIcons, ...strip.tabIcons].filter((icon) => icon.w < 6 || icon.h < 6);
+    assert.deepEqual(blank, [], `${where}: title-strip icons rendered with no size — ${JSON.stringify(strip)}`);
+    assert.equal(strip.overflow, false, `${where}: title strip overflowed horizontally (${strip.scrollW} > ${strip.clientW})`);
+    assert.ok(strip.scrollW <= strip.clientW + 1, `${where}: strip scrollWidth ${strip.scrollW} > clientWidth ${strip.clientW}`);
+    assert.equal(strip.tabsScroll, false, `${where}: tab row scrolled (${strip.tabsOverflowX})`);
+    assert.ok(
+      strip.tabsOverflowX !== "auto" && strip.tabsOverflowX !== "scroll",
+      `${where}: .gfp-tabs must not scroll (overflow-x ${strip.tabsOverflowX})`,
+    );
+    if (strip.closeVisible) {
+      assert.ok(
+        strip.closeLeft >= strip.stripLeft - 1 && strip.closeRight <= strip.stripRight + 1,
+        `${where}: active tab X is clipped by the strip — ${JSON.stringify(strip)}`,
+      );
+    }
+    if (opts.expectChip) {
+      assert.equal(strip.chip, true, `${where}: expected the overflow chip — ${JSON.stringify(strip)}`);
+    }
+    // The maximize control may never vanish or be overlapped, in ANY state —
+    // pinned after the owner asked whether right-alignment had eaten it.
+    const maxi = await page.evaluate(() => {
+      const btn = document.querySelector(".gfp-maximize");
+      const header = document.querySelector(".gfp-header");
+      if (!btn || btn.hidden || !header) return { present: false };
+      const b = btn.getBoundingClientRect();
+      const h = header.getBoundingClientRect();
+      return {
+        present: b.width >= 16 && b.height >= 16,
+        inside: b.left >= h.left - 1 && b.right <= h.right + 1,
+        clearOfTabs: ![...document.querySelectorAll(".gfp-tab:not([hidden]), .gfp-overflow-chip")]
+          .some((t) => { const r = t.getBoundingClientRect(); return r.right > b.left + 1 && r.left < b.right - 1; }),
+      };
+    });
+    assert.ok(maxi.present, `${where}: maximize control missing or unsized`);
+    assert.ok(maxi.inside, `${where}: maximize control clipped outside the strip`);
+    assert.ok(maxi.clearOfTabs, `${where}: a tab or the chip overlaps the maximize control`);
+    return strip;
+  };
+
+  await page.waitForFunction(() => {
+    const imgs = [...document.querySelectorAll(".gfp-header img")];
+    return imgs.length > 0 && imgs.every((img) => img.complete);
+  }, { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(200);
+  await assertStripGeometry("desk 1440 title strip");
+
+  const beforeMax = await page.evaluate(() => {
+    const panel = document.querySelector(".gfp-panel");
+    const chat = document.querySelector(".desk-ft-chat");
+    return {
+      panelW: panel ? Math.round(panel.getBoundingClientRect().width) : 0,
+      chatVisible: !!chat && getComputedStyle(chat).display !== "none",
+      stored: localStorage.getItem("desk-ft-width"),
+    };
+  });
+  assert.ok(beforeMax.panelW >= 200, `desk: panel has no width before maximize (${beforeMax.panelW})`);
+  const maximizeBtn = page.locator("#desk-ft-maximize");
+  assert.ok(await maximizeBtn.isVisible().catch(() => false), "desk: maximize control must be visible on the desktop panel");
+  await maximizeBtn.click();
+  await page.waitForFunction(() => document.body.classList.contains("desk-ft-maximized"), { timeout: 5000 });
+  await page.waitForTimeout(250);
+  await shot("desk-3b-maximized");
+  await assertNoBlankIcons("desk maximized");
+  await assertBarIcons("desk maximized");
+  const maximized = await page.evaluate(() => {
+    const panel = document.querySelector(".gfp-panel");
+    const chat = document.querySelector(".desk-ft-chat");
+    const shell = document.getElementById("desk-ft-shell");
+    const pr = panel?.getBoundingClientRect();
+    const sr = shell?.getBoundingClientRect();
+    const chatCs = chat ? getComputedStyle(chat) : null;
+    return {
+      panelW: pr ? Math.round(pr.width) : 0,
+      shellW: sr ? Math.round(sr.width) : 0,
+      chatDisplay: chatCs?.display || "missing",
+      stored: localStorage.getItem("desk-ft-width"),
+    };
+  });
+  assert.equal(maximized.chatDisplay, "none", `desk: chat must hide while the panel is maximized — ${JSON.stringify(maximized)}`);
+  assert.ok(
+    maximized.panelW >= maximized.shellW - 20 && maximized.panelW <= maximized.shellW + 4,
+    `desk: maximized panel must fill the content area (panel ${maximized.panelW} vs shell ${maximized.shellW})`,
+  );
+  assert.equal(
+    maximized.stored,
+    beforeMax.stored,
+    `desk: maximize must not persist a width (stored ${maximized.stored}, was ${beforeMax.stored})`,
+  );
+  await assertStripGeometry("desk maximized title strip");
+  await maximizeBtn.click();
+  await page.waitForFunction(() => !document.body.classList.contains("desk-ft-maximized"), { timeout: 5000 });
+  await page.waitForTimeout(250);
+  const restored = await page.evaluate(() => {
+    const panel = document.querySelector(".gfp-panel");
+    const chat = document.querySelector(".desk-ft-chat");
+    return {
+      panelW: panel ? Math.round(panel.getBoundingClientRect().width) : 0,
+      chatVisible: !!chat && getComputedStyle(chat).display !== "none",
+    };
+  });
+  assert.equal(restored.chatVisible, true, "desk: chat must return after restore");
+  assert.ok(
+    Math.abs(restored.panelW - beforeMax.panelW) <= 8,
+    `desk: restore must return the prior split width (was ${beforeMax.panelW}, now ${restored.panelW})`,
+  );
+  await shot("desk-3c-restored");
+
+  // Three-state strip: open several files, then walk widths until A/B/C each
+  // appear. The old scroll model hid later tabs; this is the replacement.
+  const showTree = async () => {
+    if (await page.locator(".gfp-viewer:not([hidden])").isVisible().catch(() => false)) {
+      await page.locator("#desk-ft-title").click();
+      await page.waitForSelector(".gfp-tree:not([hidden])", { timeout: 10000 });
+      await page.waitForTimeout(150);
+    }
+  };
+  const openTreeRow = async (label) => {
+    await showTree();
+    await page.locator(".gfp-row", { hasText: label }).first().click();
+    await page.waitForTimeout(200);
+  };
+  const setPanelWidth = async (px) => {
+    await page.evaluate((w) => {
+      const panel = document.querySelector(".gfp-panel");
+      if (panel) panel.style.setProperty("--gfp-width", `${w}px`);
+    }, px);
+    await page.waitForTimeout(280);
+  };
+  await openTreeRow("package.json");
+  await openTreeRow("src");
+  await openTreeRow("index.ts");
+  await openTreeRow("util.ts");
+  await openTreeRow("docs");
+  await openTreeRow("notes.md");
+  const openTabCount = await page.evaluate(() => document.querySelectorAll(".gfp-tab").length);
+  assert.ok(openTabCount >= 3, `desk: need 3+ open files to reach B/C (got ${openTabCount})`);
+
+  const seenStates = new Set();
+  const recordState = async (name) => {
+    const strip = await assertStripGeometry(name);
+    seenStates.add(strip.state);
+    await shot(name);
+    return strip;
+  };
+
+  await maximizeBtn.click();
+  await page.waitForFunction(() => document.body.classList.contains("desk-ft-maximized"), { timeout: 5000 });
+  await page.waitForTimeout(250);
+  await recordState("desk-strip-a");
+  await maximizeBtn.click();
+  await page.waitForFunction(() => !document.body.classList.contains("desk-ft-maximized"), { timeout: 5000 });
+  await page.waitForTimeout(250);
+
+  let stateC = null;
+  for (const width of [400, 320, 280, 240, 220, 200]) {
+    await setPanelWidth(width);
+    const strip = await assertStripGeometry(`desk strip @${width}`);
+    if (strip.state && !seenStates.has(strip.state)) {
+      seenStates.add(strip.state);
+      await shot(`desk-strip-${strip.state}`);
+    }
+    if (strip.state === "c") stateC = strip;
+    if (seenStates.has("b") && seenStates.has("c")) break;
+  }
+  assert.ok(seenStates.has("a"), `desk: never reached strip state A — saw ${[...seenStates]}`);
+  assert.ok(seenStates.has("b"), `desk: never reached strip state B — saw ${[...seenStates]}`);
+  assert.ok(seenStates.has("c"), `desk: never reached strip state C — saw ${[...seenStates]}`);
+  assert.equal(stateC?.chip, true, `desk: state C must show the overflow chip — ${JSON.stringify(stateC)}`);
+
+  // Resize convergence (owner: "tabs never longer than needed, always match
+  // the last resolution"). Bounce the width and settle back wide, twice: every
+  // named tab must sit at its measured content width (no wider), and the
+  // second settle must reproduce the first — a +1px-per-pass basis ratchet
+  // once made tabs grow forever across resizes.
+  const settleMeasure = async () => {
+    await setPanelWidth(430);
+    await page.waitForTimeout(300);
+    return page.evaluate(() =>
+      [...document.querySelectorAll(".gfp-tab:not([hidden]):not(.gfp-tab-icon-only)")]
+        .map((el) => ({
+          rel: el.dataset.rel,
+          w: Math.round(el.getBoundingClientRect().width),
+          fullW: Math.round(Number(el.dataset.fullW) || 0),
+        })));
+  };
+  const settled1 = await settleMeasure();
+  await setPanelWidth(220);
+  await page.waitForTimeout(300);
+  const settled2 = await settleMeasure();
+  assert.ok(settled1.length >= 1, `desk: expected named tabs at 430px — ${JSON.stringify(settled1)}`);
+  for (const t of settled2) {
+    assert.ok(
+      t.w <= t.fullW + 2,
+      `desk: tab ${t.rel} renders wider than its content (${t.w} > fullW ${t.fullW})`,
+    );
+  }
+  assert.deepEqual(
+    settled2, settled1,
+    "desk: re-settling at the same width must reproduce identical tab widths (basis ratchet?)",
+  );
+  // Back to the narrow width the chip interaction below expects (state C).
+  await setPanelWidth(200);
+  await page.waitForTimeout(300);
+
+  await page.locator(".gfp-overflow-chip").click();
+  await page.waitForSelector(".gfp-overflow-menu", { timeout: 5000 });
+  const overflowMenu = await page.evaluate(() => {
+    const menu = document.querySelector(".gfp-overflow-menu");
+    const rows = [...(menu?.querySelectorAll(".gfp-overflow-item") || [])].map((row) => ({
+      name: row.querySelector(".gfp-overflow-name")?.textContent || "",
+      icon: !!row.querySelector(".gfp-tab-icon img, .gfp-tab-icon .gfp-file-icon-mono, .gfp-tab-icon svg"),
+      dirty: !!row.querySelector(".gfp-overflow-dirty"),
+    }));
+    return { open: !!menu, rows };
+  });
+  assert.equal(overflowMenu.open, true, "desk: overflow chip must open a dropdown");
+  assert.ok(overflowMenu.rows.length >= 2, `desk: overflow menu should list the other files — ${JSON.stringify(overflowMenu)}`);
+  assert.ok(
+    overflowMenu.rows.every((row) => row.icon && row.name),
+    `desk: every overflow row needs an icon and a name — ${JSON.stringify(overflowMenu)}`,
+  );
+  await shot("desk-strip-c-menu");
+  await page.locator(".gfp-overflow-chip").click();
+  await page.waitForFunction(() => !document.querySelector(".gfp-overflow-menu"), { timeout: 5000 });
+  await setPanelWidth(280);
+
+  await page.setViewportSize({ width: 1024, height: 900 });
+  await page.waitForTimeout(300);
+  await assertStripGeometry("desk 1024 title strip");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(300);
 
   // RENAME MUST NOT RESIZE THE BAR. Clicking the conversation name swaps a
   // label for an input, and if the two boxes measure differently the whole row
@@ -232,6 +630,7 @@ try {
   const duringRename = await renameBoxes();
   await shot("desk-5-rename");
   await assertNoBlankIcons("desk renaming");
+  await assertBarIcons("desk renaming");
   assert.deepEqual(
     duringRename,
     beforeRename,

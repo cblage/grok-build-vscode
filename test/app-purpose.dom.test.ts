@@ -114,7 +114,10 @@ describe("app purpose + session menu (DOM)", () => {
     expect(cont).toBeTruthy();
     click(h.window, cont!);
     await Promise.resolve();
-    expect(h.posted.find((m) => m.type === "forkSession")).toEqual({ type: "forkSession" });
+    expect(h.posted.find((m) => m.type === "forkSession")).toEqual({
+      type: "forkSession",
+      sessionId: "active",
+    });
     // No destination popup — gear closes without a "Where?" panel.
     expect(gearText(h)).not.toContain("Use a new worktree");
   });
@@ -144,7 +147,10 @@ describe("app purpose + session menu (DOM)", () => {
     // Workspace is focused default — click it forks.
     click(h.window, findGearItem(h, /Use this workspace/)!);
     await Promise.resolve();
-    expect(h.posted.find((m) => m.type === "forkSession")).toBeTruthy();
+    expect(h.posted.find((m) => m.type === "forkSession")).toEqual({
+      type: "forkSession",
+      sessionId: "active",
+    });
   });
 
   it("Coding → worktree destination posts newWorktreeSession", async () => {
@@ -234,6 +240,103 @@ describe("app purpose + session menu (DOM)", () => {
     openGear(h);
     expect(findGearItem(h, /Apply worktree/)).toBeFalsy();
     expect(findGearItem(h, /Remove worktree/)).toBeFalsy();
+  });
+
+  it("posts forkSession / applyWorktree / removeWorktree with the confirmed-active sessionId", async () => {
+    const h = bootWebview({ ready: true, vscode: true });
+    dispatch(h.window, {
+      type: "initialState",
+      effort: "",
+      cwd: "/w",
+      useCtrlEnter: false,
+      extVersion: "9.9.9",
+      showThinking: false,
+      expandCommandOutputs: false,
+      steerByDefault: false,
+      soundNotifications: false,
+      processingSound: false,
+      readRepliesAloud: false,
+      appPurpose: "knowledge",
+      capabilities: {},
+    });
+    dispatch(h.window, {
+      type: "session",
+      sessionId: "live-1",
+      models: [],
+      currentModelId: "grok-build",
+      worktree: { label: "feature", path: "/w/.worktrees/feature" },
+    } as never);
+    dispatch(h.window, { type: "sessionName", sessionId: "live-1", name: "Live", cwd: "/w" });
+
+    click(h.window, findSessionMenuItem(h, /Continue in a new chat/)!);
+    await Promise.resolve();
+    expect(h.posted.find((m) => m.type === "forkSession")).toEqual({
+      type: "forkSession",
+      sessionId: "live-1",
+    });
+
+    h.posted.length = 0;
+    openGear(h);
+    click(h.window, findGearItem(h, /Apply worktree/)!);
+    click(h.window, h.doc.querySelector(".confirm-overlay .confirm-primary")!);
+    await Promise.resolve();
+    expect(h.posted.find((m) => m.type === "applyWorktree")).toEqual({
+      type: "applyWorktree",
+      sessionId: "live-1",
+    });
+
+    h.posted.length = 0;
+    openGear(h);
+    click(h.window, findGearItem(h, /Remove worktree/)!);
+    click(h.window, h.doc.querySelector(".confirm-overlay .confirm-danger")!);
+    await Promise.resolve();
+    expect(h.posted.find((m) => m.type === "removeWorktree")).toEqual({
+      type: "removeWorktree",
+      sessionId: "live-1",
+    });
+  });
+
+  it("gear Apply/Remove bind the conversation at dialog-open time, not confirm time", async () => {
+    // Confirmation overlays deliberately outlive a session swap. If the id is
+    // read when the confirm RESOLVES, switching conversations while the dialog
+    // sits open removes the NEW conversation's worktree — the dialog promised
+    // A and acted on B (work loss). The open-time id turns that into a host
+    // refusal instead. (Codex round-1 finding, 2026-08-14.)
+    const h = bootWebview({ ready: true, vscode: true });
+    dispatch(h.window, {
+      type: "initialState",
+      effort: "",
+      cwd: "/w",
+      useCtrlEnter: false,
+      extVersion: "9.9.9",
+      showThinking: false,
+      expandCommandOutputs: false,
+      steerByDefault: false,
+      soundNotifications: false,
+      processingSound: false,
+      readRepliesAloud: false,
+      appPurpose: "knowledge",
+      capabilities: {},
+    });
+    dispatch(h.window, {
+      type: "session",
+      sessionId: "live-1",
+      models: [],
+      currentModelId: "grok-build",
+      worktree: { label: "feature", path: "/w/.worktrees/feature" },
+    } as never);
+    dispatch(h.window, { type: "sessionName", sessionId: "live-1", name: "Live", cwd: "/w" });
+
+    openGear(h);
+    click(h.window, findGearItem(h, /Remove worktree/)!);
+    // The swap arrives while the dialog is open.
+    dispatch(h.window, { type: "sessionName", sessionId: "live-2", name: "Other", cwd: "/w" });
+    click(h.window, h.doc.querySelector(".confirm-overlay .confirm-danger")!);
+    await Promise.resolve();
+    expect(h.posted.find((m) => m.type === "removeWorktree")).toEqual({
+      type: "removeWorktree",
+      sessionId: "live-1",
+    });
   });
 
   it("setAppPurpose posts the choice and Coding reveals thinking control", async () => {

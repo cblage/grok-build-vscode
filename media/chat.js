@@ -2736,20 +2736,28 @@
       addSection("Session");
       addGearItem(`<span class="gear-lead">${ICON.gitBranch}<span>Apply worktree</span></span>`, () => {
         closePopovers();
+        // Bind the conversation at dialog-OPEN time. Confirmation overlays
+        // outlive a session swap, so reading state.activeSessionId after the
+        // await would apply whichever conversation the user switched to; with
+        // the open-time id a stale dialog gets a host refusal instead.
+        const sessionId = state.activeSessionId;
         uiConfirm({
           title: "Apply worktree?",
           body: "Merges this worktree's edits back into the main checkout.",
           confirmLabel: "Apply",
-        }).then((ok) => { if (ok) vscode.postMessage({ type: "applyWorktree" }); });
+        }).then((ok) => { if (ok) vscode.postMessage({ type: "applyWorktree", sessionId }); });
       });
       addGearItem(`<span class="gear-lead">${ICON.gitBranch}<span>Remove worktree</span></span>`, () => {
         closePopovers();
+        // Same open-time binding as Apply — this one discards edits on the
+        // wrong target, which is exactly the class the refusal exists for.
+        const sessionId = state.activeSessionId;
         uiConfirm({
           title: "Remove worktree?",
           body: "This deletes the isolated checkout. Unapplied edits are lost.",
           confirmLabel: "Remove",
           danger: true,
-        }).then((ok) => { if (ok) vscode.postMessage({ type: "removeWorktree" }); });
+        }).then((ok) => { if (ok) vscode.postMessage({ type: "removeWorktree", sessionId }); });
       });
     }
   }
@@ -2874,25 +2882,25 @@
   }
 
   /** One destination → go straight there; several → destination picker. */
-  function beginContinueInNewChat() {
+  function beginContinueInNewChat(sessionId) {
     const dests = continueChatDestinations();
     if (dests.length <= 1) {
-      runContinueDestination(dests[0] ? dests[0].id : "workspace");
+      runContinueDestination(dests[0] ? dests[0].id : "workspace", sessionId);
       return;
     }
-    renderContinueDestinationPicker(dests);
+    renderContinueDestinationPicker(dests, sessionId);
   }
 
-  function runContinueDestination(id) {
+  function runContinueDestination(id, sessionId) {
     closePopovers();
     if (id === "worktree") {
       vscode.postMessage({ type: "newWorktreeSession" });
     } else {
-      vscode.postMessage({ type: "forkSession" });
+      vscode.postMessage({ type: "forkSession", sessionId });
     }
   }
 
-  function renderContinueDestinationPicker(dests) {
+  function renderContinueDestinationPicker(dests, sessionId) {
     state.gearView = "continue";
     gearPopover.innerHTML = "";
     // This panel used to be reachable only from the gear, so it could assume the
@@ -2921,7 +2929,7 @@
       el.tabIndex = i === 0 ? 0 : -1;
       el.onclick = (e) => {
         e.stopPropagation();
-        runContinueDestination(d.id);
+        runContinueDestination(d.id, sessionId);
       };
       gearPopover.appendChild(el);
       if (i === 0) {
@@ -4848,12 +4856,11 @@
    *
    * Separate from `railDisplayTarget` because the two answer different
    * questions, and conflating them is a work-loss bug rather than a cosmetic
-   * one. Several row actions carry **no session id** at all — "Continue in a
-   * new chat" (`newWorktreeSession` / the workspace fork) and Apply / Remove
-   * worktree — so the host executes them against ITS focused session. Offer
-   * them on an optimistic row and clicking a cold session B while A is open
-   * gives B a menu that forks A, or removes A's worktree and discards A's
-   * unapplied edits.
+   * one. Fork / apply / remove now send the conversation's `sessionId` and the
+   * host refuses a mismatch, but `newWorktreeSession` is still untargeted, and
+   * a mistimed click during a transition is still the wrong thing to offer.
+   * Offer them on an optimistic row and clicking a cold session B while A is
+   * open gives B a menu that would try to fork A, or remove A's worktree.
    *
    * So: paint with the display target, gate id-less actions on this one.
    */
@@ -4883,12 +4890,10 @@
   }
 
   /**
-   * Whether the ⋯ menu may offer the actions that carry NO session id —
-   * "Continue in a new chat", Apply worktree, Remove worktree.
+   * Whether the ⋯ menu may offer Continue / Apply / Remove.
    *
-   * The host runs all three against ITS OWN focused session
-   * (`forkFocusedSession`, `applyFocusedWorktree`, `removeFocusedWorktree`),
-   * and `openSessionReserved` reassigns `this.focused` BEFORE it switches the
+   * Those actions now name a `sessionId`, and the host refuses a mismatch, but
+   * `openSessionReserved` reassigns `this.focused` BEFORE it switches the
    * workspace, starts the session, or emits `sessionName` / `sessions.activeId`.
    *
    * So for the whole length of a rail transition the client genuinely cannot
@@ -5863,7 +5868,7 @@
         {
           label: "Continue in a new chat",
           icon: ICON.gitFork,
-          onSelect: () => beginContinueInNewChat(),
+          onSelect: () => beginContinueInNewChat(state.activeSessionId),
         },
         {
           label: "Export conversation as Markdown",
@@ -5983,6 +5988,12 @@
   function renderSessionNameRepo() {
     const el = $("session-name-repo");
     if (!el) return;
+    // Owner decision 2026-08-15: the header shows JUST the conversation name,
+    // everywhere — same as VS Code with the current project. The rail groups
+    // by project and the header tooltip still carries the full path, so the
+    // second line repeated what the surroundings already say.
+    el.hidden = true;
+    if (el.hidden) return;
     // The `sessionName` frame carries the conversation's own cwd, so prefer it:
     // a conversation resumed from another project may not be in any list this
     // webview holds, and `state.cwd` is the host's, not the conversation's.
@@ -6025,11 +6036,10 @@
     titleEl.title = name;
 
     const cwd = record?.cwd || state.selectedRepoCwd;
-    // Same worktree rule as the desk header: label the owning project, not the
-    // isolated checkout the conversation happens to run in.
-    const headProjectCwd = (activeSessionName()?.repoCwd) || cwd;
-    subEl.textContent = headProjectCwd ? railRepoLabelFor(headProjectCwd) : "";
-    subEl.hidden = !cwd;
+    // Owner decision 2026-08-15: no project line under the name, anywhere —
+    // the rail says the project, the header tooltip keeps the full path.
+    subEl.textContent = "";
+    subEl.hidden = true;
     // The name has its own tooltip on the title element; leave the header's to
     // the full path, which the truncated repo line below cannot show.
     head.title = cwd || "";
@@ -6570,11 +6580,11 @@
     // fork continues from the live transcript, so offering it on some other row
     // in the history list would promise something it cannot do.
     if (active) {
-      // None of the three below name a conversation on the wire — the host runs
-      // them against whichever one it currently has open. While a conversation
-      // is still opening the two can disagree, so they are DISABLED rather than
-      // removed: they belong to this row, they are coming back in a moment, and
-      // a menu whose contents reshuffle mid-open is its own kind of wrong.
+      // Fork / apply / remove now name a sessionId, and the host refuses a
+      // mismatch, but while a conversation is still opening the painted row and
+      // the host can still disagree. Disabled rather than removed: they belong
+      // to this row, they are coming back in a moment, and a menu whose
+      // contents reshuffle mid-open is its own kind of wrong.
       const pending = !railIdlessActionsAllowed();
       const waiting = pending
         ? { disabled: true, title: "Available once the conversation has finished opening" }
@@ -6583,7 +6593,7 @@
         label: "Continue in a new chat",
         icon: ICON.gitFork,
         ...waiting,
-        onSelect: () => beginContinueInNewChat(),
+        onSelect: () => beginContinueInNewChat(s.id),
       });
       // The live transcript this client is showing — same scope as Continue.
       items.push({
@@ -6609,7 +6619,7 @@
             title: "Apply worktree?",
             body: "Merges this worktree's edits back into the main checkout.",
             confirmLabel: "Apply",
-          }).then((ok) => { if (ok) vscode.postMessage({ type: "applyWorktree" }); }),
+          }).then((ok) => { if (ok) vscode.postMessage({ type: "applyWorktree", sessionId: s.id }); }),
         });
         items.push({
           label: "Remove worktree",
@@ -6621,7 +6631,7 @@
             body: "This deletes the isolated checkout. Unapplied edits are lost.",
             confirmLabel: "Remove",
             danger: true,
-          }).then((ok) => { if (ok) vscode.postMessage({ type: "removeWorktree" }); }),
+          }).then((ok) => { if (ok) vscode.postMessage({ type: "removeWorktree", sessionId: s.id }); }),
         });
       }
     }
@@ -12786,7 +12796,14 @@
       case "exit":
         stopProcessingCue();
         hideGrokking();
-        addError(`Grok exited (code ${msg.code}). Send a message to restart this session, or start a new one.`);
+        // A clean exit on an empty view is not an error: the composer's own
+        // "send to start" affordance already says what to do, and this event
+        // replays into freshly-refreshed empty sessions where it describes
+        // nothing real. welcomeVisible is the empty-transcript flag — it stays
+        // true until any conversation content (or an error) calls clearWelcome.
+        if (!(msg.code === 0 && state.welcomeVisible)) {
+          addError(`Grok exited (code ${msg.code}). Send a message to restart this session, or start a new one.`);
+        }
         // A process that dies takes the host's send queue with it: that text
         // never reached Grok, and the host empties the queue in the very next
         // breath after this message — so this is the last moment it exists
@@ -13054,7 +13071,17 @@
             // Also deliberately uses host-confirmed activeSessionId only — a
             // pending rail click must not be remembered as this tab's session.
             const activeRepoRow = state.repos.find((r) => sameCwd(r.cwd, state.activeRepoCwd));
-            saveRememberedRemoteSession({
+            // An EMPTY conversation is deliberately forgotten, not remembered:
+            // the host reaps an untouched session the moment this tab lets go
+            // of it (#24), so a remembered empty id turns every refresh into
+            // "could not restore — it may have been deleted" over a perfectly
+            // healthy new tab (owner-hit, 2026-08-15). Nothing to restore must
+            // mean no restore attempt. Both signals have to agree — the host's
+            // message count AND a blank view — so a refresh mid-first-turn,
+            // where the count still lags at 0, keeps remembering.
+            if (activeEntry?.numMessages === 0 && state.welcomeVisible) {
+              saveRememberedRemoteSession(null);
+            } else saveRememberedRemoteSession({
               id: state.activeSessionId,
               repoCwd: (activeRepoRow && activeRepoRow.cwd) ||
                 state.selectedRepoCwd || state.activeRepoCwd || state.cwd || "",

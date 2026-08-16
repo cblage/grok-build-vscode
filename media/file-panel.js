@@ -192,11 +192,121 @@
     return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M' + x + ' 3v18"/></svg>';
   }
 
+  // Title-strip shrink. Named states (not raw widths) so CSS and tests share
+  // one decision. Compact / extreme only shrink the PROJECT TITLE now — tabs
+  // are planned by `planStrip` (A named / B icon-only inactive / C chip).
+  // Breakpoints are against the panel's own width. No tabs → neither class.
+  const STRIP_COMPACT_MAX = 360;
+  const STRIP_EXTREME_MAX = 240;
+  const STRIP_CHIP_WIDTH = 36;
+
+  function stripShrinkState(panelWidth, tabCount) {
+    const width = Number(panelWidth) || 0;
+    const tabs = Number(tabCount) || 0;
+    if (tabs <= 0 || width <= 0) return { compact: false, extreme: false };
+    return {
+      compact: width <= STRIP_COMPACT_MAX,
+      extreme: width <= STRIP_EXTREME_MAX,
+    };
+  }
+
+  function stripRange(n) {
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(i);
+    return out;
+  }
+
+  function stripSum(values) {
+    let total = 0;
+    for (const value of values) total += Number(value) || 0;
+    return total;
+  }
+
+  /**
+   * Pure layout planner for the file-panel tab strip.
+   *
+   * State A (fits): folder+name title, every tab is icon+name, X only on active.
+   * State B (tight): inactive tabs demote to icon-only (dirty dot kept) BEFORE
+   *   any tab is hidden; active keeps icon+name+X; title may drop to icon-only.
+   * State C (minimal): folder icon + the active tab + one "…" chip of the rest.
+   *
+   * No layout: stripWidth<=0 (happy-dom) always returns A so DOM tests see every
+   * tab. The renderer measures real widths and applies this plan in at most two
+   * passes — it never scrolls the strip.
+   */
+  function planStrip(input) {
+    const src = input || {};
+    const stripWidth = Number(src.stripWidth) || 0;
+    const titleWidth = Math.max(0, Number(src.titleWidth) || 0);
+    const titleIconWidth = Math.max(0, Number(src.titleIconWidth) || 0);
+    const trailingWidth = Math.max(0, Number(src.trailingWidth) || 0);
+    const tabCount = Math.max(0, Math.floor(Number(src.tabCount) || 0));
+    const activeIndex = Number.isInteger(src.activeIndex) ? src.activeIndex : -1;
+    const tabFullWidths = Array.isArray(src.tabFullWidths) ? src.tabFullWidths : [];
+    const tabIconWidths = Array.isArray(src.tabIconWidths) ? src.tabIconWidths : [];
+    const chipWidth = Math.max(0, Number(src.chipWidth) || STRIP_CHIP_WIDTH);
+    const slack = Math.max(0, Number(src.slack) || 0);
+    const all = stripRange(tabCount);
+    const fullModes = all.map(() => "full");
+
+    function result(state, title, visible, overflow, tabModes) {
+      return { state: state, title: title, visible: visible, overflow: overflow, tabModes: tabModes };
+    }
+
+    if (tabCount <= 0 || stripWidth <= 0) {
+      return result("a", "full", all, [], fullModes);
+    }
+
+    const avail = Math.max(0, stripWidth - trailingWidth - slack);
+    const fullAt = (i) => Number(tabFullWidths[i]) || 0;
+    const iconAt = (i) => Number(tabIconWidths[i]) || 0;
+    const allFull = stripSum(all.map(fullAt));
+
+    if (titleWidth + allFull <= avail) {
+      return result("a", "full", all, [], fullModes);
+    }
+
+    const bModes = all.map((i) => (i === activeIndex ? "full" : "icon"));
+    const bTabs = stripSum(all.map((i) => (i === activeIndex ? fullAt(i) : iconAt(i))));
+    // Leftover space names MORE tabs, most-recently-opened first (owner: with
+    // room, show 2-3 names including the current one; icons for the rest).
+    const promoteIdles = (modes, budget) => {
+      let leftover = budget;
+      const out = modes.slice();
+      for (let k = all.length - 1; k >= 0; k--) {
+        if (k === activeIndex || out[k] !== "icon") continue;
+        const gain = fullAt(k) - iconAt(k);
+        if (gain <= leftover) {
+          out[k] = "full";
+          leftover -= Math.max(0, gain);
+        }
+      }
+      return out;
+    };
+    if (titleWidth + bTabs <= avail) {
+      return result("b", "full", all, [], promoteIdles(bModes, avail - titleWidth - bTabs));
+    }
+    if (titleIconWidth + bTabs <= avail) {
+      return result("b", "icon", all, [], promoteIdles(bModes, avail - titleIconWidth - bTabs));
+    }
+
+    const visible = activeIndex >= 0 && activeIndex < tabCount ? [activeIndex] : [];
+    const overflow = all.filter((i) => i !== activeIndex);
+    const cModes = all.map((i) => (i === activeIndex ? "full" : "icon"));
+    return result("c", "icon", visible, overflow, cModes);
+  }
+
   const ICON = {
     close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>',
     chevronRight: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>',
     chevronDown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>',
     file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>',
+    folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>',
+    // lucide maximize-2 / minimize-2 — expand the panel over chat, then restore.
+    // lucide `maximize` / `minimize` (corner brackets) — the owner's explicit
+    // pick over the -2 diagonal-arrow variants.
+    maximize: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>',
+    restore: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/></svg>',
     more: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg>',
     // book-open-text / code — the two Markdown modes, kept as the icon pair the
     // desktop panel has always used rather than a worded toggle. A worded
@@ -234,6 +344,14 @@
     let renderedTreeState = null;
     let unsubscribeScope = null;
     let menu = null;
+    /** The control that opened `menu` (a button). Used so a second click on
+     *  that same control toggles closed instead of close-and-reopen. */
+    let menuAnchor = null;
+    let overflowRelPaths = [];
+    let lastStripPlan = null;
+    let forcedStripPlan = null;
+    let stripBusy = false;
+    let cachedTitleWidth = 0;
 
     const rootEl = doc.createElement("aside");
     rootEl.id = mount.id || "grok-file-panel";
@@ -253,7 +371,6 @@
     const title = doc.createElement("button");
     title.type = "button";
     title.className = "gfp-title desk-ft-title";
-    title.textContent = "Files";
     title.title = "Show file tree";
     const tabsEl = doc.createElement("div");
     tabsEl.className = "gfp-tabs desk-ft-tabs";
@@ -265,7 +382,20 @@
     closePanel.title = "Close";
     closePanel.setAttribute("aria-label", "Close file panel");
     closePanel.innerHTML = ICON.close;
-    header.append(title, tabsEl, closePanel);
+    // Desktop-only: the phone overlay already goes full-viewport at the 899
+    // dock breakpoint, so a second maximize would fight that layout. The
+    // mount opts in; remote/phone leave this unset.
+    const canMaximize = !!mount.maximize;
+    let maximized = false;
+    const maximizeBtn = canMaximize ? doc.createElement("button") : null;
+    if (maximizeBtn) {
+      maximizeBtn.type = "button";
+      maximizeBtn.className = "gfp-icon-button gfp-maximize desk-ft-maximize";
+      maximizeBtn.setAttribute("aria-pressed", "false");
+      header.append(title, tabsEl, maximizeBtn, closePanel);
+    } else {
+      header.append(title, tabsEl, closePanel);
+    }
 
     const filter = doc.createElement("input");
     filter.type = "search";
@@ -285,6 +415,7 @@
     if (elementIds.tabs) tabsEl.id = elementIds.tabs;
     if (elementIds.tree) tree.id = elementIds.tree;
     if (elementIds.viewer) viewer.id = elementIds.viewer;
+    if (maximizeBtn && elementIds.maximize) maximizeBtn.id = elementIds.maximize;
 
     rootEl.append(header, filter, tree, viewer);
     panelHost.appendChild(resizer);
@@ -298,6 +429,7 @@
     toggle.addEventListener("click", () => setOpen(!open));
     closePanel.addEventListener("click", () => setOpen(false));
     title.addEventListener("click", showTree);
+    if (maximizeBtn) maximizeBtn.addEventListener("click", () => setMaximized(!maximized));
     filter.addEventListener("input", () => {
       if (!currentState) return;
       currentState.filter = filter.value;
@@ -350,7 +482,7 @@
       const bar = overlay && (from || toggle.parentElement);
       const top = bar ? Math.max(0, Math.round(bar.getBoundingClientRect().bottom)) : 0;
       rootEl.style.setProperty("--gfp-overlay-top", top + "px");
-      resizer.hidden = !open || overlay;
+      resizer.hidden = !open || overlay || maximized;
       closePanel.hidden = !overlay;
       if (!overlay && mount.dockHost && rootEl.parentElement !== mount.dockHost) {
         mount.dockHost.appendChild(resizer);
@@ -359,6 +491,7 @@
         panelHost.appendChild(resizer);
         panelHost.appendChild(rootEl);
       }
+      applyStripShrink();
     }
 
     function setOpen(next) {
@@ -366,9 +499,303 @@
       rootEl.hidden = !open;
       toggle.setAttribute("aria-expanded", String(open));
       toggle.title = open ? "Hide file panel" : "Show file panel";
+      if (!open) setMaximized(false);
       applyPresentation();
       if (open && currentState && !currentState.tree) void loadRootTree();
       if (typeof options.onOpenChanged === "function") options.onOpenChanged(open);
+    }
+
+    function paintMaximize() {
+      if (!maximizeBtn) return;
+      maximizeBtn.innerHTML = maximized ? ICON.restore : ICON.maximize;
+      maximizeBtn.title = maximized ? "Restore" : "Maximize";
+      maximizeBtn.setAttribute("aria-label", maximized ? "Restore file panel" : "Maximize file panel");
+      maximizeBtn.setAttribute("aria-pressed", String(maximized));
+    }
+
+    function setMaximized(next) {
+      if (!canMaximize) return false;
+      const value = !!next && open;
+      if (maximized === value) {
+        paintMaximize();
+        return maximized;
+      }
+      maximized = value;
+      rootEl.classList.toggle("gfp-maximized", maximized);
+      paintMaximize();
+      applyPresentation();
+      applyStripShrink();
+      if (typeof options.onMaximizedChanged === "function") options.onMaximizedChanged(maximized);
+      return maximized;
+    }
+
+    function paintTitle() {
+      const label = currentScope ? currentScope.label : "Files";
+      title.textContent = "";
+      const icon = doc.createElement("span");
+      icon.className = "gfp-title-icon";
+      renderFileIcon(icon, label, "dir");
+      const name = doc.createElement("span");
+      name.className = "gfp-title-label";
+      name.textContent = label;
+      title.append(icon, name);
+    }
+
+    function applyStripShrink() {
+      applyStripPlan();
+    }
+
+    function collectStripMeasurements() {
+      const stripWidth = header.getBoundingClientRect().width || 0;
+      // No layout engine (happy-dom) or hidden panel: the plan is A by
+      // definition, so skip the per-tab getComputedStyle sweep — it is the
+      // expensive part, and a test opening N files pays it N times.
+      if (stripWidth <= 0) {
+        return { stripWidth: 0, titleWidth: 0, titleIconWidth: 0, trailingWidth: 0, tabCount: 0, activeIndex: -1, tabFullWidths: [], tabIconWidths: [] };
+      }
+      const titleIconEl = title.querySelector(".gfp-title-icon");
+      const titleCs = typeof win.getComputedStyle === "function" ? win.getComputedStyle(title) : null;
+      const titlePad = titleCs
+        ? (parseFloat(titleCs.paddingLeft) || 0) + (parseFloat(titleCs.paddingRight) || 0)
+        : 20;
+      const titleIconWidth = (titleIconEl ? titleIconEl.getBoundingClientRect().width : 16) + titlePad;
+      if (!title.classList.contains("gfp-title-icon-only")) {
+        const live = title.getBoundingClientRect().width || title.scrollWidth || 0;
+        if (live > 0) cachedTitleWidth = live;
+      }
+      const titleWidth = cachedTitleWidth || titleIconWidth;
+
+      let trailingWidth = 0;
+      function addTrailing(el) {
+        if (!el || el.hidden) return;
+        const box = el.getBoundingClientRect();
+        const cs = typeof win.getComputedStyle === "function" ? win.getComputedStyle(el) : null;
+        trailingWidth += box.width
+          + (cs ? (parseFloat(cs.marginLeft) || 0) + (parseFloat(cs.marginRight) || 0) : 0);
+      }
+      addTrailing(maximizeBtn);
+      addTrailing(closePanel);
+      // Gap floor on the tab row (padding-right on .gfp-tabs) is measured
+      // here so A/B/C still plan against the width the last tab may use.
+      const tabsCs = typeof win.getComputedStyle === "function" ? win.getComputedStyle(tabsEl) : null;
+      if (tabsCs) {
+        trailingWidth += (parseFloat(tabsCs.paddingLeft) || 0) + (parseFloat(tabsCs.paddingRight) || 0);
+      }
+
+      const tabs = [...tabsEl.querySelectorAll(".gfp-tab")];
+      const tabFullWidths = [];
+      const tabIconWidths = [];
+      let activeIndex = -1;
+      tabs.forEach((el, i) => {
+        if (el.classList.contains("gfp-tab-active")) activeIndex = i;
+        const cachedFull = Number(el.dataset.fullW) || 0;
+        const cachedIcon = Number(el.dataset.iconW) || 0;
+        if (el.hidden) {
+          tabFullWidths.push(cachedFull);
+          tabIconWidths.push(cachedIcon);
+          return;
+        }
+        const cs = typeof win.getComputedStyle === "function" ? win.getComputedStyle(el) : null;
+        const pad = cs ? (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0) : 11;
+        const gap = cs ? parseFloat(cs.columnGap || cs.gap) || 0 : 5;
+        const iconEl = el.querySelector(".gfp-tab-icon");
+        const dirtyEl = el.querySelector(".gfp-tab-dirty");
+        const iconW = iconEl ? iconEl.getBoundingClientRect().width : 16;
+        // Two dirty numbers: the SLOT is always rendered on a full tab
+        // (flex-basis 10px, empty or not) — counting it only when dirty
+        // under-budgeted clean tabs by slot+gap and the shortfall came out of
+        // the name. Icon-only mode display:nones the EMPTY slot, so there the
+        // dot counts only when actually dirty.
+        const dirtyOn = dirtyEl && dirtyEl.textContent;
+        const dirtySlotW = dirtyEl ? Math.max(dirtyEl.getBoundingClientRect().width, 10) : 0;
+        const dirtyDotW = dirtyOn ? Math.max(dirtyEl.getBoundingClientRect().width, 10) : 0;
+        // Floor so an unloaded img (0×0) cannot convince the planner that
+        // icon-only tabs are free. 28px is pad+icon in the icon-only rule.
+        const iconOnly = Math.max(28, pad + Math.max(iconW, 16) + (dirtyDotW ? gap + dirtyDotW : 0));
+        const wasIconOnly = el.classList.contains("gfp-tab-icon-only");
+        const box = el.getBoundingClientRect().width || 0;
+        // A tab's own scrollWidth cannot see through the NAME's ellipsis (the
+        // span hides its own overflow), so a tab that ever rendered squeezed
+        // would measure its squeezed width as "full" and the plan would
+        // believe it forever. Sum the parts with the name's scrollWidth — the
+        // one number that still knows the untruncated text.
+        const nameEl = el.querySelector(".gfp-tab-name");
+        const nameW = nameEl
+          ? Math.max(nameEl.scrollWidth || 0, nameEl.getBoundingClientRect().width || 0)
+          : 0;
+        const closeEl = el.querySelector(".gfp-tab-close");
+        const closeW = closeEl && !closeEl.hidden ? Math.max(closeEl.getBoundingClientRect().width, 22) : 0;
+        // +2 on the name: integer scrollWidth under-reports fractional text
+        // widths at mobile DPRs (measured: CLAUDE.md needed 69, got 68 at
+        // dpr 2.625) and the shortfall ellipsized the last glyph.
+        const parts = pad + 1 + Math.max(iconW, 16)
+          + (nameW ? gap + nameW + 2 : 0)
+          + (dirtySlotW ? gap + dirtySlotW : 0)
+          + (closeW ? gap + closeW : 0);
+        // Parts-FIRST, never max(box, parts): the rendered box is the previous
+        // ceiled basis, so feeding it back ratchets every named tab +1px per
+        // apply pass — tabs slowly grew across resizes and never shrank back
+        // to content size (owner: "never longer than needed").
+        const liveFull = parts > (pad + 17) ? parts : box;
+        const full = wasIconOnly ? (cachedFull || liveFull) : (liveFull || cachedFull);
+        el.dataset.fullW = String(full);
+        el.dataset.iconW = String(iconOnly);
+        tabFullWidths.push(full);
+        tabIconWidths.push(iconOnly);
+      });
+
+      let chipWidth = STRIP_CHIP_WIDTH;
+      const chip = tabsEl.querySelector(".gfp-overflow-chip");
+      if (chip && !chip.hidden) {
+        const w = chip.getBoundingClientRect().width;
+        if (w > 0) chipWidth = w;
+      }
+
+      return {
+        stripWidth,
+        titleWidth,
+        titleIconWidth,
+        trailingWidth,
+        tabCount: tabs.length,
+        activeIndex,
+        tabFullWidths,
+        tabIconWidths,
+        chipWidth,
+      };
+    }
+
+    function applyPlanToDom(plan) {
+      lastStripPlan = plan;
+      rootEl.dataset.stripState = plan.state;
+      rootEl.classList.toggle("gfp-strip-a", plan.state === "a");
+      rootEl.classList.toggle("gfp-strip-b", plan.state === "b");
+      rootEl.classList.toggle("gfp-strip-c", plan.state === "c");
+      title.classList.toggle("gfp-title-icon-only", plan.title === "icon");
+      title.classList.toggle("gfp-title-selected", !!treeMode);
+
+      const tabs = [...tabsEl.querySelectorAll(".gfp-tab")];
+      overflowRelPaths = [];
+      tabs.forEach((el, i) => {
+        const hidden = plan.overflow.indexOf(i) !== -1;
+        el.hidden = hidden;
+        const mode = plan.tabModes[i];
+        el.classList.toggle("gfp-tab-icon-only", mode === "icon");
+        // Named tabs get their measured full width as an explicit basis:
+        // Chromium's intrinsic sizing contributes the name below its real
+        // max-content (the CLAUDE…-beside-free-space bug), so "auto" cannot
+        // be trusted to show the full name. The planner already budgeted
+        // exactly this number; flex-shrink still yields under true pressure.
+        const fullW = Number(el.dataset.fullW) || 0;
+        el.style.flexBasis = !hidden && mode === "full" && fullW > 0
+          ? Math.ceil(fullW) + "px"
+          : "";
+        if (hidden && el.dataset.rel) overflowRelPaths.push(el.dataset.rel);
+      });
+
+      let chip = tabsEl.querySelector(".gfp-overflow-chip");
+      if (plan.state === "c" && overflowRelPaths.length) {
+        if (!chip) {
+          chip = doc.createElement("button");
+          chip.type = "button";
+          chip.className = "gfp-overflow-chip";
+          chip.setAttribute("aria-haspopup", "menu");
+          chip.setAttribute("aria-label", "More open files");
+          chip.textContent = "…";
+          chip.addEventListener("click", () => openOverflowMenu(chip));
+          tabsEl.appendChild(chip);
+        }
+        chip.title = overflowRelPaths.map((rel) => fileName(rel)).join(", ");
+        chip.setAttribute("aria-expanded", menu && menu.classList.contains("gfp-overflow-menu") ? "true" : "false");
+        chip.hidden = false;
+      } else if (chip) {
+        chip.remove();
+        if (menu && menu.classList.contains("gfp-overflow-menu")) closeMenu();
+      }
+    }
+
+    function tabsRowOverflows() {
+      const client = tabsEl.clientWidth;
+      const scroll = tabsEl.scrollWidth;
+      if (client <= 0 || scroll <= 0) return false;
+      return scroll > client + 1;
+    }
+
+    /**
+     * The truth the plan math cannot see: flex-shrink absorbs an over-packed
+     * row silently (no scroll overflow), ellipsizing names the plan promised.
+     * Post-apply, ask the DOM whether any visible NAMED tab actually shows
+     * its whole name — measurement drift then demotes instead of truncating.
+     */
+    function namesTruncated() {
+      for (const el of tabsEl.querySelectorAll(".gfp-tab:not([hidden]):not(.gfp-tab-icon-only)")) {
+        const name = el.querySelector(".gfp-tab-name");
+        if (name && name.clientWidth > 0 && name.scrollWidth > name.clientWidth + 1) return true;
+      }
+      return false;
+    }
+
+    /** Strip B-state promotions back to the base plan (icons for every idle). */
+    function withoutPromotions(plan) {
+      if (plan.state !== "b") return plan;
+      const tabs = [...tabsEl.querySelectorAll(".gfp-tab")];
+      const activeIndex = tabs.findIndex((el) => el.classList.contains("gfp-tab-active"));
+      return {
+        ...plan,
+        tabModes: plan.tabModes.map((m, i) => (i === activeIndex ? "full" : "icon")),
+      };
+    }
+
+    function forceTighterPlan(plan) {
+      const tabs = [...tabsEl.querySelectorAll(".gfp-tab")];
+      const n = tabs.length;
+      const activeIndex = tabs.findIndex((el) => el.classList.contains("gfp-tab-active"));
+      const all = stripRange(n);
+      const bModes = all.map((i) => (i === activeIndex ? "full" : "icon"));
+      if (plan.state === "a") {
+        return { state: "b", title: plan.title, visible: all, overflow: [], tabModes: bModes };
+      }
+      return {
+        state: "c",
+        title: "icon",
+        visible: activeIndex >= 0 ? [activeIndex] : [],
+        overflow: all.filter((i) => i !== activeIndex),
+        tabModes: bModes,
+      };
+    }
+
+    function applyStripPlan() {
+      // Bound the measure→plan→apply cycle: ResizeObserver can fire when we
+      // hide tabs / add the chip, and a nested pass would thrash. At most two
+      // applies — the second only if the first still overflows the row.
+      if (stripBusy) return;
+      stripBusy = true;
+      try {
+        const width = rootEl.getBoundingClientRect().width || 0;
+        const tabCount = currentState ? currentState.order.length : 0;
+        const shrink = stripShrinkState(width, tabCount);
+        rootEl.classList.toggle("gfp-strip-compact", shrink.compact);
+        rootEl.classList.toggle("gfp-strip-extreme", shrink.extreme);
+        let plan = forcedStripPlan || planStrip({
+          ...collectStripMeasurements(),
+          slack: 12,
+        });
+        applyPlanToDom(plan);
+        // Promotions are speculative: verify against the RENDERED truth and
+        // back them out before ever letting a promised name ellipsize.
+        if (!forcedStripPlan && plan.state === "b" && namesTruncated()) {
+          plan = withoutPromotions(plan);
+          applyPlanToDom(plan);
+        }
+        if (!forcedStripPlan && (tabsRowOverflows() || namesTruncated()) && plan.state !== "c") {
+          plan = forceTighterPlan(plan);
+          applyPlanToDom(plan);
+          if ((tabsRowOverflows() || namesTruncated()) && plan.state !== "c") {
+            applyPlanToDom(forceTighterPlan(plan));
+          }
+        }
+      } finally {
+        stripBusy = false;
+      }
     }
 
     function setPanelWidth(px, persist) {
@@ -405,6 +832,7 @@
       if (persist !== false && options.preferences && options.preferences.setWidth) {
         options.preferences.setWidth(value);
       }
+      applyStripShrink();
       return value;
     }
 
@@ -468,8 +896,8 @@
       if (currentState !== nextState) abortPending();
       currentState = nextState;
       currentScope = nextState ? nextState.scope : null;
-      title.textContent = scope ? scope.label : "Files";
       title.title = scope && (scope.title || scope.label) || "Show file tree";
+      paintTitle();
       filter.value = currentState ? currentState.filter : "";
       treeMode = !(currentState && currentState.activeRelPath);
       renderTabs();
@@ -635,7 +1063,7 @@
     function renderFileIcon(host, name, kind) {
       const icons = ui.fileIcons;
       if (!icons || !icons.baseUrl) {
-        host.innerHTML = ICON.file;
+        host.innerHTML = kind === "dir" ? ICON.folder : ICON.file;
         return;
       }
       const id = typeof icons.idFor === "function"
@@ -735,7 +1163,13 @@
 
     async function closeTab(relPath) {
       if (!currentState) return false;
-      const tab = currentState.tabs.get(relPath);
+      // Capture the scope before the await: switching projects while
+      // "Discard changes?" is open swaps currentState, and the same relPath
+      // can exist in both scopes — mutating the module variable afterwards
+      // would discard the OTHER scope's draft. (The identifier-stale-after-
+      // await class; review find, 2026-08-14.)
+      const state = currentState;
+      const tab = state.tabs.get(relPath);
       if (!tab) return false;
       if (tab.dirty) {
         const answer = await confirmChoice({
@@ -745,51 +1179,68 @@
         });
         if (answer !== "discard") return false;
       }
-      currentState.tabs.delete(relPath);
-      currentState.order = currentState.order.filter((item) => item !== relPath);
-      if (currentState.activeRelPath === relPath) {
-        currentState.activeRelPath = currentState.order.length
-          ? currentState.order[currentState.order.length - 1]
+      state.tabs.delete(relPath);
+      state.order = state.order.filter((item) => item !== relPath);
+      if (state.activeRelPath === relPath) {
+        state.activeRelPath = state.order.length
+          ? state.order[state.order.length - 1]
           : null;
       }
+      // Repaint only if this scope is still the one on screen — the close
+      // took effect in its own scope either way.
+      if (state !== currentState) return true;
       renderTabs();
-      if (currentState.activeRelPath) renderViewer();
+      if (state.activeRelPath) renderViewer();
       else showTree();
       return true;
     }
 
     function renderTabs() {
       tabsEl.textContent = "";
-      if (!currentState) return;
+      overflowRelPaths = [];
+      if (!currentState) {
+        applyStripPlan();
+        return;
+      }
       for (const relPath of currentState.order) {
         const tab = currentState.tabs.get(relPath);
         if (!tab) continue;
+        const isActive = !treeMode && currentState.activeRelPath === relPath;
         const item = doc.createElement("div");
-        item.className = "gfp-tab desk-ft-tab" + (!treeMode && currentState.activeRelPath === relPath ? " gfp-tab-active desk-ft-tab-active" : "");
+        item.className = "gfp-tab desk-ft-tab" + (isActive ? " gfp-tab-active desk-ft-tab-active" : "");
         item.setAttribute("role", "tab");
         item.dataset.rel = relPath;
         item.title = relPath;
         item.tabIndex = 0;
+        const icon = doc.createElement("span");
+        icon.className = "gfp-tab-icon";
+        renderFileIcon(icon, fileName(relPath), tab.kind === "dir" ? "dir" : "file");
         const name = doc.createElement("span");
         name.className = "gfp-tab-name desk-ft-tab-name";
         name.textContent = fileName(relPath);
         const dirty = doc.createElement("span");
         dirty.className = "gfp-tab-dirty desk-ft-tab-dirty";
         dirty.textContent = tab.dirty ? "•" : "";
-        const close = doc.createElement("button");
-        close.type = "button";
-        close.className = "gfp-tab-close desk-ft-tab-close";
-        close.innerHTML = ICON.close;
-        close.title = "Close";
-        close.setAttribute("aria-label", "Close " + fileName(relPath));
-        close.addEventListener("click", (event) => {
-          event.stopPropagation();
-          void closeTab(relPath);
-        });
-        item.append(name, dirty, close);
+        item.append(icon, name, dirty);
+        // Inactive tabs never render an X. The active tab's close is structural
+        // (not CSS-hidden) so it cannot be clipped away by a shrink rule.
+        if (isActive) {
+          const close = doc.createElement("button");
+          close.type = "button";
+          close.className = "gfp-tab-close desk-ft-tab-close";
+          close.innerHTML = ICON.close;
+          close.title = "Close";
+          close.setAttribute("aria-label", "Close " + fileName(relPath));
+          close.addEventListener("click", (event) => {
+            event.stopPropagation();
+            void closeTab(relPath);
+          });
+          item.appendChild(close);
+        }
         item.addEventListener("click", () => activateTab(relPath));
         tabsEl.appendChild(item);
       }
+      applyStripPlan();
     }
 
     function currentTab() {
@@ -1053,16 +1504,35 @@
     }
 
     function renderViewerActions(head, tab) {
+      // Right-end group: Cancel / Save (text buttons) and ⋯ (bar-icon).
+      // margin-left:auto on this node parks them at the toolbar's trailing edge.
+      const end = doc.createElement("div");
+      end.className = "gfp-viewer-end";
       if (EDITABLE_KINDS.has(tab.kind) && access.write && tab.stamp && tab.expectedAbsPath) {
         if (tab.kind === "markdown") {
-          // Markdown has two modes and the desktop panel has always shown them
-          // as a PAIR of icon buttons with the current one marked active — not
-          // as one worded toggle. The worded version was a divergence
-          // introduced by the extraction, and it made Markdown read as a
-          // different kind of file from every other text file, which shows the
-          // pencil below.
+          // Modes are a segmented control (`.gfp-seg`), not bar-icons. A
+          // worded toggle made Markdown the odd one out beside the pencil
+          // every other text file gets; an accent-underline on a bar-icon
+          // pair read as two actions rather than one chosen mode.
+          const seg = doc.createElement("div");
+          seg.className = "gfp-seg";
+          seg.setAttribute("role", "group");
+          seg.setAttribute("aria-label", "View mode");
           const modeButton = (icon, label, mode) => {
-            const button = actionButton("", "", () => {
+            const button = doc.createElement("button");
+            button.type = "button";
+            button.className = "gfp-seg-btn gfp-mode files-browse-action";
+            // "Edit source" IS Markdown's edit control, so it keeps the class
+            // every other text file's pencil carries. One selector means
+            // "the control that puts this file into edit mode", whatever the
+            // file type — which is what callers and tests actually want.
+            if (mode === "code") button.classList.add("gfp-edit");
+            if (tab.mode === mode) button.classList.add("gfp-seg-on");
+            button.innerHTML = icon;
+            button.title = label;
+            button.setAttribute("aria-label", label);
+            button.setAttribute("aria-pressed", String(tab.mode === mode));
+            button.addEventListener("click", () => {
               tab.mode = mode;
               tab.editing = mode === "code";
               if (mode === "code") {
@@ -1073,21 +1543,11 @@
               const editor = viewer.querySelector(".gfp-editor");
               if (editor) editor.focus();
             });
-            button.classList.add("gfp-mode", "files-browse-action");
-            // "Edit source" IS Markdown's edit control, so it keeps the class
-            // every other text file's pencil carries. One selector means
-            // "the control that puts this file into edit mode", whatever the
-            // file type — which is what callers and tests actually want.
-            if (mode === "code") button.classList.add("gfp-edit");
-            if (tab.mode === mode) button.classList.add("gfp-active", "desk-ft-active");
-            button.innerHTML = icon;
-            button.title = label;
-            button.setAttribute("aria-label", label);
-            button.setAttribute("aria-pressed", String(tab.mode === mode));
             return button;
           };
-          head.appendChild(modeButton(ICON.preview, "Preview", "preview"));
-          head.appendChild(modeButton(ICON.code, "Edit source", "code"));
+          seg.appendChild(modeButton(ICON.preview, "Preview", "preview"));
+          seg.appendChild(modeButton(ICON.code, "Edit source", "code"));
+          head.appendChild(seg);
         } else if (!tab.editing) {
           const edit = actionButton("", "", () => {
             tab.editing = true;
@@ -1110,7 +1570,7 @@
           const save = actionButton(tab.saving ? "Saving…" : "Save", "primary", () => void saveTab(tab));
           save.classList.add("gfp-save", "files-browse-action", "files-browse-action-primary");
           save.disabled = tab.saving || !tab.dirty;
-          head.append(cancel, save);
+          end.append(cancel, save);
         }
       }
       if (access.openExternal || access.reveal) {
@@ -1120,8 +1580,9 @@
         more.innerHTML = ICON.more;
         more.title = "More actions";
         more.setAttribute("aria-label", "More actions");
-        head.appendChild(more);
+        end.appendChild(more);
       }
+      if (end.childNodes.length) head.appendChild(end);
     }
 
     function patchDirtyUi(tab) {
@@ -1129,6 +1590,7 @@
       if (save) save.disabled = tab.saving || !tab.dirty;
       const item = tabsEl.querySelector('[data-rel="' + cssEscape(tab.relPath) + '"] .gfp-tab-dirty');
       if (item) item.textContent = tab.dirty ? "•" : "";
+      applyStripPlan();
     }
 
     async function cancelChanges(tab) {
@@ -1305,25 +1767,13 @@
       const button = doc.createElement("button");
       button.type = "button";
       button.className = "gfp-action" + (tone ? " gfp-action-" + tone : "");
+      if (!label) button.classList.add("gfp-icon-only");
       button.textContent = label;
       button.addEventListener("click", listener);
       return button;
     }
 
-    function openRowMenu(anchor, entry, pointerEvent) {
-      closeMenu();
-      menu = doc.createElement("div");
-      menu.className = "gfp-menu desk-ft-overflow-menu desk-ft-open";
-      menu.setAttribute("role", "menu");
-      if (entry.kind !== "dir" && access.openExternal) {
-        menu.appendChild(menuItem("Open in default app", () => access.openExternal(currentScope.id, entry.relPath)));
-      }
-      if (access.reveal) {
-        menu.appendChild(menuItem(ui.revealLabel || "Reveal in file manager", () => access.reveal(currentScope.id, entry.relPath)));
-      }
-      if (!menu.childNodes.length) return closeMenu();
-      doc.body.appendChild(menu);
-
+    function positionMenu(anchor, pointerEvent) {
       // Zoom-corrected and clamped to the viewport.
       //
       // The chat scales with `--chat-zoom`, and body zoom scales VISUAL rects
@@ -1365,6 +1815,89 @@
       menu.style.right = "auto";
     }
 
+    /** True when this click should toggle the open menu rather than dismiss
+     *  it from outside. Only a BUTTON (or the chip) counts — a tree row used
+     *  as a context-menu origin is too large to treat as the opener. */
+    function isOpenMenuAnchor(target) {
+      if (!menu || !menuAnchor || !target) return false;
+      if (menuAnchor === target) return true;
+      if (!menuAnchor.contains || !menuAnchor.contains(target)) return false;
+      const tag = String(menuAnchor.tagName || "").toLowerCase();
+      return tag === "button";
+    }
+
+    /** Shared by every gfp-menu opener: a second click on the same anchor
+     *  closes and does not reopen. Returns false when the caller should stop. */
+    function beginMenu(anchor) {
+      if (menu && menuAnchor === anchor) {
+        closeMenu();
+        return false;
+      }
+      closeMenu();
+      return true;
+    }
+
+    function openRowMenu(anchor, entry, pointerEvent) {
+      if (!beginMenu(anchor)) return;
+      menu = doc.createElement("div");
+      menu.className = "gfp-menu desk-ft-overflow-menu desk-ft-open";
+      menu.setAttribute("role", "menu");
+      if (entry.kind !== "dir" && access.openExternal) {
+        menu.appendChild(menuItem("Open in default app", () => access.openExternal(currentScope.id, entry.relPath)));
+      }
+      if (access.reveal) {
+        menu.appendChild(menuItem(ui.revealLabel || "Reveal in file manager", () => access.reveal(currentScope.id, entry.relPath)));
+      }
+      if (!menu.childNodes.length) return closeMenu();
+      menuAnchor = anchor;
+      doc.body.appendChild(menu);
+      positionMenu(anchor, pointerEvent);
+    }
+
+    function openOverflowMenu(anchor) {
+      if (!overflowRelPaths.length || !currentState) return;
+      if (!beginMenu(anchor)) return;
+      menu = doc.createElement("div");
+      menu.className = "gfp-menu gfp-overflow-menu desk-ft-overflow-menu desk-ft-open";
+      menu.setAttribute("role", "menu");
+      for (const relPath of overflowRelPaths) {
+        const tab = currentState.tabs.get(relPath);
+        if (!tab) continue;
+        menu.appendChild(overflowMenuItem(relPath, tab));
+      }
+      if (!menu.childNodes.length) return closeMenu();
+      menuAnchor = anchor;
+      doc.body.appendChild(menu);
+      const chip = tabsEl.querySelector(".gfp-overflow-chip");
+      if (chip) chip.setAttribute("aria-expanded", "true");
+      positionMenu(anchor);
+    }
+
+    function overflowMenuItem(relPath, tab) {
+      const button = doc.createElement("button");
+      button.type = "button";
+      button.className = "gfp-menu-item gfp-overflow-item desk-ft-overflow-item";
+      button.setAttribute("role", "menuitem");
+      const icon = doc.createElement("span");
+      icon.className = "gfp-tab-icon";
+      renderFileIcon(icon, fileName(relPath), tab.kind === "dir" ? "dir" : "file");
+      const name = doc.createElement("span");
+      name.className = "gfp-overflow-name";
+      name.textContent = fileName(relPath);
+      button.append(icon, name);
+      if (tab.dirty) {
+        const dirty = doc.createElement("span");
+        dirty.className = "gfp-overflow-dirty";
+        dirty.textContent = "•";
+        button.appendChild(dirty);
+      }
+      button.addEventListener("click", () => {
+        closeMenu();
+        activateTab(relPath);
+      });
+      return button;
+    }
+
     function menuItem(label, listener) {
       const button = doc.createElement("button");
       button.type = "button";
@@ -1380,6 +1913,9 @@
     function closeMenu() {
       if (menu) menu.remove();
       menu = null;
+      menuAnchor = null;
+      const chip = tabsEl.querySelector(".gfp-overflow-chip");
+      if (chip) chip.setAttribute("aria-expanded", "false");
     }
 
     function appendStatus(host, message, error) {
@@ -1414,9 +1950,15 @@
       destroyed = true;
       abortPending();
       closeMenu();
+      setMaximized(false);
+      if (stripObserver) {
+        try { stripObserver.disconnect(); } catch (_) { /* noop */ }
+        stripObserver = null;
+      }
       if (typeof unsubscribeScope === "function") unsubscribeScope();
       win.removeEventListener("beforeunload", beforeUnload);
       win.removeEventListener("resize", applyPresentation);
+      win.removeEventListener("keydown", onChromeKey);
       // The `true` must match the registration, or this removes nothing and the
       // listener outlives the panel.
       doc.removeEventListener("click", closeMenuFromOutside, true);
@@ -1426,17 +1968,41 @@
     }
 
     function closeMenuFromOutside(event) {
-      if (menu && !menu.contains(event.target)) closeMenu();
+      if (!menu) return;
+      if (menu.contains(event.target)) return;
+      // The open menu's own button must not be an "outside" click — the
+      // opener's handler is about to run and is what toggles. Closing here
+      // first made every second click close-and-reopen.
+      if (isOpenMenuAnchor(event.target)) return;
+      closeMenu();
     }
-    // CAPTURE phase, and that is the whole fix. On the bubble phase this ran
-    // AFTER the button that opened the menu, saw a click outside the (brand new)
-    // menu, and closed it again — so the viewer's "More actions" button did
-    // nothing at all on the desktop, silently. The tree's own more-button had
-    // been papered over with `stopPropagation`, which fixes one button and
-    // leaves the trap set for the next one. On capture, this runs BEFORE any
-    // opener, when `menu` is still null, so it cannot close what has not opened.
+    // CAPTURE phase. On the bubble phase this ran AFTER the button that opened
+    // the menu, saw a click outside the (brand new) menu, and closed it again
+    // — so the viewer's "More actions" button did nothing at all on the
+    // desktop, silently. The tree's own more-button had been papered over with
+    // `stopPropagation`, which fixes one button and leaves the trap set for
+    // the next one. On capture, this runs BEFORE any opener: `menu` is still
+    // null on the opening click (so it cannot close what has not opened), and
+    // on a second click of the same button it skips so `beginMenu` can toggle.
     doc.addEventListener("click", closeMenuFromOutside, true);
     win.addEventListener("resize", applyPresentation);
+    function onChromeKey(event) {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      if (menu) {
+        closeMenu();
+        event.preventDefault();
+        return;
+      }
+      if (!canMaximize || !maximized || !open) return;
+      if (doc.getElementById("preview-overlay")) return;
+      setMaximized(false);
+      event.preventDefault();
+    }
+    win.addEventListener("keydown", onChromeKey);
+    let stripObserver = typeof win.ResizeObserver === "function"
+      ? new win.ResizeObserver(() => applyStripShrink())
+      : null;
+    if (stripObserver) stripObserver.observe(rootEl);
     rootEl.addEventListener("keydown", (event) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
         const tab = currentTab();
@@ -1454,6 +2020,8 @@
     }
     win.addEventListener("beforeunload", beforeUnload);
 
+    paintTitle();
+    paintMaximize();
     setPanelWidth(options.preferences && options.preferences.getWidth
       ? options.preferences.getWidth() : DEFAULT_WIDTH, true);
     if (typeof access.onScopeChanged === "function") {
@@ -1475,12 +2043,20 @@
       isOpen: () => open,
       setScope,
       setWidth: setPanelWidth,
+      setMaximized,
+      isMaximized: () => maximized,
       openPath: openFile,
       hasDirty: () => anyDirty(scopes),
       confirmClose,
       clearMemory,
       destroy,
       _scopes: scopes,
+      _applyStripShrink: applyStripPlan,
+      _forceStripPlan: (plan) => {
+        forcedStripPlan = plan || null;
+        applyStripPlan();
+      },
+      _lastStripPlan: () => lastStripPlan,
     };
   }
 
@@ -1557,6 +2133,11 @@
     fileName,
     scopeKey,
     defaultFileIconId,
+    stripShrinkState,
+    planStrip,
+    STRIP_COMPACT_MAX,
+    STRIP_EXTREME_MAX,
+    STRIP_CHIP_WIDTH,
     makeTab,
     applyDraft,
     applySaveSuccess,

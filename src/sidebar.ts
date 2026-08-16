@@ -427,6 +427,13 @@ interface SessionLoadReservation {
   timer: NodeJS.Timeout;
 }
 
+type RemoteResumeTarget =
+  | { kind: "conflict"; selectedCwd: string }
+  | { kind: "repo-mismatch"; selectedCwd: string }
+  | { kind: "live"; selectedCwd: string; session: Session }
+  | { kind: "disk"; selectedCwd: string; actualCwd: string; provider: AcpProvider }
+  | { kind: "missing"; selectedCwd: string };
+
 interface RemoteRequester {
   clientId: string;
   tabToken?: string;
@@ -614,6 +621,7 @@ export class GrokSidebar {
     absByRel: Map<string, string>;
   }>();
   private editorWatcher?: HostDisposable;
+  private terminalManager = new TerminalManager();
   private voiceRecorder = new VoiceRecorder();
   private voiceTempPath?: string;
   private voiceStreamer?: VoiceStreamer;
@@ -655,6 +663,21 @@ export class GrokSidebar {
     started: () => void;
     wait: Promise<void>;
   };
+  /** First full boot pass — repo catalog AND the deferred session-list — finished. */
+  private firstBootScanStarted = false;
+  private firstBootScanCompleted = false;
+  private resolveFirstBootScan: () => void = () => {};
+  private firstBootScanDone = new Promise<void>((resolve) => {
+    this.resolveFirstBootScan = resolve;
+  });
+  /** Test hook: parks the first boot pass after catalog, before session-list. */
+  private testCatalogHold?: {
+    started: () => void;
+    wait: Promise<void>;
+    release: () => void;
+  };
+  /** Stalled boot must not hang a resume; the miss then stands as a real refusal. */
+  private static readonly FIRST_BOOT_SCAN_WAIT_MS = 8_000;
   // OS wake lock, held for exactly as long as the uplink is (linked device token
   // + live extension host) so an AFK machine can't idle-suspend out from under a
   // remote turn. `grok.remote.keepAwake` is the opt-out. See src/keep-awake.ts.
@@ -3568,18 +3591,15 @@ Only continue if you trust this code.`,
     // Minimal handlers so the handshake doesn't hang on server requests.
     client.fsRead = async (p) => fs.readFileSync(p, "utf8");
     client.fsWrite = async () => { /* create-only client */ };
-    const terminalManager = new TerminalManager();
-    client.terminal = terminalManager;
-    client.executionBackend = { dispose: () => terminalManager.disposeAll() };
+    client.terminal = this.terminalManager;
     await client.start();
     await client.newSession();
     return { client, disposeAfter: true };
   }
 
-  /** Merge the focused worktree's changes back into the main checkout.
+  /** Merge the given session's worktree back into the main checkout.
    *  `skipConfirm` = the webview's custom confirm dialog already ran. */
-  async applyFocusedWorktree(skipConfirm = false): Promise<void> {
-    const session = this.focused;
+  async applyFocusedWorktree(session: Session = this.focused, skipConfirm = false): Promise<void> {
     const wt = session.worktree;
     if (!wt) {
       return void this.host.showInformationMessage(
@@ -3614,10 +3634,9 @@ Only continue if you trust this code.`,
     }
   }
 
-  /** Remove the focused session's worktree (after disposing processes that use it).
+  /** Remove the given session's worktree (after disposing processes that use it).
    *  `skipConfirm` = the webview's custom confirm dialog already ran. */
-  async removeFocusedWorktree(skipConfirm = false): Promise<void> {
-    const session = this.focused;
+  async removeFocusedWorktree(session: Session = this.focused, skipConfirm = false): Promise<void> {
     const wt = session.worktree;
     if (!wt) {
       return void this.host.showInformationMessage("This session is not in a worktree.");
@@ -3645,11 +3664,11 @@ Only continue if you trust this code.`,
           // live token and a matching generation and would respawn the session
           // against a checkout that no longer exists.
           this.detachClient(s)?.dispose();
-          if (s !== this.focused) this.pool.delete(s);
+          if (s !== session) this.pool.delete(s);
         }
       }
-      // Need a live client for the remove RPC — use focused if still up, else temp.
-      let client = this.focused.client;
+      // Need a live client for the remove RPC — use the target if still up, else temp.
+      let client = session.client;
       let disposeAfter = false;
       if (!client) {
         const tmp = await this.clientForWorktreeCreate(this.workspaceRoot());
@@ -3721,7 +3740,7 @@ Only continue if you trust this code.`,
         }
       }
       if (changed) await this.state.update(SESSION_META_KEY, next);
-      this.focused.worktree = undefined;
+      session.worktree = undefined;
       // Leave the chat; start a normal session so the user isn't stuck — in the
       // repository this worktree was cut FROM, which is where the work goes back
       // to. The open folder was right only while conversations were pinned to
@@ -5914,6 +5933,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     void this.disposePool();
     this.editorWatcher?.dispose();
     this.configWatcher?.dispose();
+    this.terminalManager.disposeAll();
     this.stopVoiceInput();
     this.remoteClients.clear();
     try { if (this.voiceTempPath) fs.unlinkSync(this.voiceTempPath); } catch { /* best effort */ }
@@ -6662,81 +6682,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // would just be wasted work.
       this.postSandboxState(sandboxEnv);
     }
+    // Reassigned fresh at the top of each retry attempt below (never shared
+    // across attempts): AcpClient.dispose() always tears down whatever it
+    // finds on client.executionBackend, so a broker that outlived a failed
+    // attempt would be killed by that attempt's own cleanup, taking the next
+    // retry down with it. One broker per attempt, owned by that attempt's
+    // client, sidesteps the bookkeeping entirely.
     let broker: SeatbeltBroker | undefined;
     let brokerClient: AcpClient | undefined;
-    if (sandbox) {
-      try {
-        // Seatbelt can only confine a real local directory. The Host API hands
-        // back a path rather than a URI, so the old scheme check becomes an
-        // existence check: a virtual workspace (github://, vscode-vfs://) has
-        // no local directory to compile a policy against.
-        if (!cwd || !fs.existsSync(cwd)) {
-          throw new Error(
-            `Seatbelt requires a local file workspace (got ${cwd || "no workspace folder"})`,
-          );
-        }
-        const tomls = this.readSandboxTomls(cwd, sandboxEnv);
-        const brokerRuntime = resolveSeatbeltBrokerRuntime(sandboxEnv);
-        const trustedTempDir = os.tmpdir();
-        const compiled = resolveAndCompileSeatbeltPolicy(
-          sandbox,
-          {
-            projectSandbox: tomls.project,
-            globalSandbox: tomls.global,
-          },
-          {
-            cwd,
-            home: sandboxEnv.HOME || sandboxEnv.USERPROFILE || os.homedir(),
-            grokHome: resolveGrokHome(sandboxEnv),
-            tempDir: trustedTempDir,
-            runtimeReadPaths: [...brokerRuntime.readRoots, this.context.extensionUri.fsPath],
-          },
-        );
-        this.host.appendLine(
-          `[sandbox] broker runtime: ${brokerRuntime.executable} (${brokerRuntime.kind})`,
-        );
-        broker = new SeatbeltBroker({
-          policy: compiled.policy,
-          workspaceRoot: cwd,
-          childScriptPath: path.join(this.context.extensionUri.fsPath, "out", "seatbelt-broker-child.js"),
-          runtimePath: brokerRuntime.executable,
-          env,
-          trustedTempDir,
-          onLog: (message) => this.host.appendLine(message),
-          onFatal: (error) => {
-            if (!brokerClient || gen !== session.gen) return;
-            this.host.appendLine(`[sandbox] broker failed closed: ${error.message}`);
-            this.emit(session, {
-              type: "error",
-              text: `Sandbox broker stopped unexpectedly: ${error.message}`,
-            });
-            void brokerClient.dispose();
-          },
-        });
-        await broker.start();
-        this.host.appendLine(
-          `[sandbox] Seatbelt broker ready (${compiled.profile.lineage.join(" → ")})`,
-        );
-      } catch (error) {
-        broker?.dispose();
-        broker = undefined;
-        const message = (error as Error).message || String(error);
-        if (sandboxStartupFailureDisposition(sandbox) === "warn-and-continue") {
-          const warning = `Built-in sandbox "${sandbox}" could not be applied to host-side ACP operations; continuing with Grok's native built-in handling: ${message}`;
-          this.host.appendLine(`[sandbox] ${warning}`);
-          void this.host.showWarningMessage(warning);
-        } else {
-          this.host.appendLine(`[sandbox] refusing unsandboxed custom-profile fallback: ${message}`);
-          session.priming = false;
-          session.client = undefined;
-          this.pool.delete(session);
-          this.setStatus(session, "error");
-          this.emit(session, { type: "setBusy", value: false });
-          this.emit(session, { type: "error", text: `Failed to start sandbox: ${message}` });
-          return undefined;
-        }
-      }
-    }
+    // Transient spawn/init after an update can throw once; retry the plain
+    // failure only (auth and the Windows stdio pin keep their own paths).
+    const startSpawnAttempts = 3;
+    const startSpawnBackoffMs = [300, 900] as const;
+    const createBoundClient = (): AcpClient => {
     const client = new AcpClient({
       cliPath,
       cwd,
@@ -6758,9 +6716,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       client.terminal = broker;
       client.executionBackend = broker;
     } else {
-      // Unsandboxed/off sessions keep the normal host filesystem path, but
-      // their terminals are still per client so a restart/reap cannot leak or
-      // kill another conversation's processes.
+      // Unsandboxed/off sessions keep the normal host filesystem path. Terminals
+      // share one sidebar-wide manager; each is tracked by its own terminalId, so
+      // a restart/reap still only ever kills/releases that session's own — never
+      // reaches for another conversation's — and disposeAll() is reserved for
+      // full sidebar teardown.
       client.fsRead = async (p: string) => {
         try {
           // Agent paths are genuine workspace disk paths on the extension host.
@@ -6779,9 +6739,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           fs.writeFileSync(p, content, "utf8");
         }
       };
-      const terminalManager = new TerminalManager();
-      client.terminal = terminalManager;
-      client.executionBackend = { dispose: () => terminalManager.disposeAll() };
+      client.terminal = this.terminalManager;
     }
 
     client.on("initialized", (init) => {
@@ -7176,6 +7134,22 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("exit", (code) => {
       if (gen !== session.gen) return; // suppress exit events from disposed/replaced clients
+      // Startup window: teardown owns the user-facing outcome — no banner
+      // (this is the empty-session spawn window the bounded retry exists
+      // for), and no detachClient, whose gen bump would abort that retry.
+      // But a death here is not always followed by a catch: the best-effort
+      // setMode during resume swallows its error, so a client that died
+      // there used to finish startup marked live and route every send into
+      // a dead pipe (review find, 2026-08-15). Drop the attachment only;
+      // the next send respawns. The equality check keeps a late exit from a
+      // replaced attempt's client away from the current attempt's pipe.
+      if (session.priming) {
+        if (session.client === client) {
+          session.client = undefined;
+          this.pool.delete(session);
+        }
+        return;
+      }
       this.emit(session, { type: "exit", code });
       if (session.queuedSends.length) {
         session.queuedSendDispatch = undefined;
@@ -7198,7 +7172,91 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       void client.dispose();
     });
     client.on("stderr", (text: string) => this.host.append(text));
+    return client;
+    };
 
+    for (let attempt = 1; attempt <= startSpawnAttempts; attempt++) {
+      if (gen !== session.gen) return undefined;
+      if (sandbox) {
+        try {
+          // Seatbelt can only confine a real local directory. The Host API hands
+          // back a path rather than a URI, so the old scheme check becomes an
+          // existence check: a virtual workspace (github://, vscode-vfs://) has
+          // no local directory to compile a policy against.
+          if (!cwd || !fs.existsSync(cwd)) {
+            throw new Error(
+              `Seatbelt requires a local file workspace (got ${cwd || "no workspace folder"})`,
+            );
+          }
+          const tomls = this.readSandboxTomls(cwd, sandboxEnv);
+          const brokerRuntime = resolveSeatbeltBrokerRuntime(sandboxEnv);
+          const trustedTempDir = os.tmpdir();
+          const compiled = resolveAndCompileSeatbeltPolicy(
+            sandbox,
+            {
+              projectSandbox: tomls.project,
+              globalSandbox: tomls.global,
+            },
+            {
+              cwd,
+              home: sandboxEnv.HOME || sandboxEnv.USERPROFILE || os.homedir(),
+              grokHome: resolveGrokHome(sandboxEnv),
+              tempDir: trustedTempDir,
+              runtimeReadPaths: [...brokerRuntime.readRoots, this.context.extensionUri.fsPath],
+            },
+          );
+          this.host.appendLine(
+            `[sandbox] broker runtime: ${brokerRuntime.executable} (${brokerRuntime.kind})`,
+          );
+          broker = new SeatbeltBroker({
+            policy: compiled.policy,
+            workspaceRoot: cwd,
+            childScriptPath: path.join(this.context.extensionUri.fsPath, "out", "seatbelt-broker-child.js"),
+            runtimePath: brokerRuntime.executable,
+            env,
+            trustedTempDir,
+            onLog: (message) => this.host.appendLine(message),
+            onFatal: (error) => {
+              if (!brokerClient || gen !== session.gen) return;
+              this.host.appendLine(`[sandbox] broker failed closed: ${error.message}`);
+              this.emit(session, {
+                type: "error",
+                text: `Sandbox broker stopped unexpectedly: ${error.message}`,
+              });
+              void brokerClient.dispose();
+            },
+          });
+          await broker.start();
+          this.host.appendLine(
+            `[sandbox] Seatbelt broker ready (${compiled.profile.lineage.join(" → ")})`,
+          );
+        } catch (error) {
+          broker?.dispose();
+          broker = undefined;
+          const message = (error as Error).message || String(error);
+          if (sandboxStartupFailureDisposition(sandbox) === "warn-and-continue") {
+            const warning = `Built-in sandbox "${sandbox}" could not be applied to host-side ACP operations; continuing with Grok's native built-in handling: ${message}`;
+            this.host.appendLine(`[sandbox] ${warning}`);
+            void this.host.showWarningMessage(warning);
+          } else {
+            this.host.appendLine(`[sandbox] refusing unsandboxed custom-profile fallback: ${message}`);
+            session.priming = false;
+            session.client = undefined;
+            this.pool.delete(session);
+            this.setStatus(session, "error");
+            this.emit(session, { type: "setBusy", value: false });
+            this.emit(session, { type: "error", text: `Failed to start sandbox: ${message}` });
+            return undefined;
+          }
+        }
+      }
+      const client = createBoundClient();
+      // Once the resume branch starts emitting (queued plan/permission cards,
+      // then streamed history), a retry would replay onto the partial
+      // transcript and duplicate every message (review find, 2026-08-15) —
+      // so a failure past this flag surfaces immediately, like before the
+      // retry existed. The fresh-session path stays retryable end to end.
+      let replayBegan = false;
     try {
       const spawnAt = clock.now();
       await client.start();
@@ -7206,6 +7264,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (gen !== session.gen) { client.dispose(); return undefined; }
       const defaultModel = this.providerDefaultForProject(cwd, session.provider) ?? "";
       if (resumeId) {
+        replayBegan = true;
         // Queue any saved plans BEFORE replay starts so the webview can interleave
         // them inline with user messages as they replay (instead of dumping all
         // cards at the bottom).
@@ -7348,6 +7407,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
       }
 
+      // A spontaneous death during startup detaches the pipe (see the exit
+      // handler) without failing any awaited step — the best-effort setMode
+      // swallows its error. Returning here would hand callers a silent
+      // undefined, which recoverAuthAndResend and the send paths read as
+      // "failure already surfaced" (review find, 2026-08-15: a swallowed
+      // death consumed an auth-recovery resend with no error anywhere).
+      // Throw into the classifier instead: the retry budget owns transient
+      // startup deaths, and the final failure surfaces like any other.
+      if (session.client !== client) throw new Error("the provider exited during startup");
       // Session is live — unlock the composer and flush anything typed during
       // the startup window (#37).
       session.priming = false;
@@ -7361,18 +7429,40 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // it, before the queue flushes — the composer is where it was typed.
       this.restorePersistedDraft(session);
       if (gen === session.gen) void this.maybeFlushQueuedSends(session);
+      // A spontaneous death during startup detaches the pipe (see the exit
+      // handler) without failing any awaited step. Returning the dead client
+      // would hand the caller a dead pipe; report "no client" and let the
+      // next send respawn.
+      if (session.client !== client) { this.pool.delete(session); return undefined; }
+      return client;
     } catch (err) {
       if (gen !== session.gen) { client.dispose(); return undefined; }
       const msg = (err as any).message ?? String(err);
+      // Decide the branch first: only the plain-failure path retries. Auth
+      // must surface immediately; the Windows stdio pin has its own recovery.
+      const credentialFailure =
+        (client.provider === "codex" && client.isCredentialError(err)) ||
+        /auth|unauthor|401|api[_\s-]?key|credential|sign.?in/i.test(msg);
+      const stdioRegression =
+        session.provider === "grok" &&
+        process.platform === "win32" &&
+        /timed out: (initialize|session\/(new|load))|exited \(code null\)/i.test(msg);
+      const userFacing = credentialFailure || stdioRegression || replayBegan || attempt >= startSpawnAttempts;
+      client.removeAllListeners("exit");
       client.dispose();
       session.client = undefined;
+      if (!userFacing) {
+        await new Promise<void>((resolve) => setTimeout(resolve, startSpawnBackoffMs[attempt - 1]));
+        if (gen !== session.gen) return undefined;
+        continue;
+      }
       this.pool.delete(session);
       session.priming = false;
       this.emit(session, { type: "setBusy", value: false });
       // No `403`/`forbidden` here: the CLI deliberately does NOT map 403 to an
       // auth failure (entitlement/policy, which sign-in can't fix — #58); a
       // startup error carrying that wording surfaces as a plain error below.
-      if ((client.provider === "codex" && client.isCredentialError(err)) || /auth|unauthor|401|api[_\s-]?key|credential|sign.?in/i.test(msg)) {
+      if (credentialFailure) {
         // The onboarding overlay only reaches whoever is looking at THIS
         // session. The account-level flag is what tells the gear and the model
         // picker, on every view, that signing in is the action — strictly
@@ -7382,7 +7472,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           this.setProviderNeedsLogin(session.provider, true);
         }
         this.emit(session, { type: "onboarding", state: providerLoginState(session.provider) });
-      } else if (session.provider === "grok" && process.platform === "win32" && /timed out: (initialize|session\/(new|load))|exited \(code null\)/i.test(msg)) {
+      } else if (stdioRegression) {
         // The signature of the Windows stdio regression (issue #22): a startup request
         // hangs because the agent won't read stdin until EOF. It spanned 0.2.61–0.2.70
         // (`initialize` on 0.2.61–0.2.64, `session/new` on 0.2.67/0.2.69/0.2.70) and was
@@ -7393,11 +7483,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // once. A target-or-older build cannot loop through this recovery; a
         // later manual upgrade above the target re-arms it.
         const version = await this.readGrokVersion(cliPath);
+        if (gen !== session.gen) return undefined;
         if (!this.reactiveDowngradeInFlight && shouldReactivelyDowngrade(version, process.platform)) {
           this.reactiveDowngradeInFlight = true;
           try {
             const detected = parseGrokVersion(version)?.join(".") ?? version;
             if (await this.downgradeBrokenCli(cliPath, detected, "reactive")) {
+              if (gen !== session.gen) return undefined;
               return await this.startSession(resumeId, session); // retry the spawn on the supported build
             }
           } finally {
@@ -7418,7 +7510,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       return undefined;
     }
-    return client;
+    }
+    return undefined;
   }
 
   private remoteSessionFor(clientId: string): Session {
@@ -7486,8 +7579,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // catalog scan is deferred so ready returns and the UI paints first
         // (large histories must not block activation).
         if (!rehydrating) {
-          this.postRepoCatalog();
-          setImmediate(() => this.postSessionsList());
+          if (!this.firstBootScanStarted && !this.firstBootScanCompleted) {
+            void this.runFirstBootScan({ deferSessions: true });
+          } else {
+            this.postRepoCatalog();
+            setImmediate(() => this.postSessionsList());
+          }
+        } else {
+          this.completeFirstBootScan();
         }
         break;
       }
@@ -7638,6 +7737,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await this.steerSend(msg.text, session, requester);
         break;
       case "forkSession":
+        if (this.refuseMismatchedSessionId(msg.sessionId, session, requester)) break;
         await this.forkFocusedSession(session, requester);
         break;
       case "newWorktreeSession":
@@ -7653,10 +7753,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       case "applyWorktree":
         // The webview's custom confirm already ran (native modals stay only on
         // the Command-Palette path).
-        await this.applyFocusedWorktree(true);
+        if (this.refuseMismatchedSessionId(msg.sessionId, session, requester)) break;
+        await this.applyFocusedWorktree(session, true);
         break;
       case "removeWorktree":
-        await this.removeFocusedWorktree(true);
+        if (this.refuseMismatchedSessionId(msg.sessionId, session, requester)) break;
+        await this.removeFocusedWorktree(session, true);
         break;
       case "remoteSignIn":
         await this.linkRemoteDevice();
@@ -9295,6 +9397,27 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private sendRemoteRequester(requester: RemoteRequester, message: HostMsg): void {
     const clientId = this.resolveRemoteRequester(requester);
     if (clientId) this.sendRemoteClient(clientId, message);
+  }
+
+  /**
+   * Explicit session identity on fork/apply/remove. A present id that is not
+   * the dispatch-resolved session is refused here, before any await — this
+   * codebase has been bitten three times by an identifier captured before an
+   * await going stale after it.
+   */
+  private refuseMismatchedSessionId(
+    requestedId: string | undefined,
+    session: Session,
+    requester: RemoteRequester | undefined,
+  ): boolean {
+    if (requestedId === undefined || requestedId === session.activeSessionId) return false;
+    const text = "That conversation is no longer focused — nothing was changed.";
+    if (requester) {
+      this.reportRequester(requester, "info", text);
+    } else {
+      this.postLocal({ type: "hostNotice", level: "info", text });
+    }
+    return true;
   }
 
   private reportRequester(
@@ -12046,6 +12169,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   installTestHooks(): {
     onPost(fn: (dest: MsgOrigin, message: HostMsg, clientIds?: string[]) => void): void;
     fromRemote(message: WebviewMsg, clientId?: string): void;
+    fromLocal(message: WebviewMsg): void;
     fromRelayFrame(raw: string): void;
     emitRemote(clientId: string, message: HostMsg): void;
     replayRemote(clientId: string, messages: HostMsg[], during?: () => void, fail?: boolean): Promise<void>;
@@ -12098,11 +12222,22 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       sessionUsage: PromptUsage | undefined;
     };
     delayNextSessionStart(resumeId?: string): { started: Promise<void>; release(): void };
+    delayFirstCatalogBuild(): { started: Promise<void>; release(): void; beginDeferred(): void };
     waitForSessionLoad(id: string): Promise<void>;
     setSessionStatus(id: string, status: SessionStatus): void;
     activeRemoteSessionId(clientId: string): string | undefined;
     activeRemoteWorktree(clientId: string): Session["worktree"];
     focusedSessionId(): string | undefined;
+    seedFocusedWorktreeSession(
+      id: string,
+      worktree: NonNullable<Session["worktree"]>,
+    ): {
+      applyCount(): number;
+      removeCount(): number;
+      lastApplyPath(): string | undefined;
+      lastRemovePath(): string | undefined;
+      restore(): void;
+    };
     hasLiveSession(id: string): boolean;
     remoteClientLeft(clientId: string): void;
     remoteClientRoster(clientIds: string[]): void;
@@ -12114,6 +12249,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.postTap = fn;
       },
       fromRemote: (message, clientId = "test-client") => this.handleRemoteMessage(clientId, message),
+      fromLocal: (message) => { void this.onMessage(message, "local"); },
       fromRelayFrame: (raw) => {
         const frame = parseRelayFrame(raw);
         if (frame?.t !== "client-ready") return;
@@ -12308,6 +12444,30 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.testSessionStartDelay = { resumeId, started: markStarted, wait };
         return { started, release };
       },
+      delayFirstCatalogBuild: () => {
+        let markStarted!: () => void;
+        let releaseWait!: () => void;
+        const started = new Promise<void>((resolve) => { markStarted = resolve; });
+        const wait = new Promise<void>((resolve) => { releaseWait = resolve; });
+        let released = false;
+        const release = () => {
+          if (released) return;
+          released = true;
+          this.testCatalogHold = undefined;
+          releaseWait();
+        };
+        this.firstBootScanStarted = false;
+        this.firstBootScanCompleted = false;
+        this.firstBootScanDone = new Promise<void>((resolve) => {
+          this.resolveFirstBootScan = resolve;
+        });
+        this.testCatalogHold = { started: markStarted, wait, release };
+        return {
+          started,
+          release,
+          beginDeferred: () => { void this.runFirstBootScan({ deferSessions: true }); },
+        };
+      },
       waitForSessionLoad: (id) => {
         const reservation = this.sessionLoadReservations.get(id);
         return reservation
@@ -12321,6 +12481,47 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       activeRemoteSessionId: (clientId) => this.remoteActiveSessionId(clientId) ?? undefined,
       activeRemoteWorktree: (clientId) => this.remoteClients.active(clientId)?.worktree,
       focusedSessionId: () => this.focused.activeSessionId,
+      seedFocusedWorktreeSession: (id, worktree) => {
+        const prev = {
+          id: this.focused.activeSessionId,
+          cwd: this.focused.cwd,
+          worktree: this.focused.worktree,
+          client: this.focused.client,
+        };
+        this.focused.activeSessionId = id;
+        this.focused.cwd = worktree.sourceGitRoot;
+        this.focused.worktree = worktree;
+        let applyCount = 0;
+        let removeCount = 0;
+        let lastApplyPath: string | undefined;
+        let lastRemovePath: string | undefined;
+        this.focused.client = {
+          dispose() {},
+          sessionId: id,
+          applyWorktree: async (worktreePath: string) => {
+            applyCount += 1;
+            lastApplyPath = worktreePath;
+            return { status: "ok", files: [], gitRoot: worktree.sourceGitRoot };
+          },
+          removeWorktree: async (worktreePath: string) => {
+            removeCount += 1;
+            lastRemovePath = worktreePath;
+            throw new Error("test-probe-stop");
+          },
+        } as unknown as AcpClient;
+        return {
+          applyCount: () => applyCount,
+          removeCount: () => removeCount,
+          lastApplyPath: () => lastApplyPath,
+          lastRemovePath: () => lastRemovePath,
+          restore: () => {
+            this.focused.activeSessionId = prev.id;
+            this.focused.cwd = prev.cwd;
+            this.focused.worktree = prev.worktree;
+            this.focused.client = prev.client;
+          },
+        };
+      },
       hasLiveSession: (id) => [...this.pool].some((session) =>
         session.activeSessionId === id && !!session.client
       ),
@@ -13211,6 +13412,95 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.sendRemoteSessionList(session, ownerTabToken);
   }
 
+  private refuseRemoteResume(clientId: string, id: string, text: string, selectedCwd: string): void {
+    this.sendRemoteClient(clientId, { type: "error", text, resumeFailed: { id } });
+    this.sendRemoteClient(clientId, this.buildSessionsList(selectedCwd, undefined, this.remoteActiveSessionId(clientId)));
+  }
+
+  /**
+   * First full boot pass: repo catalog plus the deferred session-list build
+   * that ready/cold-boot schedule after it. "Warmed" means this pair finished,
+   * not that postRepoCatalog has merely started.
+   */
+  private async runFirstBootScan(opts?: { deferSessions?: boolean }): Promise<void> {
+    if (this.firstBootScanStarted || this.firstBootScanCompleted) return;
+    this.firstBootScanStarted = true;
+    this.postRepoCatalog();
+    const finish = async () => {
+      const hold = this.testCatalogHold;
+      if (hold) {
+        // Consume before awaiting so a resume that arrives in this window
+        // waits on firstBootScanCompleted, not on the hold flag itself.
+        this.testCatalogHold = undefined;
+        hold.started();
+        await hold.wait;
+      }
+      this.postSessionsList();
+      this.completeFirstBootScan();
+    };
+    if (opts?.deferSessions) {
+      setImmediate(() => { void finish(); });
+      return;
+    }
+    await finish();
+  }
+
+  private completeFirstBootScan(): void {
+    if (this.firstBootScanCompleted) return;
+    this.firstBootScanCompleted = true;
+    this.resolveFirstBootScan();
+  }
+
+  private async waitForCatalogWarmup(): Promise<void> {
+    if (this.firstBootScanCompleted) return;
+    if (!this.firstBootScanStarted) {
+      void this.runFirstBootScan({ deferSessions: false });
+    }
+    await Promise.race([
+      this.firstBootScanDone,
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, GrokSidebar.FIRST_BOOT_SCAN_WAIT_MS);
+      }),
+    ]);
+  }
+
+  private findRemoteResumeTarget(clientId: string, id: string, sessionCwd?: string): RemoteResumeTarget {
+    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const selectedCwd = this.adoptRepoForRemoteSession(clientId, sessionCwd, overrides);
+    const allowedCwds = this.sessionCwdsForRepo(selectedCwd, overrides);
+    const conflictingOwner = this.remoteClients.clients().find((ownerId) =>
+      ownerId !== clientId && this.remoteClients.active(ownerId)?.activeSessionId === id
+    );
+    if (conflictingOwner) return { kind: "conflict", selectedCwd };
+    for (const session of this.pool) {
+      if (session.activeSessionId === id && session.client) {
+        if (!sessionCwdBelongsToRepo(this.sessionCwd(session), allowedCwds, pathsEqual)) {
+          return { kind: "repo-mismatch", selectedCwd };
+        }
+        return { kind: "live", selectedCwd, session };
+      }
+    }
+    const cachedCwd = this.sessionCache.get(id)?.entry.cwd;
+    const resumeCandidates = orderedResumeCwdCandidates({
+      messageCwd: sessionCwd,
+      trustedCwds: allowedCwds,
+      metaWorktreePath: overrides[id]?.worktreePath,
+      cachedCwd: overrides[id]?.providerCwd ?? cachedCwd,
+      sameCwd: pathsEqual,
+    });
+    const provider = overrides[id]?.provider ?? "grok";
+    const actualCwd = provider === "codex"
+      ? resumeCandidates.find((candidate) => allowedCwds.some((allowed) => pathsEqual(candidate, allowed)))
+      : findSessionCatalogCwd({
+          fs: defaultFs,
+          grokHome: resolveGrokHome(process.env),
+          id,
+          candidates: resumeCandidates,
+        });
+    if (!actualCwd) return { kind: "missing", selectedCwd };
+    return { kind: "disk", selectedCwd, actualCwd, provider };
+  }
+
   private async openRemoteSession(
     clientId: string,
     id: string,
@@ -13221,17 +13511,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (!claim) {
       const selectedCwd = this.remoteClients.cwd(clientId);
       this.host.appendLine(`[remote] dropped resumeSession (session load is reserved by another view)`);
-      this.sendRemoteClient(clientId, {
-        type: "error",
-        text: "Could not restore this conversation because it is already being opened in another tab or the VS Code view.",
-      });
-      this.sendRemoteClient(
+      this.refuseRemoteResume(
         clientId,
-        this.buildSessionsList(
-          selectedCwd,
-          undefined,
-          this.remoteActiveSessionId(clientId),
-        ),
+        id,
+        "Could not restore this conversation because it is already being opened in another tab or the VS Code view.",
+        selectedCwd,
       );
       return;
     }
@@ -13287,7 +13571,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     sessionCwd?: string,
     notifyCatalog = true,
   ): Promise<void> {
-    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     // A remote may name a session that lives in a DIFFERENT repo of the catalog
     // it was shown — the projects rail lists every repo's sessions at once, so
     // "open that conversation over there" is now an ordinary click. Move the
@@ -13300,91 +13583,62 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // this replaces is unchanged in substance — the cwd must still belong to a
     // repo in the catalog (`remoteTargetableCwd` already gated it inbound), and
     // a cwd owned by no catalog repo still falls through to the refusal below.
-    const selectedCwd = this.adoptRepoForRemoteSession(clientId, sessionCwd, overrides);
-    const allowedCwds = this.sessionCwdsForRepo(selectedCwd, overrides);
-    const conflictingOwner = this.remoteClients.clients().find((ownerId) =>
-      ownerId !== clientId && this.remoteClients.active(ownerId)?.activeSessionId === id
-    );
+    let target = this.findRemoteResumeTarget(clientId, id, sessionCwd);
+    // Retry only while the first boot pass could EXPLAIN the miss — a completed
+    // catalog+session-list miss is genuine, and waiting again would just delay
+    // the refusal. catalog-posted-but-list-still-deferred is still warming.
+    if (target.kind === "missing" && !this.firstBootScanCompleted) {
+      await this.waitForCatalogWarmup();
+      // Re-resolve after the await: the requesting tab, reservation, and catalog
+      // can all have moved. Thread the live Session object, not a captured id.
+      if (!this.remoteClients.isCurrent(clientId)) return;
+      const held = this.sessionLoadReservations.get(id);
+      if (held?.token !== reservation.token) return;
+      target = this.findRemoteResumeTarget(clientId, id, sessionCwd);
+    }
     // Tabs stay mutually exclusive: each browser tab is its own conversation,
     // and the duplicate-tab theft guard builds on that. The VS Code view is
     // NOT a rival tab — a session open (or parked) at the desk is joined, not
     // refused: emit() fans every frame of a session to the focused webview and
     // to each remote holder, so the desk and the phone stay in sync.
-    if (conflictingOwner) {
+    if (target.kind === "conflict") {
       this.host.appendLine(`[remote] dropped resumeSession (session is open in another tab)`);
-      this.sendRemoteClient(clientId, {
-        type: "error",
-        text: "Could not restore this conversation because it is already open in another tab.",
-      });
-      this.sendRemoteClient(
+      this.refuseRemoteResume(
         clientId,
-        this.buildSessionsList(
-          selectedCwd,
-          undefined,
-          this.remoteActiveSessionId(clientId),
-        ),
+        id,
+        "Could not restore this conversation because it is already open in another tab.",
+        target.selectedCwd,
       );
       return;
     }
-    for (const session of this.pool) {
-      if (session.activeSessionId === id && session.client) {
-        if (!sessionCwdBelongsToRepo(this.sessionCwd(session), allowedCwds, pathsEqual)) {
-          this.host.appendLine(`[remote] dropped resumeSession (session cwd does not match selected repo)`);
-          this.sendRemoteClient(clientId, {
-            type: "error",
-            text: "Could not restore this tab's conversation because its repository is no longer selected or available.",
-          });
-          this.sendRemoteClient(
-            clientId,
-            this.buildSessionsList(
-              selectedCwd,
-              undefined,
-              this.remoteActiveSessionId(clientId),
-            ),
-          );
-          return;
-        }
-        this.parkRemoteSession(clientId, session);
-        this.dropRemoteVoice(clientId);
-        this.focusRemoteSession(clientId, session, notifyCatalog);
-        return;
-      }
+    if (target.kind === "repo-mismatch") {
+      this.host.appendLine(`[remote] dropped resumeSession (session cwd does not match selected repo)`);
+      this.refuseRemoteResume(
+        clientId,
+        id,
+        "Could not restore this tab's conversation because its repository is no longer selected or available.",
+        target.selectedCwd,
+      );
+      return;
     }
-    const cachedCwd = this.sessionCache.get(id)?.entry.cwd;
-    // Same property as local resume: message cwd is only a look-first among
-    // already-authorized repo catalogs; process root comes from disk.
-    const resumeCandidates = orderedResumeCwdCandidates({
-        messageCwd: sessionCwd,
-        trustedCwds: allowedCwds,
-        metaWorktreePath: overrides[id]?.worktreePath,
-        cachedCwd: overrides[id]?.providerCwd ?? cachedCwd,
-        sameCwd: pathsEqual,
-      });
-    const provider = overrides[id]?.provider ?? "grok";
-    const actualCwd = provider === "codex"
-      ? resumeCandidates.find((candidate) => allowedCwds.some((allowed) => pathsEqual(candidate, allowed)))
-      : findSessionCatalogCwd({
-          fs: defaultFs,
-          grokHome: resolveGrokHome(process.env),
-          id,
-          candidates: resumeCandidates,
-        });
-    if (!actualCwd) {
+    if (target.kind === "live") {
+      this.parkRemoteSession(clientId, target.session);
+      this.dropRemoteVoice(clientId);
+      this.focusRemoteSession(clientId, target.session, notifyCatalog);
+      return;
+    }
+    if (target.kind === "missing") {
       this.host.appendLine(`[remote] dropped resumeSession (session was not found in selected repo)`);
-      this.sendRemoteClient(clientId, {
-        type: "error",
-        text: "Could not restore this tab's previous conversation. It may have been deleted, or its repository may no longer be available. Start a new session explicitly to continue.",
-      });
-      this.sendRemoteClient(
+      this.refuseRemoteResume(
         clientId,
-        this.buildSessionsList(
-          selectedCwd,
-          undefined,
-          this.remoteActiveSessionId(clientId),
-        ),
+        id,
+        "Could not restore this tab's previous conversation. It may have been deleted, or its repository may no longer be available. Start a new session explicitly to continue.",
+        target.selectedCwd,
       );
       return;
     }
+    const { selectedCwd, actualCwd, provider } = target;
+    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const current = this.remoteClients.active(clientId);
     // Mirror of the desk-side adoption: if the DESK still holds this
     // conversation as a clientless object (crashed / reaped focused session),
