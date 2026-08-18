@@ -25,6 +25,7 @@ import {
   type ProtocolRequest,
 } from "electron";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { GrokSidebar } from "../sidebar";
 import { Uri } from "../host";
@@ -47,11 +48,19 @@ import {
 } from "./host-dialogs";
 import { createFileMemento } from "./memento";
 import {
+  desktopUserHomeDir,
+  provisionDefaultProjectDir,
   resolveDesktopProfileDir,
   resolveExtensionRoot,
   resolveUserDataDir,
 } from "./paths";
 import { createSafeStorageSecrets } from "./safe-secrets";
+import {
+  RELAY_DEVICE_TOKEN_ENV,
+  RELAY_DEVICE_TOKEN_SECRET,
+  consumeInjectedDeviceToken,
+  withInjectedSecret,
+} from "../remote-frames";
 import {
   injectFileTreePanelLogged,
   registerFileTreeIpc,
@@ -314,6 +323,20 @@ async function createApp(): Promise<void> {
     }
   }
 
+  // Open-folder set BEFORE the sidebar exists so workspaceRoot() is already
+  // the first-run default (or a restored/discovered project). After this the
+  // constructor's RemoteClientState / default provider see a real cwd.
+  // Empty is still valid: a user who removed every project owns that set.
+  const workspace = ensureWorkspaceRoot(config, () => mainWindow, args.workspace, {
+    provisionDefaultProject: () =>
+      provisionDefaultProjectDir({
+        homeDir: desktopUserHomeDir(),
+        userDataDir: userData,
+      })?.dir,
+  });
+  if (workspace) log(`workspace: ${workspace}`);
+  else log("workspace: (none — empty project rail; use Add Project Folder)");
+
   const globalStorageDir = path.join(userData, "globalStorage");
   fs.mkdirSync(globalStorageDir, { recursive: true });
 
@@ -321,11 +344,37 @@ async function createApp(): Promise<void> {
   // Device token is a credential: encrypt with OS keychain via safeStorage.
   // Ciphertext file only — never plaintext next to config. Encryption-unavailable
   // fails on store/get (createSafeStorageSecrets), never silent fallback.
+  //
+  // A Node harness cannot pre-seed that file (the ciphertext is OS-keyed),
+  // so a development overlay answers the one key from memory when
+  // resolveInjectedDeviceToken is certain the relay URL was also overridden.
+  // Packaged builds are isPackaged=true; the resolver returns undefined and
+  // withInjectedSecret is a no-op — no token, no uplink, regardless of env.
+  const storedSecrets = createSafeStorageSecrets(
+    path.join(userData, "secrets.enc.json"),
+    safeStorage,
+  );
+  // Capture then delete — sidebar copies process.env into every ACP spawn.
+  const envTokenPresent = !!process.env[RELAY_DEVICE_TOKEN_ENV];
+  const injectedToken = consumeInjectedDeviceToken({
+    isProduction: app.isPackaged,
+    env: process.env,
+  });
+  if (envTokenPresent && !injectedToken) {
+    log("ignoring GROK_RELAY_DEVICE_TOKEN (production build or relay URL not overridden)");
+  } else if (injectedToken) {
+    log("using injected development device token (relay URL override active)");
+  }
   const hostContext: HostContext = {
-    secrets: createSafeStorageSecrets(
-      path.join(userData, "secrets.enc.json"),
-      safeStorage,
-    ),
+    secrets: {
+      get: withInjectedSecret(
+        (key) => storedSecrets.get(key),
+        RELAY_DEVICE_TOKEN_SECRET,
+        injectedToken,
+      ),
+      store: (key, value) => storedSecrets.store(key, value),
+      delete: (key) => storedSecrets.delete(key),
+    },
     globalStorageUri: Uri.file(globalStorageDir),
     extensionUri: Uri.file(extensionRoot),
     extensionId: pkg.id,
@@ -432,6 +481,11 @@ async function createApp(): Promise<void> {
       // Path derivation is cheap, but keep it on the same path-bearing lazy seam.
       get planReviewSessionRoot() {
         return sidebar!.desktopPlanReviewSessionRoot();
+      },
+      // Where Claude Code writes the plans it then links to. Same narrow
+      // provenance rule as above — a direct .md child, never a read root.
+      get claudePlansRoot() {
+        return path.join(os.homedir(), ".claude", "plans");
       },
     } satisfies DesktopOpenFileContext;
   };
@@ -576,11 +630,6 @@ async function createApp(): Promise<void> {
     webview?.dispatchMessage(message);
   });
 
-  // Open-folder set: restore prefs or one-shot discovery seed — never a folder
-  // picker. Empty is valid (user adds via File → Add Project Folder).
-  const workspace = ensureWorkspaceRoot(config, () => mainWindow, args.workspace);
-  if (workspace) log(`workspace: ${workspace}`);
-  else log("workspace: (none — empty project rail; use Add Project Folder)");
   log(`extension root: ${extensionRoot}`);
   log(`cliPath config: ${String(config.getValue("grok.cliPath") || "(auto)")}`);
 

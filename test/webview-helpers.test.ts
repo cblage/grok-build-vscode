@@ -1,8 +1,43 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 // @ts-expect-error — plain JS module, no types
-import { looksLikeFileRef, formatRelativeTime, FILE_EXTS, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, parseAttachmentContext, parseSelectionBlocks, parseImageTags, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx } from "../media/webview-helpers.js";
+import { looksLikeFileRef, formatRelativeTime, FILE_EXTS, modelPickerLabel, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, parseAttachmentContext, parseSelectionBlocks, parseImageTags, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, createPendingOverlay } from "../media/webview-helpers.js";
 import { buildPrompt, buildPromptWithImages } from "../src/prompt-builder";
 import { makeExplicitChip, makeImplicitChip, makeImageChip } from "../src/chips";
+
+describe("createPendingOverlay", () => {
+  it("paints until a frame for that key arrives, then dies", () => {
+    const overlay = createPendingOverlay({ timeoutMs: 60_000 });
+    overlay.paint("s1", "New name");
+    expect(overlay.valueFor("s1")).toBe("New name");
+    expect(overlay.valueFor("s2")).toBeUndefined();
+    expect(overlay.settle("s2")).toBe(false);
+    expect(overlay.valueFor("s1")).toBe("New name");
+    expect(overlay.settle("s1")).toBe(true);
+    expect(overlay.valueFor("s1")).toBeUndefined();
+  });
+
+  it("a contradicting settle still clears — the frame is the authority", () => {
+    const overlay = createPendingOverlay({ timeoutMs: 60_000 });
+    overlay.paint("/work/a", "blue");
+    expect(overlay.settleAny(["/work/b", "/work/a"])).toBe(true);
+    expect(overlay.peek()).toBeNull();
+  });
+
+  it("expires a silent host so a lie cannot stick", async () => {
+    vi.useFakeTimers();
+    try {
+      let expired = 0;
+      const overlay = createPendingOverlay({ timeoutMs: 50, onExpire: () => { expired += 1; } });
+      overlay.paint("s1", "Ghost");
+      expect(overlay.valueFor("s1")).toBe("Ghost");
+      await vi.advanceTimersByTimeAsync(50);
+      expect(overlay.valueFor("s1")).toBeUndefined();
+      expect(expired).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("spokenTextFromMarkdown", () => {
   it("keeps prose and link labels while omitting fenced code", () => {
@@ -215,6 +250,35 @@ describe("modelDisplayName", () => {
   it("returns '' for a falsy model ID", () => {
     expect(modelDisplayName("", models)).toBe("");
     expect(modelDisplayName(undefined, models)).toBe("");
+  });
+
+  it("uses a Claude description lead so the gear button shows the generation", () => {
+    expect(modelDisplayName("claude-sonnet-4-5", [
+      { modelId: "claude-sonnet-4-5", name: "Sonnet", description: "Sonnet 5 · Efficient for routine tasks" },
+    ])).toBe("Sonnet 5");
+  });
+});
+
+describe("modelPickerLabel", () => {
+  it("keeps grok and Codex names that already include a generation", () => {
+    expect(modelPickerLabel({ name: "Grok Build", description: "The default Grok Build agent" })).toBe("Grok Build");
+    expect(modelPickerLabel({ name: "GPT-5.6 Sol", description: "GPT-5.6 Sol · Codex" })).toBe("GPT-5.6 Sol");
+  });
+
+  it("promotes Claude's versioned description lead over a family-only name", () => {
+    expect(modelPickerLabel({ name: "Sonnet", description: "Sonnet 5 · Efficient for routine tasks" })).toBe("Sonnet 5");
+    expect(modelPickerLabel({ name: "Haiku", description: "Haiku 4.5 · Fastest for quick answers" })).toBe("Haiku 4.5");
+    expect(modelPickerLabel({ name: "Fable", description: "Fable 5 · Most capable for your hardest and longest-running tasks" })).toBe("Fable 5");
+    expect(modelPickerLabel({
+      name: "Opus (1M context)",
+      description: "Opus 5 with 1M context · Best for everyday, complex tasks",
+    })).toBe("Opus 5 with 1M context");
+  });
+
+  it("falls back to name or id when there is no usable description", () => {
+    expect(modelPickerLabel({ name: "Sonnet" })).toBe("Sonnet");
+    expect(modelPickerLabel({ modelId: "claude-sonnet-4-5" })).toBe("claude-sonnet-4-5");
+    expect(modelPickerLabel({})).toBe("");
   });
 });
 

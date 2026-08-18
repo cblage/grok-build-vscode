@@ -6,12 +6,15 @@ const root = path.resolve(__dirname, "..");
 const read = (file: string) => readFileSync(path.join(root, file), "utf8");
 
 describe("provider logo assets", () => {
-  it.each(["media/chat.js", "media/projects-rail.js"])("inlines both currentColor Lobe marks in %s", (file) => {
+  // settings.js carries a third copy because the VS Code settings TAB loads
+  // only settings.css + settings.js — it cannot reach a shared helper.
+  it.each(["media/chat.js", "media/projects-rail.js", "media/settings.js"])("inlines both currentColor Lobe marks in %s", (file) => {
     const source = read(file);
     expect(source).toContain("Provider marks from Lobe Icons (MIT)");
     expect(source).toContain('viewBox="0 0 24 24" fill="currentColor"');
     expect(source).toContain("M9.27 15.29l7.978-5.897");
     expect(source).toContain("M9.205 8.658v-2.26");
+    expect(source).toContain("M4.709 15.955l4.72-2.647.08-.23-.08-.128");
     const providerSvgs = source.match(/<svg class="provider-logo"[^>]*>/g) ?? [];
     expect(providerSvgs.length).toBeGreaterThan(0);
     expect(providerSvgs.every((svg) => !svg.includes("style="))).toBe(true);

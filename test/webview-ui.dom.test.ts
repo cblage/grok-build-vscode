@@ -109,6 +109,58 @@ describe("focused conversation name chip", () => {
     ]);
   });
 
+  it("paints a header rename on the history row before any host frame", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "sessions", entries: [row("s1", "Keep this")], activeId: "s1", dots: {} });
+    dispatch(window, { type: "sessionName", sessionId: "s1", name: "Keep this", cwd: "/work/repo" });
+    click(window, doc.getElementById("history-btn")!);
+    click(window, doc.getElementById("session-name-edit")!);
+    const input = doc.getElementById("session-name-label") as HTMLInputElement;
+    input.value = "Painted now";
+    input.dispatchEvent(new (window as any).KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+
+    expect(doc.getElementById("session-name-label")!.textContent).toBe("Painted now");
+    expect(doc.querySelector(".history-row-name")!.textContent).toBe("Painted now");
+
+    dispatch(window, { type: "sessionName", sessionId: "s1", name: "Painted now", cwd: "/work/repo" });
+    expect(doc.getElementById("session-name-label")!.textContent).toBe("Painted now");
+    expect(doc.querySelector(".history-row-name")!.textContent).toBe("Painted now");
+
+    dispatch(window, {
+      type: "sessions",
+      entries: [row("s1", "Painted now")],
+      activeId: "s1",
+      dots: {},
+    });
+    expect(doc.getElementById("session-name-label")!.textContent).toBe("Painted now");
+    expect(doc.querySelector(".history-row-name")!.textContent).toBe("Painted now");
+  });
+
+  it("paints a history-row rename on the header before any host frame", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "sessions", entries: [row("s1", "Keep this")], activeId: "s1", dots: {} });
+    dispatch(window, { type: "sessionName", sessionId: "s1", name: "Keep this", cwd: "/work/repo" });
+    click(window, doc.getElementById("history-btn")!);
+    click(window, doc.querySelector(".history-row .history-action-btn") as HTMLElement);
+    const inp = doc.querySelector(".history-rename") as HTMLInputElement;
+    inp.value = "From history";
+    inp.dispatchEvent(new (window as any).KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+
+    expect(doc.getElementById("session-name-label")!.textContent).toBe("From history");
+    expect(doc.querySelector(".history-row-name")!.textContent).toBe("From history");
+
+    // Contradict while the overlay is still live — a catalog that names this
+    // id is the authority, including a refusal that sends the old title back.
+    dispatch(window, {
+      type: "sessions",
+      entries: [row("s1", "Catalog override")],
+      activeId: "s1",
+      dots: {},
+    });
+    expect(doc.getElementById("session-name-label")!.textContent).toBe("Catalog override");
+    expect(doc.querySelector(".history-row-name")!.textContent).toBe("Catalog override");
+  });
+
   it("stays quiet against an older host that never sends the name frame", () => {
     const local = bootWebview();
     dispatch(local.window, { type: "sessions", entries: [row("s1", "Legacy title")], activeId: "s1", dots: {} });
@@ -430,6 +482,62 @@ describe("session rows (regression: only the label was clickable)", () => {
 
     expect(doc.querySelector(".history-row input.history-rename")).not.toBeNull();
     expect(types(posted)).not.toContain("resumeSession");
+  });
+
+  it("opening a history row paints the title and hides the old transcript before any host frame", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, {
+      type: "sessions",
+      entries,
+      activeId: "s1",
+      dots: {},
+    });
+    dispatch(window, { type: "sessionName", sessionId: "s1", name: "Add subtract fn", cwd: "/work/project" });
+    dispatch(window, { type: "userMessage", text: "old transcript" });
+    expect(doc.querySelector(".msg.user")?.textContent).toContain("old transcript");
+    expect(doc.getElementById("session-name-label")!.textContent).toBe("Add subtract fn");
+
+    click(window, doc.getElementById("history-btn")!);
+    posted.length = 0;
+    const rows = doc.querySelectorAll(".history-row");
+    click(window, rows[1] as HTMLElement);
+
+    expect(posted.filter((p) => p.type === "resumeSession")).toEqual([
+      { type: "resumeSession", id: "s2", cwd: undefined },
+    ]);
+    expect(doc.getElementById("session-name-label")!.textContent).toBe("Refactor parser");
+    expect((doc.querySelector(".msg.user") as HTMLElement).hidden).toBe(true);
+    expect(doc.getElementById("welcome")!.hidden).toBe(false);
+    const ver = doc.getElementById("welcome-version") as HTMLElement;
+    expect(ver.dataset.status).toBe("Loading conversation");
+
+    dispatch(window, { type: "clearMessages" });
+    expect(doc.getElementById("session-name-label")!.textContent).toBe("Refactor parser");
+
+    dispatch(window, { type: "sessionName", sessionId: "s2", name: "Refactor parser", cwd: "/work/project" });
+    dispatch(window, { type: "historyReplay", active: true });
+    dispatch(window, { type: "userMessage", text: "new transcript" });
+    dispatch(window, { type: "historyReplay", active: false });
+    expect(doc.getElementById("session-name-label")!.textContent).toBe("Refactor parser");
+    expect(doc.querySelector(".msg.user")?.textContent).toContain("new transcript");
+    expect((doc.querySelector(".msg.user") as HTMLElement).hidden).toBe(false);
+  });
+
+  it("a failed history open restores the previous title and transcript", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "sessions", entries, activeId: "s1", dots: {} });
+    dispatch(window, { type: "sessionName", sessionId: "s1", name: "Add subtract fn", cwd: "/work/project" });
+    dispatch(window, { type: "userMessage", text: "old transcript" });
+
+    click(window, doc.getElementById("history-btn")!);
+    click(window, doc.querySelectorAll(".history-row")[1] as HTMLElement);
+    expect(doc.getElementById("session-name-label")!.textContent).toBe("Refactor parser");
+    expect((doc.querySelector(".msg.user") as HTMLElement).hidden).toBe(true);
+
+    dispatch(window, { type: "error", text: "Session is owned by another client.", resumeFailed: { id: "s2" } });
+    expect(doc.getElementById("session-name-label")!.textContent).toBe("Add subtract fn");
+    expect((doc.querySelector(".msg.user") as HTMLElement).hidden).toBe(false);
+    expect(doc.querySelector(".msg.user")?.textContent).toContain("old transcript");
   });
 
   it("shows a Clear all footer that confirms in-page, then posts clearAllSessions", async () => {
@@ -1201,6 +1309,13 @@ describe("context donut (token usage)", () => {
     dispatch(window, { type: "contextUsage", used: 29088 });
     expect($(doc, "donut-label").textContent).toBe("29K/100K");
   });
+
+  it("a window-only contextUsage rescales without inventing a used count", () => {
+    const { window, doc } = boot();
+    dispatch(window, { type: "contextUsage", used: 44123, window: 100000 });
+    dispatch(window, { type: "contextUsage", window: 1000000 });
+    expect($(doc, "donut-label").textContent).toBe("44K/1000K");
+  });
 });
 
 describe("gear settings lock (model + effort disabled while busy / priming)", () => {
@@ -1382,10 +1497,44 @@ describe("gear settings lock (model + effort disabled while busy / priming)", ()
 });
 
 describe("provider onboarding", () => {
+  it("names a missing project and blocks send instead of leaving Starting up", () => {
+    const { window, doc, posted } = bootWebview();
+    const send = doc.getElementById("send-btn") as HTMLButtonElement;
+    const welcome = doc.getElementById("welcome-version")!;
+    expect(welcome.textContent).toContain("Starting");
+
+    dispatch(window, { type: "onboarding", state: "no-project" });
+    const onboarding = doc.getElementById("welcome-onboarding")!;
+    expect(onboarding.textContent).toContain("No project folder");
+    expect(onboarding.textContent).toContain("Add one to continue");
+    expect(welcome.textContent).toContain("No project folder");
+    expect(welcome.classList.contains("welcome-status-busy")).toBe(false);
+    expect(send.disabled).toBe(true);
+    expect(send.title).toContain("Add a project folder");
+
+    (doc.getElementById("input") as HTMLTextAreaElement).value = "hello";
+    click(window, send);
+    expect(posted.filter((p) => p.type === "send")).toEqual([]);
+
+    const add = onboarding.querySelector('[data-act="addProjectFolder"]') as HTMLButtonElement;
+    expect(add).toBeTruthy();
+    click(window, add);
+    expect(posted).toContainEqual({ type: "addProjectFolder" });
+  });
+
+  it("tells a remote client to add the folder at the desk", () => {
+    const { window, doc, posted } = bootWebview({ remote: true });
+    dispatch(window, { type: "onboarding", state: "no-project" });
+    const onboarding = doc.getElementById("welcome-onboarding")!;
+    expect(onboarding.textContent).toContain("Add a project folder on the computer");
+    expect(onboarding.querySelectorAll("button")).toHaveLength(0);
+    expect(posted).toEqual([]);
+  });
+
   it("shows desk sign-in guidance remotely and posts no provider-management action", () => {
     const { window, doc, posted } = bootWebview({ remote: true });
 
-    for (const state of ["connect-agent", "auth-required", "codex-login"] as const) {
+    for (const state of ["connect-agent", "auth-required", "codex-login", "claude-login"] as const) {
       dispatch(window, { type: "onboarding", state });
       const onboarding = doc.getElementById("welcome-onboarding")!;
       expect(onboarding.textContent).toContain("Sign in at the desk");
@@ -1402,14 +1551,35 @@ describe("provider onboarding", () => {
     dispatch(window, { type: "onboarding", state: "connect-agent" });
 
     const tiles = [...doc.querySelectorAll(".onb-agent-tile")] as HTMLButtonElement[];
-    expect(tiles).toHaveLength(2);
+    expect(tiles).toHaveLength(3);
     expect(tiles[0].textContent).toContain("Grok");
     expect(tiles[0].classList.contains("primary")).toBe(true);
     expect(tiles[1].textContent).toContain("Codex");
+    expect(tiles[2].textContent).toContain("Claude");
     expect(tiles.every((tile) => !!tile.querySelector("svg.provider-logo path"))).toBe(true);
 
     click(window, tiles[1]);
     expect(posted).toContainEqual({ type: "runGrokLogin", provider: "codex" });
+    click(window, tiles[2]);
+    expect(posted).toContainEqual({ type: "runGrokLogin", provider: "claude" });
+  });
+
+  it("tells the user to install and sign in with Anthropic's own Claude CLI", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "onboarding", state: "missing-claude" });
+    expect(doc.getElementById("welcome-onboarding")!.textContent).toContain("does not install or sign in to Claude");
+    expect(doc.getElementById("welcome-onboarding")!.textContent).toContain("claude auth login");
+
+    dispatch(window, { type: "onboarding", state: "claude-login" });
+    const loginCopy = doc.getElementById("welcome-onboarding")!.textContent ?? "";
+    expect(loginCopy).toContain("never implements, proxies, holds, or forwards Claude credentials");
+    expect(loginCopy).toContain("Claude subscription");
+    expect(loginCopy).toContain("Anthropic Console");
+    expect(loginCopy).not.toContain("does not offer Claude.ai login");
+    const recheck = [...doc.querySelectorAll("#welcome-onboarding button")]
+      .find((el) => el.textContent?.includes("connect Claude")) as HTMLElement;
+    click(window, recheck);
+    expect(posted).toContainEqual({ type: "recheckConnection", provider: "claude" });
   });
 
   it("shows Codex install guidance and provider-specific re-check", () => {
@@ -1778,6 +1948,19 @@ describe("Grokking… indicator (waiting placeholder)", () => {
     expect(el.querySelector(".grokking-label")?.textContent).toBe("Opening AI");
     expect(el.getAttribute("aria-label")).toBe("OpenAI is working");
     expect(el.querySelector(".grokking-icon svg")).not.toBeNull();
+  });
+
+  it("uses Clauding for Claude and Ask Claude in the composer", () => {
+    const h = bootWebview();
+    const input = h.doc.getElementById("input") as HTMLTextAreaElement;
+    dispatch(h.window, {
+      type: "session", sessionId: "cl1", models: [], currentModelId: "claude-sonnet-4-5", provider: "claude",
+    });
+    expect(input.placeholder).toBe("Ask Claude…");
+    dispatch(h.window, { type: "agentStart" });
+    const el = grokking(h.doc)!;
+    expect(el.querySelector(".grokking-label")?.textContent).toBe("Clauding");
+    expect(el.getAttribute("aria-label")).toBe("Claude is working");
   });
 
   it("mounts on agentStart with a spinning orbit icon, a label, and no dots or chevron", () => {
@@ -3260,6 +3443,24 @@ describe("context popover (donut click, #39)", () => {
 
     click(window, $(doc, "messages"));
     expect((pop as any).hidden).toBe(true);
+  });
+
+  it("labels Claude and Codex occupancy as context used, not last prompt", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "session",
+      sessionId: "s1",
+      provider: "claude",
+      currentModelId: "claude-opus-4-6",
+      models: [{ modelId: "claude-opus-4-6", name: "Opus", totalContextTokens: 1000000 }],
+    });
+    dispatch(window, { type: "contextUsage", used: 389000, window: 1000000 });
+    click(window, $(doc, "donut"));
+    const text = $(doc, "context-popover").textContent!;
+    expect(text).toContain("Context used");
+    expect(text).not.toContain("Last prompt");
+    expect(text).not.toMatch(/last turn's prompt size/i);
+    expect($(doc, "donut").title).toMatch(/^Context usage —/);
   });
 
   it("offers Compact, disabled until there is context to compact", () => {

@@ -1,6 +1,6 @@
 # Grok Build (Community)
 
-[![License: FSL-1.1-MIT](https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg)](LICENSE) [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com) [![Cursor](https://badgen.net/badge/Cursor/Extension/007ACC)](https://cursor.com) [![Companion](https://img.shields.io/badge/Companion-afkpilot-0E639C)](https://github.com/phuryn/afkpilot) [![The Product Compass](https://img.shields.io/badge/The%20Product%20Compass-productcompass.pm-FF6B35)](https://www.productcompass.pm)
+[![License: FSL-1.1-MIT](https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg)](LICENSE) ![Agents](https://img.shields.io/badge/Agents-Grok%20Build%20%C2%B7%20Codex%20%C2%B7%20Claude%20Code-000000) [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com) [![Cursor](https://badgen.net/badge/Cursor/Extension/007ACC)](https://cursor.com) [![Companion](https://img.shields.io/badge/Companion-afkpilot-0E639C)](https://github.com/phuryn/afkpilot) [![The Product Compass](https://img.shields.io/badge/The%20Product%20Compass-productcompass.pm-FF6B35)](https://www.productcompass.pm)
 
 > **GUI for Grok Build CLI (incl. Grok 4.6)** — not affiliated with or endorsed by SpaceXAI (formerly xAI). *Grok*, *Grok Build*, and *xAI* are trademarks of xAI; this project uses those names only to describe what it's compatible with.
 
@@ -12,7 +12,7 @@ Two ways to use the same agent UI on top of the **Grok Build CLI**:
 | **Get it** | [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=PawelHuryn.grok-vscode-phuryn) · [Open VSX](https://open-vsx.org/extension/PawelHuryn/grok-vscode-phuryn) | [afkpilot.com/desktop](https://afkpilot.com/desktop) (see [Desktop install](#grok-build-desktop)) |
 | **Best when** | You already live in the editor | You want the agent as its own window |
 
-Both speak JSON-RPC to `grok agent stdio` (and to other ACP agents, Codex included), share chat history under `~/.grok`, and support **Remote Control** via **[AFK Pilot](https://afkpilot.com)** — pair once and watch, approve, and steer from your phone or any browser. Drop files in as `@`-context, run **multiple sessions**, generate **images & video inline**, and dictate by **voice**.
+Both speak JSON-RPC to `grok agent stdio` (and to other ACP agents — **Codex** and **Claude Code** included), share chat history under `~/.grok`, and support **Remote Control** via **[AFK Pilot](https://afkpilot.com)** — pair once and watch, approve, and steer from your phone or any browser. Drop files in as `@`-context, run **multiple sessions**, generate **images & video inline**, and dictate by **voice**.
 
 No manual setup on either host: onboarding **walks you through installing the `grok` CLI and signing in** — with a **SuperGrok or X Premium+ subscription**, or an **xAI API key**.
 
@@ -199,7 +199,7 @@ Click the model name in the gear popover. The list comes from your CLI; switchin
 <details>
 <summary><strong>Multi-provider</strong> — built for Grok Build, works with other ACP agents</summary>
 
-The host talks **ACP** (JSON-RPC over stdio), not a Grok-specific protocol, so the same UI drives any agent that speaks it — **Codex** included. Grok Build is the default and the one everything is tuned against; other providers are selected per session and get the same chat, diffs, permission cards, and history.
+The host talks **ACP** (JSON-RPC over stdio), not a Grok-specific protocol, so the same UI drives any agent that speaks it — **OpenAI Codex** and **Claude Code** included. Connect them in **Settings → Providers**; each signs in through its own CLI. Grok Build is the default and the one everything is tuned against, but every connected agent shares one model picker, and each conversation keeps the agent it started with, so all three can run side by side with the same chat, diffs, permission cards, and history.
 
 </details>
 

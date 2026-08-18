@@ -84,6 +84,7 @@ export type UpdateRoute =
   | { event: "toolCallUpdate"; payload: any }
   | { event: "plan"; payload: any }
   | { event: "modeChanged"; modeId: string }
+  | { event: "configOptionUpdate"; configOptions: any[] }
   | { event: "commandsUpdate"; commands: any[] }
   | { event: "taskBackgrounded"; payload: any }
   | { event: "taskCompleted"; payload: any }
@@ -193,7 +194,7 @@ export function collectToolImages(payload: any): MediaRef[] {
 /** MIRRORED in media/webview-helpers.js so the webview can gate a failure hint
  *  without a host rewrite. KEEP THE TWO IN STEP: test/media-gen-mirror.test.ts
  *  drives one fixture set through both and fails if either changes alone. */
-export function isMediaGenToolCall(payload: any, provider: "grok" | "codex" = "grok"): boolean {
+export function isMediaGenToolCall(payload: any, provider: "grok" | "codex" | "claude" = "grok"): boolean {
   if (!payload || typeof payload !== "object") return false;
   const title = String(payload.title ?? "");
   if (provider === "codex") {
@@ -271,6 +272,11 @@ export function routeSessionUpdate(u: any): UpdateRoute | null {
       return { event: "plan", payload: u };
     case "current_mode_update":
       return { event: "modeChanged", modeId: u.currentModeId };
+    case "config_option_update":
+      return {
+        event: "configOptionUpdate",
+        configOptions: Array.isArray(u.configOptions) ? u.configOptions : [],
+      };
     case "available_commands_update":
       return { event: "commandsUpdate", commands: u.availableCommands ?? [] };
     case "task_backgrounded":
@@ -318,7 +324,9 @@ export function childStreamFromRoute(
  * 16371 context vs 32488 billed. The two never decompose into each other, so the
  * donut arc stays context-only and this drives the popover's usage rows (#53).
  *
- * There is **no cache-CREATION field** anywhere in the CLI — only `cachedRead`.
+ * There is **no cache-CREATION field** anywhere in the grok CLI — only `cachedRead`.
+ * Claude/Codex may send `cachedWriteTokens`; keep it when present so occupancy
+ * can be derived without inventing grok cache-write rows.
  * Wire capture: research/grok-build-oss-findings.md § 3b.
  */
 export interface PromptUsage {
@@ -326,6 +334,7 @@ export interface PromptUsage {
   outputTokens?: number;
   totalTokens?: number;
   cachedReadTokens?: number;
+  cachedWriteTokens?: number;
   reasoningTokens?: number;
   modelCalls?: number;
   apiDurationMs?: number;
@@ -339,6 +348,7 @@ export interface PromptResultMeta {
   inputTokens?: number;
   outputTokens?: number;
   cachedReadTokens?: number;
+  cachedWriteTokens?: number;
   reasoningTokens?: number;
   modelId?: string;
   usage?: PromptUsage;
@@ -356,6 +366,7 @@ export function extractPromptUsage(meta: any): PromptUsage | undefined {
     outputTokens: num(u.outputTokens),
     totalTokens: num(u.totalTokens),
     cachedReadTokens: num(u.cachedReadTokens),
+    ...(num(u.cachedWriteTokens) !== undefined ? { cachedWriteTokens: num(u.cachedWriteTokens) } : {}),
     reasoningTokens: num(u.reasoningTokens),
     modelCalls: num(u.modelCalls),
     apiDurationMs: num(u.apiDurationMs),
@@ -372,6 +383,7 @@ export function extractPromptMeta(result: any): PromptResultMeta {
     inputTokens: m.inputTokens,
     outputTokens: m.outputTokens,
     cachedReadTokens: m.cachedReadTokens,
+    cachedWriteTokens: m.cachedWriteTokens,
     reasoningTokens: m.reasoningTokens,
     modelId: m.modelId,
     usage: extractPromptUsage(m),
@@ -395,8 +407,8 @@ export function addUsage(a: PromptUsage | undefined, b: PromptUsage | undefined)
   if (!b) return { ...a };
   const keys: (keyof PromptUsage)[] = [
     "inputTokens", "outputTokens", "totalTokens", "cachedReadTokens",
-    "reasoningTokens", "modelCalls", "apiDurationMs", "numTurns",
-    "costUsdTicks",
+    "cachedWriteTokens", "reasoningTokens", "modelCalls", "apiDurationMs",
+    "numTurns", "costUsdTicks",
   ];
   const out: PromptUsage = {};
   for (const k of keys) {
@@ -499,6 +511,158 @@ export function gateZeroTokenMeta(meta: PromptResultMeta): PromptResultMeta {
 export function contextUsedFromUpdateEnvelope(meta: unknown): number | null {
   const used = (meta as { totalTokens?: unknown } | null | undefined)?.totalTokens;
   return typeof used === "number" && Number.isFinite(used) && used > 0 ? used : null;
+}
+
+/**
+ * Adapter occupancy is the prompt actually sent this call: uncached input plus
+ * cache read and cache write. Those three partitions are disjoint on both
+ * Claude and Codex. `usage.totalTokens` / `usage_update.used` add output and
+ * are a billing sum, not conversation occupancy.
+ *
+ * When the parts are missing, `totalTokens - outputTokens` is the same
+ * quantity (verified against Claude 0.69.0 and a live Codex 5.6 turn).
+ *
+ * Claude's PromptResponse.usage is the SUM of every call in the turn — do
+ * not pass that figure here and treat the result as occupancy. Reduce a
+ * turn with `occupancyFromAdapterTurn`.
+ */
+export function adapterContextOccupancy(usage: {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
+} | null | undefined): number | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const num = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
+  const input = num(usage.inputTokens);
+  const output = num(usage.outputTokens);
+  const billed = num(usage.totalTokens);
+  const cacheRead = num(usage.cachedReadTokens) ?? 0;
+  const cacheWrite = num(usage.cachedWriteTokens) ?? 0;
+  if (input !== undefined) return input + cacheRead + cacheWrite;
+  if (billed !== undefined && output !== undefined) return Math.max(0, billed - output);
+  return billed;
+}
+
+function positiveTokens(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * Occupancy for one adapter turn. Claude's PromptResponse.usage is
+ * `accumulatedUsage` — the SUM of every model call — so
+ * `adapterContextOccupancy(result)` is larger than the conversation.
+ * `usage_update.used` is the current call's billed total. Occupancy is
+ * the largest of those, never the sum. When the result does not exceed
+ * that max it is a single/last call and excludes output, so it wins.
+ *
+ * Without per-call observations the wire cannot tell a sum from a
+ * single call; the result is the honest fallback.
+ * Measurement: research/claude-acp.md, adapter-usage-probe.cjs.
+ */
+export function occupancyFromAdapterTurn(
+  resultOccupancy: number | undefined,
+  perCallUsed: readonly number[] | undefined,
+): number | undefined {
+  let callMax: number | undefined;
+  for (const used of perCallUsed ?? []) {
+    const n = positiveTokens(used);
+    if (n === undefined) continue;
+    callMax = callMax === undefined ? n : Math.max(callMax, n);
+  }
+  const result = positiveTokens(resultOccupancy);
+  if (callMax === undefined) return result;
+  if (result === undefined) return callMax;
+  return result > callMax ? callMax : result;
+}
+
+/**
+ * Per-session adapter occupancy. The prompt sent on a call *is* the
+ * conversation at that moment (every call re-sends it). Feed
+ * `occupancyFromAdapterTurn`, not Claude's summed PromptResponse. A later
+ * smaller prompt without a compact is a different-shaped call (subagent,
+ * tool follow-up) and must not replace the conversation figure — that is
+ * the 135k↔389k swing. Compaction is the only reset.
+ */
+export interface ContextOccupancyState {
+  used?: number;
+  window?: number;
+  pendingCompact?: boolean;
+}
+
+export interface ContextOccupancyEvent {
+  occupancy?: number;
+  window?: number;
+  /** Compact started or /compact — the next prompt size may be lower. */
+  compacted?: boolean;
+  /** Compaction failed; keep the stored figure and stop waiting. */
+  compactFailed?: boolean;
+}
+
+export function applyContextOccupancy(
+  state: ContextOccupancyState,
+  event: ContextOccupancyEvent,
+): ContextOccupancyState {
+  const window = positiveTokens(event.window) ?? state.window;
+  if (event.compactFailed) {
+    return { used: state.used, window, pendingCompact: false };
+  }
+  const pendingCompact = event.compacted ? true : !!state.pendingCompact;
+  const occupancy = positiveTokens(event.occupancy);
+  if (occupancy === undefined) {
+    return { used: state.used, window, pendingCompact };
+  }
+  if (pendingCompact || state.used === undefined) {
+    return { used: occupancy, window, pendingCompact: false };
+  }
+  return { used: Math.max(state.used, occupancy), window, pendingCompact: false };
+}
+
+export function occupancyFromUsageLog(
+  entries: readonly { contextUsed?: number; compacted?: boolean }[] | undefined,
+): ContextOccupancyState {
+  let state: ContextOccupancyState = {};
+  for (const entry of entries ?? []) {
+    state = applyContextOccupancy(state, {
+      occupancy: entry.contextUsed,
+      compacted: entry.compacted,
+    });
+  }
+  return state;
+}
+
+/**
+ * Claude emits exact status strings; Codex stamps `_meta.contextCompaction`.
+ * Title matching is the Codex fallback only — a grep titled "compact" is
+ * not a compaction.
+ */
+export function adapterCompactSignal(update: unknown): "started" | "completed" | "failed" | null {
+  if (typeof update === "string") {
+    const text = update.trim();
+    if (/compacting failed/i.test(text)) return "failed";
+    if (/compacting completed/i.test(text)) return "completed";
+    if (/^compacting\.\.\.$/i.test(text)) return "started";
+    return null;
+  }
+  if (!update || typeof update !== "object") return null;
+  const u = update as {
+    sessionUpdate?: unknown;
+    content?: { text?: unknown };
+    title?: unknown;
+    status?: unknown;
+    _meta?: { contextCompaction?: unknown };
+  };
+  if (typeof u.content?.text === "string") {
+    const fromText = adapterCompactSignal(u.content.text);
+    if (fromText) return fromText;
+  }
+  if (u._meta?.contextCompaction === true) {
+    if (u.status === "failed") return "failed";
+    if (u.status === "completed") return "completed";
+    return "started";
+  }
+  return null;
 }
 
 /**

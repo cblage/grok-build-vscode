@@ -1,6 +1,16 @@
 import type { EffortLevel } from "./acp";
 
-export type AcpProvider = "grok" | "codex";
+export const ACP_PROVIDERS = ["grok", "codex", "claude"] as const;
+export type AcpProvider = (typeof ACP_PROVIDERS)[number];
+
+export function isAcpProvider(value: unknown): value is AcpProvider {
+  return value === "grok" || value === "codex" || value === "claude";
+}
+
+/** Providers whose conversations live in an adapter catalog, not ~/.grok. */
+export function isAdapterProvider(provider: AcpProvider): boolean {
+  return provider === "codex" || provider === "claude";
+}
 
 export interface BackendSpawnOptions {
   cliPath: string;
@@ -32,6 +42,13 @@ export interface BackendUpdate {
   meta?: any;
   sessionTitle?: string;
   contextWindow?: number;
+  /**
+   * Ordinary `usage_update.used` is billed per model call (includes output).
+   * Compact's getContextUsage is the exception — the host only adopts this
+   * when a compact just completed. Otherwise these are per-call observations
+   * for occupancyFromAdapterTurn, not occupancy by themselves.
+   */
+  usageUpdateUsed?: number;
 }
 
 export interface BackendSessionListEntry {

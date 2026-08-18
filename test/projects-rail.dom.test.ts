@@ -124,6 +124,34 @@ describe("projects rail", () => {
     expect(rail(doc).hidden).toBe(false);
   });
 
+  it("empty first repos frame is No projects yet, not a stuck Loading…", () => {
+    // Desktop paints "Loading…" until the first `repos` frame. An empty
+    // catalog after that frame is a real empty state, not an unfinished boot.
+    const { doc, window, posted } = bootWebview({
+      beforeScripts: (w) => {
+        w.document.body.classList.add("desk");
+        withRail(w);
+      },
+    });
+    dispatch(window, {
+      type: "initialState",
+      effort: "", cwd: "", useCtrlEnter: false, extVersion: "0",
+      showThinking: false, expandCommandOutputs: false, steerByDefault: false,
+      soundNotifications: false, processingSound: false, readRepliesAloud: false,
+      capabilities: { addProjectFolder: true },
+    });
+    expect(rail(doc).textContent).toContain("Loading…");
+    dispatch(window, { type: "repos", entries: [], selectedCwd: "", activeCwd: "" });
+    expect(rail(doc).textContent).toContain("No projects yet");
+    expect(rail(doc).textContent).not.toContain("Loading…");
+    const add = doc.querySelector(".rail-empty-action") as HTMLButtonElement;
+    expect(add).toBeTruthy();
+    expect(add.textContent).toBe("Add a project folder");
+    posted.length = 0;
+    add.click();
+    expect(posted).toEqual([{ type: "addProjectFolder" }]);
+  });
+
   // By name, and nothing else. Recency was the first answer and the wrong one:
   // the rail is navigated by memory, so a list that reorders itself as you work
   // moves the row you were reaching for. `beta` carries pinned:true in the
@@ -1144,6 +1172,48 @@ describe("projects rail", () => {
         { type: "setRepoColor", cwd: "/work/alpha", color: "blue" },
       ]);
       expect(h.doc.querySelector(".rail-color-picker")).toBe(null);
+      // Optimistic: the folder tints before any repos frame.
+      const alphaAfter = h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")];
+      expect(alphaAfter.querySelector(".rail-twisty")?.getAttribute("data-repo-color")).toBe("blue");
+    });
+
+    it("keeps a confirming color frame and yields to a contradicting one", () => {
+      const h = bootWebview({ remote: true, beforeScripts: withRail });
+      dispatch(h.window, {
+        type: "repos",
+        entries: withColors(),
+        selectedCwd: "/work/alpha",
+        activeCwd: "/work/alpha",
+      });
+      const alpha = h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")];
+      click(h.window, menuItem(openMenu(h.window, alpha.querySelector(".rail-repo-head") as HTMLElement), "Set color") as HTMLElement);
+      click(h.window, [...h.doc.querySelectorAll(".rail-color-swatch")].find((s) => s.getAttribute("aria-label") === "Blue") as HTMLElement);
+      expect(h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")]
+        .querySelector(".rail-twisty")?.getAttribute("data-repo-color")).toBe("blue");
+
+      dispatch(h.window, {
+        type: "repos",
+        entries: withColors().map((r) => r.cwd === "/work/alpha" ? { ...r, color: "blue" } : r),
+        selectedCwd: "/work/alpha",
+        activeCwd: "/work/alpha",
+      });
+      expect(h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")]
+        .querySelector(".rail-twisty")?.getAttribute("data-repo-color")).toBe("blue");
+
+      const alpha2 = h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")];
+      click(h.window, menuItem(openMenu(h.window, alpha2.querySelector(".rail-repo-head") as HTMLElement), "Set color") as HTMLElement);
+      click(h.window, [...h.doc.querySelectorAll(".rail-color-swatch")].find((s) => s.getAttribute("aria-label") === "Coral") as HTMLElement);
+      expect(h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")]
+        .querySelector(".rail-twisty")?.getAttribute("data-repo-color")).toBe("coral");
+
+      dispatch(h.window, {
+        type: "repos",
+        entries: withColors(),
+        selectedCwd: "/work/alpha",
+        activeCwd: "/work/alpha",
+      });
+      expect(h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")]
+        .querySelector(".rail-twisty")?.getAttribute("data-repo-color")).toBe(null);
     });
 
     it("tints the folder stroke when the catalog carries a colour", () => {
@@ -1950,6 +2020,85 @@ describe("rail transition (optimistic highlight)", () => {
     expect(welcomeStatus(doc)).toBe("Loading conversation");
   });
 
+  it("switches the header and hides the old transcript before any host reply", () => {
+    const { doc, window } = boot("/work/alpha");
+    dispatch(window, {
+      ...sessionsFrame([
+        row("a1", "/work/alpha", "alpha one", 9),
+        row("a2", "/work/alpha", "alpha two", 8),
+      ]),
+      activeId: "a1",
+    });
+    dispatch(window, { type: "sessionName", sessionId: "a1", name: "alpha one", cwd: "/work/alpha" });
+    dispatch(window, { type: "userMessage", text: "old transcript" });
+    expect(doc.getElementById("session-head-title")!.textContent).toBe("alpha one");
+    expect(doc.querySelector(".msg.user")?.textContent).toContain("old transcript");
+
+    const section = doc.querySelectorAll(".rail-repo")[repoNames(doc).indexOf("alpha")];
+    click(window, section.querySelectorAll(".rail-session")[1] as HTMLElement);
+
+    expect(doc.getElementById("session-head-title")!.textContent).toBe("alpha two");
+    expect((doc.querySelector(".msg.user") as HTMLElement).hidden).toBe(true);
+    expect(welcomeStatus(doc)).toBe("Loading conversation");
+
+    dispatch(window, { type: "sessionName", sessionId: "a2", name: "alpha two", cwd: "/work/alpha" });
+    expect(doc.getElementById("session-head-title")!.textContent).toBe("alpha two");
+
+    dispatch(window, { type: "clearMessages" });
+    dispatch(window, { type: "historyReplay", active: true });
+    dispatch(window, { type: "userMessage", text: "new transcript" });
+    dispatch(window, { type: "historyReplay", active: false });
+    expect(doc.getElementById("session-head-title")!.textContent).toBe("alpha two");
+    expect(doc.querySelector(".msg.user")?.textContent).toContain("new transcript");
+  });
+
+  it("a contradicting identity frame after a rail open does not keep the pending title", () => {
+    const { doc, window } = boot("/work/alpha");
+    dispatch(window, {
+      ...sessionsFrame([
+        row("a1", "/work/alpha", "alpha one", 9),
+        row("a2", "/work/alpha", "alpha two", 8),
+      ]),
+      activeId: "a1",
+    });
+    dispatch(window, { type: "sessionName", sessionId: "a1", name: "alpha one", cwd: "/work/alpha" });
+
+    const section = doc.querySelectorAll(".rail-repo")[repoNames(doc).indexOf("alpha")];
+    click(window, section.querySelectorAll(".rail-session")[1] as HTMLElement);
+    expect(doc.getElementById("session-head-title")!.textContent).toBe("alpha two");
+
+    dispatch(window, { type: "error", text: "not found", resumeFailed: { id: "a2" } });
+    expect(doc.getElementById("session-head-title")!.textContent).toBe("alpha one");
+    expect(activeName(doc, "alpha")).toBe("alpha one");
+  });
+
+  it("paints a rail rename on the header and row before any host frame", async () => {
+    const { doc, window } = boot("/work/alpha");
+    dispatch(window, {
+      ...sessionsFrame([row("a1", "/work/alpha", "alpha one", 9)]),
+      activeId: "a1",
+    });
+    dispatch(window, { type: "sessionName", sessionId: "a1", name: "alpha one", cwd: "/work/alpha" });
+
+    const section = doc.querySelectorAll(".rail-repo")[repoNames(doc).indexOf("alpha")];
+    click(window, menuItem(openMenu(window, section.querySelector(".rail-session") as HTMLElement), "Rename")!);
+    const input = doc.querySelector(".confirm-input") as HTMLInputElement;
+    expect(input).toBeTruthy();
+    input.value = "Renamed on rail";
+    click(window, doc.querySelector(".confirm-primary") as HTMLElement);
+    await Promise.resolve();
+
+    expect(doc.getElementById("session-head-title")!.textContent).toBe("Renamed on rail");
+    expect(sessionNames(doc, repoNames(doc).indexOf("alpha"))[0]).toBe("Renamed on rail");
+
+    dispatch(window, {
+      ...sessionsFrame([row("a1", "/work/alpha", "Catalog title", 9)]),
+      activeId: "a1",
+    });
+    expect(doc.getElementById("session-head-title")!.textContent).toBe("Catalog title");
+    expect(sessionNames(doc, repoNames(doc).indexOf("alpha"))[0]).toBe("Catalog title");
+  });
+
   it("does not confirm a resume on a non-matching activeId (multi-tab echo)", () => {
     const { doc, window } = boot("/work/alpha");
     dispatch(window, {
@@ -2124,6 +2273,35 @@ describe("rail overflow menus toggle", () => {
     const again = h.doc.querySelector(".rail-menu-btn") as HTMLElement;
     click(h.window, again);
     expect(h.doc.querySelector(".rail-menu")).toBeFalsy();
+  });
+
+  it("keeps the top-right session ⋯ open across catalog refreshes", () => {
+    // The header overflow is parented to <body> but its button lives in
+    // #session-head-actions, outside the rail. renderRail used to look for
+    // that button only inside the rail, miss it, and closeRailMenu() on every
+    // repos / repoSessions / pinnedSessions frame — so Export as Markdown
+    // vanished every few seconds while projects were still loading.
+    const { window, doc } = boot();
+    dispatch(window, {
+      type: "sessionName",
+      sessionId: "s-alpha-1",
+      name: "Alpha one",
+      cwd: "/work/alpha",
+    });
+    const btn = doc.querySelector("#session-head-actions .rail-menu-btn") as HTMLButtonElement | null;
+    expect(btn, "session-head ⋯").toBeTruthy();
+    click(window, btn!);
+    const open = doc.querySelector(".rail-menu");
+    expect(open?.textContent).toContain("Export as Markdown");
+
+    dispatch(window, { type: "repoSessions", cwd: "/work/beta", entries: [row("s-beta-1", "/work/beta", "Beta")], dots: {}, total: 1 });
+    dispatch(window, { type: "pinnedSessions", entries: [], dots: {} });
+    dispatch(window, { type: "repos", entries: repos, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
+
+    const still = doc.querySelector(".rail-menu");
+    expect(still, "menu must survive catalog frames").toBeTruthy();
+    expect(still).toBe(open);
+    expect(still!.textContent).toContain("Export as Markdown");
   });
 
   it("keys the menu to what it acts on, not to the element", () => {

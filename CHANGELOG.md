@@ -1,10 +1,10 @@
 # Changelog
 
-## 3.10.2-sandbox.1 — 2026-08-16
+## 3.12.2-sandbox.1 — 2026-08-18
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.10.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.12.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,11 +21,47 @@
 
 ---
 
+## 3.12.1 — 2026-08-17
+
+### Fixed
+
+- **The desktop app opens on a fresh install instead of hanging (#116).** Launching with no project configured sat on "Starting" forever. The app asked itself to open a conversation, found no folder to open it in, and returned without ever telling the window it had stopped working — so the loading state had nothing to clear it. Reported by @ffgrep, who also found the workaround: adding a project, or setting `workspaceRoots` by hand.
+- **A first run now has somewhere to work.** Rather than asking you to understand projects before you can send a message, the app creates a **Grok Build** folder in your home directory and starts there. It happens once, only when you have no projects at all, and it is an ordinary project you can remove — adding your own stops it being offered again. Plenty of people want this for chat or knowledge work and have no reason to think about project organisation.
+- **Removing every project gives you an empty state, not a spinner.** It names what is needed and offers **Add project folder**, and starting a conversation stays blocked until you add one — the same dead end was reachable that way too.
+
+## 3.12.0 — 2026-08-17
+
+### Added
+
+- **Colour, rename and opening a conversation happen the moment you do them.** Picking a project colour, renaming a conversation, or opening one from the rail or history used to sit still for a second or two while the host was asked and answered — longest in the browser, where every confirmation makes a round trip to your desk. All three now apply immediately. Renaming anywhere updates every surface at once, so the top bar no longer shows the old name after you renamed it in the history list. Opening a conversation switches the title and holds the messages panel on a loading state instead of leaving the previous transcript sitting under the new name. Your desk stays the authority throughout: if it disagrees, or never answers, the display returns to what it actually says.
+- **Maximize the file panel in the browser.** afkpilot.com on a monitor docks the panel beside the chat, exactly like the desktop app — but had no way to give it the whole window. It does now, with Escape to restore. On a phone nothing changes: the panel already fills the screen there.
+- **Provider marks on Settings → Providers.** Each row carries its agent's mark, so Grok, Codex and Claude Code are identifiable at a glance rather than by reading down a column of names.
+
+### Fixed
+
+- **Opening a Grok conversation no longer runs it on a different agent.** With Grok disconnected, opening a Grok conversation from the rail reported "Failed to start Codex" — and it meant it: the conversation had been quietly handed to whichever agent could answer, because a freshly opened session looked empty before its history loaded. A conversation now keeps the agent it belongs to, and if that agent cannot answer you are told so by name. The wrong error text was the visible symptom; running your conversation on an agent you did not choose was the actual bug.
+- **Refresh finds an agent you signed into somewhere else.** Approving Grok in a browser and pressing Refresh in Settings → Providers did nothing, because it only re-checked accounts already marked connected — which is precisely the case you press it to fix. Every installed agent is re-checked now.
+- **The ⋯ menu stops closing itself while projects load.** Opening it during the first seconds after a window opens had it vanish every few seconds until the project list settled.
+- **The browser matches the editor's text size.** afkpilot.com on a desktop rendered a size larger than the same UI in VS Code or the desktop app, because the browser has no editor font setting to inherit and fell back to its own default. It now matches at 13px. Phones and tablets are unchanged — text stays at the larger size the touch layout was designed around.
+
+## 3.11.0 — 2026-08-17
+
+### Added
+
+- **Settings → Providers can be made to tell the truth.** The page said whether Grok, Codex and Claude were connected, but nothing ever re-checked: sign out inside a terminal, install a CLI, let a token lapse, and it kept repeating whatever it last heard. There's now a **Refresh** button above the list, and opening the page runs the same check on its own. It re-looks for each CLI and re-tests the accounts that are actually connected — it never marks an account connected on your behalf, so a refresh can only ever tell you what is true. The button says "Checking…" while it works. On the phone the list stays read-only, as it was, but it updates the moment your desk re-checks.
+
+### Fixed
+
+- **The VS Code settings tab keeps up with your accounts.** Opened as an editor tab, Settings → Providers only ever showed the state it started with — connect or sign out anywhere else and that tab never heard about it, so it could sit there contradicting the sidebar until you closed and reopened it. It now receives the same live updates every other surface gets.
+
 ## 3.10.1 — 2026-08-16
 
 ### Fixed
 
 - **Grok can see the images it opens (#79).** Asking Grok to read a `.png` or `.jpg` came back `Cannot read binary file`, while the same CLI in a terminal described pictures happily. The cause was on this side: the extension told the CLI it could resolve files on its behalf, and that routed *every* read — images included — down a text-only path with no image branch. It no longer does, so reading a picture reaches the CLI's own image-aware path and the model actually sees it. Generated images, screenshots a subagent produced, anything Grok opens by path. Pasting and attaching images were never affected — those always sent the pixels, and still do. Applies to grok CLI 1.0.4 and newer, where that image-aware read exists; older CLIs keep their previous behaviour, and Codex sessions are unchanged.
+- **Codex Auto accept stays Auto accept.** Codex reports Plan/Default and Agent/full-access as two options on every snapshot. Treating collaboration `default` as the host mode discarded `agent-full-access`, so picking Auto accept snapped back to Agent and approving a plan from full-access implemented under an Agent badge.
+- **A rejected Plan switch no longer leaves the Plan badge up.** The toolbar followed the click, not `session/set_mode`. When that RPC failed, Claude and Codex stayed writable (no client gate) while the UI claimed Plan.
+- **Plan mode blocks a command that arrives in the same stdout chunk as the switch.** Raising the client gate after `await setMode` left a window: readline can deliver the success reply and a `terminal/create` in one turn, and the handler still saw the gate down. A successful Plan reply now commits the gate in the response hook, before the next line is dispatched. A refused switch still leaves the badge and gate unchanged.
 
 ## 3.10.0 — 2026-08-15
 

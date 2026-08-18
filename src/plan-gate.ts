@@ -796,6 +796,62 @@ export interface PermissionOptionLike {
   name?: string;
 }
 
+/** Claude/Codex modes that mean Auto accept in the host picker. */
+const ADAPTER_AUTO_ACCEPT_MODES = new Set([
+  "yolo",
+  "auto",
+  "acceptEdits",
+  "bypassPermissions",
+  "agent-full-access",
+]);
+
+/**
+ * Map an agent-reported mode onto the host's Plan / Auto-accept flags.
+ *
+ * Grok's `current_mode_update` is descriptive: only a Plan *entry* raises the
+ * client gate; a writable mode does not lower it (the verdict / `setMode` own
+ * that). Adapters with `usesClientPlanGate === false` are the opposite — the
+ * agent's mode is authority, because they switch to a writable mode and then
+ * edit (Claude `ExitPlanMode`, Codex plan approval).
+ */
+export function applyAgentModeToHostPlan(
+  modeId: string,
+  usesClientPlanGate: boolean,
+): { planActive: boolean; autoApprove: boolean } | null {
+  if (modeId === "plan") {
+    return { planActive: true, autoApprove: false };
+  }
+  if (usesClientPlanGate) return null;
+  return {
+    planActive: false,
+    autoApprove: ADAPTER_AUTO_ACCEPT_MODES.has(modeId),
+  };
+}
+
+/**
+ * Live Plan bit for a permission decision.
+ *
+ * Grok commits the client gate in the `session/set_mode` response hook, before
+ * the next ACP line in that stdout chunk. Session chrome (`session.planActive`)
+ * and `autoApprove` still wait on the host await, so reading those here would
+ * auto-grant a same-chunk `request_permission`.
+ *
+ * Adapters without the fs/terminal gate still raise `client.planActive` on a
+ * successful Plan RPC: Codex plan review is an ordinary `request_permission`
+ * whose `allow_once` means "implement this plan", and Auto accept would select
+ * it. `usesClientPlanGate` stays false, so this bit does not enable grok's
+ * write/terminal refusal. The session flag remains a fallback because a
+ * `config_option_update` can raise Plan without going through that RPC.
+ */
+export function effectivePlanActive(
+  usesClientPlanGate: boolean,
+  clientPlanActive: boolean,
+  sessionPlanActive: boolean,
+): boolean {
+  if (usesClientPlanGate) return clientPlanActive;
+  return clientPlanActive || sessionPlanActive;
+}
+
 export function permissionOptionsForPlan<T extends PermissionOptionLike>(
   options: T[],
   planActive: boolean,
@@ -816,6 +872,49 @@ export function permissionAnswerAllowed(
   return !(planActive &&
     String(toolKind || "").toLowerCase() === "execute" &&
     option.kind === "allow_always");
+}
+
+/**
+ * Adapter plan-review rides an ordinary `request_permission` whose allow
+ * option means "implement this plan" (Codex `implement_plan`, Claude
+ * `acceptEdits` / `default`). Auto accept is consent to routine tool
+ * grants, not to that unread card.
+ */
+export function isPlanReviewPermission(toolKind?: string): boolean {
+  return String(toolKind || "").toLowerCase() === "switch_mode";
+}
+
+/**
+ * Codex puts the plan on `rawInput.plan`. Claude ExitPlanMode puts the same
+ * string there and also as a `content` text block. Empty means the adapter
+ * asked for a mode change without sending anything to review.
+ */
+export function planTextFromPermissionToolCall(toolCall?: {
+  rawInput?: unknown;
+  content?: unknown;
+} | null): string {
+  const raw = toolCall?.rawInput as { plan?: unknown } | undefined;
+  if (typeof raw?.plan === "string" && raw.plan.trim()) return raw.plan;
+  const blocks = Array.isArray(toolCall?.content) ? toolCall.content : [];
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    const rec = block as Record<string, unknown>;
+    if (rec.type === "content" && rec.content && typeof rec.content === "object") {
+      const inner = rec.content as Record<string, unknown>;
+      if (inner.type === "text" && typeof inner.text === "string" && inner.text.trim()) {
+        return inner.text;
+      }
+    }
+    if ((rec.type === "text" || rec.type === "input_text") && typeof rec.text === "string" && rec.text.trim()) {
+      return rec.text;
+    }
+  }
+  return "";
+}
+
+/** Adapter allow options implement the plan; reject keeps planning. */
+export function planReviewVerdictForOption(kind?: string): "approved" | "rejected" {
+  return kind && /reject|deny/i.test(kind) ? "rejected" : "approved";
 }
 
 /**

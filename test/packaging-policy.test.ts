@@ -111,6 +111,7 @@ describe("VSIX excludes desktop app", () => {
     expect(vscodeignore).toMatch(/^\s*out\/desktop\/\*\*/m);
     expect(vscodeignore).toMatch(/^\s*src\/desktop\/\*\*/m);
     expect(vscodeignore).toMatch(/^\s*scripts\/run-desktop\.cjs\s*$/m);
+    expect(vscodeignore).toMatch(/^\s*scripts\/lifecycle-host\.mjs\s*$/m);
     expect(vscodeignore).toMatch(/^\s*vitest\.desktop\.config\.ts\s*$/m);
     expect(vscodeignore).toMatch(/^\s*electron-builder\.yml\s*$/m);
     expect(vscodeignore).toMatch(/^\s*docs\/desktop-update-spec\.md\s*$/m);
@@ -144,6 +145,14 @@ describe("VSIX excludes desktop app", () => {
     // runs on every push and PR — otherwise it is a script nobody invokes.
     expect(pkg.scripts["check:vsix"]).toMatch(/check-vsix-requires/);
     expect(pkg.scripts.prepackage).toMatch(/check:vsix/);
+  });
+
+  it("packaging cannot run without the production-relay check", () => {
+    expect(pkg.scripts["check:relay"]).toMatch(/check-production-relay/);
+    expect(pkg.scripts.prepackage).toMatch(/check:relay/);
+    expect(pkg.scripts.prepackage.indexOf("check:vsix")).toBeGreaterThan(
+      pkg.scripts.prepackage.indexOf("check:relay"),
+    );
   });
 
   it("desktop dist scripts exist and do not replace npm run package", () => {
@@ -184,6 +193,34 @@ describe("VSIX excludes desktop app", () => {
     expect(full.scripts["dist:mac"]).toMatch(/electron-builder --mac/);
     expect(full.scripts["dist:mac"]).not.toMatch(/--arm64/);
     expect(full.scripts["dist:mac"]).not.toMatch(/--x64/);
+  });
+
+  it("does not pack Claude Agent SDK type declarations", () => {
+    const vscodeignore = read(".vscodeignore");
+    const builder = read("electron-builder.yml");
+    expect(vscodeignore).not.toMatch(/claude-agent-sdk\/\*\.d\.ts/);
+    expect(builder).not.toMatch(/claude-agent-sdk\/\*\.d\.ts/);
+    expect(vscodeignore).toMatch(/!node_modules\/@anthropic-ai\/claude-agent-sdk\/\*\.js/);
+    expect(builder).toMatch(/node_modules\/@anthropic-ai\/claude-agent-sdk\/\*\.js/);
+  });
+
+  it("packages the pinned Claude ACP runtime without native SDK binaries", () => {
+    const builder = read("electron-builder.yml");
+    const full = JSON.parse(read("package.json")) as { dependencies?: Record<string, string> };
+    expect(full.dependencies?.["@agentclientprotocol/claude-agent-acp"]).toBe("0.69.0");
+    expect(builder).toMatch(/node_modules\/@agentclientprotocol\/claude-agent-acp\/package\.json/);
+    expect(builder).toMatch(/node_modules\/@agentclientprotocol\/claude-agent-acp\/dist\/\*\*\/\*/);
+    expect(builder).not.toMatch(/node_modules\/@agentclientprotocol\/claude-agent-acp\/\*\*\/\*/);
+    expect(builder).toMatch(/node_modules\/@anthropic-ai\/claude-agent-sdk\/package\.json/);
+    expect(builder).toMatch(/^\s*- "!node_modules\/@anthropic-ai\/claude-agent-sdk-\*\/\*\*"\s*$/m);
+    expect(fs.existsSync(path.join(
+      root,
+      "node_modules",
+      "@agentclientprotocol",
+      "claude-agent-acp",
+      "dist",
+      "index.js",
+    ))).toBe(true);
   });
 
   it("packages the pinned Codex ACP runtime in the desktop artifact", () => {
@@ -245,6 +282,18 @@ describe("VSIX excludes desktop app", () => {
     // nested node_modules once npm installs the declared tree.
     expect(vscodeignore).not.toMatch(
       /^\s*!node_modules\/@agentclientprotocol\/codex-acp\/\*\*\s*$/m,
+    );
+    expect(vscodeignore).toMatch(
+      /^\s*!node_modules\/@agentclientprotocol\/claude-agent-acp\/package\.json\s*$/m,
+    );
+    expect(vscodeignore).toMatch(
+      /^\s*!node_modules\/@agentclientprotocol\/claude-agent-acp\/dist\/\*\*\s*$/m,
+    );
+    expect(vscodeignore).not.toMatch(
+      /^\s*!node_modules\/@agentclientprotocol\/claude-agent-acp\/\*\*\s*$/m,
+    );
+    expect(vscodeignore).not.toMatch(
+      /^\s*!node_modules\/@anthropic-ai\/claude-agent-sdk-\*\*?\s*$/m,
     );
   });
 });

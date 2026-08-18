@@ -1,13 +1,21 @@
 import type { ModelInfo } from "./acp";
 import type { AcpProvider, BackendSessionListEntry } from "./acp-backend";
+import { isAdapterProvider } from "./acp-backend";
 import { normalizeWorkspaceFsPath } from "./host";
 import type { SessionListEntry, SessionMetaOverrides } from "./sessions";
 
-export const PROVIDER_ORDER: readonly AcpProvider[] = ["grok", "codex"];
+export const PROVIDER_ORDER: readonly AcpProvider[] = ["grok", "codex", "claude"];
+
+export function providerDisplayName(provider: AcpProvider): string {
+  if (provider === "codex") return "Codex";
+  if (provider === "claude") return "Claude";
+  return "Grok";
+}
 
 export interface ProviderConnections {
   grok?: boolean;
   codex?: boolean;
+  claude?: boolean;
 }
 
 export interface ProviderModelCacheEntry {
@@ -71,8 +79,53 @@ export function connectedProviderIds(
   return PROVIDER_ORDER.filter((provider) => connections[provider] === true && located[provider] === true);
 }
 
-export function providerLoginState(provider: AcpProvider): "auth-required" | "codex-login" {
-  return provider === "codex" ? "codex-login" : "auth-required";
+/**
+ * Connected AND able to answer — the set a new session may be handed to.
+ *
+ * "Connected" only means the user linked this provider and we can find its
+ * binary. A provider whose credentials have since lapsed is still connected and
+ * still located, so it stayed at the head of {@link connectedProviderIds} and
+ * captured every new empty session: the owner had Grok and Claude unconnected,
+ * Codex connected with expired credentials, and got dropped into "Complete
+ * codex login" on a fresh session he might have wanted Grok for.
+ *
+ * Keep both functions. Deciding whether to OFFER a sign-out, or whether to show
+ * a provider as stale at all, genuinely wants "connected"; deciding who runs a
+ * turn wants this.
+ */
+export function usableProviderIds(
+  connections: ProviderConnections,
+  located: Partial<Record<AcpProvider, boolean>>,
+  needsLogin: Partial<Record<AcpProvider, boolean>>,
+): AcpProvider[] {
+  return connectedProviderIds(connections, located).filter((provider) => needsLogin[provider] !== true);
+}
+
+export function providerLoginState(provider: AcpProvider): "auth-required" | "codex-login" | "claude-login" {
+  if (provider === "codex") return "codex-login";
+  if (provider === "claude") return "claude-login";
+  return "auth-required";
+}
+
+export function missingProviderState(provider: AcpProvider): "missing-cli" | "missing-codex" | "missing-claude" {
+  if (provider === "codex") return "missing-codex";
+  if (provider === "claude") return "missing-claude";
+  return "missing-cli";
+}
+
+export function findCachedAdapterSession(
+  catalogs: Iterable<readonly SessionListEntry[]>,
+  id: string,
+  allowedCwds: readonly string[],
+  belongsToAllowedCwd: (cwd: string, allowedCwds: readonly string[]) => boolean,
+): SessionListEntry | undefined {
+  for (const entries of catalogs) {
+    const found = entries.find((entry) =>
+      !!entry.provider && isAdapterProvider(entry.provider) && entry.id === id && belongsToAllowedCwd(entry.cwd, allowedCwds)
+    );
+    if (found) return found;
+  }
+  return undefined;
 }
 
 export function findCachedCodexSession(
@@ -81,13 +134,8 @@ export function findCachedCodexSession(
   allowedCwds: readonly string[],
   belongsToAllowedCwd: (cwd: string, allowedCwds: readonly string[]) => boolean,
 ): SessionListEntry | undefined {
-  for (const entries of catalogs) {
-    const found = entries.find((entry) =>
-      entry.provider === "codex" && entry.id === id && belongsToAllowedCwd(entry.cwd, allowedCwds)
-    );
-    if (found) return found;
-  }
-  return undefined;
+  const found = findCachedAdapterSession(catalogs, id, allowedCwds, belongsToAllowedCwd);
+  return found?.provider === "codex" ? found : undefined;
 }
 
 export function modelsForConnectedProviders(
@@ -105,7 +153,7 @@ export function modelsForConnectedProviders(
       out.push({
         provider,
         modelId: "",
-        name: provider === "grok" ? "Grok default" : "Codex default",
+        name: `${providerDisplayName(provider)} default`,
         description: "Uses this agent's default model",
         defaultImplied: true,
       });
@@ -116,9 +164,30 @@ export function modelsForConnectedProviders(
   return out;
 }
 
-export function codexListEntry(
+/** Codex restamps listing time on load, so send-time `activeAt` is the clock.
+ *  Claude reports the SDK's real lastModified — a later listing may promote.
+ *  A local send still wins when it is newer than the adapter stamp. */
+export function adapterActivityAt(
+  provider: AcpProvider,
+  reportedAt: number,
+  activeAt?: number,
+): number {
+  if (typeof activeAt !== "number") return reportedAt;
+  if (provider === "codex") return activeAt;
+  return Math.max(reportedAt, activeAt);
+}
+
+export function adapterEntriesEligibleForClear<T>(
+  caches: ReadonlyArray<{ provider: AcpProvider; entries: readonly T[] }>,
+  refreshed: ReadonlySet<AcpProvider>,
+): T[] {
+  return caches.flatMap((cache) => refreshed.has(cache.provider) ? [...cache.entries] : []);
+}
+
+export function adapterListEntry(
   raw: BackendSessionListEntry,
   overrides: SessionMetaOverrides,
+  provider: AcpProvider,
   now = Date.now(),
 ): SessionListEntry {
   const meta = overrides[raw.sessionId];
@@ -126,11 +195,8 @@ export function codexListEntry(
   const parsed = typeof raw.updatedAt === "number"
     ? raw.updatedAt
     : Date.parse(String(raw.updatedAt ?? ""));
-  // Codex currently restamps its listing timestamp when a conversation is
-  // loaded. Once the host has observed a row, its own send-time clock is the
-  // canonical activity time; opening alone must never promote it.
   const reportedAt = Number.isFinite(parsed) ? parsed : now;
-  const updatedAt = typeof meta?.activeAt === "number" ? meta.activeAt : reportedAt;
+  const updatedAt = adapterActivityAt(provider, reportedAt, meta?.activeAt);
   const customName = meta?.customName?.trim() || undefined;
   const autoName = meta?.autoName?.trim() || title;
   return {
@@ -142,9 +208,17 @@ export function codexListEntry(
     updatedAt,
     createdAt: updatedAt,
     numMessages: 0,
-    provider: "codex",
+    provider,
     pinnedAt: meta?.pinnedAt,
   };
+}
+
+export function codexListEntry(
+  raw: BackendSessionListEntry,
+  overrides: SessionMetaOverrides,
+  now = Date.now(),
+): SessionListEntry {
+  return adapterListEntry(raw, overrides, "codex", now);
 }
 
 /** Normalize `codex --version` output (`codex-cli 0.147.0`, etc.) for display. */
@@ -165,16 +239,16 @@ export function versionIsOlder(current: string, target: string): boolean {
 
 export function mergeProviderSessionEntries(
   grokEntries: readonly SessionListEntry[],
-  codexEntries: readonly SessionListEntry[],
+  adapterEntries: readonly SessionListEntry[],
   providers: readonly AcpProvider[],
   query = "",
 ): SessionListEntry[] {
   const q = query.trim().toLowerCase();
   const entries = [
     // Grok rows are disk/buffer-truth (same contract as the unfiltered page).
-    // Codex rows come from the adapter RPC, so they stay connection-gated.
+    // Adapter rows come from session/list, so they stay connection-gated.
     ...grokEntries,
-    ...(providers.includes("codex") ? codexEntries : []),
+    ...adapterEntries.filter((entry) => !entry.provider || providers.includes(entry.provider)),
   ];
   return dedupeSessionEntriesById(entries)
     .filter((entry) => !q || entry.displayName.toLowerCase().includes(q) || entry.worktreeLabel?.toLowerCase().includes(q))
@@ -195,9 +269,10 @@ function followsCodexHighWater(
 }
 
 /** Grok owns page pacing and its cursor remains opaque to the combined path.
- * Codex is a complete, cheap in-memory catalog. While Grok has another page,
- * emit the not-yet-consumed Codex prefix down through this page's oldest Grok
- * timestamp. Once Grok is exhausted, drain the remaining Codex suffix. */
+ * Adapter catalogs (Codex, Claude) are complete and cheap in memory. While
+ * Grok has another page, emit the not-yet-consumed adapter prefix down through
+ * this page's oldest Grok timestamp. Once Grok is exhausted, drain the rest.
+ * `codexHighWater` is that adapter-catalog cursor — the name is historical. */
 export function mergeProviderHistoryPage(
   grok: GrokHistoryPage | undefined,
   codexEntries: readonly SessionListEntry[],

@@ -188,6 +188,9 @@
     if (saved.repoCwd && saved.repoCwd !== state.cwd) {
       vscode.postMessage({ type: "selectRepo", cwd: saved.repoCwd });
     }
+    // Startup restore has no display name in the remembered payload, and the
+    // page is already on the welcome/"Starting" hold. Treating it like a
+    // user click would invent a title we do not have.
     vscode.postMessage({ type: "resumeSession", id: saved.id, cwd: saved.cwd || undefined });
   }
   const ttsAvailable = !!window.speechSynthesis && typeof window.SpeechSynthesisUtterance === "function";
@@ -265,9 +268,11 @@
   const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh"];
   const GROK_ACTIVITY_VERB = "Grokking";
   const CODEX_ACTIVITY_VERB = "Opening AI";
+  const CLAUDE_ACTIVITY_VERB = "Clauding";
   const COMPOSER_PLACEHOLDER = {
     grok: "Ask Grok\u2026",
     codex: "Ask GPT\u2026",
+    claude: "Ask Claude\u2026",
   };
   const EFFORT_TOOLTIPS = {
     none: "None — no extra reasoning",
@@ -307,6 +312,9 @@
     activeProvider: "grok",
     providersKnown: false,
     providers: [],
+    // Settings → Providers re-observation in flight. Host-owned; see the
+    // `providerState` case for why the client never sets it on its own.
+    providersChecking: false,
     onboardingMode: null,
     onboardingInfo: {},
     codexInstall: { phase: "idle", receivedBytes: 0, totalBytes: 0, reason: "" },
@@ -389,6 +397,10 @@
     // whether it works — we offer it and let the host latch this off the first
     // time the CLI answers -32601 (the text falls back to the queue, never lost).
     steerSupported: true,
+    // Claude Code has no mid-turn interject, so a message typed while it is
+    // working is always SCHEDULED, never steered — whatever the steer-by-default
+    // setting says (owner, 2026-08-17). Offering Steer there would promise the
+    // running turn hears you now, and it does not. See steerableProvider().
     lastTurnUsage: null, // last prompt's billing split (#53), for the donut popover
     sessionUsage: null, // session-cumulative billing — summed by the host, not grok
     activeAgentEl: null,
@@ -1069,6 +1081,7 @@
 
   newBtn.innerHTML = ICON.squarePen;
   historyBtn.innerHTML = ICON.clock;
+  ensureVisibleNewSession();
   // "Continue remotely", one tap from the chat instead of buried in the gear
   // menu — the desk is where someone decides to get up and keep going on
   // their phone. Local client only (a remote is already remote), and only
@@ -1086,7 +1099,7 @@
 
   // ---------- markdown ----------
 
-  const { looksLikeFileRef, formatRelativeTime, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents } = globalThis.GrokWebviewHelpers;
+  const { looksLikeFileRef, formatRelativeTime, modelPickerLabel, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, createPendingOverlay, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents } = globalThis.GrokWebviewHelpers;
 
   function escapeAttr(s) {
     return String(s == null ? "" : s)
@@ -1868,7 +1881,10 @@
 
     const used = state.usedTokens || 0;
     const pct = Math.min(100, Math.round((used / state.contextWindow) * 100));
-    info("Context used", `${tok(used)} / ${tok(state.contextWindow)} (${pct}%)`);
+    info(
+      "Context used",
+      `${tok(used)} / ${tok(state.contextWindow)} (${pct}%)`,
+    );
 
     // Compact sits directly under the context line — it is the action ON that
     // number, so it belongs to it, not stranded below the billing sections.
@@ -1902,6 +1918,7 @@
       section("Session total");
       row(sess, "Input", "inputTokens");
       row(sess, "↳ cache read", "cachedReadTokens");
+      row(sess, "↳ cache write", "cachedWriteTokens");
       row(sess, "Output", "outputTokens");
       row(sess, "Cost", "costUsdTicks", usdTicks);
     }
@@ -1916,6 +1933,7 @@
       contextPopover.appendChild(body);
       row(turn, "Input", "inputTokens", null, body);
       row(turn, "↳ cache read", "cachedReadTokens", null, body);
+      row(turn, "↳ cache write", "cachedWriteTokens", null, body);
       row(turn, "Output", "outputTokens", null, body);
       row(turn, "↳ reasoning", "reasoningTokens", null, body);
       row(turn, "Cost", "costUsdTicks", usdTicks, body);
@@ -2339,6 +2357,7 @@
       voiceKeyterms: Array.isArray(state.voiceKeyterms) ? state.voiceKeyterms : [],
       telemetryEnabled: state.telemetryEnabled,
       providers: state.providers || [],
+      providersChecking: !!state.providersChecking,
       extVersion: state.extVersion,
       cliVersion: state.cliVersion,
       hostKind: state.hostKind,
@@ -2475,13 +2494,19 @@
   }
 
   function openAllSettings() {
-    const opener = document.getElementById("gear-btn") || document.activeElement;
+    openSettingsCategory();
+  }
+
+  function openSettingsCategory(category) {
+    const opener = appSettingsButton() || document.getElementById("gear-btn") || document.activeElement;
     closePopovers();
     if (hostOpensSettingsEditor()) {
-      vscode.postMessage({ type: "openSettingsSurface" });
+      const message = { type: "openSettingsSurface" };
+      if (category) message.category = category;
+      vscode.postMessage(message);
       return;
     }
-    openSettingsOverlay(opener);
+    openSettingsOverlay(opener, category ? { category } : undefined);
   }
 
   // Public UI service consumed by media/file-panel.js in both renderer hosts.
@@ -2671,7 +2696,14 @@
 
     // Model + effort both restart or race the session, so they are locked while
     // a turn or session startup is in flight (the same busy signal as Send).
-    const settingsLocked = state.busy;
+    //
+    // Also locked when NOTHING can answer: with no usable agent there is no
+    // model to choose between, and an enabled picker offering a list you cannot
+    // act on is worse than one that plainly says not yet. Connect an agent and
+    // it unlocks with that agent's own default selected (owner, 2026-08-17).
+    const anyUsableProvider = !state.providersKnown
+      || (state.providers || []).some((p) => p.connected && p.needsLogin !== true);
+    const settingsLocked = state.busy || !anyUsableProvider;
 
     // Until the session's model info arrives (its name + advertised effort menu),
     // don't show a guessed model or a stale effort ladder — show a Loading state.
@@ -2680,12 +2712,19 @@
     const nameBtn = document.createElement("button");
     nameBtn.className = "toolbar-btn model-name-btn" + (settingsLocked || !modelLoaded ? " disabled" : "");
     const ownModels = state.availableModels.filter((model) => !model.provider || model.provider === state.activeProvider);
-    const modelName = modelLoaded ? (modelDisplayName(state.currentModelId, ownModels) || "Grok Build") : "Loading…";
-    nameBtn.innerHTML = `<span class="btn-label">${escapeHtml(truncate(modelName, 16))}</span>`;
+    // With no agent able to answer, show that rather than the last model a
+    // session happened to remember. "GPT-5.6 Sol" sitting under the composer
+    // reads as a working selection when nothing can run at all.
+    const modelName = !anyUsableProvider
+      ? "Models unavailable"
+      : (modelLoaded ? (modelDisplayName(state.currentModelId, ownModels) || "Grok Build") : "Loading…");
+    nameBtn.innerHTML = `<span class="btn-label">${escapeHtml(truncate(modelName, 18))}</span>`;
     nameBtn.disabled = settingsLocked || !modelLoaded;
-    nameBtn.title = !modelLoaded
-      ? "Loading the session…"
-      : (settingsLocked ? `${modelName} — available once the session is ready` : `${modelName} — click to change`);
+    nameBtn.title = !anyUsableProvider
+      ? "Connect an agent to choose a model"
+      : (!modelLoaded
+        ? "Loading the session…"
+        : (settingsLocked ? `${modelName} — available once the session is ready` : `${modelName} — click to change`));
     if (!settingsLocked && modelLoaded) nameBtn.onclick = (e) => { e.stopPropagation(); renderModelPicker(); };
     row.appendChild(nameBtn);
 
@@ -2815,14 +2854,24 @@
     }
   }
 
-  /** Gear account rows: only when nothing is connected, or a connected
-   *  account needs sign-in. Healthy connected accounts live in Settings. */
+  /**
+   * Gear account rows: ONLY while nothing can answer. Once any agent is usable
+   * the gear stops carrying accounts entirely and Settings → Providers owns
+   * them (owner, 2026-08-17).
+   *
+   * This used to stay visible whenever any connected account needed a sign-in,
+   * which meant a working setup with one lapsed extra account kept a
+   * half-broken Accounts list in the quick menu forever. The gear's job is to
+   * get someone unstuck; a second account that needs attention is management,
+   * not a blocker.
+   *
+   * "Usable", not "connected" — a linked account whose credentials lapsed
+   * cannot answer, so it must not count as the thing that hides this.
+   */
   function gearShowsProviderAccounts() {
     if (IS_REMOTE || !state.providersKnown) return false;
     const list = state.providers || [];
-    const anyConnected = list.some((p) => p.connected);
-    const needsAttention = list.some((p) => p.connected && p.needsLogin === true);
-    return !anyConnected || needsAttention;
+    return !list.some((p) => p.connected && p.needsLogin !== true);
   }
 
   function renderProviderAccounts() {
@@ -2834,8 +2883,14 @@
       // action is the connect flow, not "Sign out" of credentials that are
       // already refused.
       const needsLogin = connected && provider.needsLogin === true;
-      const action = needsLogin ? "Sign in again" : connected ? "Sign out" : "Connect";
-      const name = provider.id === "codex" ? "Codex" : "Grok";
+      // Two states in the verb, not three. "Sign in again" told the user about
+      // OUR bookkeeping — that this account was linked once and its credentials
+      // lapsed — while "Connect" next to it meant the same thing to them: this
+      // one does not work, press here to fix it. Both open the same login. The
+      // stale case keeps its warning styling, so the difference is still
+      // visible without inventing a second word for one action.
+      const action = connected && !needsLogin ? "Sign out" : "Connect";
+      const name = providerDisplayName(provider.id);
       addGearItem(
         `<span class="gear-lead"><span class="provider-glyph provider-${provider.id}">${providerLogoMarkup(provider.id)}</span><span>${name}</span></span><span class="popover-ver${needsLogin ? " popover-warn" : ""}">${action}</span>`,
         () => {
@@ -2954,10 +3009,10 @@
     // A signed-out agent has no knowable model list, and the placeholder shown
     // in its place ("Codex default") reads as something you can select — so its
     // rows are replaced by the one action that can actually help.
-    const signInProviders = ["grok", "codex"].filter(providerNeedsLogin);
+    const signInProviders = ["grok", "codex", "claude"].filter(providerNeedsLogin);
     models = models.filter((model) => !signInProviders.includes(model.provider || state.activeProvider));
     if (grouped) {
-      models = ["grok", "codex"].flatMap((provider) => models.filter((model) =>
+      models = ["grok", "codex", "claude"].flatMap((provider) => models.filter((model) =>
         (model.provider || state.activeProvider) === provider));
     }
     let group = "";
@@ -2966,33 +3021,30 @@
       group = provider;
       const heading = document.createElement("div");
       heading.className = "popover-section model-provider-heading";
-      heading.textContent = provider === "codex" ? "Codex" : "Grok";
+      heading.textContent = providerDisplayName(provider);
       gearPopover.appendChild(heading);
     };
-    const addSignInRow = (provider) => {
-      addProviderHeading(provider);
-      const el = document.createElement("div");
-      // Accounts are connected on the machine running the workspace, and the
-      // host refuses `runGrokLogin` from a remote — so a phone gets the fact,
-      // not a button that would do nothing.
-      el.className = "toolbar-popover-item model-signin" + (IS_REMOTE ? "" : " popover-action");
-      el.innerHTML = `<span class="popover-warn">${IS_REMOTE ? "Sign in at the desk to load models" : "Sign in to load models"}</span>`;
-      if (!IS_REMOTE) {
-        el.onclick = (e) => {
-          e.stopPropagation();
-          vscode.postMessage({ type: "runGrokLogin", provider });
-          closePopovers();
-        };
-      }
-      gearPopover.appendChild(el);
-    };
+    // A provider that cannot answer is simply not in this list. It used to get
+    // a heading and a "Sign in to load models" row, which put an agent you
+    // cannot pick in the middle of the menu for picking one — and on a phone it
+    // could not even be actioned, since the host refuses runGrokLogin from a
+    // remote. Manage providers at the bottom is the way back for all three
+    // (owner, 2026-08-17: "Not connected => Not visible").
     const renderModelRow = (m) => {
       const modelProvider = m.provider || state.activeProvider;
       addProviderHeading(modelProvider);
       const el = document.createElement("div");
       const active = m.modelId === state.currentModelId && (!m.provider || m.provider === state.activeProvider);
-      el.className = "toolbar-popover-item" + (active ? " active" : "");
-      el.innerHTML = `<span>${escapeHtml(truncate(m.name || m.modelId, 28))}</span>${active ? '<span class="popover-check">✓</span>' : ""}`;
+      const label = modelPickerLabel(m) || m.modelId;
+      const glyphId = providerLogoId(modelProvider);
+      el.className = "toolbar-popover-item model-picker-row";
+      if (active) el.classList.add("active");
+      el.innerHTML =
+        `<span class="gear-lead">` +
+          `<span class="provider-glyph provider-${glyphId}">${providerLogoMarkup(glyphId)}</span>` +
+          `<span class="model-picker-name">${escapeHtml(truncate(label, 28))}</span>` +
+        `</span>` +
+        (active ? '<span class="popover-check">✓</span>' : "");
       el.title = m.modelId;
       el.onclick = (e) => {
         e.stopPropagation();
@@ -3003,18 +3055,30 @@
       };
       gearPopover.appendChild(el);
     };
+    const addManageProvidersRow = () => {
+      const sep = document.createElement("div");
+      sep.className = "popover-sep";
+      gearPopover.appendChild(sep);
+      const el = document.createElement("div");
+      el.className = "toolbar-popover-item model-manage-providers";
+      el.innerHTML = `<span class="gear-lead">${ICON.settings2}<span>Manage providers</span></span>`;
+      el.onclick = (e) => {
+        e.stopPropagation();
+        openSettingsCategory("providers");
+      };
+      gearPopover.appendChild(el);
+    };
     if (grouped) {
-      for (const provider of ["grok", "codex"]) {
+      for (const provider of ["grok", "codex", "claude"]) {
         for (const m of models) {
           if ((m.provider || state.activeProvider) === provider) renderModelRow(m);
         }
-        if (signInProviders.includes(provider)) addSignInRow(provider);
       }
+      addManageProvidersRow();
       return;
     }
     for (const m of models) renderModelRow(m);
-    // Ungrouped means one agent is in play: only its own gap is worth an action.
-    if (signInProviders.includes(state.activeProvider)) addSignInRow(state.activeProvider);
+    addManageProvidersRow();
   }
 
   /** The trigger for the surface currently being rendered. */
@@ -3753,19 +3817,47 @@
   const PROVIDER_LOGO_PATHS = {
     grok: "M9.27 15.29l7.978-5.897c.391-.29.95-.177 1.137.272.98 2.369.542 5.215-1.41 7.169-1.951 1.954-4.667 2.382-7.149 1.406l-2.711 1.257c3.889 2.661 8.611 2.003 11.562-.953 2.341-2.344 3.066-5.539 2.388-8.42l.006.007c-.983-4.232.242-5.924 2.75-9.383.06-.082.12-.164.179-.248l-3.301 3.305v-.01L9.267 15.292M7.623 16.723c-2.792-2.67-2.31-6.801.071-9.184 1.761-1.763 4.647-2.483 7.166-1.425l2.705-1.25a7.808 7.808 0 00-1.829-1A8.975 8.975 0 005.984 5.83c-2.533 2.536-3.33 6.436-1.962 9.764 1.022 2.487-.653 4.246-2.34 6.022-.599.63-1.199 1.259-1.682 1.925l7.62-6.815",
     codex: "M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z",
+    // Four-point sparkle — distinct from the Grok/Codex marks, currentColor.
+    claude: "M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z",
   };
 
+  /**
+   * Whether the agent running this session can hear a mid-turn message.
+   *
+   * Steer is `_x.ai/interject`, an xAI extension to ACP — so it is a GROK
+   * capability, not an ACP one. Codex's adapter answers -32601 and the text
+   * falls back to the queue, and Claude Code has no interject at all. Both
+   * therefore schedule instead, and neither is offered a button that describes
+   * something its agent cannot do.
+   *
+   * An absent provider means an older host that only ever ran Grok.
+   */
+  function steerableProvider() {
+    return state.activeProvider !== "claude" && state.activeProvider !== "codex";
+  }
+
+  function providerDisplayName(provider) {
+    if (provider === "codex") return "Codex";
+    if (provider === "claude") return "Claude";
+    return "Grok";
+  }
+
+  function providerLogoId(provider) {
+    if (provider === "codex" || provider === "claude") return provider;
+    return "grok";
+  }
+
   function providerLogoMarkup(provider) {
-    const id = provider === "codex" ? "codex" : "grok";
+    const id = providerLogoId(provider);
     return `<svg class="provider-logo" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="${PROVIDER_LOGO_PATHS[id]}"></path></svg>`;
   }
 
   function makeProviderGlyph(provider, dotValue, sessionId) {
-    const id = provider === "codex" ? "codex" : "grok";
+    const id = providerLogoId(provider);
     const glyph = document.createElement("span");
     glyph.className = "provider-glyph provider-" + id;
     glyph.innerHTML = providerLogoMarkup(id);
-    glyph.title = id === "codex" ? "Codex" : "Grok";
+    glyph.title = providerDisplayName(id);
     glyph.setAttribute("aria-label", glyph.title);
     if (sessionId) {
       const badge = document.createElement("span");
@@ -3810,6 +3902,68 @@
     return raw.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
   };
   const sameCwd = (a, b) => cwdKey(a) === cwdKey(b);
+
+  // Optimistic writes. Local overlays only — the next frame that names the
+  // entity is the authority (confirm, contradict, or refuse). A silent host
+  // cannot leave a lie: the overlay expires and the last frame re-renders.
+  const pendingRepoColor = createPendingOverlay({
+    onExpire() { renderRail(); },
+  });
+  const pendingRename = createPendingOverlay({
+    onExpire() { paintSessionSurfaces(); },
+  });
+
+  function repoColorOf(repo) {
+    const painted = pendingRepoColor.valueFor(cwdKey(repo && repo.cwd));
+    if (painted !== undefined) return painted;
+    return typeof repo?.color === "string" ? repo.color : "";
+  }
+
+  function sessionRowName(s) {
+    const painted = s && pendingRename.valueFor(s.id);
+    if (painted !== undefined) return painted || "Untitled";
+    return (s && s.displayName) || "Untitled";
+  }
+
+  function paintSessionSurfaces() {
+    if (!historyPopover.hidden) renderSessionRows();
+    renderSessionName();
+    renderSessionHead();
+    renderRail();
+  }
+
+  function paintPendingRepoColor(cwd, color) {
+    pendingRepoColor.paint(cwdKey(cwd), color);
+    renderRail();
+  }
+
+  function paintPendingRename(id, name) {
+    if (!id) return;
+    pendingRename.paint(id, name);
+    paintSessionSurfaces();
+  }
+
+  function settlePendingRepoColor(entries) {
+    pendingRepoColor.settleAny((entries || []).map((r) => r && cwdKey(r.cwd)).filter(Boolean));
+  }
+
+  function settlePendingRename(entries) {
+    const pending = pendingRename.peek();
+    if (!pending) return false;
+    const hit = (entries || []).find((e) => e && e.id === pending.key);
+    if (!hit) return false;
+    pendingRename.settle(pending.key);
+    // The list frame is the authority we just accepted. If the header is
+    // still holding a pre-rename sessionName for this id, adopt the row so
+    // a late name frame cannot snap the title back for a beat.
+    if (state.sessionName && state.sessionName.sessionId === hit.id) {
+      state.sessionName = {
+        ...state.sessionName,
+        name: String(hit.displayName || "New session"),
+      };
+    }
+    return true;
+  }
   const uniqueSessionRows = (entries) => {
     const byId = new Map();
     for (const entry of Array.isArray(entries) ? entries : []) {
@@ -4081,7 +4235,8 @@
 
   function renderSessionRow(s) {
       const row = document.createElement("div");
-      const active = s.id === state.activeSessionId;
+      const displayId = (railDisplayTarget() && railDisplayTarget().id) || state.activeSessionId;
+      const active = s.id === displayId;
       row.className = "history-row" + (active ? " active" : "");
       row.dataset.sessionId = s.id || "";
 
@@ -4112,6 +4267,7 @@
           // deliberate act.
           if (next !== s.displayName) {
             vscode.postMessage({ type: "renameSession", id: s.id, name: next });
+            paintPendingRename(s.id, next);
           }
           state.renamingSessionId = null;
           renderSessionRows();
@@ -4135,11 +4291,11 @@
         name.className = "history-row-name";
         // Tooltip is the name the USER sees/gave — never a legacy primer-derived
         // summary (rawSummary), which is internal compatibility data.
-        name.title = s.displayName || "";
+        name.title = sessionRowName(s);
         // A worktree session gets a branch icon (a TYPE marker in muted gray,
         // off the status-dot palette), not a "(WT)" text prefix like a fork's
         // "(Fork)" — it's an isolated checkout, not a renamed conversation.
-        let displayName = s.displayName || "Untitled";
+        let displayName = sessionRowName(s);
         if (s.worktreeLabel) {
           if (displayName.startsWith("(WT)")) displayName = displayName.slice(4).trim() || "Worktree";
           const branch = document.createElement("span");
@@ -4166,6 +4322,7 @@
         // stopPropagation so they don't also trigger a resume.
         row.onclick = () => {
           if (active) { closePopovers(); return; }
+          startRailResumeTransition(s.id, s.cwd, s.cwd, s.displayName);
           vscode.postMessage({ type: "resumeSession", id: s.id, cwd: s.cwd });
           closePopovers();
         };
@@ -4473,7 +4630,7 @@
     closeRailColorPicker();
     if (!anchor || !repo) return;
     railColorPickerAnchorEl = anchor;
-    const current = typeof repo.color === "string" ? repo.color : "";
+    const current = repoColorOf(repo);
     const picker = document.createElement("div");
     picker.className = "rail-color-picker";
     picker.setAttribute("role", "listbox");
@@ -4498,6 +4655,9 @@
         // the catalog (and a remote round-trip for nothing).
         if (sw.id === current) return;
         vscode.postMessage({ type: "setRepoColor", cwd: repo.cwd, color: sw.id });
+        // Paint now. The next `repos` frame that names this cwd is the
+        // authority — confirm, contradict, or a silent host's expiry.
+        paintPendingRepoColor(repo.cwd, sw.id);
       };
       picker.appendChild(btn);
       swatches.push(btn);
@@ -5043,7 +5203,12 @@
       };
     // Highlight without a veil would claim conversation X while Y is still on
     // screen and fully actionable. Pair them so the click is visibly owned.
+    veilTranscriptForPendingOpen();
     setConversationLoading(true);
+    if (fields.kind === "resume") {
+      renderSessionName();
+      renderSessionHead();
+    }
     const ms = Number(window.__grokRailTransitionTimeoutMs) > 0
       ? Number(window.__grokRailTransitionTimeoutMs)
       : RAIL_TRANSITION_TIMEOUT_MS;
@@ -5056,12 +5221,13 @@
     renderRail();
   }
 
-  function startRailResumeTransition(sessionId, sessionCwd, repoCwd) {
+  function startRailResumeTransition(sessionId, sessionCwd, repoCwd, displayName) {
     startRailTransition({
       kind: "resume",
       sessionId,
       sessionCwd: sessionCwd || repoCwd,
       repoCwd,
+      displayName: displayName || "",
     });
   }
 
@@ -5087,8 +5253,13 @@
     // historyReplay owns the veil while a transcript is materialising; leave
     // it up if we are mid-replay so aborting a superseded click cannot blank a
     // real load still in progress.
-    if (!state.replaying) setConversationLoading(false);
+    if (!state.replaying) {
+      unveilTranscriptAfterFailedOpen();
+      setConversationLoading(false);
+    }
     renderRail();
+    renderSessionName();
+    renderSessionHead();
   }
 
   function completeRailTransition(token) {
@@ -5360,7 +5531,12 @@
     // panel on every rail rebuild, and a session load produces a burst of those.
     const filesBtn = document.getElementById("files-browse-btn");
     if (filesBtn) placeRemoteFilesButton(filesBtn);
-    if (!on) { renderSessionHead(); return; }
+    if (!on) {
+      const openMenuKey = railMenuEl ? railMenuEl.dataset.anchorId || "" : "";
+      renderSessionHead();
+      reanchorOpenRailMenu(openMenuKey);
+      return;
+    }
     wireRailSearch();
     // The rail rebuilds itself wholesale, and a session load produces a burst of
     // frames that each trigger one. Closing the menu here meant an open ⋯ was
@@ -5501,20 +5677,14 @@
       }
     }
 
-    // Re-anchor an open ⋯ to its rebuilt button, or close it if the row it
-    // belonged to is gone (deleted, filtered out, its project collapsed).
-    if (openMenuKey) {
-      const esc = window.CSS && CSS.escape ? CSS.escape(openMenuKey) : openMenuKey;
-      const anchor = root.querySelector('[data-rail-menu-key="' + esc + '"]');
-      if (anchor) {
-        railMenuAnchorEl = anchor;
-        // Re-place it. Keeping the menu open but leaving it at the old fixed
-        // coordinates is worse than closing it: rows insert and reorder as
-        // frames arrive, so the menu would end up beside whichever row moved
-        // into that spot while still acting on the one it was opened from.
-        if (railMenuEl) placeRailPopover(railMenuEl, anchor);
-      } else closeRailMenu();
-    }
+    // Re-anchor AFTER renderSessionHead: the top-right ⋯ lives in
+    // #session-head-actions (key "session-head"), which fillSessionHeadActions
+    // rebuilds. Searching only `root` here used to miss that button and slam
+    // the menu shut on every catalog frame — the thing the owner hit while
+    // projects were still loading. Search the document so both a rail-row
+    // menu and the header menu survive the wipe.
+    renderSessionHead();
+    reanchorOpenRailMenu(openMenuKey);
     // Colour picker is one-shot and short-lived — the rebuild destroys its
     // anchor button, and re-opening it mid-catalog-refresh is not worth the
     // bookkeeping. Closing avoids a fixed popover stranded over a gone row.
@@ -5527,7 +5697,23 @@
     } else {
       root.classList.remove("rail-rebuilding");
     }
-    renderSessionHead();
+  }
+
+  /** Re-hang an open ⋯ on the button that replaced its anchor, or close it
+   *  if that row/header is gone. Searches the whole document, not just the
+   *  rail: the conversation overflow is outside `#projects-rail`. */
+  function reanchorOpenRailMenu(openMenuKey) {
+    if (!openMenuKey) return;
+    const esc = window.CSS && CSS.escape ? CSS.escape(openMenuKey) : openMenuKey;
+    const anchor = document.querySelector('[data-rail-menu-key="' + esc + '"]');
+    if (anchor) {
+      railMenuAnchorEl = anchor;
+      // Re-place it. Keeping the menu open but leaving it at the old fixed
+      // coordinates is worse than closing it: rows insert and reorder as
+      // frames arrive, so the menu would end up beside whichever row moved
+      // into that spot while still acting on the one it was opened from.
+      if (railMenuEl) placeRailPopover(railMenuEl, anchor);
+    } else closeRailMenu();
   }
 
   /** Non-collapsible group label (PINNED). */
@@ -5710,8 +5896,22 @@
   }
 
   function displayedSessionName(record) {
-    const data = activeSessionName();
-    let name = data?.name || record?.displayName || "New session";
+    const t = state.railTransition;
+    const displayId = (t && t.kind === "resume" && t.sessionId)
+      || record?.id
+      || activeSessionName()?.sessionId
+      || state.activeSessionId;
+    const renamed = displayId ? pendingRename.valueFor(displayId) : undefined;
+    let name;
+    // Overlay wins until a catalog frame names this id. sessionName can
+    // arrive first carrying the pre-rename title, and treating it as
+    // authority would snap the header back for a beat.
+    if (renamed !== undefined) name = renamed || "Untitled";
+    else if (t && t.kind === "resume" && t.displayName) name = t.displayName;
+    else {
+      const data = activeSessionName();
+      name = data?.name || record?.displayName || "New session";
+    }
     if (record?.worktreeLabel && name.startsWith("(WT)")) name = name.slice(4).trim() || "Worktree";
     return name;
   }
@@ -5780,7 +5980,9 @@
     if (edit.input.isConnected) edit.input.replaceWith(edit.label);
     edit.editBtn.classList.remove("session-name-edit-editing");
     edit.editBtn.hidden = false;
-    if (edit.surface === "local") renderSessionName();
+    // After the input is gone — paintSessionSurfaces rebuilds the label.
+    if (commit && next !== edit.original) paintPendingRename(edit.id, next);
+    else if (edit.surface === "local") renderSessionName();
     else renderSessionHead();
   }
 
@@ -5841,6 +6043,9 @@
   }
 
   function beginNewSession() {
+    // Empty open set: New would reset the welcome to Starting and then the
+    // host would refuse to spawn. Leave the empty-state card up.
+    if (state.onboardingMode === "no-project") return;
     // Capture before reset — activeSessionId is host-confirmed and is the only
     // honest "what we are leaving" for the identity frames that will confirm
     // the new conversation (they must differ from previousSessionId).
@@ -5853,6 +6058,44 @@
     // never enters state.sessions.
     startRailNewTransition(repoCwd, "creating", previousSessionId);
     vscode.postMessage({ type: "newSession" });
+  }
+
+  function wireSessionNewButton(btn) {
+    if (!btn || btn.dataset.railWired) return;
+    btn.dataset.railWired = "1";
+    btn.hidden = false;
+    btn.type = "button";
+    btn.title = "New session";
+    btn.setAttribute("aria-label", "New session");
+    btn.innerHTML = ICON.squarePen;
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      closePopovers();
+      beginNewSession();
+    };
+  }
+
+  // History stays a dedicated control; New sits next to it on every surface
+  // (top-bar `#new-btn`, remote `#session-new`). Older remote pages omit the
+  // latter — inject it after History so current-project New is still there
+  // when the rail is closed (see railSessionMenuItems).
+  function ensureVisibleNewSession() {
+    if (newBtn) {
+      newBtn.hidden = false;
+      newBtn.title = "New session";
+    }
+    const history = document.getElementById("session-history");
+    let sessionNew = document.getElementById("session-new");
+    if (!sessionNew && history && history.parentElement) {
+      sessionNew = document.createElement("button");
+      sessionNew.id = "session-new";
+      sessionNew.className = (history.className ? history.className + " " : "") + "icon-btn";
+      history.insertAdjacentElement("afterend", sessionNew);
+    }
+    if (sessionNew) {
+      if (!sessionNew.classList.contains("icon-btn")) sessionNew.classList.add("icon-btn");
+      wireSessionNewButton(sessionNew);
+    }
   }
 
   /** VS Code's compact top-bar overflow. Desktop and remote keep the richer
@@ -5881,7 +6124,7 @@
   }
 
   /**
-   * Conversation overflow (⋯) in the top-right cluster (after Remote + History).
+   * Conversation overflow (⋯) in the top-right cluster (after Remote, History, New).
    * Present only when the host shipped `#session-head-actions` (desktop getHtml /
    * AFK Pilot page). VS Code's smaller two-item menu uses its own slot so this
    * richer desktop/remote menu stays unchanged. Capability = the slot exists,
@@ -5889,20 +6132,17 @@
    */
   function fillSessionHeadActions() {
     fillVsCodeSessionActions();
+    ensureVisibleNewSession();
     const menuSlot = document.getElementById("session-head-actions");
-    // Hide the top-bar New wherever the overflow menu exists so New is not three
-    // similar icons in a row (top-bar + rail project + menu).
-    if (newBtn) newBtn.hidden = !!menuSlot;
-    const sessionNew = document.getElementById("session-new");
-    if (sessionNew) sessionNew.hidden = !!menuSlot;
     if (!menuSlot) return;
 
     menuSlot.innerHTML = "";
     // Fall back to what we already know rather than degrading the menu.
     // activeSessionRecord() searches the loaded lists, and a conversation can be
     // the live one before it appears in any of them — right after a fork, most
-    // visibly. The menu then dropped to New-only, and came back later when a
-    // list happened to refresh, which read as options randomly disappearing.
+    // visibly. The menu then dropped its conversation actions, and came back
+    // later when a list happened to refresh, which read as options randomly
+    // disappearing.
     // This menu acts on the conversation you are IN; its id and cwd are state we
     // hold, so a missing list entry is not a reason to withhold Rename, Delete
     // or Continue in a new chat.
@@ -5928,22 +6168,10 @@
     // reads the conversation being LEFT while the host has already moved to the
     // one being opened. railSessionMenuItems disables the id-less actions for
     // that window rather than this call site withholding them.
+    if (!record) return;
     menuSlot.appendChild(railMenuButton(
       "Session actions",
-      () => {
-        if (record) {
-          return railSessionMenuItems(record, repo, true, {
-            inlineRename: true,
-            includeNew: true,
-          });
-        }
-        // No live record yet (brand-new / still starting): still offer New.
-        return [{
-          label: "New session",
-          icon: ICON.squarePen,
-          onSelect: () => beginNewSession(),
-        }];
-      },
+      () => railSessionMenuItems(record, repo, true, { inlineRename: true }),
       "session-head",
     ));
   }
@@ -5955,15 +6183,19 @@
     const editBtn = $("session-name-edit");
     if (!chip || !label || !editBtn) return;
     const data = activeSessionName();
-    chip.hidden = !data;
+    const pendingOpen = !!(state.railTransition && state.railTransition.kind === "resume" && state.railTransition.displayName);
+    chip.hidden = !data && !pendingOpen;
     // Desktop rail hosts: overflow lives in the top-right cluster (after History).
     fillSessionHeadActions();
     renderSessionNameRepo();
-    if (!data || state.sessionNameEditing?.surface === "local") return;
+    if ((!data && !pendingOpen) || state.sessionNameEditing?.surface === "local") return;
     const name = displayedSessionName(activeSessionRecord());
     label.textContent = name;
     label.title = name;
-    editBtn.hidden = false;
+    // Pending open paints the title only. Rename stays gated on sessionName
+    // (the host confirmation), same as an older host that never sent the frame.
+    editBtn.hidden = !data;
+    if (!data) return;
     label.setAttribute("aria-label", `Conversation: ${name}. Activate to rename.`);
     editBtn.title = "Rename conversation";
     editBtn.setAttribute("aria-label", "Rename conversation");
@@ -6078,24 +6310,14 @@
 
     fillSessionHeadActions();
 
-    // History stays a separate control; New lives in the overflow menu when
-    // #session-head-actions is present (fillSessionHeadActions hides session-new).
     const history = document.getElementById("session-history");
     if (history && !history.dataset.railWired) {
       history.dataset.railWired = "1";
       history.innerHTML = ICON.clock;
+      history.title = history.title || "Session history";
       history.onclick = (e) => { e.stopPropagation(); openHistoryPopover(); };
     }
-    const add = document.getElementById("session-new");
-    if (add && !add.dataset.railWired) {
-      add.dataset.railWired = "1";
-      add.innerHTML = ICON.squarePen;
-      add.onclick = (e) => {
-        e.stopPropagation();
-        closePopovers();
-        beginNewSession();
-      };
-    }
+    ensureVisibleNewSession();
   }
 
   function renderRailRepo(repo, inArchive) {
@@ -6146,9 +6368,8 @@
     twisty.className = "rail-twisty";
     twisty.innerHTML = expanded ? ICON.folderOpen : ICON.folderClosed;
     twisty.setAttribute("aria-hidden", "true");
-    if (typeof repo.color === "string" && repo.color) {
-      twisty.dataset.repoColor = repo.color;
-    }
+    const repoColor = repoColorOf(repo);
+    if (repoColor) twisty.dataset.repoColor = repoColor;
     head.appendChild(twisty);
 
     const name = document.createElement("span");
@@ -6439,7 +6660,7 @@
     const hostActive = railIdlessActionsAllowed() && active;
     row.className = "rail-session" + (active ? " active" : "");
     row.dataset.sessionId = s.id || "";
-    row.title = s.displayName || "";
+    row.title = sessionRowName(s);
     // The row is the primary control, so it has to behave like one: reachable by
     // Tab and openable with Enter/Space. The repo names and pin buttons around it
     // are real <button>s; without this the conversations themselves — the whole
@@ -6478,7 +6699,7 @@
       branch.title = "Worktree: " + s.worktreeLabel;
       row.appendChild(branch);
     }
-    let name = s.displayName || "Untitled";
+    let name = sessionRowName(s);
     if (s.worktreeLabel && name.startsWith("(WT)")) name = name.slice(4).trim() || "Worktree";
     label.textContent = name;
     row.appendChild(label);
@@ -6563,16 +6784,15 @@
         onSelect: () => railRenameSession(s, cwd),
       },
     ];
-    // Header overflow only: New is folded out of the top bar on rail hosts so
-    // the bar is not three similar icons. Rail ROWS keep their own project-level
-    // New (+ on the project head) and must not gain a second one here.
-    if (opts?.includeNew) {
-      items.unshift({
-        label: "New session",
-        icon: ICON.squarePen,
-        onSelect: () => beginNewSession(),
-      });
-    }
+    // New used to live in the conversation overflow so rail hosts would not
+    // show three similar New icons (top bar, rail +, project +). That
+    // assumed the rail is on screen. It can be closed or minimised, and then
+    // neither + is reachable — the top-bar New is the only one left. It is
+    // also a different object: a new session in the CURRENT project, not
+    // "create one in the project I am pointing at". So New is top-bar only.
+    // Two places, not three: rail + (project-scoped, only while the rail is
+    // open) and the top bar (current project, always). Rail rows must not
+    // gain a copy — they already have + on the project head.
     // "Continue in a new chat" belongs with the other things you do TO a
     // conversation (rename, pin, delete), not in the composer's settings beside
     // model and effort — those adjust how the agent answers; this one makes a
@@ -6717,6 +6937,7 @@
       const next = (name || "").trim();
       if (!next || next === s.displayName) return;
       vscode.postMessage({ type: "renameSession", id: s.id, name: next, ...(cwd ? { cwd } : {}) });
+      paintPendingRename(s.id, next);
     });
   }
 
@@ -6732,7 +6953,7 @@
       if (active || isRailPendingRow(s)) return;
       // Optimistic highlight + veil before the host answers. activeSessionId is
       // left alone until sessionName / sessions.activeId confirm this id.
-      startRailResumeTransition(s.id, s.cwd || repo.cwd, repo.cwd);
+      startRailResumeTransition(s.id, s.cwd || repo.cwd, repo.cwd, s.displayName);
       // `cwd` rides along so a session in another repo reopens in ITS checkout —
       // the host resolves sessions by cwd, and omitting it would look the id up
       // under the repo we happen to be in.
@@ -6809,6 +7030,40 @@
     const label = document.createElement("span");
     label.textContent = text;
     ver.appendChild(label);
+  }
+
+  /**
+   * Hide the current transcript without deleting it. Opening B must not leave
+   * A's messages under B's title; aborting B must be able to put A's messages
+   * back. Host `clearMessages` still destroys the nodes when the open is real.
+   */
+  function veilTranscriptForPendingOpen() {
+    const welcome = $("welcome");
+    for (const child of Array.from(messagesEl.children)) {
+      if (child.id === "welcome") continue;
+      if (child.hasAttribute("data-pending-open-hide")) continue;
+      child.setAttribute("data-pending-open-hide", "1");
+      child.hidden = true;
+    }
+    if (welcome) {
+      welcome.hidden = false;
+      state.welcomeVisible = true;
+    }
+  }
+
+  function unveilTranscriptAfterFailedOpen() {
+    let restored = 0;
+    for (const child of Array.from(messagesEl.children)) {
+      if (child.getAttribute("data-pending-open-hide") !== "1") continue;
+      child.removeAttribute("data-pending-open-hide");
+      child.hidden = false;
+      restored++;
+    }
+    const welcome = $("welcome");
+    if (welcome && restored > 0) {
+      welcome.hidden = true;
+      state.welcomeVisible = false;
+    }
   }
 
   function setConversationLoading(active) {
@@ -6924,12 +7179,21 @@
     if (welcome) {
       welcome.hidden = false;
       const onb = $("welcome-onboarding");
-      if (onb) onb.innerHTML = "";
+      // Keep a just-shown "Connected" confirmation. Connecting an agent starts a
+      // fresh session for it, and that session swap arrives as clearMessages —
+      // so wiping the panel here erased the very confirmation the swap was
+      // announcing, which is why Codex and Claude never showed one. Any other
+      // panel is genuinely stale at this point and still goes.
+      if (onb && state.onboardingMode !== "provider-connected" && state.onboardingMode !== "no-project") onb.innerHTML = "";
       // A host clearMessages during an optimistic new-session transition must
       // not replace the paired "Loading conversation" veil with Starting — the
       // click already owns that wait. Otherwise the rail highlights the
       // placeholder while the welcome says something unrelated.
+      // no-project is the other hold: last-folder-removed emits clearMessages
+      // then the empty-state card, and flipping to Starting in between is the
+      // hang that card exists to replace.
       if (state.railTransition) setConversationLoading(true);
+      else if (state.onboardingMode === "no-project") setWelcomeStatus("No project folder", false);
       else setWelcomeStatus("Starting", true);
       // The empty state is rebuilt on every new session, so the tip is too —
       // until the host stops advertising it.
@@ -7003,23 +7267,152 @@
     closePreviewOverlay();
   }
 
-  function showOnboarding(mode, info) {
+  /** Acts that open a terminal we cannot observe finishing. */
+  const LAUNCH_ACTS = ["runInstall", "runLogin", "connectProvider"];
+  const launchKey = (act, provider) => act + ":" + (provider || "");
+
+  /**
+   * Remember that a terminal was launched, and re-apply that on every render.
+   *
+   * Clicking one of these re-posts the onboarding state from the host, so the
+   * panel is rebuilt immediately — a mark written straight onto the DOM node
+   * vanished on the very next frame, which is why it looked like nothing had
+   * happened even after pressing the button twice.
+   *
+   * Keyed per mode, so moving to a different panel starts clean; a re-render of
+   * the SAME panel (a failed re-check) keeps it, because the terminal really was
+   * opened and pressing it again just stacks another login on top.
+   */
+  function markOnboardingLaunched(act, provider) {
+    if (state.onboardingRanMode !== state.onboardingMode) {
+      state.onboardingRanMode = state.onboardingMode;
+      state.onboardingRan = [];
+      state.onboardingLaunched = [];
+    }
+    const key = launchKey(act, provider);
+    if (!state.onboardingRan.includes(key)) state.onboardingRan.push(key);
+    applyOnboardingLaunchState();
+  }
+
+  /**
+   * The HOST opened a login terminal — from a Settings → Providers connect, or
+   * from a connect tile it handled itself. A click in this webview is not the
+   * only way one gets opened, and marking only on click meant an automatically
+   * launched terminal left the button looking untouched.
+   *
+   * Recorded per provider rather than per button, because the same launch is
+   * spelled `runLogin` on Grok's panel and `connectProvider` on the adapters'.
+   */
+  function markOnboardingLaunchedByHost(provider) {
+    if (state.onboardingRanMode !== state.onboardingMode) {
+      state.onboardingRanMode = state.onboardingMode;
+      state.onboardingRan = [];
+      state.onboardingLaunched = [];
+    }
+    const list = state.onboardingLaunched || (state.onboardingLaunched = []);
+    if (provider && !list.includes(provider)) list.push(provider);
+    if (!provider && !list.includes("*")) list.push("*");
+  }
+
+  /**
+   * Once a terminal has been opened, the next thing to press is the re-check —
+   * so it takes the primary styling and the launch button steps back to a dim
+   * secondary with a done mark. The launch button stays clickable: re-running a
+   * login is legitimate if the terminal was closed by accident.
+   */
+  function applyOnboardingLaunchState() {
+    const onb = $("welcome-onboarding");
+    if (!onb) return;
+    if (state.onboardingRanMode !== state.onboardingMode) return;
+    const ran = state.onboardingRan || [];
+    const launched = state.onboardingLaunched || [];
+    if (!ran.length && !launched.length) return;
+    // The panel's own provider, for Grok's `runLogin` button which carries none.
+    const panelProvider = (state.onboardingInfo && state.onboardingInfo.provider)
+      || (state.onboardingMode === "codex-login" ? "codex"
+        : state.onboardingMode === "claude-login" ? "claude"
+        : state.onboardingMode === "auth-required" ? "grok" : undefined);
+    let anyRan = false;
+    for (const btn of onb.querySelectorAll(".onb-action")) {
+      const act = btn.dataset.act;
+      if (!LAUNCH_ACTS.includes(act)) continue;
+      const forProvider = btn.dataset.provider || panelProvider;
+      const hostLaunched = launched.includes("*")
+        || (forProvider && launched.includes(forProvider));
+      if (!ran.includes(launchKey(act, btn.dataset.provider)) && !hostLaunched) continue;
+      anyRan = true;
+      btn.classList.add("onb-ran", "onb-secondary");
+      if (!btn.querySelector(".onb-ran-mark")) {
+        btn.insertAdjacentHTML("afterbegin", `<span class="onb-ran-mark">${ICON.check}</span>`);
+      }
+    }
+    if (!anyRan) return;
+    for (const btn of onb.querySelectorAll('.onb-action[data-act="recheckProvider"], .onb-action[data-act="recheck"]')) {
+      btn.classList.remove("onb-secondary");
+    }
+  }
+
+  /** `beforeRender` runs after the mode is set and before markup is built, so a
+   *  host-launched terminal can be recorded against the panel it belongs to. */
+  function showOnboarding(mode, info, beforeRender) {
     info = info || {};
     state.onboardingMode = mode;
     state.onboardingInfo = info;
+    if (beforeRender) beforeRender();
     const welcome = $("welcome");
     if (welcome) welcome.hidden = false;
     state.welcomeVisible = true;
     const onb = $("welcome-onboarding");
     const ver = $("welcome-version");
     if (!onb) return;
-    if (IS_REMOTE && (mode === "connect-agent" || mode === "codex-login" || mode === "auth-required")) {
+    if (IS_REMOTE && (mode === "connect-agent" || mode === "codex-login" || mode === "claude-login" || mode === "auth-required")) {
       if (ver) setWelcomeStatus("Sign in at the desk", false);
-      const providerName = mode === "codex-login" ? "Codex" : mode === "auth-required" ? "Grok" : "an agent";
+      const providerName = mode === "codex-login" ? "Codex" : mode === "claude-login" ? "Claude" : mode === "auth-required" ? "Grok" : "an agent";
       onb.innerHTML =
         `<div class="onb">` +
           `<p class="onb-heading">Sign in at the desk</p>` +
           `<p class="onb-desc">${providerName} accounts can only be connected on the computer running this workspace. Sign in there, then refresh this remote view.</p>` +
+        `</div>`;
+      return;
+    }
+    if (mode === "no-project") {
+      // Desktop with nothing open. Names the block and points at the same
+      // action the rail already offers — do not leave the baked Starting
+      // spinner up (that is the first-run hang).
+      if (ver) setWelcomeStatus("No project folder", false);
+      if (IS_REMOTE) {
+        onb.innerHTML =
+          `<div class="onb">` +
+            `<p class="onb-heading">No project folder</p>` +
+            `<p class="onb-desc">Add a project folder on the computer running this workspace, then start a conversation there.</p>` +
+          `</div>`;
+        updateSendButton();
+        return;
+      }
+      onb.innerHTML =
+        `<div class="onb">` +
+          `<p class="onb-heading">No project folder</p>` +
+          `<p class="onb-desc">A conversation needs a project folder before it can start. Add one to continue.</p>` +
+          `<button class="onb-action" type="button" data-act="addProjectFolder">Add project folder</button>` +
+        `</div>`;
+      updateSendButton();
+      return;
+    }
+    if (mode === "provider-connected") {
+      // A successful re-check used to leave a bare empty session, which reads
+      // identically to "nothing happened" — the one moment someone most wants
+      // to be told it worked. It clears itself the instant a message is added
+      // (addMessage calls clearWelcome), so it never survives into a real
+      // conversation and does not need dismissing.
+      const id = info.provider || "grok";
+      const done = id === "codex"
+        ? "You can start working with OpenAI!"
+        : id === "claude" ? "You can start clauding!" : "You can start grokking!";
+      if (ver) setWelcomeStatus("Connected", false);
+      onb.innerHTML =
+        `<div class="onb onb-connected">` +
+          `<p class="onb-heading"><span class="onb-ok">${ICON.check}</span>Connected</p>` +
+          `<p class="onb-desc">${done}</p>` +
         `</div>`;
       return;
     }
@@ -7030,11 +7423,21 @@
           `<p class="onb-heading">Connect an agent</p>` +
           `<p class="onb-desc">Choose the command-line agent that will own this conversation.</p>` +
           `<div class="onb-agent-grid">` +
+            // One row each, not a grid: three side-by-side tiles squeezed the
+            // name and the CLI into a column too narrow to read either, and the
+            // list is short enough that stacking costs nothing. Each row names
+            // the agent and the CLI it will install — "Recommended default"
+            // used to describe our ranking where the others described what the
+            // thing IS, so the row a newcomer reads first was the only one not
+            // saying what it would put on their machine.
             `<button class="onb-agent-tile primary onb-action" type="button" data-act="connectProvider" data-provider="grok">` +
-              `<span class="onb-agent-mark">${providerLogoMarkup("grok")}</span><span><strong>Grok</strong><small>Recommended default</small></span>` +
+              `<span class="onb-agent-mark">${providerLogoMarkup("grok")}</span><span><strong>Grok Build (Recommended)</strong><small>Grok Build CLI</small></span>` +
             `</button>` +
             `<button class="onb-agent-tile onb-action" type="button" data-act="connectProvider" data-provider="codex">` +
               `<span class="onb-agent-mark">${providerLogoMarkup("codex")}</span><span><strong>Codex</strong><small>OpenAI Codex CLI</small></span>` +
+            `</button>` +
+            `<button class="onb-agent-tile onb-action" type="button" data-act="connectProvider" data-provider="claude">` +
+              `<span class="onb-agent-mark">${providerLogoMarkup("claude")}</span><span><strong>Claude Code</strong><small>Claude Code CLI</small></span>` +
             `</button>` +
           `</div>` +
         `</div>`;
@@ -7099,6 +7502,29 @@
           `<button class="onb-action onb-secondary" type="button" data-act="connectProvider" data-provider="codex">Open terminal &amp; run <code>codex login</code></button>` +
           `<button class="onb-action" type="button" data-act="recheckProvider" data-provider="codex">Done - connect Codex</button>` +
         `</div>`;
+    } else if (mode === "missing-claude") {
+      if (ver) setWelcomeStatus("Claude Code not found", false);
+      if (IS_REMOTE) {
+        onb.innerHTML = `<div class="onb"><p class="onb-heading">Claude Code is missing at the desk</p>` +
+          `<p class="onb-desc">Install Anthropic's Claude Code CLI on the computer running this workspace, then refresh this remote view.</p></div>`;
+        return;
+      }
+      onb.innerHTML =
+        `<div class="onb">` +
+          `<p class="onb-heading">Install Claude Code</p>` +
+          `<p class="onb-desc">This app does not install or sign in to Claude for you. Install Anthropic's own Claude Code CLI, sign in with <code>claude auth login</code>, then re-check.</p>` +
+          `<div class="onb-cmd"><code>claude --version</code><button class="onb-copy" type="button" title="Copy" data-cmd="claude --version">${ICON.copy}</button></div>` +
+          `<button class="onb-action" type="button" data-act="recheckProvider" data-provider="claude">Re-check</button>` +
+        `</div>`;
+    } else if (mode === "claude-login") {
+      if (ver) setWelcomeStatus("Finish signing in", false);
+      onb.innerHTML =
+        `<div class="onb">` +
+          `<p class="onb-heading">Sign in with Claude Code</p>` +
+          `<p class="onb-desc">This app never implements, proxies, holds, or forwards Claude credentials. Sign-in happens entirely inside Anthropic's own CLI, which may use your Claude subscription or an Anthropic Console account depending on how you sign in.</p>` +
+          `<button class="onb-action onb-secondary" type="button" data-act="connectProvider" data-provider="claude">Open terminal &amp; run <code>claude auth login</code></button>` +
+          `<button class="onb-action" type="button" data-act="recheckProvider" data-provider="claude">Done - connect Claude</button>` +
+        `</div>`;
     } else if (mode === "auth-required") {
       if (ver) setWelcomeStatus("Authentication required", false);
       onb.innerHTML =
@@ -7118,6 +7544,10 @@
     } else {
       onb.innerHTML = "";
     }
+    // Every branch above rebuilds innerHTML, so the launched-terminal state has
+    // to be re-applied here rather than living on the node.
+    applyOnboardingLaunchState();
+    updateSendButton();
   }
 
   function makeCollapsible(el, container) {
@@ -7377,18 +7807,37 @@
   function toolName(call) {
     return call.tool || call.name || call.title || "";
   }
+  function pathFromToolTitle(call) {
+    const title = String(call && call.title || "").trim();
+    if (!title) return "";
+    const tick = title.match(/`([^`]+)`/);
+    if (tick && tick[1]) return tick[1].trim();
+    const stripped = title.replace(/^(edit|write|read|delete|create|update)\s+/i, "").trim();
+    if (stripped && stripped !== title && /[\\/]|\.\w{1,8}$/.test(stripped)) return stripped;
+    return "";
+  }
   function toolFilePath(call) {
     const r = call.rawInput || call.input || {};
     // `target_directory` is list_dir's path field (verified against real sessions);
     // without it, "List" rendered with no target.
     return r.target_file || r.filePath || r.file_path || r.path ||
+      r.new_path || r.new_file || r.file || r.filename ||
       r.target_directory || r.directory || r.dir ||
-      (Array.isArray(r.paths) ? r.paths[0] : "");
+      (Array.isArray(r.paths) ? r.paths[0] : "") ||
+      pathFromToolTitle(call);
+  }
+  function toolRenamePaths(call) {
+    const r = call && (call.rawInput || call.input) || {};
+    const from = r.old_path || r.old_file || r.from;
+    const to = r.new_path || r.new_file || r.to;
+    if (from && to && from !== to) return { from, to };
+    return null;
   }
   function prettyPath(p) {
     if (!p) return "";
     if (p === "." || p === "./") return "root folder";
-    return p.split("/").pop() || p;
+    const leaf = String(p).replace(/\\/g, "/").split("/").pop();
+    return leaf || p;
   }
   // Directory target for a list_dir call. Unlike prettyPath (basename only, right
   // for files), a folder reads better as its full *relative* path with a trailing
@@ -7483,6 +7932,8 @@
     if (/^(web_fetch|webfetch)$/.test(name)) return "Fetching page";
     if (/^(grep|ripgrep|search_files)$/.test(name) || kind === "search") return "Searching";
     if (/^(write_file|file_write|write|edit_file|search_replace|str_replace)$/.test(name) || kind === "edit" || kind === "write") {
+      const renamed = toolRenamePaths(call);
+      if (renamed) return `Editing ${prettyPath(renamed.from)} → ${prettyPath(renamed.to)}`;
       return filePath ? `Editing ${prettyPath(filePath)}` : "Editing file";
     }
     if (kind === "delete") return filePath ? `Deleting ${prettyPath(filePath)}` : "Deleting file";
@@ -7515,7 +7966,10 @@
       kind === "search" || /\b(grep|glob|ripgrep|search_files|web_search|search_web)\b/i.test(name);
 
     let target = "";
-    if (isSearch && pattern) {
+    const renamed = toolRenamePaths(call);
+    if (renamed && (kind === "edit" || kind === "write" || kind === "delete" || verb === "Edit" || verb === "Write")) {
+      target = `${prettyPath(renamed.from)} → ${prettyPath(renamed.to)}`;
+    } else if (isSearch && pattern) {
       target = clamp(pattern);
     } else if (url) {
       target = clamp(url.replace(/^https?:\/\//i, ""));
@@ -7672,6 +8126,7 @@
     itemLabel.className = "tool-item-label";
     itemLabel.textContent = toolLabel(call);
     item.appendChild(itemLabel);
+    item._call = call;
     body.appendChild(item);
     if (call.toolCallId) state.toolItemsByToolCallId.set(call.toolCallId, item);
     // #41: a shell command's row carries an expandable detail — the FULL
@@ -7959,6 +8414,54 @@
     state.pendingCommandDetails.push({ command, details, done: false, toolCallId });
   }
 
+  /**
+   * Fold a `tool_call_update` back into its row's label and detail.
+   *
+   * Grok puts the arguments on the FIRST `tool_call`, so its rows read correctly
+   * the moment they appear. Claude does not: the first call is a generic
+   * `{title:"Read File", rawInput:{}}` and the real `{title:"Read package.json",
+   * rawInput:{file_path:…}}` arrives on an update — which nothing was applying,
+   * so a Claude turn rendered as a flat list of bare verbs: Run, Read, Search,
+   * with no argument, input or output.
+   *
+   * Applies to every provider, not just Claude — it is simply a no-op where the
+   * first call was already complete, which is the Grok case. That is also why
+   * the merge is field by field and skips null: Grok's updates frequently carry
+   * `title: null`, and a wholesale replace would blank a good label. Claude also
+   * sends an update carrying ONLY a toolCallId and `_meta` (the tool response),
+   * which would erase everything gathered so far.
+   */
+  function refreshToolRowFromUpdate(update) {
+    const id = update && update.toolCallId;
+    if (!id) return;
+    const item = state.toolItemsByToolCallId.get(id);
+    if (!item || !item._call) return;
+    const merged = { ...item._call };
+    for (const key of ["title", "kind", "status", "locations", "rawOutput"]) {
+      if (update[key] !== undefined && update[key] !== null) merged[key] = update[key];
+    }
+    // Arguments accumulate across updates (`{}` → `{file_path}` → `{file_path,
+    // limit}`), so merge rather than replace or a later, sparser update would
+    // drop the path.
+    for (const key of ["rawInput", "input"]) {
+      if (update[key] && typeof update[key] === "object") {
+        merged[key] = { ...(item._call[key] || {}), ...update[key] };
+      }
+    }
+    item._call = merged;
+    const labelEl = item.querySelector(".tool-item-label");
+    if (labelEl) {
+      const next = toolLabel(merged);
+      if (next && next !== labelEl.textContent) labelEl.textContent = next;
+    }
+    // A shell command that only shows up on the update still earns its IN/OUT
+    // box; attachCommandDetails is a no-op once the row already has one.
+    const args = merged.rawInput || merged.input || {};
+    const cmd = typeof args.command === "string" ? args.command.trim()
+      : typeof args.cmd === "string" ? args.cmd.trim() : "";
+    if (cmd && !item.querySelector(".cmd-block")) attachCommandDetails(item, cmd, id);
+  }
+
   function attachCommandOutput(details, msg) {
     const block = details.querySelector(".cmd-block");
     if (!block || block.querySelector(".cmd-out")) return; // idempotent (buffer replay)
@@ -8213,6 +8716,21 @@
       blocks.push({ diff, hunks });
     }
     item._diffStat = { added, removed, path: diffs[0] && diffs[0].path };
+    const diffPath = diffs[0] && diffs[0].path;
+    if (diffPath && item._call && !toolFilePath(item._call)) {
+      item._call.rawInput = { ...(item._call.rawInput || {}), path: diffPath };
+    }
+    const itemLabel = item.querySelector(".tool-item-label");
+    if (itemLabel && item._call) itemLabel.textContent = toolLabel(item._call);
+    const group = item.closest && item.closest(".tool-group");
+    if (group && group.classList.contains("in-progress") && item._call) {
+      const groupLabel = group.querySelector(".tool-group-label");
+      if (groupLabel) {
+        const totals = groupLabel.querySelector(".tool-group-diff-totals");
+        groupLabel.textContent = inProgressLabel(item._call);
+        if (totals) groupLabel.appendChild(totals);
+      }
+    }
 
     // Always-visible +A −R on the row (and the roll-up onto the group header).
     const stat = makeDiffStat(added, removed);
@@ -8467,11 +8985,12 @@
     scrollToBottom();
   }
 
-  function addError(text) {
+  function addError(text, code) {
     clearWelcome();
     const el = document.createElement("div");
     el.className = "msg error";
     el.textContent = text;
+    if (typeof code === "string" && code) el.setAttribute("data-error-code", code);
     messagesEl.appendChild(el);
     scrollToBottom();
   }
@@ -9678,9 +10197,9 @@
     el.className = "grokking";
     // No blink-dots here — the spinning orbit icon is Grokking's "waiting" motion
     // (Thinking / tools use the dots for discrete progress instead).
-    const verb = state.activeProvider === "codex" ? CODEX_ACTIVITY_VERB : GROK_ACTIVITY_VERB;
+    const verb = activityVerb();
     el.innerHTML = `<span class="grokking-icon">${ICON.orbit}</span><span class="grokking-label">${verb}</span>`;
-    el.setAttribute("aria-label", state.activeProvider === "codex" ? "OpenAI is working" : "Grok is working");
+    el.setAttribute("aria-label", activityAriaLabel());
     el.title = "Waiting for response";
     messagesEl.appendChild(el);
     state.grokkingEl = el;
@@ -9694,12 +10213,24 @@
     state.grokkingEl = null;
   }
 
+  function activityVerb() {
+    if (state.activeProvider === "codex") return CODEX_ACTIVITY_VERB;
+    if (state.activeProvider === "claude") return CLAUDE_ACTIVITY_VERB;
+    return GROK_ACTIVITY_VERB;
+  }
+
+  function activityAriaLabel() {
+    if (state.activeProvider === "codex") return "OpenAI is working";
+    if (state.activeProvider === "claude") return "Claude is working";
+    return "Grok is working";
+  }
+
   function syncProviderVoice() {
     input.placeholder = COMPOSER_PLACEHOLDER[state.activeProvider] || COMPOSER_PLACEHOLDER.grok;
     if (!state.grokkingEl) return;
     const label = state.grokkingEl.querySelector(".grokking-label");
-    if (label) label.textContent = state.activeProvider === "codex" ? CODEX_ACTIVITY_VERB : GROK_ACTIVITY_VERB;
-    state.grokkingEl.setAttribute("aria-label", state.activeProvider === "codex" ? "OpenAI is working" : "Grok is working");
+    if (label) label.textContent = activityVerb();
+    state.grokkingEl.setAttribute("aria-label", activityAriaLabel());
   }
 
   // "Thinking…" — the stand-in shown while thinking traces are hidden (#26, the
@@ -9929,6 +10460,20 @@
     el.appendChild(line);
   }
 
+  function resolvePermissionCardEl(el, opt, fallbackTitle) {
+    if (el._planShown) {
+      resolvePlanCardEl(el, /reject|deny/i.test(opt && opt.kind) ? "rejected" : "approved");
+      return;
+    }
+    if (el.classList.contains("plan")) {
+      // A switch_mode card with no plan text is a mode question. Do not claim
+      // a plan was approved.
+      collapsePermissionCard(el, opt && opt.kind, (opt && opt.name) || "mode change");
+      return;
+    }
+    collapsePermissionCard(el, opt && opt.kind, fallbackTitle);
+  }
+
   function renderPermissionActions(el, requestId, cardTitle, rawOptions) {
     const oldActions = el.querySelector(".card-actions");
     if (oldActions) oldActions.remove();
@@ -9967,7 +10512,7 @@
         });
         // Collapse to one muted line and show the working indicator — grok
         // resumes the turn after the answer.
-        collapsePermissionCard(el, opt.kind, cardTitle);
+        resolvePermissionCardEl(el, opt, cardTitle);
         showGrokking();
         // Return the caret to the composer so the next message can be typed
         // immediately — answering must not orphan focus on the collapsed card
@@ -10008,9 +10553,67 @@
     const cards = [...messagesEl.querySelectorAll(".card.permission")];
     const el = cards.find((card) =>
       card.dataset.permReqId === String(requestId) &&
-      !card.classList.contains("perm-resolved")
+      !card.classList.contains("perm-resolved") &&
+      !card.classList.contains("resolved")
     );
     if (el) renderPermissionActions(el, requestId, el._permTitle, options);
+  }
+
+  function isPlanReviewTool(call) {
+    return String((call && call.kind) || "").toLowerCase() === "switch_mode";
+  }
+
+  function addPlanReviewPermissionCard(req) {
+    clearWelcome();
+    hideGrokking();
+    commitAgentTurn();
+    const planText = typeof req.plan === "string" ? req.plan : "";
+    const hasPlan = !!planText.trim();
+    const el = document.createElement("div");
+    el.className = "card plan permission";
+    el.dataset.permReqId = String(req.id);
+    el._permTitle = req.toolCall?.title || "Plan review";
+    el._planShown = hasPlan;
+
+    const title = document.createElement("div");
+    title.className = "card-title";
+    title.textContent = "Plan ready for review";
+    el.appendChild(title);
+
+    const sub = document.createElement("div");
+    sub.className = "card-subtitle";
+    sub.textContent = hasPlan
+      ? "Nothing has been written yet. Choose how to continue."
+      : "The agent asked to leave plan mode, but did not include the plan text.";
+    el.appendChild(sub);
+
+    const body = document.createElement("div");
+    body.className = "plan-body";
+    if (hasPlan) {
+      body.innerHTML = renderMarkdown(planText);
+      applyAutoDir(body);
+      renderMermaidIn(body);
+    } else {
+      body.textContent = "No plan was provided with this request.";
+    }
+    el.appendChild(body);
+
+    const { buttons, defaultIndex } =
+      renderPermissionActions(el, req.id, el._permTitle, req.options);
+    messagesEl.appendChild(el);
+    el.querySelectorAll("pre").forEach((pre) => pre._syncOverflowAffordance?.());
+    forceScrollToBottom();
+    if (
+      defaultIndex >= 0 &&
+      shouldFocusPermissionCard({
+        replaying: state.replaying,
+        composing: state.composingIME,
+        composerText: input.value,
+        defaultIndex,
+      })
+    ) {
+      focusPermissionButton(buttons, defaultIndex);
+    }
   }
 
   function addPermissionCard(req) {
@@ -10020,6 +10623,10 @@
     // grok's continuation after the answer renders BELOW this card, not appended
     // to the bubble that was streaming above it.
     commitAgentTurn();
+    if (typeof req.plan === "string" || isPlanReviewTool(req.toolCall)) {
+      addPlanReviewPermissionCard(req);
+      return;
+    }
     const cardTitle = req.toolCall?.title || `permission: ${req.toolCall?.kind || "tool"}`;
     const el = document.createElement("div");
     el.className = "card permission";
@@ -11005,10 +11612,22 @@
     modeBtn.classList.toggle("disabled", state.busyLocked);
     modeBtn.title = modeButtonTitle(state.currentModeId);
     updateSandboxBtn();
-    if (!state.busy) {
+    if (state.onboardingMode === "no-project") {
+      sendBtn.innerHTML = ICON.arrowUp;
+      sendBtn.title = "Add a project folder first";
+      sendBtn.disabled = true;
+      if (newBtn) {
+        newBtn.disabled = true;
+        newBtn.title = "Add a project folder first";
+      }
+    } else if (!state.busy) {
       sendBtn.innerHTML = ICON.arrowUp;
       sendBtn.title = "Send";
       sendBtn.disabled = false;
+      if (newBtn) {
+        newBtn.disabled = false;
+        newBtn.title = "New session";
+      }
     } else if (state.busyLocked) {
       sendBtn.innerHTML = ICON.spinner;
       sendBtn.title = "Initializing…";
@@ -11095,6 +11714,7 @@
   }
 
   function sendOrStop() {
+    if (state.onboardingMode === "no-project") return;
     if (state.busy) {
       // Typed text signals send-intent — queue it; text present never cancels.
       if (queueFromComposer()) return;
@@ -11185,7 +11805,7 @@
       micBtn.innerHTML = ICON.spinner;
       micBtn.title = "Transcribing…";
       micBtn.disabled = true;
-    } else if (IS_REMOTE && !state.voiceConfigured) {
+    } else if (IS_REMOTE && !state.voiceConfigured && !voiceNeedsGrokAccount()) {
       micBtn.innerHTML = ICON.mic;
       micBtn.title = "Voice dictation is unavailable because the host has no Speech-to-Text credential";
       micBtn.disabled = true;
@@ -11193,11 +11813,28 @@
       micBtn.innerHTML = ICON.mic;
       micBtn.title = state.voiceConfigured
         ? "Voice control"
-        : "Voice control — click to set up (needs an xAI API key)";
+        : voiceNeedsGrokAccount()
+          ? "Voice needs Grok connected"
+          : "Voice control — click to set up (needs an xAI API key)";
       micBtn.disabled = false;
     }
-    // "needs setup" dot only when idle and no key is configured.
-    micBtn.classList.toggle("needs-setup", !IS_REMOTE && state.mic === "idle" && !state.voiceConfigured);
+    // "needs setup" dot only when idle, clickable, and no key is configured.
+    micBtn.classList.toggle("needs-setup", !micBtn.disabled && state.mic === "idle" && !state.voiceConfigured);
+  }
+
+  function voiceNeedsGrokAccount() {
+    return !!state.providersKnown && !state.voiceConfigured
+      && !state.providers.some((provider) => provider.id === "grok" && provider.connected);
+  }
+
+  function explainVoiceNeedsGrok() {
+    return uiConfirm({
+      title: "Voice needs Grok",
+      body: "Voice uses your Grok account for speech-to-text. Connect Grok to use it.",
+      confirmLabel: "Connect Grok",
+    }).then((ok) => {
+      if (ok) openSettingsCategory("providers");
+    });
   }
 
   function setMic(event) {
@@ -11211,6 +11848,10 @@
       return;
     }
     if (state.mic === "idle") {
+      if (voiceNeedsGrokAccount()) {
+        void explainVoiceNeedsGrok();
+        return;
+      }
       // The host is the authority on whether voice is configured, but the
       // anchors must be captured before every start request it receives.
       captureVoiceInsertion();
@@ -11420,6 +12061,10 @@
       remoteMicStart.cancelled = true;
       setMic("error");
     } else if (state.mic === "idle") {
+      if (voiceNeedsGrokAccount()) {
+        void explainVoiceNeedsGrok();
+        return;
+      }
       void startBrowserMic();
     }
   }
@@ -11593,7 +12238,7 @@
   // can't interject, and (defensively) not being busy at all. Any of those fall
   // back to the queue, which is the safe home for the text either way.
   function queueOutgoing(text) {
-    if (state.steerByDefault && state.steerSupported && state.busy && !state.busyLocked) {
+    if (state.steerByDefault && state.steerSupported && steerableProvider() && state.busy && !state.busyLocked) {
       vscode.postMessage({ type: "steerSend", text });
       return;
     }
@@ -11695,7 +12340,9 @@
     // Rendered whenever the CLI supports it; `body.turn-busy` (updateSendButton)
     // does the show/hide, so a replay that delivers queuedSends before agentStart
     // still ends up with the button once busy lands.
-    if (state.steerSupported) {
+    // Not for Claude Code: it has no mid-turn interject, so the button would
+    // offer to do something the agent cannot do. Its messages stay scheduled.
+    if (state.steerSupported && steerableProvider()) {
       const steerBtn = document.createElement("button");
       steerBtn.className = "queued-action queued-steer";
       steerBtn.title = "Steer — submit now without interrupting Grok";
@@ -11814,7 +12461,11 @@
       case "providerState":
         state.providersKnown = true;
         state.providers = Array.isArray(msg.providers) ? msg.providers.filter((provider) =>
-          provider && (provider.id === "grok" || provider.id === "codex")) : [];
+          provider && (provider.id === "grok" || provider.id === "codex" || provider.id === "claude")) : [];
+        // Read, never latched on click: a host too old to know `refreshProviders`
+        // sends no frame at all, and a locally-set flag would spin forever.
+        // Absent means idle, which is also what every pre-refresh host means.
+        state.providersChecking = msg.checking === true;
         // Connecting an additional account happens from the gear while the
         // current transcript stays mounted. The login/recovery view temporarily
         // borrows the welcome overlay; dismiss it when the provider it was
@@ -12067,11 +12718,13 @@
       case "initialized": {
         // The ACP handshake is done, but session/new or session/load may still be
         // running. Keep showing Starting until the startup lock clears.
-        if (msg.info.provider !== "codex") state.cliVersion = msg.info.version || "";
+        if (!msg.info.provider || msg.info.provider === "grok") state.cliVersion = msg.info.version || "";
         state.startingPhase = true;
+        state.onboardingMode = null;
         setWelcomeStatus("Starting", true);
         const onb = $("welcome-onboarding");
         if (onb) onb.innerHTML = "";
+        updateSendButton();
         break;
       }
       case "cliUpdating": {
@@ -12088,7 +12741,7 @@
         // a project-level .grok/config.toml may select xhigh while
         // grok.defaultEffort is intentionally empty ("CLI default").
         if (typeof msg.effort === "string") state.effort = msg.effort;
-        state.activeProvider = msg.provider === "codex" ? "codex" : "grok";
+        state.activeProvider = msg.provider === "codex" || msg.provider === "claude" ? msg.provider : "grok";
         syncProviderVoice();
         if (state.railTransition?.kind === "new") renderRail();
         state.isWorktree = !!msg.worktree; // gates the gear Apply/Remove worktree items
@@ -12425,6 +13078,10 @@
       case "toolCall":
         advanceHistoryEvent();
         if (state.suppressReplayTurn) break; // tool calls inside the primer turn (unlikely but defensive)
+        if (isPlanReviewTool(msg.call)) {
+          // Plan text belongs on the review card, not a generic tool row.
+          break;
+        }
         if (isQuestionTool(msg.call)) {
           // No generic tool chip — the question card stands in for it.
           if (state.replaying) {
@@ -12475,6 +13132,7 @@
       case "toolCallUpdate": {
         advanceHistoryEvent();
         if (state.suppressReplayTurn) break;
+        if (isPlanReviewTool(msg.call)) break;
         // Resume: anchor a restored permission card here — the update carries the
         // tool's real title (the tool_call is often a generic "Shell"/"Grep"), so
         // a card saved without a toolCallId still matches by title.
@@ -12536,6 +13194,9 @@
           markToolFailed(id, hint ? failure + "\n" + hint : failure);
           break;
         }
+        // Fold the refined title and arguments into the row before the diff
+        // pass — for Claude this is where a row stops being a bare verb.
+        refreshToolRowFromUpdate(msg.call);
         applyToolDiffs(msg.call);
         break;
       }
@@ -12632,10 +13293,14 @@
         // live right after the user answers — collapse the matching card if it's
         // still active. Idempotent: a live click already collapsed it.
         const cards = [...messagesEl.querySelectorAll(".card.permission")];
-        const el = cards.find((c) => c.dataset.permReqId === String(msg.requestId) && !c.classList.contains("perm-resolved"));
+        const el = cards.find((c) =>
+          c.dataset.permReqId === String(msg.requestId) &&
+          !c.classList.contains("perm-resolved") &&
+          !c.classList.contains("resolved")
+        );
         if (el) {
           const opt = (el._permOptions || []).find((o) => o.optionId === msg.optionId);
-          collapsePermissionCard(el, opt && opt.kind, el._permTitle);
+          resolvePermissionCardEl(el, opt, el._permTitle);
         }
         break;
       }
@@ -12699,13 +13364,12 @@
         if (msg.meta?.totalTokens != null) updateDonut(msg.meta.totalTokens);
         break;
       case "contextUsage":
-        // Read from grok's on-disk signals.json by the host — a real count for
-        // the cases the turn meta can't cover: cold restore (donut would sit
-        // at 0 until the first turn) and zero-reporting turns where signals
-        // holds a fresher count than the last meta (e.g. /session-info right
-        // after a /compact).
+        // Host-authoritative occupancy: grok's signals.json / live envelope,
+        // or the remembered adapter prompt size. A window-only frame updates
+        // the denominator without inventing a used count.
         if (msg.window) state.contextWindow = msg.window;
-        updateDonut(msg.used);
+        if (msg.used != null) updateDonut(msg.used);
+        else updateDonut();
         break;
       case "expandCommandOutputs":
         // Live toggle (grok.expandCommandOutputs): applies to existing rows
@@ -12950,7 +13614,12 @@
         resetForNewSession();
         break;
       case "onboarding":
-          showOnboarding(msg.state, { platform: msg.platform, reason: msg.reason, provider: msg.provider });
+          // Record the host-launched terminal BEFORE rendering, so the panel is
+          // painted with the done mark already on rather than flashing an
+          // untouched button first.
+          showOnboarding(msg.state, { platform: msg.platform, reason: msg.reason, provider: msg.provider }, () => {
+            if (msg.launched) markOnboardingLaunchedByHost(msg.provider);
+          });
         break;
       case "error":
         if (state.repoSwitchPending) {
@@ -12989,7 +13658,7 @@
           renderQueuedBlocks();
           updateSendButton();
         }
-        addError(msg.text);
+        addError(msg.text, msg.code);
         break;
       case "hostNotice":
         addPlanNotice(msg.text);
@@ -13040,6 +13709,7 @@
           state.sessionQuery = msg.query || "";
           state.sessionLastAutoPageKey = "";
         }
+        settlePendingRename(state.sessions);
         if (msg.activeId !== undefined) {
           // Host-confirmed only — never an optimistic rail-transition id.
           // noteHostIdentityKnown is deliberately NOT here — this handler's
@@ -13136,6 +13806,10 @@
         state.pinnedSessionsKnown = true;
         state.pinnedSessions = uniqueSessionRows(msg.entries);
         state.dots = Object.assign({}, state.dots, msg.dots || {});
+        if (settlePendingRename(state.pinnedSessions)) {
+          renderSessionName();
+          renderSessionHead();
+        }
         renderRail();
         break;
       }
@@ -13151,6 +13825,10 @@
           total: typeof msg.total === "number" ? msg.total : (msg.entries || []).length,
         };
         state.dots = Object.assign({}, state.dots, msg.dots || {});
+        if (settlePendingRename(state.repoPreviews[cwdKey(msg.cwd)].entries)) {
+          renderSessionName();
+          renderSessionHead();
+        }
         // First answer: the probe only asked about one repo, so now ask for the rest.
         if (!known) requestRailPreviews();
         renderRail();
@@ -13159,6 +13837,7 @@
       case "repos": {
         state.reposKnown = true;
         state.repos = Array.isArray(msg.entries) ? msg.entries : [];
+        settlePendingRepoColor(state.repos);
         const wasSelected = state.selectedRepoCwd;
         state.selectedRepoCwd = msg.selectedCwd || "";
         state.activeRepoCwd = msg.activeCwd || "";
@@ -13297,8 +13976,6 @@
     renderMic();
   }
   newBtn.onclick = () => beginNewSession();
-  // Hide top-bar New immediately when the overflow slot is in the DOM (rail
-  // hosts). fillSessionHeadActions re-asserts this whenever the menu refreshes.
   fillSessionHeadActions();
   // Desktop ships the rail mount in the first HTML frame. Paint the skeleton
   // before catalog frames arrive so the window never starts panel-less.
@@ -13495,6 +14172,10 @@
           toggleHost: remoteFilesButtonHost(),
           presentation: "responsive",
           id: "files-browse-panel",
+          // Same content-area maximize as desktop. The panel hides the control
+          // while it is an overlay (phone / <900) and toggles the shared body
+          // class itself.
+          maximize: true,
         },
         ui: {
           confirm: uiChoice,
@@ -13642,6 +14323,7 @@
       e.preventDefault();
       e.stopPropagation();
       const act = onbAction.dataset.act;
+      if (LAUNCH_ACTS.includes(act)) markOnboardingLaunched(act, onbAction.dataset.provider);
       if (act === "runInstall") vscode.postMessage({ type: "runInstallCmd" });
       else if (act === "installCodex") vscode.postMessage({ type: "installCodex" });
       else if (act === "cancelCodexInstall") vscode.postMessage({ type: "cancelCodexInstall" });
@@ -13650,6 +14332,7 @@
       else if (act === "connectProvider") vscode.postMessage({ type: "runGrokLogin", provider: onbAction.dataset.provider });
       else if (act === "recheckProvider") vscode.postMessage({ type: "recheckConnection", provider: onbAction.dataset.provider });
       else if (act === "retryProvider") vscode.postMessage({ type: "retryProviderSession", provider: onbAction.dataset.provider });
+      else if (act === "addProjectFolder") vscode.postMessage({ type: "addProjectFolder" });
       return;
     }
     const onbCopy = e.target.closest(".onb-copy");

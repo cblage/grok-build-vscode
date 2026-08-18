@@ -11,17 +11,24 @@
     1. assert on `main`
     2. tsc --noEmit + npm test       (skip all gating with -NoTest)
        + npm run test:integration    (real Extension Host; skip with -SkipIntegration)
+       + npm run e2e:screens         (real Electron desktop; skip with -SkipScreens)
        + npm run test:live           (real grok — mandatory gate; skip with -SkipLive)
     3. assert tag vX.Y.Z is free     (bump the version if it isn't)
     4. npm run package               -> grok-vscode-phuryn-X.Y.Z.vsix
     5. commit the working tree        (message from -MessageFile / -Message / default)
     6. push main
+    6b. wait for CI to go GREEN on the pushed SHA  (skip with -SkipCiWait,
+        budget with -CiTimeoutMinutes) — before any tag exists
     7. annotated tag vX.Y.Z + push
     8. gh release create vX.Y.Z       with the changelog section as notes
                                        AND the .vsix attached as a release asset
+    9. npm run publish:ovsx           publish that .vsix to Open VSX
+   10. install.ps1 -VsixPath ... -All install the released .vsix into every
+                                       detected local editor (skip with
+                                       -NoInstall; never fails the release)
 
-  Marketplace publish (vsce) is deliberately NOT here — that's a separate,
-  explicit step (`npm run publish`).
+  Open VSX is part of the release. The VS Code Marketplace is deliberately NOT —
+  that one is the owner's, a separate explicit step (`npm run publish`).
 
 .EXAMPLE
   pwsh scripts\release.ps1
@@ -37,6 +44,10 @@ param(
   [switch]$NoTest,
   [switch]$SkipLive,
   [switch]$SkipIntegration,
+  [switch]$SkipScreens,
+  [switch]$SkipCiWait,
+  [int]$CiTimeoutMinutes = 20,
+  [switch]$NoInstall,
   [switch]$DryRun
 )
 
@@ -89,6 +100,14 @@ if (-not $NoTest) {
   # explicit -SkipLive escape hatch, but the DEFAULT is to run it so it can't be
   # silently forgotten under release pressure. A live FAIL (non-zero exit) aborts the
   # release; a SKIP inside the suite (no subscription, grok declined to delegate) is exit 0.
+  # The desktop app ships the same compiled src/ as the extension, so a change
+  # can reach it without src/desktop/ being touched — 3.10.1 shipped an ACP
+  # capability change that way. This is the only gate that boots real Electron.
+  if (-not $SkipScreens) {
+    Run "npm run e2e:screens (real Electron desktop)" { npm run e2e:screens }
+  } else {
+    Step "SKIPPING the Electron desktop gate (-SkipScreens) - nothing else exercises the packaged app"
+  }
   if (-not $SkipLive) {
     Run "npm run test:live (real grok)" { npm run test:live }
   } else {
@@ -101,6 +120,9 @@ if (git tag --list $tag) { throw "Tag $tag already exists - bump package.json/ch
 
 # 4. build the vsix that will be attached to the release
 $vsix = "grok-vscode-phuryn-$version.vsix"
+# install.ps1 sets this so a local staging vsix can build. A release must not
+# inherit it from the shell — that is how a staging artifact could ship.
+Remove-Item Env:GROK_ALLOW_STAGING_RELAY_VSIX -ErrorAction SilentlyContinue
 Run "npm run package" { npm run package }
 if (-not (Test-Path $vsix)) { throw "Expected $vsix but it wasn't produced." }
 
@@ -137,12 +159,84 @@ if (git status --porcelain) {
 
 # 7. push, tag, push tag
 Run "git push origin main" { git push origin main }
+
+# 7b. CI must be green on exactly what was just pushed, and this is checked
+# BEFORE a tag exists. Order is the whole point: a red build then costs a fix
+# and a re-run, instead of a tag, a GitHub Release and an Open VSX publish that
+# all have to be withdrawn. Local suites are not a substitute — v2.3.0 and
+# v2.3.1 both shipped with `main` red because a green Windows box was taken as
+# the answer, and the owner found it rather than the release.
+if ($SkipCiWait) {
+  Step "skipping the CI wait (-SkipCiWait)"
+} else {
+  # Full SHA, never the short form: `gh run list --commit` matches literally and
+  # answers an empty list for an abbreviated one — which would read as "no CI
+  # configured" and wave the release straight through.
+  $sha = (git rev-parse HEAD).Trim()
+  Step "waiting for CI on $sha"
+  $deadline = (Get-Date).AddMinutes($CiTimeoutMinutes)
+  $everSeen = $false
+  while ($true) {
+    $ErrorActionPreference = "Continue"
+    $raw = gh run list --commit $sha --json status,conclusion,workflowName 2>$null
+    $ErrorActionPreference = "Stop"
+    $runs = @()
+    if ($raw) { $runs = @(($raw | ConvertFrom-Json) | Where-Object { $_.workflowName -eq "CI" }) }
+    if ($runs.Count -gt 0) {
+      $everSeen = $true
+      if (@($runs | Where-Object { $_.status -ne "completed" }).Count -eq 0) {
+        $bad = @($runs | Where-Object { $_.conclusion -ne "success" })
+        if ($bad.Count) { throw "CI is $($bad[0].conclusion) on $sha. Nothing tagged - fix it and re-run." }
+        Write-Host "    CI green on $sha" -ForegroundColor DarkGray
+        break
+      }
+    }
+    if ((Get-Date) -ge $deadline) {
+      if ($everSeen) { throw "CI did not finish on $sha within $CiTimeoutMinutes min. Nothing tagged." }
+      throw "No CI run appeared for $sha within $CiTimeoutMinutes min. Nothing tagged."
+    }
+    Start-Sleep -Seconds 15
+  }
+}
+
 Run "git tag -a $tag"      { git tag -a $tag -m "Release $tag" }
 Run "git push origin $tag" { git push origin $tag }
 
 # 8. GitHub Release with the vsix attached (always attach - update procedure)
 Run "gh release create $tag" { gh release create $tag --title "Release $tag" --notes-file $notesFile $vsix }
 
-Write-Host "`nReleased $tag with $vsix attached." -ForegroundColor Green
-Write-Host "Marketplace publish is separate: npm run publish" -ForegroundColor DarkGray
-Write-Host "Open VSX publish:                npm run publish:ovsx" -ForegroundColor DarkGray
+# 9. Open VSX. Part of the release, not a reminder printed after it: leaving it
+# to a follow-up step is how a version ships to GitHub and the Marketplace while
+# Open VSX silently stays a release behind. It runs LAST on purpose — everything
+# above is already durable, so a missing token costs a re-run of this one
+# command rather than a half-made release.
+#
+# The VS Code Marketplace is deliberately still NOT here. That one is the
+# owner's to run (`npm run publish`).
+Run "npm run publish:ovsx" { npm run publish:ovsx }
+
+# 10. Install what was just released into this machine's editors. The released
+# .vsix is passed by path on purpose, so install.ps1 skips its own build AND its
+# staging-relay swap — the editors end up running the exact artifact users get,
+# production relay included, rather than a look-alike rebuilt afterwards.
+#
+# Never fatal. Everything above this line is published and irreversible, so a
+# missing editor CLI must read as "install it yourself" and not as a failed
+# release. -NoInstall skips it outright (CI, or a release cut from a machine
+# that is not the one being tested on).
+if ($NoInstall) {
+  Step "skipping the local install (-NoInstall)"
+} else {
+  Step "installing $tag into local editors"
+  $ErrorActionPreference = "Continue"
+  & (Join-Path $PSScriptRoot "install.ps1") -VsixPath $vsix -All
+  $installExit = $LASTEXITCODE
+  $ErrorActionPreference = "Stop"
+  if ($installExit) {
+    Write-Host "  Local install did not complete (exit $installExit). The release itself is done;" -ForegroundColor Yellow
+    Write-Host "  re-run: scripts\install.ps1 -VsixPath $vsix -All" -ForegroundColor Yellow
+  }
+}
+
+Write-Host "`nReleased $tag with $vsix attached, and published to Open VSX." -ForegroundColor Green
+Write-Host "Marketplace publish is the owner's: npm run publish" -ForegroundColor DarkGray

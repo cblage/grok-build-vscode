@@ -66,7 +66,8 @@ describe("Codex ACP integration (real subprocess, fake adapter)", () => {
     expect(modes).toContain("plan");
     await client.setMode("default");
     await client.setMode("agent-full-access");
-    expect(client.currentModeId).toBe("default");
+    expect(client.currentModeId).toBe("agent-full-access");
+    expect(modes).toContain("agent-full-access");
   });
 
   it("normalizes streamed tools, usage, title, permissions, plan review, and prompt usage", async () => {
@@ -87,7 +88,7 @@ describe("Codex ACP integration (real subprocess, fake adapter)", () => {
 
     const meta = await client.prompt("exercise codex wire shapes");
     expect(titles).toEqual(["Generated Codex title"]);
-    expect(contexts).toEqual([4321]);
+    expect(contexts).toEqual([undefined]);
     expect(client.availableModels.find((model) => model.modelId === client.currentModelId)?.totalContextTokens).toBe(258400);
     expect(tools.find((tool) => tool.toolCallId === "edit-1").content[0].oldText).toBe("");
     expect(updates.find((update) => update.toolCallId === "cmd-1").rawOutput).toMatchObject({ output: "ok\n", exit_code: 0 });
@@ -99,9 +100,9 @@ describe("Codex ACP integration (real subprocess, fake adapter)", () => {
       _meta: { codex: { kind: "plan_review" } },
     });
     expect(meta).toMatchObject({
-      totalTokens: 100,
+      totalTokens: 80,
       reasoningTokens: 10,
-      usage: { inputTokens: 60, outputTokens: 30, cachedReadTokens: 20, reasoningTokens: 10 },
+      usage: { inputTokens: 60, outputTokens: 30, cachedReadTokens: 20, totalTokens: 100, reasoningTokens: 10 },
     });
     expect(meta.usage?.costUsdTicks).toBeUndefined();
   });

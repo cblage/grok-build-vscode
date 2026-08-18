@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  adapterActivityAt,
+  adapterEntriesEligibleForClear,
+  adapterListEntry,
   codexListEntry,
   compareHistoryEntries,
   connectedProviderIds,
+  usableProviderIds,
   findCachedCodexSession,
   mergeProviderHistoryPage,
   mergeProviderSessionEntries,
@@ -25,6 +29,40 @@ describe("provider UI pure policy", () => {
       { codex: true },
       { grok: true, codex: true },
     )).toEqual(["codex"]);
+  });
+
+  it("excludes a connected provider whose credentials lapsed from the usable set", () => {
+    // The exact state the owner hit: Grok and Claude never connected, Codex
+    // connected and located but its credential probe failed. It stayed
+    // connected[0], so every new empty session was handed to Codex and opened
+    // its terminal-login screen. Nothing here can answer a turn.
+    const connections = { codex: true } as const;
+    const located = { grok: true, codex: true, claude: true } as const;
+    expect(connectedProviderIds(connections, located)).toEqual(["codex"]);
+    expect(usableProviderIds(connections, located, { codex: true })).toEqual([]);
+    // A working Codex is still usable — the filter is the lapsed flag, not the
+    // provider.
+    expect(usableProviderIds(connections, located, {})).toEqual(["codex"]);
+    expect(usableProviderIds(connections, located, { codex: false })).toEqual(["codex"]);
+  });
+
+  it("keeps a usable provider when another one has lapsed", () => {
+    expect(usableProviderIds(
+      { grok: true, codex: true },
+      { grok: true, codex: true },
+      { codex: true },
+    )).toEqual(["grok"]);
+  });
+
+  it("prefers Grok, then Codex, then Claude when several can answer", () => {
+    // The order a stranded empty session falls back through (owner, 2026-08-17:
+    // "Prefer Grok > Codex > Claude Code"). It is PROVIDER_ORDER, so this test
+    // exists to stop that list being reordered for an unrelated reason —
+    // grouping in the picker reads from the same constant.
+    const all = { grok: true, codex: true, claude: true } as const;
+    expect(usableProviderIds(all, all, {})).toEqual(["grok", "codex", "claude"]);
+    expect(usableProviderIds(all, all, { grok: true })).toEqual(["codex", "claude"]);
+    expect(usableProviderIds(all, all, { grok: true, codex: true })).toEqual(["claude"]);
   });
 
   it("groups Grok first, uses live models, and implies a default for an empty cache", () => {
@@ -233,6 +271,51 @@ describe("provider UI pure policy", () => {
   it("selects the provider-specific second-stage login state", () => {
     expect(providerLoginState("grok")).toBe("auth-required");
     expect(providerLoginState("codex")).toBe("codex-login");
+    expect(providerLoginState("claude")).toBe("claude-login");
+  });
+
+  it("places Claude as a third picker group with its own default row", () => {
+    const models = modelsForConnectedProviders(
+      ["grok", "codex", "claude"],
+      { claude: { models: [], seenAt: 1 } },
+    );
+    expect(models.map((model) => `${model.provider}:${model.name}`)).toEqual([
+      "grok:Grok default",
+      "codex:Codex default",
+      "claude:Claude default",
+    ]);
+  });
+
+  it("pins Codex recency to send-time but lets Claude listing timestamps move", () => {
+    expect(adapterActivityAt("codex", 900, 100)).toBe(100);
+    expect(adapterActivityAt("claude", 900, 100)).toBe(900);
+    expect(adapterActivityAt("claude", 200, 500)).toBe(500);
+    expect(adapterActivityAt("claude", 300)).toBe(300);
+
+    const claude = adapterListEntry(
+      { sessionId: "c1", cwd: "/repo", title: "External", updatedAt: 900 },
+      { c1: { provider: "claude", activeAt: 100 } },
+      "claude",
+    );
+    expect(claude.updatedAt).toBe(900);
+
+    const codex = adapterListEntry(
+      { sessionId: "x1", cwd: "/repo", title: "Opened", updatedAt: 900 },
+      { x1: { provider: "codex", activeAt: 100 } },
+      "codex",
+    );
+    expect(codex.updatedAt).toBe(100);
+  });
+
+  it("omits adapter history that was not successfully refreshed before clear-all", () => {
+    const checked = new Set<"codex" | "claude">(["claude"]);
+    expect(adapterEntriesEligibleForClear([
+      { provider: "codex", entries: [{ id: "stale-codex" }] },
+      { provider: "claude", entries: [{ id: "fresh-claude" }] },
+    ], checked)).toEqual([{ id: "fresh-claude" }]);
+    expect(adapterEntriesEligibleForClear([
+      { provider: "codex", entries: [{ id: "stale-codex" }] },
+    ], new Set())).toEqual([]);
   });
 
   it("keeps Codex ordering stable across an open-only adapter restamp, then moves on send", () => {

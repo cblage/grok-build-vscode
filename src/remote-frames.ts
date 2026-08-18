@@ -332,14 +332,40 @@ function parseRemoteWebviewMsg(msg: unknown): WebviewMsg | null {
   }
 }
 
+/** The production relay. The hostname is written only here.
+ *  `scripts/check-production-relay.mjs` refuses to package unless
+ *  {@link REMOTE_RELAY_URL} resolves to this value. */
+export const PRODUCTION_RELAY_URL = "wss://afkpilot.com";
+
 /** The relay the extension talks to. Fixed in code on purpose — the pairing
  *  flow, the web portal, and the gear "AFK Pilot" section all assume this one
  *  service, so there is no user SETTING. A development build can override it
- *  (see {@link resolveRelayUrl}); a published one never can. */
-export const REMOTE_RELAY_URL = "wss://afkpilot.com";
+ *  (see {@link resolveRelayUrl}); a published one never can. A local
+ *  `install.ps1` build rewrites this assignment to a staging URL and restores
+ *  it afterwards. */
+export const REMOTE_RELAY_URL = PRODUCTION_RELAY_URL;
 
 /** Environment variable a DEVELOPMENT build reads instead of the constant. */
 export const RELAY_URL_ENV = "GROK_RELAY_URL";
+
+/**
+ * Environment variable a DEVELOPMENT build may read as a pre-linked device
+ * token. Honour it only when {@link RELAY_URL_ENV} actually moved the relay
+ * off this build's default — see {@link resolveInjectedDeviceToken}. A
+ * published build never can: {@link resolveRelayUrl} already ignores the
+ * URL override in production, and this gate pairs the token to that same
+ * condition so the two cannot be split.
+ *
+ * Lives next to {@link RELAY_URL_ENV} so a third development-only override
+ * is not invented somewhere else.
+ */
+export const RELAY_DEVICE_TOKEN_ENV = "GROK_RELAY_DEVICE_TOKEN";
+
+/**
+ * SecretStorage key for the linked-device token. The development overlay
+ * and the sidebar uplink must name the same slot.
+ */
+export const RELAY_DEVICE_TOKEN_SECRET = "grok.remoteControl.deviceToken";
 
 /**
  * The relay this build should actually use.
@@ -392,6 +418,76 @@ export function resolveRelayUrl(opts: {
   // endpoint that reads like the relay is down rather than like a bad variable.
   if (parsed.search || parsed.hash) return REMOTE_RELAY_URL;
   return `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/+$/, "");
+}
+
+/**
+ * A development-only device token, or `undefined`.
+ *
+ * Fail closed on every path that is not certain:
+ *   - production (`isProduction: true`) — packaged desktop / published
+ *     extension — never reads the environment, even when both variables
+ *     are set;
+ *   - the relay URL was not overridden (resolved URL equals this build's
+ *     default, including a malformed {@link RELAY_URL_ENV} that fell back);
+ *   - the resolved URL is the production hostname, so a source-run cannot
+ *     be talked into handing a token to the real relay via env;
+ *   - missing / non-string / blank token.
+ *
+ * Same shape as `acpClientCapabilities`: the safe value (`undefined`)
+ * is the default, and only a fully-qualified development override returns
+ * the token. The uplink still starts from SecretStorage; this function
+ * never opens a socket.
+ */
+export function resolveInjectedDeviceToken(opts: {
+  isProduction: boolean;
+  env?: Record<string, string | undefined>;
+}): string | undefined {
+  if (opts.isProduction) return undefined;
+  const env = opts.env ?? {};
+  const resolved = resolveRelayUrl({ isProduction: false, env });
+  const baseline = resolveRelayUrl({ isProduction: false, env: {} });
+  if (resolved === baseline) return undefined;
+  if (resolved === PRODUCTION_RELAY_URL) return undefined;
+  const raw = env[RELAY_DEVICE_TOKEN_ENV];
+  if (typeof raw !== "string") return undefined;
+  const token = raw.trim();
+  if (!token) return undefined;
+  return token;
+}
+
+/**
+ * Read {@link resolveInjectedDeviceToken}, then drop the env entry.
+ *
+ * Desktop `buildEnv` and every `{...process.env}` spawn copy inherit the
+ * process environment. Leaving the token there would leak a credential that
+ * used to live only in SecretStorage into the agent binary and any command
+ * it runs. The in-memory overlay already holds the value.
+ */
+export function consumeInjectedDeviceToken(opts: {
+  isProduction: boolean;
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>;
+}): string | undefined {
+  const token = resolveInjectedDeviceToken(opts);
+  delete opts.env[RELAY_DEVICE_TOKEN_ENV];
+  return token;
+}
+
+/**
+ * Overlay one SecretStorage key. `undefined` / empty returns `get` unchanged
+ * so a production build — whose resolver already returned `undefined` —
+ * cannot grow an overlay by accident.
+ *
+ * The overlay answers the key from memory and never touches the encrypted
+ * store, which is what makes a headless Linux runner work: Electron
+ * safeStorage is often unavailable there, and a disk write would throw.
+ */
+export function withInjectedSecret(
+  get: (key: string) => PromiseLike<string | undefined>,
+  key: string,
+  value: string | undefined,
+): (key: string) => PromiseLike<string | undefined> {
+  if (typeof value !== "string" || !value) return get;
+  return (k) => (k === key ? Promise.resolve(value) : get(k));
 }
 
 /**

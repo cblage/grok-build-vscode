@@ -34,7 +34,8 @@ describe("single-edit tool group stays expandable + reviewable (#30, #45)", () =
     expect(item.classList.contains("has-details")).toBe(true); // rides the command detail machinery
     expect(item.querySelector(".tool-chevron")).not.toBeNull();
 
-    // Always-visible +A −R on the row.
+    // Always-visible +A −R on the row, with the file name — not just "Edit".
+    expect(item.querySelector(".tool-item-label")!.textContent).toBe("Edit foo.ts");
     expect(item.querySelector(".diff-stat-add")!.textContent).toBe("+2");
     expect(item.querySelector(".diff-stat-del")!.textContent).toBe("−1");
 
@@ -62,6 +63,69 @@ describe("single-edit tool group stays expandable + reviewable (#30, #45)", () =
     const openDiffs = posted.filter((m: any) => m.type === "openDiff");
     expect(openDiffs).toHaveLength(1);
     expect(openDiffs[0]).toMatchObject({ path: "src/foo.ts", oldText: "a\nb", newText: "a\nB\nc" });
+  });
+
+  it("names a pathless Edit from the diff path and a rename from old/new paths", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "toolCall", call: { toolCallId: "p1", kind: "edit", title: "Edit" } });
+    dispatch(window, {
+      type: "toolCallUpdate",
+      call: { toolCallId: "p1", content: [{ type: "diff", path: "docs/plan.md", oldText: "a", newText: "b" }] },
+    });
+    expect(doc.querySelector(".tool-item-label")!.textContent).toBe("Edit plan.md");
+
+    dispatch(window, {
+      type: "toolCall",
+      call: {
+        toolCallId: "r1",
+        kind: "edit",
+        title: "Edit",
+        rawInput: { old_path: "src/old-name.ts", new_path: "src/new-name.ts" },
+      },
+    });
+    expect([...doc.querySelectorAll(".tool-item-label")].at(-1)!.textContent)
+      .toBe("Edit old-name.ts → new-name.ts");
+  });
+
+  it("names a tool whose arguments only arrive on the update, and keeps them", () => {
+    // Claude's shape: a generic first call, then the real title and arguments,
+    // then an update carrying ONLY the tool response. Rendering the first call
+    // and ignoring the rest produced a flat list of bare verbs — Run, Read,
+    // Search — with no argument, input or output.
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "toolCall",
+      call: { toolCallId: "c1", kind: "read", title: "Read File", rawInput: {} },
+    });
+    const label = () => doc.querySelector(".tool-item-label")!.textContent;
+    expect(label()).toBe("Read");
+
+    dispatch(window, {
+      type: "toolCallUpdate",
+      call: { toolCallId: "c1", title: "Read package.json", rawInput: { file_path: "/repo/package.json" } },
+    });
+    expect(label()).toBe("Read package.json");
+
+    // The sparse response-only update must not blank what we just learned, and
+    // a null title (Grok sends these) must not either.
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "c1" } });
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "c1", title: null, status: "completed" } });
+    expect(label()).toBe("Read package.json");
+  });
+
+  it("gives a row its IN/OUT box when the command only lands on the update", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "toolCall",
+      call: { toolCallId: "s1", kind: "execute", title: "Run Shell", rawInput: {} },
+    });
+    expect(doc.querySelector(".cmd-block")).toBeNull();
+
+    dispatch(window, {
+      type: "toolCallUpdate",
+      call: { toolCallId: "s1", title: "Run git status", rawInput: { command: "git status" } },
+    });
+    expect(doc.querySelector(".cmd-block")).not.toBeNull();
   });
 
   it("collapsed by default; expanding the group then the row reveals the diff", () => {

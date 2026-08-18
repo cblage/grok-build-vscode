@@ -85,6 +85,9 @@ export const HOST_CAPABILITIES = {
   editProjectFiles: true,
 } as const;
 
+/** Machine-readable `error.code` for a send abandoned after its userMessage echo. */
+export const INTERRUPTED_SEND_CODE = "interrupted-send" as const;
+
 /** Host-kind affordances merged into `initialState.capabilities` at post time. */
 export type HostUiCapabilities = {
   uploadFile: boolean;
@@ -199,8 +202,11 @@ export type HostMsg =
    * `needsLogin` is the account that is still configured but answered an
    * auth-shaped failure: every affordance that would otherwise imply it works
    * (a selectable model row, a silently empty history) becomes the same sign-in
-   * action the connect flow uses. */
-  | { type: "providerState"; providers: { id: "grok" | "codex"; connected: boolean; needsLogin?: boolean; cliVersion?: string; adapterVersion?: string; latestCliVersion?: string; updateAvailable?: boolean }[] }
+   * action the connect flow uses.
+   * `checking` is a re-observation in flight (Settings → Providers Refresh). It
+   * is the ONLY source of that spinner: a client must never latch it locally,
+   * or an older host that ignores `refreshProviders` would spin forever. */
+  | { type: "providerState"; providers: { id: "grok" | "codex" | "claude"; connected: boolean; needsLogin?: boolean; cliVersion?: string; adapterVersion?: string; latestCliVersion?: string; updateAvailable?: boolean }[]; checking?: boolean }
   | { type: "codexInstallProgress"; phase: "downloading" | "verifying" | "installing" | "idle"; receivedBytes?: number; totalBytes?: number; reason?: string }
   /** Plan picker gate. `recheckable` means the version probe failed (not a
    *  verified-old CLI) — the row stays clickable so a later pick re-probes. */
@@ -227,10 +233,10 @@ export type HostMsg =
   | { type: "updateAvailable"; version: string; url: string }
   /** Desktop in-app update is downloaded and waiting for restart. Host-local. */
   | { type: "updateReady"; version: string }
-  | { type: "initialized"; info: { cliPath: string; cwd: string; version: string | null; provider?: "grok" | "codex"; init: { protocolVersion?: unknown } } }
+  | { type: "initialized"; info: { cliPath: string; cwd: string; version: string | null; provider?: "grok" | "codex" | "claude"; init: { protocolVersion?: unknown } } }
   | { type: "cliUpdating" }
   // `worktree` gates the gear's Apply/Remove worktree items to worktree sessions.
-  | { type: "session"; sessionId: string; models: ModelInfo[]; currentModelId: string | undefined; effort?: string; worktree?: boolean; provider?: "grok" | "codex" }
+  | { type: "session"; sessionId: string; models: ModelInfo[]; currentModelId: string | undefined; effort?: string; worktree?: boolean; provider?: "grok" | "codex" | "claude" }
   // The focused conversation's display name, using the same precedence as a
   // history row. It is separate from `sessions` because VS Code does not keep
   // that browser-only list populated while the history popover is closed.
@@ -366,10 +372,9 @@ export type HostMsg =
   | { type: "autoCompactNotice"; text: string }
   | { type: "planBlocked"; kind: string; target: string }
   | { type: "promptComplete"; meta: PromptResultMeta }
-  // Context size read from grok's on-disk signals.json — the source that has a
-  // real count when the turn meta can't: a cold restore (no turn yet) and a
-  // /compact turn (its meta reports 0, stripped by gateZeroTokenMeta).
-  | { type: "contextUsage"; used: number; window?: number }
+  // Context occupancy for the donut. `used` is optional so an adapter can
+  // deliver `usage_update.size` (the real window) before any occupancy exists.
+  | { type: "contextUsage"; used?: number; window?: number }
   | { type: "agentReset" }
   | { type: "agentError"; text: string }
   | { type: "agentEnd"; meta?: PromptResultMeta }
@@ -378,10 +383,21 @@ export type HostMsg =
   | { type: "summarizing" }
   | { type: "sessionContext" }
   | { type: "clearMessages" }
-  | { type: "onboarding"; state: "connect-agent" | "missing-cli" | "auth-required" | "missing-codex" | "codex-login"; platform?: string; reason?: string; provider?: "grok" | "codex" }
+  // "provider-connected" is the one SUCCESS state here: a re-check that worked
+  // used to leave a bare empty session, indistinguishable from nothing having
+  // happened. It clears itself when the first message paints.
+  // "no-project" is the desktop empty-open-set state: chat cannot start until
+  // the user adds a folder. It replaces the baked "Starting" spinner that
+  // otherwise never clears (startSession used to return without unlocking).
+  // `launched` says the HOST already opened the login terminal, so the panel can
+  // show it as done. Without it an automatically opened terminal leaves the
+  // button looking untouched, which reads as "press it again".
+  | { type: "onboarding"; state: "connect-agent" | "missing-cli" | "auth-required" | "missing-codex" | "codex-login" | "missing-claude" | "claude-login" | "provider-connected" | "no-project"; platform?: string; reason?: string; provider?: "grok" | "codex" | "claude"; launched?: boolean }
   // resumeFailed is additive: a remote resume refusal names the requested id so
   // the browser outbox can fail closed. Older clients ignore the extra field.
-  | { type: "error"; text: string; resumeFailed?: { id: string } }
+  // code is additive too — a harness must not match user-facing `text`.
+  // "interrupted-send" is a send abandoned after its userMessage echo.
+  | { type: "error"; text: string; resumeFailed?: { id: string }; code?: typeof INTERRUPTED_SEND_CODE }
   | { type: "hostNotice"; level: "info" | "warning"; text: string }
   | { type: "xaiNotification"; update?: unknown }
   // Persisted xAI lifecycle (method _x.ai/session/update): subagent spawn/finish
@@ -581,16 +597,21 @@ export type WebviewMsg =
   | { type: "exitPlanAnswer"; requestId: number | string; verdict: "approved" | "abandoned" | "rejected"; comment?: string }
   | { type: "questionAnswer"; requestId: number | string; answers?: Record<string, string>; annotations?: Record<string, { notes?: string; preview?: string }> }
   | { type: "questionCancel"; requestId: number | string }
-  | { type: "setModel"; modelId: string; provider?: "grok" | "codex" }
+  | { type: "setModel"; modelId: string; provider?: "grok" | "codex" | "claude" }
   | { type: "installCodex" }
   | { type: "cancelCodexInstall" }
   | { type: "runInstallCmd" }
-  | { type: "runGrokLogin"; provider?: "grok" | "codex" }
-  | { type: "logout"; provider?: "grok" | "codex" }
+  | { type: "runGrokLogin"; provider?: "grok" | "codex" | "claude" }
+  | { type: "logout"; provider?: "grok" | "codex" | "claude" }
   | { type: "checkGrokUpdate" }
   | { type: "updateGrok" }
-  | { type: "recheckConnection"; provider?: "grok" | "codex" }
-  | { type: "retryProviderSession"; provider?: "grok" | "codex" }
+  | { type: "recheckConnection"; provider?: "grok" | "codex" | "claude" }
+  /** Re-observe every account without asserting anything about it. Unlike
+   *  `recheckConnection` this never marks a provider connected — it re-runs the
+   *  CLI locators and re-probes the credentials of accounts already connected,
+   *  so Settings → Providers can be made to tell the truth on demand. */
+  | { type: "refreshProviders" }
+  | { type: "retryProviderSession"; provider?: "grok" | "codex" | "claude" }
   | { type: "listSessions"; offset?: number; limit?: number; providerCursor?: { grokOffset: number; codexHighWater?: { updatedAt: number; id: string } }; query?: string }
   // Preview rows for a repo the client is NOT currently in — the projects rail
   // shows a few sessions per repo without switching to it. `cwd` is matched
@@ -758,7 +779,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, setVoiceSendPhrase: true, setVoiceKeyterms: true, setTelemetryEnabled: true, summarizeSpeech: true, requestImageFull: true, composerFocus: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
   questionCancel: true, setModel: true, installCodex: true, cancelCodexInstall: true, runInstallCmd: true, runGrokLogin: true,
-  logout: true, checkGrokUpdate: true, updateGrok: true, recheckConnection: true, retryProviderSession: true,
+  logout: true, checkGrokUpdate: true, updateGrok: true, recheckConnection: true, refreshProviders: true, retryProviderSession: true,
   listSessions: true, listRepoSessions: true, selectRepo: true, toggleRepoPin: true, toggleSessionPin: true,
   setRepoArchived: true, setRepoColor: true,
   resumeSession: true, renameSession: true, deleteSession: true,

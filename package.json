@@ -2,7 +2,7 @@
   "name": "grok-vscode-phuryn",
   "displayName": "Grok Build for VS Code (Community)",
   "description": "GUI for Grok Build CLI (incl. Grok 4.6). Remote Control from your phone, voice control, multiple sessions, images and videos, Mermaid diagrams, and LaTeX. Works with SuperGrok, X Premium+, and xAI API key. Fair Source (FSL-1.1-MIT). Not affiliated with or endorsed by SpaceXAI (formerly xAI).",
-  "version": "3.10.2-sandbox.1",
+  "version": "3.12.2-sandbox.1",
   "publisher": "PawelHuryn",
   "author": {
     "name": "Paweł Huryn",
@@ -263,6 +263,11 @@
           "default": "",
           "description": "Path to the OpenAI Codex binary. Empty = auto-discover on PATH, then in the newest OpenAI ChatGPT bundle installed by VS Code, Cursor, or remote VS Code."
         },
+        "grok.claudeCliPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Anthropic Claude Code CLI (`claude`). Empty = auto-discover on PATH, then well-known user-bin locations. Authentication stays in Anthropic's own CLI."
+        },
         "grok.defaultModel": {
           "type": "string",
           "default": "",
@@ -448,10 +453,12 @@
     "desktop-dev": "npm run compile && node scripts/run-desktop.cjs --relay-dev --open-devtools",
     "test:desktop": "npm run compile && vitest run --config vitest.desktop.config.ts",
     "e2e:screens": "npm run compile && node scripts/desk-screens-check.mjs",
+    "e2e:lifecycle-host": "npm run compile && node scripts/lifecycle-host.mjs",
     "smoke:live": "npm run compile && node scripts/live-smoke.mjs",
     "telemetry:probe": "tsc -p . && node scripts/telemetry-probe.cjs",
+    "check:relay": "node scripts/check-production-relay.mjs",
     "check:vsix": "npm run compile && node scripts/check-vsix-requires.mjs",
-    "prepackage": "node -e \"const fs=require('fs'); for (const f of fs.readdirSync('.')) if (f.endsWith('.vsix')) fs.unlinkSync(f); fs.rmSync('out',{recursive:true,force:true})\" && npm run check:vsix",
+    "prepackage": "node -e \"const fs=require('fs'); for (const f of fs.readdirSync('.')) if (f.endsWith('.vsix')) fs.unlinkSync(f); fs.rmSync('out',{recursive:true,force:true})\" && npm run check:relay && npm run check:vsix",
     "package": "vsce package --readme-path README.marketplace.md",
     "publish": "vsce publish --readme-path README.marketplace.md",
     "publish:ovsx": "node scripts/publish-ovsx.mjs",
@@ -476,6 +483,7 @@
     "vitest": "^1.6.0"
   },
   "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.69.0",
     "@agentclientprotocol/codex-acp": "1.1.14",
     "electron-updater": "^6.6.4",
     "jpeg-js": "^0.4.4",

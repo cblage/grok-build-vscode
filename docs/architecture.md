@@ -31,9 +31,10 @@ history survives.
 webview / browser
        │ additive HostMsg/WebviewMsg (session.provider, providerState, models)
        ▼
-sidebar host ──► AcpClient ──► GrokBackend  ──► grok agent stdio
-                         └────► CodexBackend ──► node codex-acp (CODEX_PATH=codex,
-                                                     ELECTRON_RUN_AS_NODE=1)
+sidebar host ──► AcpClient ──► GrokBackend   ──► grok agent stdio
+                         ├────► CodexBackend  ──► node codex-acp (CODEX_PATH=codex)
+                         └────► ClaudeBackend ──► node claude-agent-acp
+                                                   (CLAUDE_CODE_EXECUTABLE=claude)
        ▲                         │
        └── established internal events ◄── Codex wire normalization
 ```
@@ -53,15 +54,16 @@ Codex, an unreadable version, and a cache/unverified banner keep
 `terminal` is a separate capability.
 
 `AcpClient` has a provider seam at the wire's divergence points. The default
-`grokBackend` is an identity adapter: it preserves Grok's spawn arguments,
-requests, responses, and notifications. `CodexBackend`
-spawns the pinned `@agentclientprotocol/codex-acp` entry point under Node with
-`CODEX_PATH` set to the discovered Codex CLI and `ELECTRON_RUN_AS_NODE=1`
-explicitly set for VS Code, desktop Electron, and plain Node hosts, then normalizes composite model
-ids, config-option responses, usage, tool output, diffs, permissions, generated
-titles, and session-list pages into the existing host event shapes. Codex runs
-commands and edits server-side, and its Plan enforcement stays server-side, so
-the Grok terminal/fs Plan gate is disabled for that provider.
+`grokBackend` is an identity adapter. `CodexBackend` and `ClaudeBackend` spawn
+the pinned `@agentclientprotocol/*-acp` entry points under Node with
+`ELECTRON_RUN_AS_NODE=1` and the user's own CLI path (`CODEX_PATH` /
+`CLAUDE_CODE_EXECUTABLE`). Claude's adapter is unbundled ESM, so the vsix also
+packs its JS deps and never the optional native SDK binaries. Both adapters
+normalize models, config options, usage, titles, and `session/list` into the
+existing host shapes. Plan enforcement stays in the adapter/CLI, so the Grok
+terminal/fs Plan gate is off for those providers. Claude authentication stays
+in Anthropic's own `claude` CLI — this host never implements, proxies, holds,
+or forwards Claude credentials.
 
 Connection is explicit and binary-aware. `grok.providerConnections` records the
 user choice; a located binary alone never connects Codex. `grok.providerModelCache`
@@ -166,6 +168,59 @@ The composer unlocks as soon as the session is live. Its placeholder follows the
 session provider (**Ask Grok…** / **Ask GPT…**). While a user turn is waiting, the
 same animated activity row says **Grokking…** for Grok or **Opening AI…** for
 Codex, then is replaced in place by the first thought / message / tool card.
+
+### One stdout chunk is dispatched synchronously — state raised after an `await` is too late
+
+`readline` emits a `line` event for **every** line in a chunk before the write
+returns, so two ACP messages that arrive together are handled in the same
+synchronous turn. Anything a handler sets *after* awaiting a response is
+therefore **not** in force when the next line is processed.
+
+This is not theoretical. It is how a `terminal/create` arriving in the same chunk
+as a `session/set_mode` success ran `rm -rf` with Plan mode's gate still down:
+the gate was raised after the await, one event-loop turn too late. The fix, and
+the pattern to copy, is the `onResolve` hook on `AcpClient.request(...)` — it
+runs **inside** `onLine`, after a successful response and before the promise
+resolves, so state committed there is visible to the very next line. See
+[Plan Mode](#plan-mode--provider-owned-review-grok-client-safety-gate).
+
+Whenever a decision depends on state a response is *about* to establish, commit
+it in that hook, not after the `await`. Tests must drive real line dispatch — a
+single `stdout.write` carrying both JSON lines — because a test that
+hand-sequences the two events cannot fail the way production does. Three review
+rounds missed this precisely because the tests sequenced by hand.
+
+### Session starts are serialized, and an abandoned send says so
+
+`startSession` bumps `session.gen`, and `handleSend` checks that generation
+after it has already emitted `userMessage`. A concurrent start therefore used to
+strand a send: the echo painted a bubble, any client reasonably read it as
+acceptance, and the guard then returned with no `agentEnd` and no `agentError`,
+so no reply ever came and nothing retried. Remote clients drop their retry record
+on that echo, so this was silent work loss.
+
+Two rules now hold:
+
+- **A post-echo bail reports itself.** `emitAbandonedSend` emits a generic
+  `error` (`INTERRUPTED_SEND_TEXT` + additive `code: "interrupted-send"`),
+  not `agentError` — after the generation bump this `Session` *is* the
+  replacement, and `agentError` would clear its startup lock or a flushed
+  follow-on turn. Cancel recovery emits its own `agentError` first and sets
+  `staleSendReported`, so an abandoned send is never double-reported.
+- **Starts do not interleave with a live turn.** `runExclusiveSessionStart`
+  serializes starts per `Session`, and `handleSend` waits for that tail before
+  committing. `decideSessionStart` takes an intent: opportunistic callers —
+  desktop boot, `client-ready`, non-live `resumeSession` — pass `"ensure"`,
+  which refuses while a turn is in flight, reuses a matching ready client, and
+  never bumps `gen` over a live send. Deliberate restarts (cancel recovery, auth
+  recovery, model/effort changes) pass `"replace"`.
+
+The generation guard itself is correct and stays; the bug was the silent return.
+Note that an already-echoed send **cannot** be transparently replayed — the echo
+is in the session buffer, so a client-side retry duplicates the prompt. Visible
+and recoverable is the correct terminal outcome for that interleaving; it is not
+a substitute for delivering work queued while the host was down, which still
+arrives.
 
 ## The session pool (Agent Dashboard)
 
@@ -286,7 +341,10 @@ cancel, or synthetic lifecycle.
   (`exit_plan_mode.planContent` arrives populated on 1.x; 0.2.117 still sends
   `null`); the plan.md snoop is a fallback. Entering plan mode *any* way —
   including the agent self-initiating it — raises the gate; only an explicit
-  user action lowers it.
+  user action lowers it. A grok user Plan pick commits `planActive` in the
+  `session/set_mode` response hook — after a successful reply, before the next
+  ACP line — so a same-chunk `terminal/create` or `session/request_permission`
+  still sees the gate. A rejected transition keeps the previous badge and gate.
 
 - **Verdict state and comments.** `handleExitPlan` settles all implementation-
   relevant state *before* releasing the blocked response. Approval restores the
@@ -334,11 +392,29 @@ cancel, or synthetic lifecycle.
   also retained for other hidden maintenance turns; they are no longer a priming
   mechanism.
 
-Codex plan review follows a different wire path: it is a normal
-`session/request_permission` whose tool kind is `switch_mode`. The host renders
-the ordinary permission card and returns the selected option. `CodexBackend`
-reports `usesClientPlanGate = false`, so none of the Grok filesystem/terminal
+Codex and Claude plan review follow a different wire path: a normal
+`session/request_permission` whose tool kind is `switch_mode` and whose
+allow option means "implement this plan". The reply is still the selected
+permission option. The card is not the generic permission chrome —
+`planTextFromPermissionToolCall` lifts Codex `rawInput.plan` / Claude's
+ExitPlanMode content block, and the webview renders grok's plan-review
+shape with those adapter mode options. A `switch_mode` card that arrives
+with no plan text must not collapse to an "Approved" / "Plan approved"
+label. Auto accept does not select that option — `isPlanReviewPermission`
+keeps `switch_mode` cards out of `autoApprovePendingPermissions` and the
+incoming Auto-accept grant, so a mode flip (even one whose RPC later
+fails) cannot implement an unread plan. `CodexBackend` reports
+`usesClientPlanGate = false`, so none of the Grok filesystem/terminal
 gate, plan-file snooping, or `x.ai/exit_plan_mode` verdict machinery is attached.
+A successful Plan `session/set_config_option` still raises `client.planActive`
+in the response hook so Auto accept cannot grant that review (or any other
+same-chunk permission) before the host await continues. Their Plan/Agent chrome
+still follows the agent's mode (`applyAgentModeToHostPlan`, plus Codex
+`config_option_update`) so the button cannot stay on Plan after an approved
+exit. Codex's effective mode is Plan when `collaboration_mode` is Plan
+and otherwise the permission `mode` (`codexEffectiveModeId`) — collaboration
+`default` is not flattened to Agent, because the adapter always reports
+`agent-full-access` on that same snapshot.
 
 The full pedagogical write-up lives in
 [research/understanding-plan-mode.md](../research/understanding-plan-mode.md).
@@ -350,18 +426,18 @@ The full pedagogical write-up lives in
 | [src/extension.ts](../src/extension.ts) | Entry point — registers commands, keybindings, output channel |
 | [src/sidebar.ts](../src/sidebar.ts) | Webview provider, message routing, sandbox orchestration, fs handlers, native diff opening, logout, worktree/rewind control, and symlink-safe generated-media serving (`postGeneratedMedia` → `asWebviewUri`, base64 fallback) |
 | [src/diff-view.ts](../src/diff-view.ts) | Pure whole-file native-diff reconstruction (#66) — combines Grok's replaced regions + positioned sites with disk content, bounds expansion size, and finds the first changed line |
-| [src/acp.ts](../src/acp.ts) | Provider-neutral ACP client — spawns the selected backend, manages session lifecycle, normalizes through its backend hooks, and awaits its per-client execution backend so sandbox brokers own ACP fs/terminal teardown (grok only — see `src/grok-backend.ts` / `src/sidebar.ts`). `interject` (#52 Steer), `forkSession` (#48), and worktree RPCs (P2-8) call the unadvertised `_x.ai/*` methods, returning `"unsupported"` on -32601 rather than throwing |
-| [src/acp-backend.ts](../src/acp-backend.ts) / [src/grok-backend.ts](../src/grok-backend.ts) / [src/codex-backend.ts](../src/codex-backend.ts) | Backend contract, Grok identity implementation (incl. `buildGrokAgentArgs`'s `--sandbox` flag ordering), and Codex host normalization. Codex uses `session/set_config_option`, consumes `session_info_update`, paginates `session/list` without `cwd`, and keeps the existing host/webview shapes provider-neutral |
-| [src/codex-model-cache.ts](../src/codex-model-cache.ts) | Short-lived connect warm-up that caches Codex models from a scratch `session/new`, deletes the temporary adapter-owned session, and cleans up the client/cwd |
-| [src/provider-ui.ts](../src/provider-ui.ts) | Pure provider presentation/state policy — Grok-first model grouping, empty-model default sentinel, normalized project defaults, Codex history shaping, and mixed-provider recency merge |
+| [src/acp.ts](../src/acp.ts) | Provider-neutral ACP client — spawns the selected backend, manages session lifecycle, normalizes through its backend hooks, and emits the extension's established events. `interject` (#52 Steer), `forkSession` (#48), and worktree RPCs (P2-8) call the unadvertised `_x.ai/*` methods, returning `"unsupported"` on -32601 rather than throwing |
+| [src/acp-backend.ts](../src/acp-backend.ts) / [src/grok-backend.ts](../src/grok-backend.ts) / [src/codex-backend.ts](../src/codex-backend.ts) / [src/claude-backend.ts](../src/claude-backend.ts) | Backend contract, Grok identity, Codex and Claude host normalization. Codex uses `session/set_config_option`; Claude maps `configOptions` into the host model picker, lists sessions with `{ cwd }`, and maps Agent/Auto-accept onto native permission modes |
+| [src/codex-model-cache.ts](../src/codex-model-cache.ts) / [src/claude-model-cache.ts](../src/claude-model-cache.ts) | Short-lived connect warm-up that caches adapter models from a scratch `session/new`, deletes the temporary adapter-owned session, and cleans up the client/cwd |
+| [src/provider-ui.ts](../src/provider-ui.ts) | Pure provider presentation/state policy — Grok-first model grouping, empty-model default sentinel, normalized project defaults, Codex-only listing-time freeze (`adapterActivityAt`), clear-all refresh guard (`adapterEntriesEligibleForClear`), and mixed-provider recency merge |
 | [src/worktree.ts](../src/worktree.ts) | Pure worktree helpers (P2-8) — parse create/list/apply/remove/status, multi-cwd history merge; wire notes in [research/worktree.md](../research/worktree.md) |
 | [src/session.ts](../src/session.ts) | Per-session state bag — one `Session` per live backend process, with immutable `provider` identity (the sidebar holds a *pool* plus one focused); carries the send queue (#37) and optional worktree binding (`cwd` / `worktree`), while cumulative billing stays solely in session-id-keyed metadata (#53) |
 | [src/session-pool.ts](../src/session-pool.ts) | Pure reaping policy (`selectReapable`) — idle-TTL + LRU cap over the live-session pool |
-| [src/acp-dispatch.ts](../src/acp-dispatch.ts) | Pure protocol helpers — line parsing, update routing, response + generated-media extraction, live context extraction (`contextUsedFromUpdateEnvelope` plus compact notifications), billing helpers (`extractPromptUsage`/`addUsage`/`usageIsRealMeasurement`, including `costUsdTicks`), and the -32601 capability gate behind private RPCs |
+| [src/acp-dispatch.ts](../src/acp-dispatch.ts) | Pure protocol helpers — line parsing, update routing, response + generated-media extraction, live context extraction (`contextUsedFromUpdateEnvelope`, compact notifications, `occupancyFromAdapterTurn` / `applyContextOccupancy`), billing helpers (`extractPromptUsage`/`addUsage`/`usageIsRealMeasurement`, including `costUsdTicks`), and the -32601 capability gate behind private RPCs |
 | [src/protocol.ts](../src/protocol.ts) | Single source of truth for the host↔webview message contract — `HostMsg`/`WebviewMsg` unions + the runtime `HOST_MESSAGE_TYPES`/`WEBVIEW_MESSAGE_TYPES` arrays (kept exhaustive by compile-time `Record` maps). Pure types + two arrays, no runtime deps |
 | [src/cli-locator.ts](../src/cli-locator.ts) / [src/cli-process.ts](../src/cli-process.ts) | Locate and invoke the `grok` binary cross-platform; one shim-aware execution policy covers ACP spawn plus version/update commands |
-| [src/codex-cli-locator.ts](../src/codex-cli-locator.ts) / [src/codex-managed-installer.ts](../src/codex-managed-installer.ts) | Pure, injected Codex discovery with the managed package at lowest priority; pinned target/URL/hash selection, streamed download, SHA-256 verification, dependency-free tar extraction, cleanup, and atomic versioned layout |
-| [src/terminal-manager.ts](../src/terminal-manager.ts) | Headless shells for the agent's `terminal/*` calls; POSIX commands run in killable process groups |
+| [src/codex-cli-locator.ts](../src/codex-cli-locator.ts) / [src/codex-managed-installer.ts](../src/codex-managed-installer.ts) / [src/claude-cli-locator.ts](../src/claude-cli-locator.ts) | Pure, injected Codex discovery with the managed package at lowest priority; Claude discovery is PATH + `grok.claudeCliPath` + well-known user-bin locations only — no managed Anthropic installer. Windows `.cmd` shims are resolved to a native exe (`resolveClaudeSpawnTarget`) because the SDK spawn is `shell: false` |
+| [src/terminal-manager.ts](../src/terminal-manager.ts) | Headless shells for the agent's `terminal/*` calls |
 | [src/seatbelt-policy.ts](../src/seatbelt-policy.ts) | Pure parser/resolver/compiler for built-in + recursively inherited user/project sandbox profiles |
 | [src/seatbelt-broker.ts](../src/seatbelt-broker.ts) | Per-session `sandbox-exec` process + correlated NDJSON execution client — grok sessions only; `src/sidebar.ts` never attaches it to a Codex session, whose home directory the compiled policy knows nothing about |
 | [src/seatbelt-broker-child.ts](../src/seatbelt-broker-child.ts) | Sandboxed filesystem/terminal executor whose child commands inherit Seatbelt |

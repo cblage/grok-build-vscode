@@ -620,6 +620,38 @@ describe("desktop main wiring (source gates)", () => {
     expect(sidebar.slice(unlinkStart, unlinkEnd)).not.toContain("confirmHostExecute");
   });
 
+  it("first-run default project is provisioned from paths.ts before the sidebar starts", () => {
+    const main = fs.readFileSync(path.join(testRepoRoot, "src", "desktop", "main.ts"), "utf8");
+    expect(main).toContain("provisionDefaultProjectDir");
+    expect(main).toContain("desktopUserHomeDir");
+    expect(main).toContain("provisionDefaultProject:");
+    // Sidebar must already see the root — constructing it first left
+    // RemoteClientState / defaultProvider on "".
+    const provisionAt = main.indexOf("provisionDefaultProjectDir");
+    const sidebarAt = main.indexOf("new GrokSidebar");
+    expect(provisionAt).toBeGreaterThan(0);
+    expect(sidebarAt).toBeGreaterThan(provisionAt);
+
+    const host = fs.readFileSync(path.join(testRepoRoot, "src", "desktop", "electron-host.ts"), "utf8");
+    expect(host).toContain("provisionDefaultProject?.()");
+    expect(host).toContain("seeded.length");
+
+    const sidebar = fs.readFileSync(path.join(testRepoRoot, "src", "sidebar.ts"), "utf8");
+    expect(sidebar).toContain("presentEmptyProjectState");
+    const startBody = sidebar.slice(
+      sidebar.indexOf("private async startSessionBody("),
+      sidebar.indexOf("private async startSessionBody(") + 1800,
+    );
+    expect(startBody).toContain("presentEmptyProjectState(target)");
+    expect(startBody).toContain("refused startSession");
+    const removeBody = sidebar.slice(
+      sidebar.indexOf("async removeProjectFolder("),
+      sidebar.indexOf("private presentEmptyProjectState("),
+    );
+    expect(removeBody).toContain("presentEmptyProjectState(this.focused)");
+    expect(sidebar).toMatch(/if \(this\.host\.canSwitchWorkspaceFolder\) return "";/);
+  });
+
   it("registers file-tree IPC while getHtml loads the component only for desktop", () => {
     const main = fs.readFileSync(
       path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "desktop", "main.ts"),
@@ -2045,8 +2077,8 @@ describe("IPC sender validation helper", () => {
 });
 
 describe("file-tree panel assets", () => {
-  it("top-bar order is Remote, History, overflow, then Panel with separator on Panel only", () => {
-    // Owner preference: Remote, Session history, ⋯, |, Panel — not ⋯ first.
+  it("top-bar order is Remote, History, New, overflow, then Panel with separator on Panel only", () => {
+    // Owner preference: Remote, Session history, New, ⋯, |, Panel — not ⋯ first.
     // Separator lives on the Panel toggle so remote (no panel) has no dangling |.
     const sidebar = fs.readFileSync(
       path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "sidebar.ts"),
@@ -2056,10 +2088,12 @@ describe("file-tree panel assets", () => {
     expect(topBar).toBeTruthy();
     const remote = topBar.indexOf('id="remote-btn"');
     const history = topBar.indexOf('id="history-btn"');
+    const newSession = topBar.indexOf('id="new-btn"');
     const overflow = topBar.indexOf('id="session-head-actions"');
     expect(remote).toBeGreaterThan(-1);
     expect(history).toBeGreaterThan(remote);
-    expect(overflow).toBeGreaterThan(history);
+    expect(newSession).toBeGreaterThan(history);
+    expect(overflow).toBeGreaterThan(newSession);
     // Mutation: overflow before remote would fail.
     expect(overflow).toBeGreaterThan(remote);
 
@@ -2119,6 +2153,8 @@ describe("file-tree panel assets", () => {
     expect(boot).toContain("desk-ft-maximize");
     expect(boot).toContain("desk-ft-maximized");
     expect(filePanelCss).toContain("body.desk-ft-maximized .desk-ft-chat");
+    expect(filePanelCss).toContain("body.desk-ft-maximized #chat-stack");
+    expect(filePanelCss).toContain("body.desk-ft-maximized #file-panel-dock");
     expect(filePanelJs).toContain("mount.maximize");
     expect(boot).toContain("absPath: request.expectedAbsPath");
     expect(boot).toContain("__grokDeskFtOpen");
@@ -4449,11 +4485,11 @@ describe("openFile / openDiff session roots (P2-4 / P2-5)", () => {
     const initialStart = sidebar.indexOf("private postInitialState(");
     const initialEnd = sidebar.indexOf("private rehydrateWebviewFromFocused(", initialStart);
     const initialBody = sidebar.slice(initialStart, initialEnd);
-    expect(initialBody).toContain("startSession()");
+    expect(initialBody).toContain('startSession(undefined, this.focused, "ensure")');
     expect(initialBody).toContain("postSessionsList()");
     expect(initialBody).toContain("sweepEmptySessions()");
     // postSessionsList must run on the startSession success path (not only on ready).
-    const thenIdx = initialBody.indexOf("startSession().then");
+    const thenIdx = initialBody.indexOf('startSession(undefined, this.focused, "ensure").then');
     expect(thenIdx).toBeGreaterThan(0);
     expect(initialBody.indexOf("postSessionsList()", thenIdx)).toBeGreaterThan(thenIdx);
   });

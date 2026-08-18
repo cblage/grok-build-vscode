@@ -5,8 +5,13 @@ import {
   isMutatingKind,
   isReadOnlyCommand,
   isPlanFileWrite,
+  applyAgentModeToHostPlan,
+  effectivePlanActive,
   permissionAnswerAllowed,
   permissionOptionsForPlan,
+  isPlanReviewPermission,
+  planReviewVerdictForOption,
+  planTextFromPermissionToolCall,
   pickRejectOption,
   shouldBlockWrite,
   shouldBlockTerminal,
@@ -700,6 +705,58 @@ describe("permission gating", () => {
     )).toEqual([]);
     expect(permissionOptionsForPlan(options, false, "execute")).toBe(options);
     expect(permissionOptionsForPlan(options, true, "edit")).toBe(options);
+  });
+
+  it("treats only switch_mode as a plan-review card", () => {
+    expect(isPlanReviewPermission("switch_mode")).toBe(true);
+    expect(isPlanReviewPermission("Switch_Mode")).toBe(true);
+    expect(isPlanReviewPermission("edit")).toBe(false);
+    expect(isPlanReviewPermission("execute")).toBe(false);
+    expect(isPlanReviewPermission(undefined)).toBe(false);
+  });
+
+  it("reads Codex rawInput.plan and Claude content-block plan text", () => {
+    expect(planTextFromPermissionToolCall({ rawInput: { plan: "# Plan\n\n1. Change it" } }))
+      .toBe("# Plan\n\n1. Change it");
+    expect(planTextFromPermissionToolCall({
+      content: [{ type: "content", content: { type: "text", text: "Claude plan" } }],
+    })).toBe("Claude plan");
+    expect(planTextFromPermissionToolCall({ rawInput: { plan: "   " }, content: [] })).toBe("");
+    expect(planReviewVerdictForOption("allow_once")).toBe("approved");
+    expect(planReviewVerdictForOption("reject_once")).toBe("rejected");
+  });
+});
+
+describe("applyAgentModeToHostPlan", () => {
+  it("raises Plan for every provider on a plan mode id", () => {
+    expect(applyAgentModeToHostPlan("plan", true)).toEqual({ planActive: true, autoApprove: false });
+    expect(applyAgentModeToHostPlan("plan", false)).toEqual({ planActive: true, autoApprove: false });
+  });
+
+  it("leaves grok's client gate raised on a writable current_mode_update", () => {
+    expect(applyAgentModeToHostPlan("default", true)).toBeNull();
+    expect(applyAgentModeToHostPlan("auto", true)).toBeNull();
+  });
+
+  it("follows the adapter's writable mode so the host stops saying Plan", () => {
+    expect(applyAgentModeToHostPlan("default", false)).toEqual({ planActive: false, autoApprove: false });
+    expect(applyAgentModeToHostPlan("auto", false)).toEqual({ planActive: false, autoApprove: true });
+    expect(applyAgentModeToHostPlan("acceptEdits", false)).toEqual({ planActive: false, autoApprove: true });
+    expect(applyAgentModeToHostPlan("bypassPermissions", false)).toEqual({ planActive: false, autoApprove: true });
+    expect(applyAgentModeToHostPlan("agent-full-access", false)).toEqual({ planActive: false, autoApprove: true });
+  });
+});
+
+describe("effectivePlanActive", () => {
+  it("reads the client gate for grok so a same-chunk Plan pick is already up", () => {
+    expect(effectivePlanActive(true, true, false)).toBe(true);
+    expect(effectivePlanActive(true, false, true)).toBe(false);
+  });
+
+  it("reads the client Plan-accepted bit for adapters, with the session flag as fallback", () => {
+    expect(effectivePlanActive(false, true, false)).toBe(true);
+    expect(effectivePlanActive(false, false, true)).toBe(true);
+    expect(effectivePlanActive(false, false, false)).toBe(false);
   });
 });
 

@@ -44,7 +44,7 @@
     "setShowThinking", "setAppPurpose", "setExpandCommandOutputs",
     "dropFile", "permissionAnswer", "exitPlanAnswer", "questionAnswer", "questionCancel",
     "setModel", "installCodex", "cancelCodexInstall", "runInstallCmd", "runGrokLogin", "logout", "checkGrokUpdate", "updateGrok",
-    "recheckConnection", "retryProviderSession", "listSessions", "listRepoSessions", "selectRepo", "toggleRepoPin", "setRepoArchived", "setRepoColor", "toggleSessionPin", "resumeSession", "renameSession", "deleteSession",
+    "recheckConnection", "refreshProviders", "retryProviderSession", "listSessions", "listRepoSessions", "selectRepo", "toggleRepoPin", "setRepoArchived", "setRepoColor", "toggleSessionPin", "resumeSession", "renameSession", "deleteSession",
       "clearAllSessions", "pickFile", "mentionQuery", "addMentionFile", "listProjectDir", "readProjectFile", "writeProjectFile", "pasteImage", "uploadFile", "voiceStart", "voiceStop",
       "remoteVoiceStart", "remoteVoiceChunk", "remoteVoiceStop",
     "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "forkSession", "setSteerByDefault",
@@ -59,6 +59,77 @@
    *  drift the sync test is designed to prevent, warned at runtime as a backstop. */
   function isKnownHostMessage(type) {
     return HOST_MESSAGE_TYPE_SET.has(type);
+  }
+
+  /**
+   * One pending user write. Paint immediately; the next frame that names
+   * `key` is the authority and the overlay dies. Not a store — confirm,
+   * contradict, and refuse all look like "a frame for this entity" from
+   * here. A silent host cannot leave a lie: `timeoutMs` (default 8s)
+   * clears the overlay and calls `onExpire`.
+   */
+  function createPendingOverlay(opts) {
+    const onExpire = opts && typeof opts.onExpire === "function" ? opts.onExpire : null;
+    let pending = null;
+    let timer = null;
+    function resolveTimeout() {
+      if (opts && typeof opts.timeoutMs === "function") {
+        const n = Number(opts.timeoutMs());
+        return n > 0 ? n : 8000;
+      }
+      if (opts && Number(opts.timeoutMs) > 0) return Number(opts.timeoutMs);
+      return 8000;
+    }
+    function clearTimer() {
+      if (timer != null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    }
+    function expire() {
+      timer = null;
+      if (!pending) return;
+      pending = null;
+      if (onExpire) onExpire();
+    }
+    return {
+      paint(key, value) {
+        clearTimer();
+        pending = { key: String(key), value };
+        timer = setTimeout(expire, resolveTimeout());
+      },
+      valueFor(key) {
+        if (key == null || !pending || pending.key !== String(key)) return undefined;
+        return pending.value;
+      },
+      has(key) {
+        return !!(pending && key != null && pending.key === String(key));
+      },
+      peek() {
+        return pending;
+      },
+      settle(key) {
+        if (!pending || key == null || pending.key !== String(key)) return false;
+        clearTimer();
+        pending = null;
+        return true;
+      },
+      settleAny(keys) {
+        if (!pending) return false;
+        for (const key of keys || []) {
+          if (key != null && pending.key === String(key)) {
+            clearTimer();
+            pending = null;
+            return true;
+          }
+        }
+        return false;
+      },
+      clear() {
+        clearTimer();
+        pending = null;
+      },
+    };
   }
 
   // ---- "@" file mention (composer autocomplete) ----
@@ -126,13 +197,29 @@
     return new Date(ts).toLocaleDateString();
   }
 
+  // Prefer the description's versioned lead when the advertised name is only a
+  // family label (Claude: "Sonnet" + "Sonnet 5 · …" → "Sonnet 5"). Grok and
+  // Codex already bake the generation into `name`, so this is a no-op there.
+  function modelPickerLabel(model) {
+    const name = String((model && (model.name || model.modelId)) || "").trim();
+    const lead = String((model && model.description) || "").split("·")[0].trim();
+    if (!lead) return name;
+    if (!name) return lead;
+    const family = name.replace(/\s*\([^)]*\)\s*$/, "").trim();
+    if (family && lead.toLowerCase().startsWith(family.toLowerCase()) && lead.length > name.length) {
+      return lead;
+    }
+    return name;
+  }
+
   // Resolve a model ID to its user-facing name (e.g. "grok-build" → "Grok Build")
   // using the availableModels list from session/new. Falls back to the ID when
   // the model isn't in the list or has no name, so the label is never blank.
   function modelDisplayName(modelId, availableModels) {
     if (!modelId) return "";
     const m = (availableModels || []).find((x) => x && x.modelId === modelId);
-    return (m && m.name) || modelId;
+    if (!m) return modelId;
+    return modelPickerLabel(m) || modelId;
   }
 
   // Mic button state machine for voice control:
@@ -456,6 +543,7 @@
     if (!payload || typeof payload !== "object") return false;
     const title = String(payload.title ?? "");
     if (provider === "codex") return payload.kind === "other" && title === "Image generation";
+    // claude falls through to the grok-shaped title/variant checks and typically matches nothing.
     if (/^imagine(-video|-edit)?:/i.test(title)) return true;
     if (/^(image_gen|image_edit|video_gen|image_to_video|reference_to_video)\b/i.test(title)) return true;
     if (/^(image-to-video:|reference-to-video:)/i.test(title)) return true;
@@ -1354,7 +1442,7 @@
     return header.join("\n") + (body ? body + "\n" : "");
   }
 
-  const api = { FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents };
+  const api = { FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, createPendingOverlay, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelPickerLabel, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;

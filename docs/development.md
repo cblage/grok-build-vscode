@@ -11,7 +11,9 @@ npm test                  # grok-free unit/DOM/fake-CLI suite
 npm run test:integration  # real VS Code Extension Host smoke (also required by CI)
 npm run test:desktop      # real Electron window + fake CLI (desktop host)
 npm run e2e:screens       # real Electron, real layout — leaves frames in .screens/
-npm run package           # → grok-vscode-phuryn-<version>.vsix (marketplace README only)
+npm run e2e:lifecycle-host  # long-lived real desktop host for the relay lifecycle e2e
+npm run package           # → grok-vscode-phuryn-<version>.vsix (marketplace README only;
+                          #    refuses a non-production REMOTE_RELAY_URL)
 npm run desktop           # run Desktop from the compile tree
 npm run dist:win          # Windows x64 installer → dist-desktop/
 npm run dist:mac          # macOS arm64 + x64 (must run on macOS)
@@ -27,6 +29,18 @@ every commit.
 no layout engine: rects are zeros and stylesheets never apply, so an icon with
 no size or a control pushed off-screen satisfies every assertion those suites
 can make. Anything about *painted geometry* belongs there instead.
+
+`npm run e2e:lifecycle-host` is the extension-side half of the cross-repo
+lifecycle suite (real relay + real browser + real host + a host restart). The
+relay repo's orchestrator spawns it as a child. Contract: `GROK_RELAY_URL`,
+`GROK_RELAY_DEVICE_TOKEN`, `GROK_HOME`, and `GROK_LIFECYCLE_WORKSPACES`
+(OS-delimited paths, or a JSON array; two folders for repo switching). It
+prints `GROK_LIFECYCLE_HOST_READY` on stdout once the relay admits the host
+(`clients` frame — not the local socket `open`), then idles until it reads
+`GROK_LIFECYCLE_HOST_SHUTDOWN` on stdin (SIGINT/SIGTERM remain a fallback).
+A production build never honours the injected token
+(`resolveInjectedDeviceToken`). Linux CI: `xvfb-run npm run e2e:lifecycle-host`.
+Details live in the header of `scripts/lifecycle-host.mjs`.
 
 Full test taxonomy: **[CLAUDE.md](../CLAUDE.md#test-taxonomy--three-layers)**.
 Architecture: **[architecture.md](architecture.md)**.

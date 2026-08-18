@@ -132,9 +132,12 @@ export interface PermissionRequest {
     kind: string; // "edit" | "execute" | "read" | ...
     title: string;
     rawInput?: any;
+    content?: unknown;
   };
   options: PermissionOption[];
   _meta?: any;
+  /** Present on adapter `switch_mode` reviews (possibly empty). */
+  plan?: string;
 }
 
 export interface ExitPlanRequest {
@@ -264,6 +267,7 @@ export class AcpClient extends EventEmitter {
   availableCommands: SlashCommand[] = [];
   lastMeta?: PromptResultMeta;
   private lastContextUsed?: number;
+  private lastContextWindow?: number;
   private currentSessionTitle?: string;
   /**
    * The session's effective reasoning effort. Seeded from the spawn flag
@@ -292,10 +296,10 @@ export class AcpClient extends EventEmitter {
   private terminalCommands = new Map<string, string>();
 
   /**
-   * Client-enforced plan gate. While true, mutating shell commands are refused
-   * at `terminal/create`, and workspace writes are refused at
-   * `fs/write_text_file` when those writes are actually delegated — see
-   * `plan-gate.ts`. The host toggles this; the CLI's own plan mode is advisory.
+   * Plan-accepted bit used by permission handling (`effectivePlanActive`).
+   * For grok (`usesClientPlanGate`) it is also the fs/terminal safety gate.
+   * A successful Plan RPC commits it in the response hook so a later line
+   * in the same stdout chunk already sees Plan.
    */
   planActive = false;
 
@@ -361,7 +365,7 @@ export class AcpClient extends EventEmitter {
       this.emit("stderr", text);
     });
     this.proc.on("exit", (code) => {
-      this.opts.log(`${this.provider === "grok" ? "grok" : "codex adapter"} exited with code ${code}`);
+      this.opts.log(`${this.backend.processName} exited with code ${code}`);
       // Drop the process handle so later writes are skipped rather than hitting
       // a destroyed pipe (`this.proc?` alone stays truthy after exit).
       this.proc = undefined;
@@ -428,6 +432,17 @@ export class AcpClient extends EventEmitter {
         await this.setModel(modelId);
       } catch (err) {
         this.opts.log(`[acp] Failed to set model to ${modelId}: ${(err as Error).message}. Falling back to default model ${this.currentModelId}.`);
+      }
+    }
+    // Spawn `--reasoning-effort` is grok-only. Adapters take effort as a
+    // session config option after session/new — recording `opts.effort`
+    // locally without this RPC left the UI showing a level Claude/Codex
+    // were not running.
+    if (this.opts.effort && this.provider !== "grok") {
+      try {
+        await this.setReasoningEffort(this.opts.effort);
+      } catch (err) {
+        this.opts.log(`[acp] Failed to set reasoning effort to ${this.opts.effort}: ${(err as Error).message}.`);
       }
     }
     return { sessionId: res.sessionId };
@@ -564,7 +579,16 @@ export class AcpClient extends EventEmitter {
   async setMode(modeId: string): Promise<void> {
     if (!this.sessionId) throw new Error("no session");
     const call = this.backend.setMode(this.sessionId, modeId);
-    const res = await this.request(call.method, call.params);
+    const res = await this.request(call.method, call.params, () => {
+      // The host still raises session chrome after this await. readline can
+      // deliver a later ACP line in this same turn, so the Plan-accepted bit
+      // has to land here — after a successful reply, before the next onLine.
+      // Grok needs the fs/terminal gate up; Codex/Claude need the same bit so
+      // Auto accept cannot grant a same-chunk request_permission (plan review
+      // is one). usesClientPlanGate still decides whether writes/terminals
+      // are blocked.
+      if (modeId === "plan") this.planActive = true;
+    });
     const state = this.backend.configState(res, {
       modelId: this.currentModelId,
       reasoningEffort: this.currentReasoningEffort,
@@ -599,7 +623,7 @@ export class AcpClient extends EventEmitter {
 
   async listSessions(cwd = this.opts.cwd, platform: NodeJS.Platform = process.platform): Promise<BackendSessionListResult> {
     const result = await this.backend.listSessions((method, params) => this.request(method, params), cwd, platform);
-    if (this.provider !== "codex" || !this.sessionId || result.sessions.some((entry) => entry.sessionId === this.sessionId)) {
+    if (this.provider === "grok" || !this.sessionId || result.sessions.some((entry) => entry.sessionId === this.sessionId)) {
       return result;
     }
     return {
@@ -609,7 +633,7 @@ export class AcpClient extends EventEmitter {
   }
 
   async deleteSession(sessionId: string): Promise<void> {
-    if (this.provider !== "codex") throw new Error("This backend does not support ACP session deletion.");
+    if (this.provider === "grok") throw new Error("This backend does not support ACP session deletion.");
     await this.request("session/delete", { sessionId });
   }
 
@@ -879,7 +903,7 @@ export class AcpClient extends EventEmitter {
       try { proc?.kill(); } catch { /* already gone */ }
       return this.disposeExecutionBackend();
     }
-    if (this.provider === "codex") {
+    if (this.provider !== "grok") {
       const processExit = new Promise<void>((resolve) => {
         let done = false;
         const finish = () => {
@@ -1011,7 +1035,7 @@ export class AcpClient extends EventEmitter {
         this.pending.delete(ev.id as number);
         if (p.timer) clearTimeout(p.timer);
         if (ev.error) {
-          if (this.provider === "codex" && this.backend.isCredentialError(ev.error)) {
+          if (this.provider !== "grok" && this.backend.isCredentialError(ev.error)) {
             this.emit("credentialError", ev.error);
           }
           p.reject(ev.error);
@@ -1039,19 +1063,38 @@ export class AcpClient extends EventEmitter {
         this.currentSessionTitle = normalized.sessionTitle;
         this.emit("sessionTitle", normalized.sessionTitle);
       }
-      if (normalized.contextWindow !== undefined && this.currentModelId) {
-        const model = this.availableModels.find((entry) => entry.modelId === this.currentModelId);
+      if (normalized.contextWindow !== undefined) {
+        this.lastContextWindow = normalized.contextWindow;
+        // Claude's live id is often an alias (`opus[1m]`) that is not the
+        // picker value. Still keep the window — the webview reads it off
+        // contextUsage, not the model catalog.
+        const model = this.currentModelId
+          ? this.availableModels.find((entry) => entry.modelId === this.currentModelId)
+          : undefined;
         if (model) model.totalContextTokens = normalized.contextWindow;
       }
     }
-    if (normalized.update === undefined) return;
-    u = normalized.update;
-    meta = normalized.meta;
+    if (normalized.update === undefined && normalized.usageUpdateUsed === undefined && normalized.contextWindow === undefined) {
+      return;
+    }
+    if (normalized.update !== undefined) {
+      u = normalized.update;
+      meta = normalized.meta;
+    }
     if (!foreign) {
+      // Ordinary adapter usage_update.used is billed per call (includes
+      // output) and is not occupancy by itself. Compact's getContextUsage
+      // is the exception — sidebar adopts it only after a compact
+      // completed. Other values are per-call observations for
+      // occupancyFromAdapterTurn.
+      if (normalized.usageUpdateUsed !== undefined) {
+        this.emit("adapterUsageUpdate", normalized.usageUpdateUsed, this.lastContextWindow);
+      }
       const contextUsed = contextUsedFromUpdateEnvelope(meta);
-      if (contextUsed !== null && contextUsed !== this.lastContextUsed) {
-        this.lastContextUsed = contextUsed;
-        this.emit("contextUsage", contextUsed);
+      const usedChanged = contextUsed !== null && contextUsed !== this.lastContextUsed;
+      if (usedChanged) this.lastContextUsed = contextUsed;
+      if (usedChanged || normalized.contextWindow !== undefined) {
+        this.emit("contextUsage", this.lastContextUsed, this.lastContextWindow);
       }
     }
     const r = routeSessionUpdate(u);
@@ -1063,6 +1106,24 @@ export class AcpClient extends EventEmitter {
     if (r.event === "modeChanged") {
       this.currentModeId = r.modeId;
       this.emit("modeChanged", r.modeId);
+      return;
+    }
+    if (r.event === "configOptionUpdate") {
+      const state = this.backend.configState({ configOptions: r.configOptions }, {
+        modelId: this.currentModelId,
+        reasoningEffort: this.currentReasoningEffort,
+        modeId: this.currentModeId,
+      });
+      if (state.modelId) this.currentModelId = state.modelId;
+      if (state.reasoningEffort !== undefined) {
+        this.currentReasoningEffort = state.reasoningEffort;
+        const current = this.availableModels.find((entry) => entry.modelId === this.currentModelId);
+        if (current) current.reasoningEffort = this.currentReasoningEffort;
+      }
+      if (state.modeId && state.modeId !== this.currentModeId) {
+        this.currentModeId = state.modeId;
+        this.emit("modeChanged", state.modeId);
+      }
       return;
     }
     if (r.event === "commandsUpdate") {
@@ -1214,7 +1275,7 @@ export class AcpClient extends EventEmitter {
           sessionId: normalizedParams.sessionId,
           toolCall: normalizedParams.toolCall,
           options: normalizedParams.options ?? [],
-          ...(this.provider === "codex" && normalizedParams._meta !== undefined
+          ...(this.provider !== "grok" && normalizedParams._meta !== undefined
             ? { _meta: normalizedParams._meta }
             : {}),
         };
