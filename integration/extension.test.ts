@@ -31,6 +31,7 @@ suite("grok-build extension smoke", () => {
       "grok.newSession",
       "grok.showLogs",
       "grok.settings",
+      "grok.findInSession",
       "grok.logout",
       // The escape hatch for an editor that hid the view somewhere unreachable —
       // useless if it is not in the palette.
@@ -1699,13 +1700,18 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     assert.strictEqual(model.promptCount(), 0, "the unreadable image must bail before model prompt");
-    assert.deepStrictEqual(model.queuedSends(), [`${first}\n\n${second}`]);
+    assert.deepStrictEqual(model.queuedSends(), [first, second]);
     assert.ok(posts.some((post) =>
       post.msg?.type === "agentError" &&
       post.msg.text?.includes("Could not read missing.png")
     ), JSON.stringify(posts));
 
+    // Chips live on the queued item, not the composer. Edit restores them so
+    // the user can drop the bad attachment; Remove-from-composer must not
+    // silently strip a snapshotted queued chip.
+    hooks.fromRemote({ type: "clearQueuedSends", restore: true }, clientId);
     hooks.fromRemote({ type: "removeChip", id: "missing-image" }, clientId);
+    hooks.fromRemote({ type: "queueSend", text: `${first}\n\n${second}` }, clientId);
     await new Promise((resolve) => setTimeout(resolve, 50));
     // Known limitation: this retained retry is a fresh relay submission, so it
     // is metered again. Pin that behavior until the queue can represent an
@@ -1727,30 +1733,24 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     hooks.remoteClientLeft(clientId);
   });
 
-  test("an image tag is numbered by its position in this message, not by the session", async () => {
-    // grok resolves `[Image #N]` against the images attached to the message it
-    // is reading, numbered from 1 — an index from an earlier message matches
-    // nothing (research/image-index-probe.cjs). The old session-scoped counter
-    // therefore sent a conversation's second image out as `[Image #2]` on a
-    // message carrying one image, and every image_edit on it was refused. The
-    // chip below is seeded with a stale high index, which is exactly what that
-    // counter produced. The pure renumbering has its own unit tests; what this
-    // covers is the wiring — that the send really does renumber before building
-    // the prompt, and that the bubble the user reads agrees with the tag.
+  test("an image tag keeps the number stamped at attach, including a lone #2", async () => {
+    // A chip shown as #2 (the earlier #1 already flushed or was removed) must
+    // still go out as `[Image #2]` so an authored `edit [Image #2]` resolves.
+    // Send must not compact it to #1. The bubble the user reads agrees.
     const suffix = Date.now();
     const clientId = `image-index-${suffix}`;
     const id = `image-index-session-${suffix}`;
-    const text = "make it green";
+    const text = "edit [Image #2]";
     const imgPath = path.join(repoB, `staged-${suffix}.png`);
     fs.writeFileSync(imgPath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
     const posts: Array<{ msg: any; clientIds?: string[] }> = [];
     hooks.onPost((_dest: string, msg: any, clientIds?: string[]) => posts.push({ msg, clientIds }));
     const model = hooks.seedRemoteQueuedDispatch(clientId, id, repoB, text, [{
-      id: `stale-index-${suffix}`,
+      id: `kept-index-${suffix}`,
       path: imgPath,
-      relPath: "Image #7",
+      relPath: "Image #2",
       hidden: false,
-      imageIndex: 7,
+      imageIndex: 2,
       mimeType: "image/png",
     }]);
     const dispatch = posts.find((post) =>
@@ -1769,20 +1769,18 @@ suite("repo selection: isolated per remote tab, workspace-local in VS Code", () 
     const imageBlocks = blocks!.filter((block: any) => block.type === "image");
     assert.strictEqual(imageBlocks.length, 1, "one visible image chip, one image block");
     assert.ok(
-      /\[Image #1\]/.test(textBlock.text),
-      `the tag must name this message's first image, got: ${textBlock.text}`,
+      /\[Image #2\]/.test(textBlock.text),
+      `the tag must keep the attach-time index, got: ${textBlock.text}`,
     );
     assert.ok(
-      !/\[Image #7\]/.test(textBlock.text),
-      `the stale session-scoped index must not survive, got: ${textBlock.text}`,
+      !/\[Image #1\]/.test(textBlock.text),
+      `send must not compact #2 down to #1, got: ${textBlock.text}`,
     );
 
-    // …and the bubble the user reads must carry the same number as the tag, or
-    // the disagreement is invisible until someone reads a transcript.
     const bubble = [...posts].reverse().find((post) => post.msg?.type === "userMessage")?.msg;
     assert.ok(bubble, JSON.stringify(posts.map((post) => post.msg?.type)));
-    assert.deepStrictEqual(bubble.chips.map((chip: any) => chip.imageIndex), [1]);
-    assert.deepStrictEqual(bubble.chips.map((chip: any) => chip.relPath), ["Image #1"]);
+    assert.deepStrictEqual(bubble.chips.map((chip: any) => chip.imageIndex), [2]);
+    assert.deepStrictEqual(bubble.chips.map((chip: any) => chip.relPath), ["Image #2"]);
 
     hooks.remoteClientLeft(clientId);
   });

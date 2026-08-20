@@ -38,6 +38,8 @@ import {
   makeQuestionResponse,
   makeRequest,
   parseAcpLine,
+  parseSessionInfoContext,
+  parseSessionInfoRpcResult,
   permissionOutcomeFor,
   resolveModelId,
   routeSessionUpdate,
@@ -45,6 +47,13 @@ import {
   isForeignSessionUpdate,
   updateHidesFromScrollback,
   childStreamFromRoute,
+  MAX_COMMAND_OUTPUT_CHARS,
+  capCommandOutput,
+  commandOutputFromReplayedToolCall,
+  commandOutputForToolCall,
+  commandOutputFromLiveTerminal,
+  SESSION_INFO_TTL_MS,
+  sessionInfoCacheFresh,
 } from "../src/acp-dispatch";
 
 describe("parseAcpLine", () => {
@@ -320,6 +329,63 @@ describe("gateZeroTokenMeta (#39)", () => {
   it("passes absent totalTokens through unchanged", () => {
     const meta = { inputTokens: 80 };
     expect(gateZeroTokenMeta(meta)).toBe(meta);
+  });
+});
+
+describe("session/info context helpers", () => {
+  const snapshot = {
+    sessionId: "s1",
+    context: {
+      used: 16017,
+      total: 512000,
+      systemPromptTokens: 1039,
+      toolDefinitionsTokens: 812,
+      toolDefinitionsCount: 17,
+      messageTokens: 12166,
+      freeTokens: 495983,
+      autoCompactThresholdPercent: 92,
+      usageCategories: [
+        { label: "Skills", tokens: 1200 },
+        { label: "MCP", tokens: 800, detail: "2 servers" },
+      ],
+    },
+  };
+
+  it("normalizes the structured control-plane snapshot", () => {
+    expect(parseSessionInfoRpcResult(snapshot)).toEqual({
+      used: 16017,
+      window: 512000,
+      systemPromptTokens: 1039,
+      toolDefinitionsTokens: 812,
+      toolDefinitionsCount: 17,
+      messageTokens: 12166,
+      freeTokens: 495983,
+      autoCompactThresholdPercent: 92,
+      categories: [
+        { label: "Skills", tokens: 1200 },
+        { label: "MCP", tokens: 800, detail: "2 servers" },
+      ],
+    });
+    expect(parseSessionInfoRpcResult({ result: snapshot })).toMatchObject({ used: 16017, window: 512000 });
+  });
+
+  it("accepts a zero RPC reading but rejects malformed shapes", () => {
+    expect(parseSessionInfoRpcResult({ context: { used: 0, total: 200000 } })).toEqual({ used: 0, window: 200000 });
+    expect(parseSessionInfoRpcResult({ context: { used: -1, total: 200000 } })).toBeNull();
+    expect(parseSessionInfoRpcResult({ context: { used: 1, total: 0 } })).toBeNull();
+    expect(parseSessionInfoRpcResult({ context: { used: 1 } })).toBeNull();
+  });
+
+  it("parses the advertised legacy prompt including an authoritative zero reading", () => {
+    expect(parseSessionInfoContext("**Context:** 16,017 / 512,000 tokens (3%)")).toEqual({ used: 16017, window: 512000 });
+    expect(parseSessionInfoContext("Context: 0 / 512000 tokens")).toEqual({ used: 0, window: 512000 });
+    expect(parseSessionInfoContext("no context here")).toBeNull();
+  });
+
+  it("expires the popover cache exactly at three seconds", () => {
+    expect(sessionInfoCacheFresh(1000, 1000 + SESSION_INFO_TTL_MS - 1)).toBe(true);
+    expect(sessionInfoCacheFresh(1000, 1000 + SESSION_INFO_TTL_MS)).toBe(false);
+    expect(sessionInfoCacheFresh(0, 1000)).toBe(false);
   });
 });
 
@@ -1259,5 +1325,281 @@ describe("agentTimestampMsFromMeta", () => {
     expect(agentTimestampMsFromMeta({ agentTimestampMs: "1783845298123" })).toBeUndefined();
     expect(agentTimestampMsFromMeta({ agentTimestampMs: Number.NaN })).toBeUndefined();
     expect(agentTimestampMsFromMeta({ agentTimestampMs: 0 })).toBeUndefined();
+  });
+});
+
+describe("commandOutputFromReplayedToolCall (#44 session/load restore)", () => {
+  const grokReplay = {
+    kind: "execute",
+    status: "completed",
+    title: "Execute `echo MARKER`",
+    rawInput: {
+      variant: "Bash",
+      command: "echo MARKER",
+      description: "Echo the specified stdout marker",
+      is_background: false,
+    },
+    content: [{ type: "content", content: { type: "text", text: "MARKER\r\n" } }],
+    rawOutput: {
+      type: "Bash",
+      output: [...Buffer.from("MARKER\r\n", "utf8")],
+      output_for_prompt: "exit: 0\nMARKER\n",
+      exit_code: 0,
+      command: "echo MARKER",
+      truncated: false,
+    },
+  };
+
+  it("reads grok's session/load completed execute tool_call (content over bytes)", () => {
+    expect(commandOutputFromReplayedToolCall(grokReplay)).toEqual({
+      command: "echo MARKER",
+      output: "MARKER\r\n",
+      exitCode: 0,
+      truncated: false,
+      cancelled: false,
+      agentSawCut: true,
+    });
+  });
+
+  it("decodes rawOutput.output bytes when there is no content text", () => {
+    const bytes = [...Buffer.from("hi ✓", "utf8")];
+    expect(commandOutputFromReplayedToolCall({
+      kind: "execute",
+      rawInput: { command: "printf hi" },
+      rawOutput: { type: "Bash", output: bytes, exit_code: 0, truncated: false },
+    })).toEqual({ command: "printf hi", output: "hi ✓", exitCode: 0, truncated: false, cancelled: false, agentSawCut: true });
+  });
+
+  it("never treats output_for_prompt as the shown output", () => {
+    expect(commandOutputFromReplayedToolCall({
+      kind: "execute",
+      rawInput: { command: "echo MARKER" },
+      rawOutput: {
+        type: "Bash",
+        output_for_prompt: "exit: 0\nMARKER\n",
+        exit_code: 0,
+        truncated: false,
+      },
+    })).toEqual({ command: "echo MARKER", output: "", exitCode: 0, truncated: false, cancelled: false, agentSawCut: true });
+  });
+
+  it("accepts Codex formatted_output (and the remapped output string)", () => {
+    expect(commandOutputFromReplayedToolCall({
+      kind: "execute",
+      rawInput: { command: "ls" },
+      rawOutput: { formatted_output: "ok\n", exit_code: 0 },
+    })).toEqual({ command: "ls", output: "ok\n", exitCode: 0, truncated: false, cancelled: false, agentSawCut: true });
+    expect(commandOutputFromReplayedToolCall({
+      kind: "execute",
+      rawInput: { command: "ls" },
+      rawOutput: { formatted_output: "ok\n", output: "ok\n", exit_code: 7 },
+    })).toEqual({ command: "ls", output: "ok\n", exitCode: 7, truncated: false, cancelled: false, agentSawCut: true });
+  });
+
+  it("returns null when there is no rawOutput (no invented OUT)", () => {
+    expect(commandOutputFromReplayedToolCall({
+      kind: "execute",
+      status: "completed",
+      rawInput: { command: "echo MARKER" },
+      content: [{ type: "content", content: { type: "text", text: "MARKER\r\n" } }],
+    })).toBeNull();
+    expect(commandOutputFromReplayedToolCall({
+      kind: "execute",
+      rawInput: { command: "echo MARKER" },
+      rawOutput: {},
+    })).toBeNull();
+    expect(commandOutputFromReplayedToolCall(null)).toBeNull();
+    expect(commandOutputFromReplayedToolCall({})).toBeNull();
+  });
+
+  it("returns null for a non-execute kind or a call with no command", () => {
+    expect(commandOutputFromReplayedToolCall({
+      kind: "read",
+      rawInput: { path: "a.ts" },
+      rawOutput: { output: "src", exit_code: 0 },
+    })).toBeNull();
+    expect(commandOutputFromReplayedToolCall({
+      kind: "execute",
+      rawOutput: { output: "x", exit_code: 0 },
+    })).toBeNull();
+  });
+
+  it("returns null for an unmeasured object rawOutput (not Claude's string)", () => {
+    expect(commandOutputFromReplayedToolCall({
+      kind: "execute",
+      rawInput: { command: "pwd" },
+      rawOutput: { type: "text", text: "/tmp" },
+    })).toBeNull();
+  });
+
+  const claudePending = {
+    toolCallId: "toolu_01AnGmToxGM69P1ovvsNgk4F",
+    kind: "execute",
+    status: "pending",
+    title: "echo REPLAY_MARKER_4b7c",
+    rawInput: { command: "echo REPLAY_MARKER_4b7c", description: "Echo replay marker string" },
+    content: [{ type: "content", content: { type: "text", text: "Echo replay marker string" } }],
+  };
+  const claudeCompleted = {
+    toolCallId: "toolu_01AnGmToxGM69P1ovvsNgk4F",
+    status: "completed",
+    rawOutput: "REPLAY_MARKER_4b7c",
+    content: [{ type: "content", content: { type: "text", text: "```console\nREPLAY_MARKER_4b7c\n```" } }],
+  };
+
+  it("prefers Claude's string rawOutput over fenced content and leaves exitCode null", () => {
+    expect(commandOutputFromReplayedToolCall({
+      kind: "execute",
+      rawInput: { command: "echo REPLAY_MARKER_4b7c" },
+      content: claudeCompleted.content,
+      rawOutput: "REPLAY_MARKER_4b7c",
+    })).toEqual({
+      command: "echo REPLAY_MARKER_4b7c",
+      output: "REPLAY_MARKER_4b7c",
+      exitCode: null,
+      truncated: false,
+      cancelled: false,
+      agentSawCut: true,
+    });
+  });
+
+  it("does not treat Claude's description-row content as command output", () => {
+    expect(commandOutputFromReplayedToolCall(claudePending)).toBeNull();
+    expect(commandOutputFromReplayedToolCall({
+      ...claudePending,
+      rawOutput: undefined,
+    })).toBeNull();
+  });
+
+  it("does not invent a command from a completed Claude update alone", () => {
+    expect(commandOutputFromReplayedToolCall(claudeCompleted)).toBeNull();
+  });
+
+  it("joins Claude's completed update to the earlier tool_call by toolCallId", () => {
+    const remembered = new Map<string, string>();
+    expect(commandOutputForToolCall(claudePending, {
+      replaying: true,
+      rememberedCommands: remembered,
+    })).toBeNull();
+    expect(commandOutputForToolCall(claudeCompleted, {
+      replaying: true,
+      rememberedCommands: remembered,
+    })).toEqual({
+      command: "echo REPLAY_MARKER_4b7c",
+      output: "REPLAY_MARKER_4b7c",
+      exitCode: null,
+      truncated: false,
+      cancelled: false,
+      agentSawCut: true,
+    });
+    expect(commandOutputForToolCall(claudeCompleted, {
+      replaying: true,
+      rememberedCommands: remembered,
+    })).toEqual(expect.objectContaining({ cancelled: false }));
+  });
+
+  it("applies the same 100K display cap to Claude's string rawOutput", () => {
+    const huge = "x".repeat(MAX_COMMAND_OUTPUT_CHARS + 25);
+    const r = commandOutputFromReplayedToolCall({
+      kind: "execute",
+      rawInput: { command: "cat big" },
+      content: [{ type: "content", content: { type: "text", text: "```console\n" + huge + "\n```" } }],
+      rawOutput: huge,
+    });
+    expect(r?.output).toHaveLength(MAX_COMMAND_OUTPUT_CHARS);
+    expect(r?.output).not.toContain("```");
+    expect(r?.exitCode).toBeNull();
+    expect(r?.truncated).toBe(true);
+    expect(r?.cancelled).toBe(false);
+    expect(r?.agentSawCut).toBe(true);
+  });
+
+  it("applies the same 100K display cap as the live terminal path", () => {
+    const huge = "x".repeat(MAX_COMMAND_OUTPUT_CHARS + 25);
+    const r = commandOutputFromReplayedToolCall({
+      kind: "execute",
+      rawInput: { command: "cat big" },
+      content: [{ type: "content", content: { type: "text", text: huge } }],
+      rawOutput: { type: "Bash", exit_code: 0, truncated: false },
+    });
+    expect(r?.output).toHaveLength(MAX_COMMAND_OUTPUT_CHARS);
+    expect(r?.truncated).toBe(true);
+    expect(r?.cancelled).toBe(false);
+    expect(r?.agentSawCut).toBe(true);
+    expect(capCommandOutput("short", false)).toEqual({ output: "short", truncated: false });
+    expect(capCommandOutput("already", true)).toEqual({ output: "already", truncated: true });
+  });
+});
+
+describe("commandOutputFromLiveTerminal", () => {
+  it("marks a null live exit as cancelled without inventing exit 0", () => {
+    expect(commandOutputFromLiveTerminal({
+      command: "sleep 999",
+      output: "partial",
+      exitCode: null,
+      truncated: true,
+    })).toEqual({
+      command: "sleep 999",
+      output: "partial",
+      exitCode: null,
+      truncated: true,
+      cancelled: true,
+      agentSawCut: true,
+    });
+  });
+
+  it("states cancelled: false when the process reported an exit", () => {
+    expect(commandOutputFromLiveTerminal({
+      command: "echo hi",
+      output: "hi\n",
+      exitCode: 0,
+      truncated: false,
+    })).toEqual({
+      command: "echo hi",
+      output: "hi\n",
+      exitCode: 0,
+      truncated: false,
+      cancelled: false,
+      agentSawCut: true,
+    });
+    expect(commandOutputFromLiveTerminal({
+      command: "false",
+      output: "",
+      exitCode: 1,
+      truncated: false,
+    })).toEqual(expect.objectContaining({ cancelled: false }));
+  });
+});
+
+describe("commandOutputForToolCall (replay gate)", () => {
+  const call = {
+    kind: "execute",
+    rawInput: { command: "echo MARKER" },
+    content: [{ type: "content", content: { type: "text", text: "MARKER\r\n" } }],
+    rawOutput: { type: "Bash", output: "MARKER\r\n", exit_code: 0, truncated: false },
+  };
+
+  it("emits nothing on a live turn even when the tool_call already has output", () => {
+    expect(commandOutputForToolCall(call, { replaying: false })).toBeNull();
+  });
+
+  it("emits the capped payload only while session/load is replaying", () => {
+    expect(commandOutputForToolCall(call, { replaying: true })).toEqual({
+      command: "echo MARKER",
+      output: "MARKER\r\n",
+      exitCode: 0,
+      truncated: false,
+      cancelled: false,
+      agentSawCut: true,
+    });
+  });
+
+  it("emits nothing on a live Claude turn even when string rawOutput is already present", () => {
+    expect(commandOutputForToolCall({
+      kind: "execute",
+      rawInput: { command: "echo REPLAY_MARKER_4b7c" },
+      rawOutput: "REPLAY_MARKER_4b7c",
+      content: [{ type: "content", content: { type: "text", text: "```console\nREPLAY_MARKER_4b7c\n```" } }],
+    }, { replaying: false })).toBeNull();
   });
 });

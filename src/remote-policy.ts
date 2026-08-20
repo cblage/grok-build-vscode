@@ -13,6 +13,7 @@
 import type { HostMsg, HostUiCapabilities, WebviewMsg } from "./protocol";
 import { isImageChip, type FileChip } from "./chips";
 import { isPrimerText } from "./grok-primer";
+import { projectMcpServersMessageForRemote } from "./mcp";
 import { countsAsUserBubble } from "./plan-restore";
 import { historyEventCount } from "./rewind";
 import { cwdIsAuthorized } from "./workspace-auth";
@@ -235,6 +236,11 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   dequeueSend: "propose",
   clearQueuedSends: "propose",
   steerSend: "propose",
+  // A thumbs rating is input about the conversation the remote is already
+  // driving — same class as steerSend, not a desk-local picker or a destructive
+  // approval. The host files it against the live process's current turn
+  // (`client_type` is extension/desktop even when a phone clicked).
+  turnFeedback: "propose",
   forkSession: "propose",
   // Worktree create/apply/remove: REVERTED to host-local 2026-08-07, hours
   // after being widened to "propose" the same day. The widening was safe in
@@ -264,6 +270,8 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   uiConfirmAnswer: "host-local",
   // Workflow pause/resume/stop is a slash turn (same class as queueSend/steer).
   workflowControl: "propose",
+  // Donut popover re-fetch — read-only meter, no turn / no mutation.
+  refreshContextDetails: "view",
   pasteImage: "propose",
   // Host validates the extension/name/bytes before staging under globalStorage.
   uploadFile: "propose",
@@ -322,7 +330,16 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   removeProjectFolder: "host-local",
   openGlobalConfig: "host-local",
   openProjectConfig: "host-local",
-  runMcpList: "host-local",
+  // Read-only inventory query through the live Grok ACP session. Same class as
+  // refreshContextDetails: no turn, no mutation, no desk-local picker. Connect
+  // and disconnect stay host-local. Mirroring the last fetch is not enough if
+  // the desk never opened Settings, so a remote may ask when it opens the page.
+  listMcpServers: "view",
+  // OAuth opens a browser on the desk and writes ~/.mcp-auth there. A phone
+  // cannot complete that flow, and must not change which tools every agent
+  // receives on the next session/new.
+  connectMcpConnector: "host-local",
+  disconnectMcpConnector: "host-local",
   showLogs: "host-local",
   toggleDevTools: "host-local",
   openSettings: "host-local",
@@ -356,6 +373,9 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   setVoiceKeyterms: "propose",
   // Remote surface is read-only for telemetry; the desk owns the switch.
   setTelemetryEnabled: "host-local",
+  // Same class as the other General host prefs: the desk owns the switch,
+  // remotes receive the live value and honour it for thumbs.
+  setThumbsFeedback: "host-local",
   // Machine-global disclosure preference in ~/.grok/client-state — the web
   // client inherits and may set it (host-owned store, not VS Code settings).
   setAppPurpose: "propose",
@@ -522,6 +542,8 @@ export type OutboundDisposition =
   | "mirror"
   /** Carries a webview-only asWebviewUri src — must be inlined to base64 first. */
   | "media"
+  /** Allowlisted subset — rewrite before crossing; never ferry the desk object. */
+  | "allowlist"
   /** Meaningless/misleading outside the local webview (host mic/voice) — suppress. */
   | "host-local";
 
@@ -535,6 +557,11 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   voiceError: "mirror",
   initialState: "mirror",
   providerState: "mirror",
+  // Page fields only (`projectMcpServerForRemote`). Launch recipes stay on
+  // the desk. Same machine-global observation as mcpConnectors; remotes may
+  // look, they cannot Connect/Disconnect (inbound host-local above).
+  mcpServers: "allowlist",
+  mcpConnectors: "mirror",
   codexInstallProgress: "host-local",
   // Placement is a property of the machine running the extension, and `moveView`
   // is host-local anyway — a remote could neither act on the hint nor need it.
@@ -543,6 +570,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   appPurpose: "mirror",
   fontScale: "mirror",
   telemetryEnabled: "mirror",
+  thumbsFeedback: "mirror",
   grokUpdateStatus: "mirror",
   // Desk-only installer notice / restart — a remote has nothing useful to do with it.
   updateAvailable: "host-local",
@@ -620,6 +648,9 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   remoteStatus: "host-local",
   setAllToolDetails: "mirror",
   focusInput: "mirror",
+  // Desk/VS Code only — a phone opens find from its own ⋯, and a palette
+  // invocation on the desk must not pop a find bar on every linked tab.
+  findInSession: "host-local",
   restoreComposer: "mirror",
   truncateMessages: "mirror",
   uiConfirmRequest: "mirror",
@@ -631,6 +662,8 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   queuedSends: "mirror",
   submitQueuedSend: "mirror",
   steerUnavailable: "mirror",
+  feedbackAvailability: "mirror",
+  turnFeedbackAck: "mirror",
   usage: "mirror",
 };
 
@@ -666,12 +699,15 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   appPurpose: "none",
   fontScale: "none",
   telemetryEnabled: "none",
+  thumbsFeedback: "none",
   grokUpdateStatus: "none",
   updateAvailable: "none",
   updateReady: "none",
   cliUpdating: "none",
   onboarding: "none",
   providerState: "none",
+  mcpServers: "none",
+  mcpConnectors: "none",
   codexInstallProgress: "none",
   expandCommandOutputs: "none",
   steerByDefault: "none",
@@ -684,6 +720,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   error: "none",
   hostNotice: "none",
   focusInput: "none",
+  findInSession: "none",
   openModePopover: "none",
   // Open-folder catalog — project-bearing selectedCwd/activeCwd/entries validated.
   repos: "repos-catalog",
@@ -772,6 +809,8 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   queuedSends: "scope",
   submitQueuedSend: "scope",
   steerUnavailable: "scope",
+  feedbackAvailability: "scope",
+  turnFeedbackAck: "scope",
   usage: "scope",
 };
 
@@ -1050,6 +1089,17 @@ export function transformHostMsgForRemote(msg: HostMsg, deps: MediaInlineDeps): 
       ...(msg.chips ? { chips: msg.chips.map((chip) => inlineChipPreviewForRemote(chip, deps)) } : {}),
     };
   }
+  if (msg.type === "queuedSends" && msg.queued) {
+    return {
+      ...msg,
+      queued: msg.queued.map((item) => ({
+        ...item,
+        ...(item.chips
+          ? { chips: item.chips.map((chip) => inlineChipPreviewForRemote(chip, deps)) }
+          : {}),
+      })),
+    };
+  }
   if (msg.type === "userMessageChunk") {
     return {
       ...msg,
@@ -1063,7 +1113,15 @@ export function transformHostMsgForRemote(msg: HostMsg, deps: MediaInlineDeps): 
       return msg;
     case "media":
       return inlineMediaForRemote(msg as MediaMsg, deps);
+    case "allowlist":
+      return allowlistHostMsgForRemote(msg);
     default:
       return null; // host-local
   }
+}
+
+/** Fail closed: an `allowlist` type with no rewriter is dropped, not ferried. */
+function allowlistHostMsgForRemote(msg: HostMsg): HostMsg | null {
+  if (msg.type === "mcpServers") return projectMcpServersMessageForRemote(msg);
+  return null;
 }

@@ -764,6 +764,12 @@ export interface Host {
    */
   readonly canToggleDevTools: boolean;
   /**
+   * Settings → Connectors. OPT-IN: absent/false = hide the nav row.
+   * Desktop and VS Code set true; the webview still reads
+   * `capabilities.mcpSettings` so an older host can omit the page.
+   */
+  readonly canShowMcpSettings: boolean;
+  /**
    * Whether clicking a generated image (or the media hover "open" action's
    * sibling click-to-enlarge path) should open a host editor tab via
    * `openFile`. Wired into `initialState.capabilities.openInEditor`. Opt-out

@@ -3,6 +3,11 @@ import type { HostMsg } from "./protocol";
 import type { FileChip } from "./chips";
 import { permissionOptionsForPlan } from "./plan-gate";
 import type { AcpProvider } from "./acp-backend";
+import {
+  queuedSendsMessage,
+  takeQueuedSendsPrefix,
+  type QueuedSendEntry,
+} from "./queued-send";
 
 /** Live state for the dashboard dot. `cold` (no live process) is represented by
  *  the absence of a Session, so it isn't in this union. */
@@ -123,6 +128,36 @@ export class Session {
   /** Drop streaming content from hidden summary/context-injection turns. */
   suppressContent = false;
 
+  /** Captures the legacy hidden `/session-info` reply without rendering it. */
+  captureAgentText?: string;
+
+  /** Last successful `_x.ai/session/info` snapshot, for the popover TTL. */
+  lastSessionInfoAt = 0;
+  /** `used` from that snapshot — occupancy that moves off it is stale. */
+  lastSessionInfoUsed?: number;
+  /** Live occupancy moved off the last session/info snapshot. */
+  sessionInfoStale = false;
+
+  /** Latched after this process returns -32601 for `_x.ai/session/info`. */
+  sessionInfoUnsupported = false;
+
+  /**
+   * Grok thumbs (#114). Off until `session/new` `_meta.feedbackEnabled` or an
+   * advertised `feedback` command says otherwise. `feedbackUnsupported` latches
+   * a -32601 / disabled-feedback RPC so the buttons cannot come back on this
+   * process. Thumbs rate only the turn that just finished in this process
+   * (`liveFeedbackEligible`); `turnRating` is that footer's local UI state.
+   */
+  feedbackAvailable = false;
+  feedbackUnsupported = false;
+  feedbackMetaEnabled?: boolean;
+  feedbackCommandsAdvertise?: boolean;
+  liveFeedbackEligible = false;
+  turnRating: 0 | 1 | -1 = 0;
+
+  /** A live compact notification already supplied this manual compact's count. */
+  sawCompactNotification = false;
+
   /**
    * True when an `auto_compact_failed` notification arrived for the CURRENT
    * manual /compact (reset before each). Gates the
@@ -186,8 +221,18 @@ export class Session {
    * True only while replaying a resumed session (session/load). grok ≥0.2.33
    * echoes the *live* prompt back as user_message_chunk too, so this gates the
    * handler to replay-only — the live bubble already comes from send().
+   * Boolean on purpose: remotes must not see a partial transcript whenever
+   * *any* load is in progress (`runExclusiveHistoryLoad`).
    */
   replaying = false;
+
+  /**
+   * Exclusive in-flight history load (`replayLoadedHistory`). A second load on
+   * this session joins this promise instead of starting another `session/load`,
+   * so the first-to-finish cannot clear `replaying` while the other is still
+   * going. Settles with the owner's outcome (rejects on failure).
+   */
+  loadInFlight?: Promise<void>;
 
   /**
    * Next Claude/Codex `usage_update.used` is getContextUsage occupancy, not
@@ -225,13 +270,13 @@ export class Session {
    */
   worktree?: { path: string; label: string; sourceGitRoot: string; id?: string };
 
-  // NOTE: there is deliberately no `[Image #N]` counter here any more. Tags are
-  // numbered per MESSAGE, from the chip's position (chips.ts
-  // `withPerMessageImageIndices`), because that is what the CLI resolves an
-  // image reference against. The session-scoped counter this replaced was
-  // chosen so two screenshots in one conversation never shared a tag — a real
-  // benefit, but it bought unambiguous transcripts at the price of tags the
-  // agent could not resolve, which is the wrong trade.
+  /**
+   * Last `[Image #N]` handed to a chip in this staging generation (`0` = idle).
+   * `allocateImageIndex` increments it at attach and resets only when nothing
+   * is staged (composer empty and queue empty), so a plain send starts at `#1`
+   * while a chip shown as `#2` keeps `#2` after an earlier image flushes.
+   */
+  imageIndexHighWater = 0;
 
   titleGenerated = false;
   firstUserMessageForTitle?: string;
@@ -288,16 +333,17 @@ export class Session {
   buffer: HostMsg[] = [];
 
   /**
-   * The ONE pending message composed while THIS session was busy (typed
-   * Enter-sends and dictated utterances), awaiting its turn end. Invariant:
-   * length ≤ 1 — composing more while one is queued appends to the entry
-   * (blank-line separator, the exact flush format), because Stop and the flush
-   * collapse everything into one message anyway. Host-owned per session — the
-   * webview renders a mirror (a pending user block) from `queuedSends`
-   * snapshots, so it survives focus switches and the flush
-   * (maybeFlushQueuedSends) fires even while the session is backgrounded.
+   * Pending follow-ups composed while THIS session was busy (typed Enter-sends
+   * and dictated utterances), awaiting turn end. Each entry keeps the text AND
+   * the attachments snapshotted at queue time, so a later composer edit cannot
+   * silently drop them. Entries are the source of truth (`""` is image-only).
+   * The flush still sends them as ONE combined prompt
+   * (`buildQueuedPromptWithImages`): each chip keeps the `[Image #N]` it was
+   * shown at attach (`allocateImageIndex`); authored text is copied verbatim.
+   * Host-owned per session — the webview renders a mirror from `queuedSends`
+   * snapshots, so it survives focus switches and flushes even while backgrounded.
    */
-  queuedSends: string[] = [];
+  queuedSends: QueuedSendEntry[] = [];
 
   /**
    * Remote-only dequeue handshake. While set, the host has asked the owning
@@ -315,7 +361,7 @@ export class Session {
    * Restoring on a rejected prompt result can also execute a partially accepted
    * prompt twice. Do not widen this window without an ACP acceptance signal or
    * an explicit retained-prefix state plus a proven never-executed classifier. */
-  queuedSendCommit?: { text: string };
+  queuedSendCommit?: { text: string; items: QueuedSendEntry[] };
 
   /** Recently accepted dequeue ids. Delayed outbox copies are ignored even
    * after the active dispatch has been retired. Bounded per live session. */
@@ -405,6 +451,63 @@ export type SessionStartDecision = "proceed" | "reuse" | "refuse-turn" | "refuse
 export const INTERRUPTED_SEND_TEXT =
   "The session restarted while this message was being sent, so delivery is uncertain. Check the conversation and send it again if needed.";
 
+/**
+ * One history load at a time per session. A second caller joins the in-flight
+ * load (does not run `load`) rather than superseding it: `session/load` cannot
+ * be aborted, and a second stream would interleave into the same buffer and
+ * leak a partial transcript through `emit`'s `!session.replaying` remote gate.
+ *
+ * The barrier settles with the owner's outcome: joiners return `"joined"` only
+ * after a successful load, and reject with the same reason the owner threw. A
+ * permanently attached no-op catch keeps a reject with no waiter from becoming
+ * unhandled.
+ *
+ * `replaying` stays a boolean ("is any replay in progress") for that gate;
+ * `loadInFlight` is the exclusive token.
+ */
+export async function runExclusiveHistoryLoad(
+  session: { replaying: boolean; loadInFlight?: Promise<void> },
+  load: () => Promise<void>,
+  hooks: { onStart(): void; onFinish(): void },
+): Promise<"ran" | "joined"> {
+  if (session.loadInFlight) {
+    await session.loadInFlight;
+    return "joined";
+  }
+
+  let resolveLoad!: () => void;
+  let rejectLoad!: (reason: unknown) => void;
+  const barrier = new Promise<void>((resolve, reject) => {
+    resolveLoad = resolve;
+    rejectLoad = reject;
+  });
+  // A reject with no joiner must not become an unhandled rejection.
+  void barrier.catch(() => undefined);
+  session.loadInFlight = barrier;
+  session.replaying = true;
+  let failure: { reason: unknown } | undefined;
+  try {
+    hooks.onStart();
+    await load();
+    return "ran";
+  } catch (reason) {
+    failure = { reason };
+    throw reason;
+  } finally {
+    try {
+      hooks.onFinish();
+    } catch (reason) {
+      failure = { reason };
+      throw reason;
+    } finally {
+      session.replaying = false;
+      session.loadInFlight = undefined;
+      if (failure) rejectLoad(failure.reason);
+      else resolveLoad();
+    }
+  }
+}
+
 export function decideSessionStart(
   session: {
     turnToken?: object;
@@ -470,35 +573,35 @@ export function sessionHasWorkInFlight(session: Session): boolean {
   return session.priming || (!!session.client && !session.client.sessionId);
 }
 
-export function beginQueuedSendCommit(session: Session, text: string): { text: string } | undefined {
+export function beginQueuedSendCommit(
+  session: Session,
+  text: string,
+): { text: string; items: QueuedSendEntry[] } | undefined {
   if (session.queuedSendCommit) return undefined;
-  const queued = session.queuedSends[0] ?? "";
-  if (queued !== text && !queued.startsWith(text + "\n\n")) return undefined;
-  const claim = { text };
+  const split = takeQueuedSendsPrefix(session.queuedSends, text);
+  if (!split) return undefined;
+  const claim = { text, items: split.prefix };
   session.queuedSendCommit = claim;
   return claim;
 }
 
 export function finishQueuedSendCommit(
   session: Session,
-  claim: { text: string },
+  claim: { text: string; items: QueuedSendEntry[] },
   committed: boolean,
 ): boolean {
   if (session.queuedSendCommit !== claim) return false;
   session.queuedSendCommit = undefined;
   if (!committed) return false;
 
-  const queued = session.queuedSends[0] ?? "";
-  if (queued === claim.text) {
-    session.queuedSends = [];
-    session.queuedSendRequiresRelay = false;
-    return true;
-  }
-  if (queued.startsWith(claim.text + "\n\n")) {
-    session.queuedSends = [queued.slice(claim.text.length + 2)];
-    return true;
-  }
-  return false;
+  const split = takeQueuedSendsPrefix(session.queuedSends, claim.text);
+  if (!split) return false;
+  session.queuedSends = split.rest.map((item) => ({
+    text: item.text,
+    chips: item.chips ?? [],
+  }));
+  if (!session.queuedSends.length) session.queuedSendRequiresRelay = false;
+  return true;
 }
 
 /** Current non-chat UI state for rebuilding a view of this live session. */
@@ -519,6 +622,10 @@ export function sessionUiSnapshot(
     // Unverified probes stay clickable so the user can re-check without restart.
     recheckable: !session.planModeAvailable && !session.planModeVersionVerified,
   });
+  messages.push({ type: "feedbackAvailability", available: session.feedbackAvailable });
+  if (session.liveFeedbackEligible) {
+    messages.push({ type: "turnFeedbackAck", rating: session.turnRating });
+  }
   for (const [requestId, pending] of session.pendingPermissions) {
     messages.push({
       type: "permissionOptions",
@@ -527,6 +634,6 @@ export function sessionUiSnapshot(
     });
   }
   messages.push({ type: "chips", chips });
-  messages.push({ type: "queuedSends", items: [...session.queuedSends] });
+  messages.push(queuedSendsMessage(session.queuedSends));
   return messages;
 }

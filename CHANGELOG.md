@@ -1,10 +1,10 @@
 # Changelog
 
-## 3.12.2-sandbox.1 — 2026-08-18
+## 3.13.2-sandbox.1 — 2026-08-20
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.12.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.13.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,71 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 3.13.1 — 2026-08-20
+
+### Added
+
+- **Connectors — sign in to the apps you already work in.** **Settings → Connectors** ships in release builds now; it was development-only in 3.13.0. Connect Linear, Notion, Atlassian, Canva, Stripe, Sentry or Cloudflare once on this computer and every agent can use them — Grok, Codex and Claude alike. You authorise in your browser and the tokens are cached by `mcp-remote` under `~/.mcp-auth`, so the extension never handles one. The page has three sections: apps you connect here, the grok.com connectors that follow your Grok account, and local Grok connectors declared in this machine's config files. Project-file servers stay off it.
+- **Copy path and Copy relative path ([#120](https://github.com/phuryn/grok-build-vscode/issues/120)).** Every row in the file panel offers both, on files and folders, on the desk and on a phone.
+- **Rate a Grok turn ([#114](https://github.com/phuryn/grok-build-vscode/issues/114)).** Thumbs on a finished turn send a rating to SpaceXAI. Off by default — turn on **Thumbs feedback to SpaceXAI** in Settings → General — and they appear only where the Grok session actually supports feedback, never on Codex or Claude.
+
+### Fixed
+
+- **Connectors could not start at all on macOS.** A desktop app launched from Finder inherits a PATH with no Homebrew in it, so `npx` was missing. Finding it was not enough either: `npx` is a script whose `#!/usr/bin/env node` line needs `node` findable as well, so the child's environment is fixed alongside the lookup. Windows keeps its PATH exactly as you wrote it.
+- **Queueing a message with images keeps the images.** Attachments were dropped when a message went to the queue — everything you attached is queued with it, or nothing is. Steer carries them too, and an image's number is stamped when you attach it and never moves afterwards.
+- **The context breakdown adds up, and stays put.** The rows in the popover did not sum to the figure above them, and a breakdown could be shown against numbers from a different reading. Each one now belongs to the measurement that produced it. Settings also stopped rebuilding itself over and over while open.
+- **Queued messages look like sent ones.** Images in a queued message sit below the text, where they sit in a message you have already sent, and the first message in a conversation gets a little room above it.
+
+## 3.13.0 — 2026-08-19
+
+### Added
+
+- **Find in a conversation.** Long conversations were navigable only by scrolling. There is now a find bar — in the **⋯** menu on every surface, and on **Ctrl/Cmd+F** in VS Code and the desktop app (the browser keeps its own find, and on a phone the menu is the only door there was). Next and previous, a live match count, case sensitivity, and regular expressions, with `^` and `$` matching per line. It searches what you wrote and what the agent replied, plus the label on each tool row — the command that ran, the file that was read — but not the contents of those rows: searching a common word used to bury the handful of hits in your conversation under dozens from command output and diffs. Matches are highlighted without touching the page, so nothing in the transcript stops working while you search.
+- **The context donut shows where the window went.** Clicking it now breaks the used space into System, Tools, Messages, Skills, MCP and Free, with the auto-compact threshold. Grok only, and it costs nothing to look: the number comes from a control-plane reading rather than a question put to the model, so opening the popover does not consume the window it is describing. Contributed by @funkpopo.
+- **Icons in the gear menu and Settings.** Knowledge work and Coding carry marks, as do Report a bug, Request a feature, Contact and the repository link.
+
+### Fixed
+
+- **A larger chat font no longer cuts the panel in half ([#119](https://github.com/phuryn/grok-build-vscode/issues/119)).** At 200% only a fraction of the chat was visible. The stylesheet was correcting for zoom in a way browsers used to require and no longer do, so the correction became the error — and it was wrong at every setting except 100%, overflowing below it as well as clipping above. Reported by @FireInWinter.
+- **Slash autocomplete stops offering commands that would not run ([#110](https://github.com/phuryn/grok-build-vscode/issues/110)).** Skills work anywhere in a message; commands only run when they start it. The popover treated both the same, so a command typed on a second line was suggested, accepted, and then quietly sent as ordinary text. Now skills are offered wherever you are typing and commands only at the start, which is exactly where each one works. Reported by @ryukenshin546-a11y and @SimonEast.
+- **A file the agent reads says which file, and which lines ([#122](https://github.com/phuryn/grok-build-vscode/issues/122)).** Read rows now carry the path and the line range, and open the whole file the same way command output does. Where the range is not reported, the path shows without one rather than a guess. Requested by @padixa.
+- **Settings is clearer about what it can act on.** The **Account** page is now **Remote control**, which is what it does — linking this desk to a phone or browser. Version rows for the two ACP adapters are gone: they ship inside the extension and move only when it does, so there was nothing to act on. The Codex updates row is gone for the opposite reason — it said updates were handled elsewhere, which was untrue whenever the extension had installed Codex itself.
+- **A fresh clone no longer produces a file the tests cannot parse.** The repository never declared its line-ending convention, so a new checkout on Windows could rewrite a script's first line into something Node refused to read.
+
+### Internal
+
+- MCP server inventory, read from the agent's own rails rather than a command that cannot see managed connectors. Contributed by @funkpopo. Together with the connector work it is visible in development builds only, until a failed sign-in stops leaving a process behind.
+- The unit suite stopped reporting the machine's mood: bounds that were measuring how fast a subprocess starts, rather than detecting one that had hung, made three or four unrelated tests fail per run.
+
+## 3.12.4 — 2026-08-18
+
+### Fixed
+
+- **MCP tool calls show what went in and what came back.** An MCP call was a single line with no way to see the arguments or the result. It now gets the same expandable IN/OUT block shell commands have, on all three agents — which took measuring each one, because they agree on nothing: the tool name, the arguments and the result each live somewhere different, and two of the three send no `content` at all on completion. Grok's internal tool-search rows fold into the explore group instead of cluttering the transcript, and a Codex server that genuinely fails to start still says so.
+- **Long tool names stay readable.** A name like `mcp.codex_apps.codex_document_control.list_documents` was cut at the end — exactly where the useful part is, leaving a column of rows that all read the same. Long names now elide in the middle, keeping both ends, and hovering shows the complete name.
+- **Skill search looks at descriptions, not just names.** A skill you remembered by what it does rather than what it is called was unfindable. Matching now covers descriptions, name matches still rank first, and the matched words are highlighted wherever they landed so a description-only hit makes sense.
+- **Opening a long conversation no longer scrolls endlessly.** Loading a big conversation replayed every message while forcing the view to the bottom after each one — roughly fifteen hundred times on the largest conversations here, which read as an infinite scroll that only stopped when you switched away. The view now settles once, at the end, and loading is quicker for it. Opening the same conversation twice at once can no longer interleave two copies of its history either.
+- **Grok conversations stop jumping in Recents when you open them.** A `session/load` rewrites `events.jsonl`, so ranking by that file promoted whatever you had just opened — and, because the previously-opened one carried a fresh stamp too, it often looked like the *previous* conversation jumping. Grok now ranks by `updates.jsonl`, which a load leaves alone and a real turn advances, so work done in the terminal still promotes a row. **Claude conversations can still jump** — its listing time is restamped on open and the pinning that should hold it does not yet survive in practice; Codex was never affected.
+- **A live turn no longer dies at 30 minutes with `ACP request timed out: session/prompt` ([#117](https://github.com/phuryn/grok-build-vscode/issues/117)).** `session/prompt` stays open for the whole turn, but the client armed a one-shot 30-minute timer that streaming `session/update` traffic never reset — so a healthy long job (training, a long tool loop, many slow steps) was cut while the agent was still working. The timer is now idle-based: any ACP traffic re-arms it (default 30 minutes of silence). A 24-hour absolute cap remains as a safety net. Tune `grok.acp.promptIdleTimeoutMs`, `grok.acp.promptAbsoluteTimeoutMs` (`0` disables), and `grok.acp.requestTimeoutMs` on newly started sessions.
+- **MCP tool results show the whole payload.** Codex rows that only printed a terse `Action completed.` were dropping `structuredContent` — where Gmail and similar servers put the actual messages. OUT now carries the text and the structured JSON, and a failed Codex call shows its error instead of an empty box. Pretty-printing that JSON stops at the 100K display cap so a nested result cannot expand into megabytes first, and a Claude JSON string is shown as the adapter sent it so 64-bit identifiers are not rounded.
+- **Stopping a command still shows [Cancelled] when the browser is newer than the desk.** An older host that never sent a cancellation flag was being read as "not cancelled", so a genuine Stop lost its marker. The host now always says whether it was a kill.
+- **Reopened conversations show shell command output again (#44).** Switching away from a live Claude conversation and back no longer drops the command's output.
+
+## 3.12.3 — 2026-08-18
+
+### Fixed
+
+- **The desktop app no longer dies when a phone or browser connects.** Opening a remote client while the app happened to be refreshing its voice settings could crash it outright — a Windows error dialog and a dead window, not a degraded feature. A background file watcher was asking a client that had connected but not yet finished its handshake which project it was on, and treating "not ready yet" as a fatal error. It now waits for that client instead, and the same assumption has been corrected everywhere else it was made.
+- **Dragging a panel edge follows your cursor when the UI is zoomed.** The rail and the file panel both jumped on grab and then drifted further from the pointer the further you dragged, because the drag was measured in screen pixels while the layout was in zoomed ones. Both now agree. At the default zoom nothing changes.
+- **Codex shows which MCP tool it ran.** Calls to MCP servers appeared as a bare `Run`, so a row of them told you nothing — the name was on the wire, but a generic label was taking precedence over it. They now read as `mcp.<server>.<tool>`, matching how the same calls already appeared for Grok and Claude.
+
+## 3.12.2 — 2026-08-18
+
+### Fixed
+
+- **Stray "New session" conversations stop piling up.** Checking whether an agent is signed in quietly started a real conversation and then tried to end it — but that particular cleanup never worked, so every check left an empty conversation behind. They showed up as identical "New session" rows you could not open (the CLI cannot load a conversation with no messages) and that survived **Clear all**. The check now runs somewhere harmless and removes after itself, so nothing new accumulates. Anything already on your disk stays where it is and is inert; it was never taking part in your work.
+- **Clear all history finishes the job.** It deleted the files while the agent processes were still shutting down, so on Windows the delete could fail — or the CLI would write the conversation back — and the rows returned. It now waits for those processes to exit first, and refreshes the project list for projects other than the one you are looking at.
 
 ## 3.12.1 — 2026-08-17
 

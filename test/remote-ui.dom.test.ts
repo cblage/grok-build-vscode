@@ -132,6 +132,16 @@ describe("AFK Pilot shared webview controls", () => {
     expect(text).not.toContain("Cost");
   });
 
+  it("voice-config refresh skips a tab that has no cwd yet", () => {
+    const body = sidebarSrc.slice(
+      sidebarSrc.indexOf("private postVoiceConfigured("),
+      sidebarSrc.indexOf("private voiceSetting<"),
+    );
+    expect(body).toContain("cwdIfPresent");
+    expect(body).not.toContain("remoteSessionFor");
+    expect(body).not.toMatch(/remoteClients\.cwd\(/);
+  });
+
   it("keeps remote voice completion out of the host prompt path", () => {
     const continuous = sidebarSrc.slice(
       sidebarSrc.indexOf("private async commitRemoteVoice"),
@@ -672,6 +682,31 @@ describe("AFK Pilot shared webview controls", () => {
 
     expect(doc.querySelector(".msg.queued")).toBeNull();
     expect(doc.getElementById("send-btn")!.classList.contains("stop")).toBe(true);
+  });
+
+  it("echoes an image-only queued dequeue whose text is empty", () => {
+    const { window, posted } = bootWebview({ remote: true });
+    dispatch(window, {
+      type: "queuedSends",
+      items: [""],
+      queued: [{
+        text: "",
+        chips: [{
+          id: "image:/s/a.png:1:1",
+          path: "/s/a.png",
+          relPath: "Image #1",
+          hidden: false,
+          imageIndex: 1,
+          mimeType: "image/png",
+        }],
+      }],
+    });
+    dispatch(window, { type: "submitQueuedSend", id: "queued-send-id-img1", text: "" });
+    expect(posted).toContainEqual({
+      type: "send",
+      text: "",
+      queuedSendId: "queued-send-id-img1",
+    });
   });
 
   it("meters a dequeued prompt as a send frame carrying its submission identity", () => {

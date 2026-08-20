@@ -1,10 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { buildPrompt, buildPromptWithImages, CONTEXT_TAG_OPEN, CONTEXT_TAG_CLOSE } from "../src/prompt-builder";
+import { buildPrompt, buildPromptWithImages, buildQueuedPromptWithImages, CONTEXT_TAG_OPEN, CONTEXT_TAG_CLOSE } from "../src/prompt-builder";
 import {
   makeImplicitChip,
   makeExplicitChip,
   makeImageChip,
-  withPerMessageImageIndices,
 } from "../src/chips";
 import { STAGED_IMAGE_TAG_HINT, WORKSPACE_IMAGE_TAG_HINT } from "../src/image-history";
 
@@ -273,55 +272,125 @@ describe("buildPromptWithImages", () => {
     ]);
   });
 
-  // The CLI numbers the images of the message it is reading from 1 and resolves
-  // `[Image #N]` against THAT (research/image-index-probe.cjs). So the only
-  // thing that makes a tag resolvable is the tag number equalling the image
-  // block's own position — which is what these pin, end to end from the chips.
-  describe("tags name the block positions the CLI will count", () => {
-    // Exactly what sidebar's send does: renumber, then one image input per
-    // visible image chip, in list order.
+  // Send reads the attach-time index on each chip. Compacting those numbers
+  // is what made an authored `[Image #2]` miss its tag after a prefix flush.
+  describe("tags keep the attach-time index, including gaps", () => {
     const sendImages = (chips: ReturnType<typeof makeImageChip>[]) =>
-      withPerMessageImageIndices(chips)
+      chips
         .filter((c) => c.imageIndex != null && !c.hidden)
         .map((c, i) => ({ index: c.imageIndex!, mimeType: c.mimeType!, data: `IMG${i}` }));
 
-    it("tags a lone image #1 even when it is the conversation's second", () => {
-      // THE BUG. Under session-scoped numbering this chip was staged as #2, the
-      // tag said #2, the CLI counted one image and called it #1, and image_edit
-      // refused: "does not match any attached image. Available: [Image #1]."
+    it("a lone survivor of a prefix flush keeps #2", () => {
       const chips = [makeImageChip("/s/second.png", 2, "image/png")];
-      const out = buildPromptWithImages("make it green", chips, sendImages(chips), deps);
-      expect(out.text).toBe(`make it green\n\n${PASTE_TAG(1)}`);
+      const out = buildPromptWithImages("edit [Image #2]", chips, sendImages(chips), deps);
+      expect(out.text).toBe(`edit [Image #2]\n\n${PASTE_TAG(2)}`);
       expect(out.blocks).toHaveLength(2);
     });
 
-    it("keeps tag N pointing at the Nth image block, for any staged numbering", () => {
+    it("emits non-contiguous tags in index order without rewriting them", () => {
       const chips = [
-        makeImageChip("/s/a.png", 4, "image/png"),
-        makeImageChip("/s/b.png", 9, "image/png"),
-        makeImageChip("/s/c.png", 11, "image/png"),
+        makeImageChip("/s/a.png", 2, "image/png"),
+        makeImageChip("/s/b.png", 5, "image/png"),
       ];
       const out = buildPromptWithImages("", chips, sendImages(chips), deps);
-      expect(out.text).toBe([PASTE_TAG(1), PASTE_TAG(2), PASTE_TAG(3)].join("\n"));
-      // The invariant stated directly: the k-th tag names the k-th image block.
+      expect(out.text).toBe([PASTE_TAG(2), PASTE_TAG(5)].join("\n"));
       const imageBlocks = out.blocks.filter((blk) => blk.type === "image");
       const tagged = [...out.text.matchAll(/\[Image #(\d+)\]/g)].map((m) => Number(m[1]));
-      expect(tagged).toEqual(imageBlocks.map((_, i) => i + 1));
+      expect(tagged).toEqual([2, 5]);
       expect(imageBlocks.map((blk) => (blk.type === "image" ? blk.data : ""))).toEqual([
         "IMG0",
         "IMG1",
-        "IMG2",
       ]);
     });
 
-    it("a hidden image neither ships a block nor consumes a number", () => {
+    it("a hidden image neither ships a block nor relabels a later chip", () => {
       const chips = [
         { ...makeImageChip("/s/a.png", 1, "image/png"), hidden: true },
         makeImageChip("/s/b.png", 2, "image/png"),
       ];
       const out = buildPromptWithImages("", chips, sendImages(chips), deps);
-      expect(out.text).toBe(PASTE_TAG(1));
+      expect(out.text).toBe(PASTE_TAG(2));
       expect(out.blocks.filter((blk) => blk.type === "image")).toHaveLength(1);
     });
+  });
+});
+
+describe("buildQueuedPromptWithImages keeps per-contribution attachments", () => {
+  const tag = (n: number) =>
+    `[Image #${n}] (${`img${n}.png`} — ${STAGED_IMAGE_TAG_HINT})`;
+
+  it("places each contribution's tags next to its own text, not as a union dump", () => {
+    const a = makeImageChip("/s/img1.png", 1, "image/png");
+    const b = makeImageChip("/s/img2.png", 2, "image/png");
+    const out = buildQueuedPromptWithImages(
+      [
+        { text: "look at A", chips: [a], images: [{ index: 1, mimeType: "image/png", data: "AAA", path: "/s/img1.png" }] },
+        { text: "and B", chips: [b], images: [{ index: 2, mimeType: "image/png", data: "BBB", path: "/s/img2.png" }] },
+      ],
+      [],
+      deps,
+    );
+    expect(out.text).toBe(`look at A\n\n${tag(1)}\n\nand B\n\n${tag(2)}`);
+    const imageBlocks = out.blocks.filter((blk) => blk.type === "image");
+    expect(imageBlocks.map((blk) => (blk.type === "image" ? blk.data : ""))).toEqual(["AAA", "BBB"]);
+    const firstTag = out.text.indexOf("[Image #1]");
+    const secondText = out.text.indexOf("and B");
+    const secondTag = out.text.indexOf("[Image #2]");
+    expect(firstTag).toBeGreaterThan(out.text.indexOf("look at A"));
+    expect(firstTag).toBeLessThan(secondText);
+    expect(secondTag).toBeGreaterThan(secondText);
+  });
+
+  it("a single contribution is byte-identical to a live send of that message", () => {
+    const chip = makeImageChip("/s/img1.png", 1, "image/png");
+    const images = [{ index: 1, mimeType: "image/png", data: "AAA", path: "/s/img1.png" }];
+    const queued = buildQueuedPromptWithImages(
+      [{ text: "look", chips: [chip], images }],
+      [],
+      deps,
+    );
+    const live = buildPromptWithImages("look", [chip], images, deps);
+    expect(queued).toEqual(live);
+  });
+
+  it("copies a later contribution's literal `[Image #1]` byte-identical", () => {
+    const authored = "Keep the literal token `[Image #1]`";
+    const a = makeImageChip("/s/img1.png", 1, "image/png");
+    const b = makeImageChip("/s/img2.png", 2, "image/png");
+    const out = buildQueuedPromptWithImages(
+      [
+        { text: "look at A", chips: [a], images: [{ index: 1, mimeType: "image/png", data: "AAA", path: "/s/img1.png" }] },
+        { text: authored, chips: [b], images: [{ index: 2, mimeType: "image/png", data: "BBB", path: "/s/img2.png" }] },
+      ],
+      [],
+      deps,
+    );
+    expect(out.text).toBe(`look at A\n\n${tag(1)}\n\n${authored}\n\n${tag(2)}`);
+    const imageBlocks = out.blocks.filter((blk) => blk.type === "image");
+    expect(imageBlocks.map((blk) => (blk.type === "image" ? blk.data : ""))).toEqual(["AAA", "BBB"]);
+  });
+
+  it("emits a later contribution's type-time tag without rewriting its text", () => {
+    const a = makeImageChip("/s/img1.png", 1, "image/png");
+    const b = makeImageChip("/s/img2.png", 2, "image/png");
+    const out = buildQueuedPromptWithImages(
+      [
+        { text: "look at A", chips: [a], images: [{ index: 1, mimeType: "image/png", data: "AAA", path: "/s/img1.png" }] },
+        { text: "edit [Image #2]", chips: [b], images: [{ index: 2, mimeType: "image/png", data: "BBB", path: "/s/img2.png" }] },
+      ],
+      [],
+      deps,
+    );
+    expect(out.text).toBe(`look at A\n\n${tag(1)}\n\nedit [Image #2]\n\n${tag(2)}`);
+  });
+
+  it("a contribution that survives a prefix flush still tags #2 next to authored [Image #2]", () => {
+    const b = makeImageChip("/s/img2.png", 2, "image/png");
+    const out = buildQueuedPromptWithImages(
+      [{ text: "edit [Image #2]", chips: [b], images: [{ index: 2, mimeType: "image/png", data: "BBB", path: "/s/img2.png" }] }],
+      [],
+      deps,
+    );
+    expect(out.text).toBe(`edit [Image #2]\n\n${tag(2)}`);
   });
 });

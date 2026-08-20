@@ -201,13 +201,39 @@ describe("multi-provider review regressions", () => {
     expect(skipIdx).toBeGreaterThan(eligibleIdx);
   });
 
-  it("freezes Codex listing time on first discovery but not Claude lastModified", () => {
+  it("tears down ownerless live sessions before deleting their directories", () => {
+    // Same lesson as deleteSession: a grok process holding the dir makes the
+    // Windows delete fail, and the row comes back as a live-empty "New session".
+    const body = methodBody("private async clearAllSessions(");
+    const dispose = body.indexOf("this.disposeSession(s)");
+    const clear = body.indexOf("clearSessions({");
+    expect(dispose).toBeGreaterThan(-1);
+    expect(clear).toBeGreaterThan(dispose);
+    expect(body).toContain("if (this.sessionHasLiveOwner(s)) continue");
+    expect(body).toContain("this.sendLocalRepoSessionsPreview(cwd)");
+  });
+
+  it("never sweeps past the newest-N window, however tempting the old shells look", () => {
+    const body = methodBody("private sweepEmptySessions(");
+    // The scan stays bounded. Walking every `hasTranscript === false` entry
+    // would reach shells that fell off the window — but that flag is a
+    // SNAPSHOT, and another editor window can start a session's first prompt
+    // after it was taken. The age gate does not save it either: an old session
+    // that stayed open still looks stale, so an in-progress first write could
+    // be deleted from a second window, unrecoverably. Historical shells are
+    // inert; a lost conversation is not. Creation is stopped at the probe
+    // instead (see the scratch cwd), which needs no such gamble.
+    expect(body).toContain("GrokSidebar.SWEEP_SCAN_LIMIT");
+    expect(body).not.toContain("entry.hasTranscript !== false");
+  });
+
+  it("freezes adapter listing time on first discovery for Codex and Claude", () => {
     const body = methodBody("private async refreshAdapterHistory(");
-    expect(body).toContain('if (provider === "codex")');
     expect(body).toContain("if (typeof previous.activeAt === \"number\") continue");
-    const freeze = body.slice(body.indexOf('if (provider === "codex")'));
-    expect(freeze).toContain("activeAt: adapterListEntry(entry, {}, provider, Date.now()).updatedAt");
-    expect(body).toContain("...(provider === \"codex\"");
+    expect(body).toContain("activeAt: adapterListEntry(entry, {}, provider, Date.now()).updatedAt");
+    // No provider carve-out — Claude restamps on load, same pin Codex already had.
+    expect(body).not.toContain('if (provider === "codex")');
+    expect(body).not.toContain("...(provider === \"codex\"");
   });
 
   it("puts minimal provider state in every remote client snapshot", () => {
@@ -225,6 +251,11 @@ describe("multi-provider review regressions", () => {
 
     const snapshot = methodBody("private buildRemoteSnapshot(");
     expect(snapshot).toContain("snap.push(this.providerStateMessage());");
+    expect(snapshot).toContain("snap.push(this.mcpConnectorsMessage());");
+    expect(snapshot).toContain("this.mcpServersMessage()");
+    expect(snapshot).not.toContain("mcpServersMessageForCwd");
+    expect(snapshot).not.toContain("mcpViewCwd");
+    expect(snapshot).not.toContain("this.mcpServersMessage(session || this.focused)");
     expect(snapshot.indexOf("snap.push(initial);")).toBeLessThan(
       snapshot.indexOf("snap.push(this.providerStateMessage());"),
     );

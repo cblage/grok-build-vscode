@@ -1258,6 +1258,28 @@ describe("webview message schema validation", () => {
       type: "setTelemetryEnabled",
       value: false,
     });
+    expect(parseWebviewMsg({ type: "setThumbsFeedback", value: true })).toEqual({
+      type: "setThumbsFeedback",
+      value: true,
+    });
+    expect(parseWebviewMsg({ type: "setThumbsFeedback", value: "yes" })).toBeNull();
+    expect(parseWebviewMsg({ type: "turnFeedback", rating: 1 })).toEqual({
+      type: "turnFeedback",
+      rating: 1,
+    });
+    expect(parseWebviewMsg({ type: "turnFeedback", rating: 0 })).toEqual({
+      type: "turnFeedback",
+      rating: 0,
+    });
+    expect(parseWebviewMsg({ type: "turnFeedback", rating: 2 })).toBeNull();
+    expect(parseWebviewMsg({ type: "turnFeedback" })).toBeNull();
+    expect(parseWebviewMsg({ type: "connectMcpConnector", id: "linear" })).toEqual({
+      type: "connectMcpConnector",
+      id: "linear",
+    });
+    expect(parseWebviewMsg({ type: "disconnectMcpConnector", id: "linear" })?.type)
+      .toBe("disconnectMcpConnector");
+    expect(parseWebviewMsg({ type: "connectMcpConnector" })).toBeNull();
     expect(parseWebviewMsg({ type: "setVoiceSendPhrase" })).toBeNull();
     expect(parseWebviewMsg({ type: "setVoiceKeyterms", value: ["ok", 1] })).toBeNull();
     expect(parseWebviewMsg({ type: "setTelemetryEnabled", value: "no" })).toBeNull();
@@ -1824,6 +1846,7 @@ describe("desktop DevTools gate (non-production only)", () => {
     expect(host).toMatch(/devTools:\s*!app\.isPackaged/);
     expect(host).not.toContain("openDevTools");
     expect(host).toMatch(/canToggleDevTools/);
+    expect(host).toMatch(/canShowMcpSettings/);
     expect(host).toContain("toggleDevTools()");
     const settingsJs = fs.readFileSync(
       path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "media", "settings.js"),
@@ -1951,7 +1974,15 @@ describe("desktop branding and menu", () => {
     // must keep its document scroller (URL-bar hide, keyboard pans).
     expect(chatCss).toMatch(/html:has\(body\.desk\)\s*\{[^}]*overflow:\s*hidden/s);
     expect(chatCss).not.toMatch(/^html\s*\{[^}]*overflow:\s*hidden/ms);
-    expect(chatCss).toContain("calc(100% / var(--chat-zoom, 1))");
+    // #119. The body must NOT divide the zoom back out. That was correct under
+    // the old non-standard `zoom`; the CSS Zoom spec (Chromium 128+) resolves
+    // percentages against the zoom-adjusted containing block, so `height: 100%`
+    // already fills the window and dividing again halves it. Measured in
+    // Chromium 149 at an 800px viewport, the old formula put the composer at
+    // 400px at zoom 2 and overflowed to 1333px at zoom 0.6 — wrong at every
+    // scale but 1. Both older shapes stay pinned out so neither comes back.
+    expect(chatCss).toMatch(/zoom: var\(--chat-zoom, 1\);\s+height: 100%;/);
+    expect(chatCss).not.toContain("calc(100% / var(--chat-zoom, 1))");
     expect(chatCss).not.toContain("calc(100vh / var(--chat-zoom, 1))");
   });
 
@@ -2124,6 +2155,7 @@ describe("file-tree panel assets", () => {
     const iconBtnRule = chatCss.match(/^\.icon-btn\s*\{[^}]+\}/m)?.[0] ?? "";
     expect(iconBtnRule).toMatch(/border-radius:\s*8px/);
     expect(iconBtnRule).toMatch(/color:\s*var\(--vscode-descriptionForeground\)/);
+    expect(chatCss).toMatch(/#add-popover \.toolbar-popover-item\s*\{[^}]*justify-content:\s*flex-start/s);
 
     // Created and torn down together. A border could not be orphaned; a
     // sibling can, and a re-inject would stack them up.
@@ -3511,6 +3543,8 @@ describe("watcher chain helpers (A4)", () => {
     expect(src).toContain("nearestExistingAncestor");
     expect(src).toContain("scheduleRebind");
     expect(src).toContain("bindChainWatcher");
+    expect(src).toContain("fs.watch listener failed");
+    expect(src).toMatch(/const notify = \(listeners: Set<\(\) => void>\): void =>/);
   });
 });
 
@@ -4664,7 +4698,7 @@ describe("typed config open intents (host-resolved paths)", () => {
     );
     const projectCase = sidebar.slice(
       sidebar.indexOf('case "openProjectConfig"'),
-      sidebar.indexOf('case "runMcpList"'),
+      sidebar.indexOf('case "listMcpServers"'),
     );
     expect(globalCase).toMatch(/openGlobalConfig\s*\(/);
     expect(globalCase).not.toMatch(/openResource\s*\(/);

@@ -11,6 +11,7 @@ import {
   isMethodNotFoundError,
   type PromptResultMeta,
   type PromptUsage,
+  type SessionInfoContext,
   makeAckResponse,
   makeExitPlanResponse,
   makeExitPlanUnavailableResponse,
@@ -20,6 +21,7 @@ import {
   makeQuestionResponse,
   makeRequest,
   parseAcpLine,
+  parseSessionInfoRpcResult,
   resolveModelId,
   routeSessionUpdate,
   isForeignSessionUpdate,
@@ -59,12 +61,67 @@ import {
   type RewindMode,
   type RewindPoint,
 } from "./rewind";
+import {
+  promptTimerDelayMs,
+  resolveAcpTimeouts,
+  type AcpTimeoutInput,
+  type AcpTimeouts,
+} from "./acp-timeout";
+import type { AcpMcpStdioServer } from "./mcp-connectors";
+import {
+  FEEDBACK_RPC_METHOD,
+  buildClientFeedbackParams,
+  isFeedbackDisabledError,
+  type FeedbackClientType,
+  type ThumbsRating,
+} from "./feedback";
 
 export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export type PromptContentBlock =
   | { type: "text"; text: string }
   | { type: "image"; mimeType: string; data: string };
+
+/**
+ * Oldest grok whose `_x.ai/interject` honors `content` (text + image blocks).
+ * 0.2.x accepts `{sessionId, text}` and ignores unknown fields, so images
+ * would drop silently — the host refuses image-bearing Steer instead.
+ * Fail closed unless the version is live-verified. Inspected on 1.0.5
+ * (`InterjectRequest.content` in `extensions/interject.rs`).
+ */
+export const GROK_INTERJECT_CONTENT_MIN_VERSION: [number, number, number] = [1, 0, 0];
+
+/** True only for a live-verified grok that will apply interject `content`. */
+export function cliHonorsInterjectContent(
+  grokVersion?: string | null,
+  versionVerified = false,
+): boolean {
+  if (!versionVerified) return false;
+  const parsed = parseGrokVersion(grokVersion ?? "");
+  if (!parsed) return false;
+  return compareVersionTuple(parsed, GROK_INTERJECT_CONTENT_MIN_VERSION) >= 0;
+}
+
+/**
+ * `_x.ai/interject` params. `content` is omitted entirely when there are no
+ * image blocks so the legacy `{sessionId, text}` wire stays byte-identical
+ * (the TUI does the same). The Text block, when present, is the rewritten
+ * prompt (`buildPromptWithImages`) and wins over `text` on a capable CLI.
+ */
+export function buildInterjectParams(
+  sessionId: string,
+  text: string,
+  content?: readonly PromptContentBlock[],
+): { sessionId: string; text: string; content?: PromptContentBlock[] } {
+  const params: { sessionId: string; text: string; content?: PromptContentBlock[] } = {
+    sessionId,
+    text,
+  };
+  if (content && content.some((block) => block.type === "image")) {
+    params.content = [...content];
+  }
+  return params;
+}
 
 export interface AcpClientOptions {
   cliPath: string;
@@ -88,6 +145,18 @@ export interface AcpClientOptions {
    * an unverified banner even when the number is at the image-read floor.
    */
   grokVersionVerified?: boolean;
+  /**
+   * Client-side JSON-RPC timeouts. `session/prompt` uses idle+absolute policy
+   * (#117); other methods use `requestTimeoutMs`. Omitted keys take defaults.
+   */
+  timeouts?: AcpTimeoutInput;
+  /**
+   * Host-owned MCP servers for `session/new` and `session/load`. A getter is
+   * read at request time so a Connect that lands after construct still applies.
+   * Omitted / empty is the historical `[]` — the field is still sent because
+   * grok rejects session/new without it.
+   */
+  mcpServers?: AcpMcpStdioServer[] | (() => AcpMcpStdioServer[]);
 }
 
 export interface ModelInfo {
@@ -111,6 +180,11 @@ export interface SlashCommand {
   name: string;
   description?: string;
   input?: { hint?: string };
+  /**
+   * ACP `_meta`. Skills carry `{scope, path}`; builtins omit those keys
+   * (`isAdvertisedSkill` in slash-filter.ts).
+   */
+  _meta?: { path?: string; scope?: string; [k: string]: unknown };
 }
 
 // Re-exported, not redeclared: `extractPromptMeta` (acp-dispatch) is what builds
@@ -188,6 +262,11 @@ type Pending = {
   reject: (e: any) => void;
   timer?: ReturnType<typeof setTimeout>;
   onResolve?: (value: any) => void;
+  method?: string;
+  isPrompt?: boolean;
+  startedAt?: number;
+  lastActivityAt?: number;
+  armTimer?: () => void;
 };
 
 export { buildGrokAgentArgs } from "./grok-backend";
@@ -256,6 +335,7 @@ export class AcpClient extends EventEmitter {
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private readonly backend: AcpBackend;
+  private readonly timeouts: AcpTimeouts;
 
   readonly provider: AcpProvider;
   readonly usesClientPlanGate: boolean;
@@ -320,6 +400,7 @@ export class AcpClient extends EventEmitter {
     this.provider = this.backend.provider;
     this.usesClientPlanGate = this.backend.usesClientPlanGate;
     this.currentReasoningEffort = this.opts.effort || undefined;
+    this.timeouts = resolveAcpTimeouts(opts.timeouts);
   }
 
   async start(): Promise<void> {
@@ -399,10 +480,16 @@ export class AcpClient extends EventEmitter {
     this.emit("initialized", init);
   }
 
+  private mcpServersForSession(): AcpMcpStdioServer[] {
+    const value = this.opts.mcpServers;
+    if (typeof value === "function") return value();
+    return Array.isArray(value) ? value : [];
+  }
+
   async newSession(modelId?: string): Promise<{ sessionId: string }> {
     const raw = await this.request("session/new", {
       cwd: this.opts.cwd,
-      mcpServers: [],
+      mcpServers: this.mcpServersForSession(),
     });
     const res = this.backend.normalizeSessionResponse(raw);
     this.sessionId = res.sessionId;
@@ -452,7 +539,7 @@ export class AcpClient extends EventEmitter {
     const raw = await this.request("session/load", {
       sessionId,
       cwd: this.opts.cwd,
-      mcpServers: [],
+      mcpServers: this.mcpServersForSession(),
     });
     const res = this.backend.normalizeSessionResponse(raw);
     this.sessionId = sessionId;
@@ -632,6 +719,23 @@ export class AcpClient extends EventEmitter {
     };
   }
 
+  /** Read Grok's MCP inventory from the same ACP session as the conversation. */
+  async listMcpServers(): Promise<unknown[] | { servers?: unknown[]; result?: unknown } | "unsupported"> {
+    if (this.provider !== "grok") return "unsupported";
+    if (!this.sessionId) throw new Error("no session");
+    try {
+      // The method is scoped to the active ACP session; unlike ordinary ACP
+      // methods it accepts an empty parameter object rather than sessionId.
+      return await this.request("_x.ai/mcp/list", {});
+    } catch (error) {
+      if (isMethodNotFoundError(error)) {
+        this.opts.log("[mcp] CLI does not support _x.ai/mcp/list");
+        return "unsupported";
+      }
+      throw error;
+    }
+  }
+
   async deleteSession(sessionId: string): Promise<void> {
     if (this.provider === "grok") throw new Error("This backend does not support ACP session deletion.");
     await this.request("session/delete", { sessionId });
@@ -651,19 +755,64 @@ export class AcpClient extends EventEmitter {
    * `_x.ai/interject` is unadvertised, so a pre-~0.2.96 CLI answers -32601. That
    * returns `"unsupported"` (not a throw) so the caller can fall back to queueing
    * — the user's text must never be lost to a capability gap.
+   *
+   * `content` is additive: image-capable CLIs take structured text + image
+   * blocks (the Text block wins over `text`); older CLIs keep reading `text`.
+   * Omit it when there are no images so the legacy wire stays byte-identical.
+   * The host must not pass image blocks to a CLI that ignores `content`.
    */
-  async interject(text: string, onQueued?: () => void): Promise<"ok" | "unsupported"> {
+  async interject(
+    text: string,
+    onQueued?: () => void,
+    content?: readonly PromptContentBlock[],
+  ): Promise<"ok" | "unsupported"> {
     if (!this.sessionId) throw new Error("no session");
     try {
       await this.request(
         "_x.ai/interject",
-        { sessionId: this.sessionId, text },
+        buildInterjectParams(this.sessionId, text, content),
         () => onQueued?.(),
       );
       return "ok";
     } catch (e: any) {
       if (isMethodNotFoundError(e)) {
         this.opts.log("[interject] CLI does not support _x.ai/interject; falling back to queue");
+        return "unsupported";
+      }
+      throw e;
+    }
+  }
+
+  /** Live-verified grok that will apply interject `content` rather than drop it. */
+  honorsInterjectContent(): boolean {
+    return this.provider === "grok"
+      && cliHonorsInterjectContent(this.opts.grokVersion, this.opts.grokVersionVerified === true);
+  }
+
+  /**
+   * Spontaneous thumbs rating (#114). Logical method `x.ai/feedback`; wire
+   * name `_x.ai/feedback` (ACP `_` extension prefix — a bare `x.ai/feedback`
+   * is -32601 at decode). `"unsupported"` on -32601, a disabled-feedback
+   * internal_error, or a non-Grok backend so the caller can hide the buttons.
+   */
+  async submitFeedback(opts: {
+    ratingValue: ThumbsRating;
+    clientType: FeedbackClientType;
+    clientVersion?: string;
+  }): Promise<"ok" | "unsupported"> {
+    if (this.provider !== "grok") return "unsupported";
+    if (!this.sessionId) throw new Error("no session");
+    try {
+      await this.request(FEEDBACK_RPC_METHOD, buildClientFeedbackParams({
+        sessionId: this.sessionId,
+        clientType: opts.clientType,
+        ratingValue: opts.ratingValue,
+        clientVersion: opts.clientVersion,
+      }));
+      return "ok";
+    } catch (e: any) {
+      if (isMethodNotFoundError(e) || isFeedbackDisabledError(e)) {
+        this.opts.log("[feedback] CLI does not accept x.ai/feedback");
         return "unsupported";
       }
       throw e;
@@ -782,6 +931,31 @@ export class AcpClient extends EventEmitter {
     } catch (e: any) {
       if (isMethodNotFoundError(e)) {
         this.opts.log("[worktree] CLI does not support _x.ai/git/worktree/remove");
+        return "unsupported";
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * Structured session context size (`_x.ai/session/info`) — control-plane only.
+   * Does **not** send a model turn or inflate the context window (probe-verified
+   * 0.2.112). Used to seed/refresh the context donut when turn meta / compact
+   * notifications / signals.json are missing or stale. `"unsupported"` on
+   * older CLIs (-32601); callers fall back to disk or the hidden `/session-info`
+   * prompt scrape.
+   */
+  async getSessionInfo(): Promise<SessionInfoContext | "unsupported"> {
+    if (!this.sessionId) throw new Error("no session");
+    if (this.provider !== "grok") return "unsupported";
+    try {
+      const r = await this.request("_x.ai/session/info", { sessionId: this.sessionId });
+      const parsed = parseSessionInfoRpcResult(r);
+      if (!parsed) throw new Error("session/info returned no usable context");
+      return parsed;
+    } catch (e: any) {
+      if (isMethodNotFoundError(e)) {
+        this.opts.log("[session/info] CLI does not support _x.ai/session/info");
         return "unsupported";
       }
       throw e;
@@ -995,23 +1169,60 @@ export class AcpClient extends EventEmitter {
   ): Promise<any> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const entry: Pending = { resolve, reject, onResolve };
+      const now = Date.now();
+      const entry: Pending = {
+        resolve,
+        reject,
+        onResolve,
+        method,
+        isPrompt: method === "session/prompt",
+        startedAt: now,
+        lastActivityAt: now,
+      };
       this.pending.set(id, entry);
       if (!this.writeLine(makeRequest(id, method, params))) {
         this.pending.delete(id);
         reject(new Error(`Grok process is not running (${method})`));
         return;
       }
-      const timeoutMs = method === "session/prompt" ? 1_800_000 : 120_000;
-      // Tracked on the pending entry so the response/exit paths can clear it —
-      // otherwise every resolved request leaves a live timer (and its closure)
-      // armed for up to 30 min.
-      entry.timer = setTimeout(() => {
-        if (this.pending.delete(id)) {
-          reject(new Error(`ACP request timed out: ${method}`));
+      // Tracked on the pending entry so the response/exit paths can clear it.
+      // session/prompt uses idle+absolute policy (#117); other methods keep a
+      // fixed cap. A live timer must not outlive the request.
+      const arm = () => {
+        if (entry.timer) clearTimeout(entry.timer);
+        entry.timer = undefined;
+        let waitMs: number;
+        if (entry.isPrompt) {
+          waitMs = promptTimerDelayMs({
+            startedAt: entry.startedAt ?? now,
+            lastActivityAt: entry.lastActivityAt ?? now,
+            now: Date.now(),
+            idleMs: this.timeouts.promptIdleTimeoutMs,
+            absoluteMs: this.timeouts.promptAbsoluteTimeoutMs,
+          });
+          if (!Number.isFinite(waitMs)) return;
+        } else {
+          waitMs = this.timeouts.requestTimeoutMs;
         }
-      }, timeoutMs);
+        entry.timer = setTimeout(() => {
+          if (this.pending.delete(id)) {
+            reject(new Error(`ACP request timed out: ${method}`));
+          }
+        }, waitMs);
+      };
+      entry.armTimer = arm;
+      arm();
     });
+  }
+
+  /** Re-arm in-flight `session/prompt` idle timers on live ACP traffic. */
+  private touchPendingPromptTimers(): void {
+    const now = Date.now();
+    for (const [, p] of this.pending) {
+      if (!p.isPrompt || typeof p.armTimer !== "function") continue;
+      p.lastActivityAt = now;
+      p.armTimer();
+    }
   }
 
   private respondOk(id: number | string, result: any = {}): boolean {
@@ -1034,6 +1245,13 @@ export class AcpClient extends EventEmitter {
       if (p) {
         this.pending.delete(ev.id as number);
         if (p.timer) clearTimeout(p.timer);
+        // A response is ACP traffic too, and the idle policy (#117) is "fire
+        // only if nothing has been heard". Concurrent in-turn calls answer
+        // during a long prompt — `_x.ai/interject`, `_x.ai/feedback`, `session/set_mode` — and
+        // each reply proves the peer is alive. Re-arm AFTER this entry is out
+        // of `pending`, so a prompt's own response doesn't arm a timer for a
+        // request that just finished.
+        this.touchPendingPromptTimers();
         if (ev.error) {
           if (this.provider !== "grok" && this.backend.isCredentialError(ev.error)) {
             this.emit("credentialError", ev.error);
@@ -1049,9 +1267,11 @@ export class AcpClient extends EventEmitter {
       return;
     }
     if (ev.kind === "session-update") {
+      this.touchPendingPromptTimers();
       this.handleSessionUpdate(ev.update, ev.meta, ev.sessionId);
       return;
     }
+    this.touchPendingPromptTimers();
     void this.handleServerRequest({ id: ev.id, method: ev.method, params: ev.params });
   }
 
@@ -1179,6 +1399,16 @@ export class AcpClient extends EventEmitter {
   private async handleServerRequest(msg: any): Promise<void> {
     const { method, id, params } = msg;
     try {
+      if (
+        method === "_x.ai/mcp/servers_updated" ||
+        method === "_x.ai/mcp/init_progress" ||
+        method === "_x.ai/mcp_initialized" ||
+        method === "_x.ai/mcp/server_status"
+      ) {
+        this.emit("mcpNotification", method, params);
+        if (id != null) this.respondOk(id, {});
+        return;
+      }
       if (method === "fs/read_text_file") {
         if (!this.fsRead) throw new Error("fsRead handler not registered");
         const content = await this.fsRead(params.path);

@@ -8,6 +8,10 @@
 // carries only a leading-verb title and no `kind`.
 import { describe, it, expect } from "vitest";
 import { bootWebview, dispatch } from "./webview-harness";
+import { normalizeCodexUpdate } from "../src/codex-backend";
+import { createMcpPrepareState, prepareMcpToolCall } from "../src/mcp-tool";
+// @ts-expect-error — plain JS module, no types
+import { middleElide, TOOL_LABEL_MAX } from "../media/webview-helpers.js";
 
 const tc = (call: any) => ({ type: "toolCall", call });
 const close = (window: Window) => dispatch(window, { type: "messageChunk", text: "done" } as any);
@@ -27,6 +31,22 @@ function flatLabel(doc: Document): string | null {
   // The label span only — a command's flat row also carries the #41 details
   // block (full command text), which is not part of the label.
   return doc.querySelector(".tool-flat .tool-label")?.textContent ?? null;
+}
+function itemLabels(doc: Document): string[] {
+  return [...doc.querySelectorAll(".tool-item-label, .tool-flat .tool-label")]
+    .map((el) => el.textContent ?? "");
+}
+
+function codexMcpCall(id: string, server: string, tool: string, extra: Record<string, unknown> = {}) {
+  const { update } = normalizeCodexUpdate({
+    sessionUpdate: "tool_call",
+    toolCallId: id,
+    kind: "execute",
+    title: `mcp.${server}.${tool}`,
+    rawInput: { server, tool, arguments: extra },
+    _meta: { is_mcp_tool_call: true },
+  });
+  return update;
 }
 
 describe("tool-call rollup categorization (live, kind present)", () => {
@@ -118,11 +138,181 @@ describe("tool-call labels (single-call flat line)", () => {
     expect(flatLabel(doc)).toBe("Read README.md lines 1-30");
   });
 
+  it("read_file without a range shows the path and does not invent line numbers", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, tc({ toolCallId: "1", kind: "read", title: "read_file", rawInput: { target_file: "hello.txt" } }));
+    close(window);
+    expect(flatLabel(doc)).toBe("Read hello.txt");
+  });
+
+  it("read_file completed FileContent.total_lines fills the range", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, tc({ toolCallId: "1", kind: "read", title: "read_file", rawInput: { target_file: "hello.txt" } }));
+    dispatch(window, {
+      type: "toolCallUpdate",
+      call: {
+        toolCallId: "1",
+        status: "completed",
+        rawOutput: { type: "ReadFile", FileContent: { offset: null, total_lines: 3 } },
+      },
+    });
+    close(window);
+    expect(flatLabel(doc)).toBe("Read hello.txt lines 1-3");
+  });
+
   it("web_fetch shows the page URL ('Fetch <host/path>'), protocol stripped", () => {
     const { window, doc } = bootWebview();
     dispatch(window, tc({ toolCallId: "1", title: "web_fetch", rawInput: { url: "https://example.com/page" } }));
     close(window);
     expect(flatLabel(doc)).toBe("Fetch example.com/page");
+  });
+});
+
+// #115: Codex MCP arrives as kind:"execute" + title "mcp.<server>.<tool>" and
+// no command. After normalizeCodexUpdate remaps kind to other, the row must
+// show that title — the same fallback Grok and Claude already use.
+describe("MCP tool names (#115)", () => {
+  it("a Codex MCP tool_call renders the adapter title, not a bare Run", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, tc(codexMcpCall("1", "canva", "search-designs", { query: "logo" })));
+    close(window);
+    expect(flatLabel(doc)).toBe("mcp.canva.search-designs");
+    expect(flatLabel(doc)).not.toBe("Run");
+  });
+
+  it("two Codex MCP calls keep their names under the group, not Run / Run", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, tc(codexMcpCall("1", "canva", "search-designs")));
+    dispatch(window, tc(codexMcpCall("2", "canva", "list-folder-items")));
+    close(window);
+    expect(groupLabel(doc)).toBe("Ran 2 commands");
+    expect(itemLabels(doc)).toEqual([
+      "mcp.canva.search-designs",
+      "mcp.canva.list-folder-items",
+    ]);
+  });
+
+  it("middle-elides a long MCP title and puts the full string on the label title", () => {
+    const title = "mcp.codex_apps.codex_document_control.list_documents";
+    const { window, doc } = bootWebview();
+    dispatch(window, tc({ toolCallId: "1", kind: "other", title }));
+    close(window);
+    const lbl = doc.querySelector(".tool-flat .tool-label") as HTMLElement | null;
+    expect(lbl).not.toBeNull();
+    const shown = middleElide(title, TOOL_LABEL_MAX);
+    expect(lbl!.textContent).toBe(shown);
+    expect(lbl!.textContent).toContain("…");
+    expect(lbl!.textContent!.startsWith("mcp.")).toBe(true);
+    expect(lbl!.textContent!.endsWith("list_documents")).toBe(true);
+    expect(lbl!.title).toBe(title);
+  });
+
+  it("keeps the full title on grouped rows after flatten does not apply", () => {
+    const a = "mcp.codex_apps.codex_document_control.list_documents";
+    const b = "mcp.codex_apps.codex_document_control.create_document";
+    const { window, doc } = bootWebview();
+    dispatch(window, tc({ toolCallId: "1", kind: "other", title: a }));
+    dispatch(window, tc({ toolCallId: "2", kind: "other", title: b }));
+    close(window);
+    const labels = [...doc.querySelectorAll(".tool-item-label")] as HTMLElement[];
+    expect(labels).toHaveLength(2);
+    expect(labels[0].textContent).toBe(middleElide(a, TOOL_LABEL_MAX));
+    expect(labels[0].title).toBe(a);
+    expect(labels[1].textContent).toBe(middleElide(b, TOOL_LABEL_MAX));
+    expect(labels[1].title).toBe(b);
+    expect(labels[0].textContent).not.toEqual(labels[1].textContent);
+  });
+
+  it("Grok's server__tool title still renders as the row", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, tc({ toolCallId: "1", title: "canva__search-designs" }));
+    close(window);
+    expect(flatLabel(doc)).toBe("canva__search-designs");
+  });
+
+  it("Claude's mcp__server__tool title still renders as the row", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, tc({
+      toolCallId: "1",
+      kind: "other",
+      title: "mcp__claude_ai_Gmail__list_labels",
+    }));
+    close(window);
+    expect(flatLabel(doc)).toBe("mcp__claude_ai_Gmail__list_labels");
+  });
+
+  it("a later Codex MCP update does not blank the first-call title", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, tc(codexMcpCall("1", "canva", "list-brand-kits")));
+    const { update } = normalizeCodexUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "1",
+      status: "completed",
+      rawInput: { server: "canva", tool: "list-brand-kits", arguments: {} },
+      rawOutput: { result: { ok: true }, error: null },
+    });
+    dispatch(window, { type: "toolCallUpdate", call: update } as any);
+    close(window);
+    expect(flatLabel(doc)).toBe("mcp.canva.list-brand-kits");
+  });
+});
+
+describe("folded MCP machinery stays in the transcript", () => {
+  it("a grok search_tool run is still present in the explore group", () => {
+    const { window, doc } = bootWebview();
+    const state = createMcpPrepareState();
+    const searchA = prepareMcpToolCall({
+      toolCallId: "call-search-0",
+      title: "search_tool",
+      rawInput: { query: "canva design titles", limit: 5 },
+      _meta: { "x.ai/tool": { name: "search_tool", kind: "search_tool" } },
+    }, state);
+    const searchB = prepareMcpToolCall({
+      toolCallId: "call-search-1",
+      title: "search_tool",
+      rawInput: { query: "untitled design", limit: 5 },
+      _meta: { "x.ai/tool": { name: "search_tool", kind: "search_tool" } },
+    }, state);
+    const use = prepareMcpToolCall({
+      toolCallId: "call-use-1",
+      title: "use_tool",
+      rawInput: { tool_name: "canva__search-designs", tool_input: { query: "logo" } },
+      _meta: { "x.ai/tool": { name: "use_tool", kind: "use_tool" } },
+    }, state);
+    dispatch(window, tc(searchA.call));
+    dispatch(window, tc(searchB.call));
+    dispatch(window, tc(use.call));
+    close(window);
+    expect(groupLabel(doc)).toBe("Explored 2 items, ran 1 command");
+    expect(itemLabels(doc)).toEqual([
+      "Search canva design titles",
+      "Search untitled design",
+      "use_tool",
+    ]);
+  });
+
+  it("a genuine Codex MCP startup failure stays reachable", () => {
+    const { window, doc } = bootWebview();
+    const prepared = prepareMcpToolCall({
+      toolCallId: "mcp_startup.canva",
+      kind: "other",
+      title: "mcp__canva__startup",
+      status: "failed",
+      content: [{
+        type: "content",
+        content: {
+          type: "text",
+          text: "MCP server `canva` failed to start: connect ECONNREFUSED 127.0.0.1:3001",
+        },
+      }],
+    }, createMcpPrepareState());
+    dispatch(window, tc(prepared.call));
+    close(window);
+    const err = doc.querySelector(".tool-error");
+    expect(err).not.toBeNull();
+    expect(err!.textContent).toContain("ECONNREFUSED");
+    expect(doc.querySelector(".tool-failed, .has-error")).not.toBeNull();
+    expect(doc.body.textContent).toContain("mcp__canva__startup");
   });
 });
 

@@ -97,6 +97,21 @@ describe("Enter while busy queues instead of cancelling (#37)", () => {
     expect(types(posted)).toContain("cancel");
   });
 
+  it("the ambient editor chip is not send-intent — a busy composer stays Stop", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "setBusy", value: true });
+    dispatch(window, {
+      type: "chips",
+      chips: [{
+        id: "implicit:/repo/a.ts",
+        path: "/repo/a.ts",
+        relPath: "a.ts",
+        hidden: false,
+      }],
+    });
+    expect($(doc, "send-btn").classList.contains("stop")).toBe(true);
+  });
+
   it("clicking the button while busy WITH typed text queues — text present never cancels (Claude model)", () => {
     const { window, posted, doc } = bootWebview();
     const input = $(doc, "input") as HTMLTextAreaElement;
@@ -150,6 +165,88 @@ describe("Enter while busy queues instead of cancelling (#37)", () => {
     expect(types(posted)).not.toContain("queueSend");
   });
 
+  it("an image-only composer while busy is Queue, never Stop — click does not cancel", () => {
+    const { window, posted, doc } = bootWebview();
+    dispatch(window, {
+      type: "initialState",
+      effort: "", cwd: "/w", useCtrlEnter: false, extVersion: "9.9.9",
+      showThinking: false, expandCommandOutputs: false, steerByDefault: false,
+      capabilities: { uploadFile: true, remoteVoice: true, queueSendChips: true },
+    });
+    dispatch(window, { type: "setBusy", value: true });
+    dispatch(window, {
+      type: "chips",
+      chips: [{
+        id: "image:/s/a.png:1:1",
+        path: "/s/a.png",
+        relPath: "Image #1",
+        hidden: false,
+        imageIndex: 1,
+        mimeType: "image/png",
+      }],
+    });
+
+    const sendBtn = $(doc, "send-btn");
+    expect(sendBtn.classList.contains("stop")).toBe(false);
+    expect(sendBtn.title).toMatch(/Queue/);
+
+    click(window, sendBtn);
+    expect(types(posted)).not.toContain("cancel");
+    expect(types(posted)).not.toContain("send");
+    expect(posted.find((p) => p.type === "queueSend")).toMatchObject({
+      type: "queueSend",
+      text: "",
+      chips: [expect.objectContaining({ id: "image:/s/a.png:1:1" })],
+    });
+  });
+
+  it("image-only + Enter queues instead of no-op, and never cancels", () => {
+    const { window, posted, doc } = bootWebview();
+    dispatch(window, {
+      type: "initialState",
+      effort: "", cwd: "/w", useCtrlEnter: false, extVersion: "9.9.9",
+      showThinking: false, expandCommandOutputs: false, steerByDefault: false,
+      capabilities: { uploadFile: true, remoteVoice: true, queueSendChips: true },
+    });
+    dispatch(window, { type: "setBusy", value: true });
+    dispatch(window, {
+      type: "chips",
+      chips: [{
+        id: "image:/s/a.png:1:1",
+        path: "/s/a.png",
+        relPath: "Image #1",
+        hidden: false,
+        imageIndex: 1,
+        mimeType: "image/png",
+      }],
+    });
+
+    pressEnter(window, $(doc, "input"));
+    expect(types(posted)).not.toContain("cancel");
+    expect(posted.find((p) => p.type === "queueSend")).toMatchObject({ text: "", chips: expect.any(Array) });
+  });
+
+  it("without queueSendChips, attachments refuse to queue rather than drop, and still do not cancel", () => {
+    const { window, posted, doc } = bootWebview();
+    dispatch(window, { type: "setBusy", value: true });
+    dispatch(window, {
+      type: "chips",
+      chips: [{
+        id: "image:/s/a.png:1:1",
+        path: "/s/a.png",
+        relPath: "Image #1",
+        hidden: false,
+        imageIndex: 1,
+        mimeType: "image/png",
+      }],
+    });
+
+    click(window, $(doc, "send-btn"));
+    expect(types(posted)).not.toContain("cancel");
+    expect(types(posted)).not.toContain("queueSend");
+    expect(doc.querySelector(".msg.error")?.textContent).toMatch(/cannot queue attachments/);
+  });
+
   it("after the turn ends the button returns to a plain Send", () => {
     const { window, doc } = bootWebview();
     const sendBtn = $(doc, "send-btn") as HTMLButtonElement;
@@ -181,6 +278,46 @@ describe("queued blocks — host-owned per session (#37)", () => {
     expect(queuedBlocks(doc)).toEqual([]);
   });
 
+  it("renders chips from additive queued entries so two contributions keep their own attachments", () => {
+    const { window, doc } = bootWebview();
+    const chipA = {
+      id: "image:/s/a.png:1:1", path: "/s/a.png", relPath: "Image #1",
+      hidden: false, imageIndex: 1, mimeType: "image/png",
+    };
+    const chipB = {
+      id: "image:/s/b.png:1:2", path: "/s/b.png", relPath: "Image #2",
+      hidden: false, imageIndex: 2, mimeType: "image/png",
+    };
+    dispatch(window, {
+      type: "queuedSends",
+      items: ["look at A", "and B"],
+      queued: [
+        { text: "look at A", chips: [chipA] },
+        { text: "and B", chips: [chipB] },
+      ],
+    });
+    expect(queuedBlocks(doc)).toEqual(["look at A\n\nand B"]);
+    const chipLabels = [...doc.querySelectorAll(".msg.queued .msg-chip")].map((el) => el.textContent);
+    expect(chipLabels).toEqual(["Image #1", "Image #2"]);
+  });
+
+  it("a surviving queued chip keeps #2 after the earlier contribution is gone", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "queuedSends",
+      items: ["edit [Image #2]"],
+      queued: [{
+        text: "edit [Image #2]",
+        chips: [{
+          id: "image:/s/b.png:2:2", path: "/s/b.png", relPath: "Image #2",
+          hidden: false, imageIndex: 2, mimeType: "image/png",
+        }],
+      }],
+    });
+    expect(queuedBlocks(doc)).toEqual(["edit [Image #2]"]);
+    expect(doc.querySelector(".msg.queued .msg-chip")?.textContent).toBe("Image #2");
+  });
+
   it("Edit hands the WHOLE pending message back to the composer (before any draft) and dequeues it", () => {
     const { window, posted, doc } = bootWebview();
     const input = $(doc, "input") as HTMLTextAreaElement;
@@ -191,7 +328,10 @@ describe("queued blocks — host-owned per session (#37)", () => {
     const editBtn = doc.querySelector('.queued-action[title^="Edit"]') as HTMLElement;
     press(window, editBtn);
 
-    expect((posted.find((p) => p.type === "dequeueSend"))?.index).toBe(0);
+    expect(posted.find((p) => p.type === "clearQueuedSends")).toEqual({
+      type: "clearQueuedSends",
+      restore: true,
+    });
     // Queued text is older than the current draft → it goes first.
     expect(input.value).toBe("fix the test\n\nand rerun\n\nhalf-typed draft");
 
@@ -208,7 +348,7 @@ describe("queued blocks — host-owned per session (#37)", () => {
     const removeBtn = doc.querySelector('.queued-action[title="Remove from queue"]') as HTMLElement;
     press(window, removeBtn);
 
-    expect((posted.find((p) => p.type === "dequeueSend"))?.index).toBe(0);
+    expect(posted.find((p) => p.type === "clearQueuedSends")).toEqual({ type: "clearQueuedSends" });
   });
 
   it("clicking Stop with messages queued hands them back to the composer and clears the host queue BEFORE cancelling", () => {
@@ -411,11 +551,57 @@ describe("Steer — submit into the running turn (#52)", () => {
     press(window, steerBtn(doc)!);
 
     expect(types(posted)).toContain("steerSend");
-    expect(posted.find((p) => p.type === "steerSend")).toMatchObject({ text: "actually, use async" });
+    expect(posted.find((p) => p.type === "steerSend")).toMatchObject({
+      text: "actually, use async",
+      fromQueue: true,
+    });
     // The whole point of #52: steering is not a disguised Stop.
     expect(types(posted)).not.toContain("cancel");
     // It leaves the queue, or the host would ALSO flush it at turn end (double send).
-    expect(types(posted)).toContain("dequeueSend");
+    expect(types(posted)).toContain("clearQueuedSends");
+    expect(types(posted).indexOf("steerSend")).toBeLessThan(types(posted).indexOf("clearQueuedSends"));
+  });
+
+  it("offers Steer when the queued item has an attachment and carries those chips", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "agentStart" });
+    const chip = {
+      id: "image:/s/a.png:1:1", path: "/s/a.png", relPath: "Image #1",
+      hidden: false, imageIndex: 1, mimeType: "image/png",
+    };
+    dispatch(window, {
+      type: "queuedSends",
+      items: ["look at this"],
+      queued: [{ text: "look at this", chips: [chip] }],
+    });
+
+    expect(steerBtn(doc)).not.toBeNull();
+    press(window, steerBtn(doc)!);
+    expect(posted.find((p) => p.type === "steerSend")).toMatchObject({
+      type: "steerSend",
+      text: "look at this",
+      fromQueue: true,
+      chips: [expect.objectContaining({ id: chip.id })],
+    });
+    expect(types(posted)).not.toContain("cancel");
+  });
+
+  it("renders queued chips below queued text, matching a sent user bubble", () => {
+    const { window, doc } = bootWebview();
+    const chip = {
+      id: "image:/s/a.png:1:1", path: "/s/a.png", relPath: "Image #1",
+      hidden: false, imageIndex: 1, mimeType: "image/png",
+    };
+    dispatch(window, {
+      type: "queuedSends",
+      items: ["look at this"],
+      queued: [{ text: "look at this", chips: [chip] }],
+    });
+    const bubble = doc.querySelector(".msg.queued .msg-bubble") as HTMLElement;
+    const classes = [...bubble.children].map((el) => el.className);
+    expect(classes).toEqual(["queued-hdr", "queued-text", "msg-chips"]);
+    expect(bubble.querySelector(".msg-chip")?.textContent).toBe("Image #1");
+    expect(bubble.querySelector(".queued-text")?.textContent).toBe("look at this");
   });
 
   it("is hidden when no turn is running — there is nothing to steer", () => {
@@ -493,6 +679,35 @@ describe("Steer by default — skip the queue (#52)", () => {
     expect(types(posted)).not.toContain("queueSend");
     // Still never a cancel — steering is not a disguised Stop.
     expect(types(posted)).not.toContain("cancel");
+  });
+
+  it("steers an attachment instead of hiding Steer or dropping the file", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, {
+      type: "initialState",
+      effort: "", cwd: "/w", useCtrlEnter: false, extVersion: "9.9.9",
+      showThinking: false, expandCommandOutputs: false, steerByDefault: true,
+      capabilities: { uploadFile: true, remoteVoice: true, queueSendChips: true },
+    });
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, {
+      type: "chips",
+      chips: [{
+        id: "image:/s/a.png:1:1",
+        path: "/s/a.png",
+        relPath: "Image #1",
+        hidden: false,
+        imageIndex: 1,
+        mimeType: "image/png",
+      }],
+    });
+    typeAndEnter(window, doc, "what is this");
+    expect(posted.find((p) => p.type === "steerSend")).toMatchObject({
+      type: "steerSend",
+      text: "what is this",
+      chips: [expect.objectContaining({ id: "image:/s/a.png:1:1" })],
+    });
+    expect(types(posted)).not.toContain("queueSend");
   });
 
   it("falls back to the queue during the locked startup window", () => {

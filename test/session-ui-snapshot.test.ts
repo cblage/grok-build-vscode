@@ -10,13 +10,14 @@ describe("sessionUiSnapshot", () => {
       relPath: "file.ts",
       hidden: false,
     }];
-    session.queuedSends = ["queued for B"];
+    session.queuedSends = [{ text: "queued for B", chips: [] }];
 
     expect(sessionUiSnapshot(session, "plan")).toEqual([
       { type: "modeChanged", modeId: "plan" },
       { type: "planModeAvailability", available: true, reason: undefined, recheckable: false },
+      { type: "feedbackAvailability", available: false },
       { type: "chips", chips: session.chips },
-      { type: "queuedSends", items: ["queued for B"] },
+      { type: "queuedSends", items: ["queued for B"], queued: [{ text: "queued for B" }] },
     ]);
   });
 
@@ -59,6 +60,30 @@ describe("sessionUiSnapshot", () => {
       reason: "Could not verify the installed Grok CLI version.",
       recheckable: true,
     });
+  });
+
+  it("replays thumbs availability and the live-turn rating after a focus swap", () => {
+    const session = new Session();
+    session.feedbackAvailable = true;
+    session.liveFeedbackEligible = true;
+    session.turnRating = -1;
+    expect(sessionUiSnapshot(session, "agent")).toContainEqual({
+      type: "feedbackAvailability",
+      available: true,
+    });
+    expect(sessionUiSnapshot(session, "agent")).toContainEqual({
+      type: "turnFeedbackAck",
+      rating: -1,
+    });
+  });
+
+  it("does not restore thumbs for a session that has not completed a live turn", () => {
+    const session = new Session();
+    session.feedbackAvailable = true;
+    session.turnRating = 1;
+    expect(sessionUiSnapshot(session, "agent")).not.toContainEqual(
+      expect.objectContaining({ type: "turnFeedbackAck" }),
+    );
   });
 
   it("accepts locally staged preview URIs for a warm focus snapshot", () => {

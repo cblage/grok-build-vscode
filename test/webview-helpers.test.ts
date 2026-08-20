@@ -1,8 +1,86 @@
 import { describe, it, expect, vi } from "vitest";
 // @ts-expect-error — plain JS module, no types
-import { looksLikeFileRef, formatRelativeTime, FILE_EXTS, modelPickerLabel, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, parseAttachmentContext, parseSelectionBlocks, parseImageTags, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, createPendingOverlay } from "../media/webview-helpers.js";
+import { looksLikeFileRef, formatRelativeTime, FILE_EXTS, modelPickerLabel, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, parseAttachmentContext, parseSelectionBlocks, parseImageTags, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, TOOL_LABEL_MAX, middleElide, filterCommands, highlightQueryParts, appendHighlightedText, commandProgramLabel, commandTextPreview, MAX_COMMAND_OUTPUT_CHARS, capCommandOutput, extractToolResultOutput, commandOutputWasCancelled, commandOutputTruncationNote, computeLineDiff, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, createPendingOverlay, contextOverheadTokens, nextContextBreakdown, contextBreakdownIsCurrent } from "../media/webview-helpers.js";
+import { Window } from "happy-dom";
 import { buildPrompt, buildPromptWithImages } from "../src/prompt-builder";
 import { makeExplicitChip, makeImplicitChip, makeImageChip } from "../src/chips";
+
+describe("contextOverheadTokens", () => {
+  it("is used minus system minus messages when that remainder is positive", () => {
+    expect(contextOverheadTokens(24273, 1516, 22757)).toBeNull();
+    expect(contextOverheadTokens(25000, 2000, 20000)).toBe(3000);
+  });
+
+  it("floors a negative remainder and hides a zero row", () => {
+    expect(contextOverheadTokens(10, 8, 5)).toBeNull();
+    expect(contextOverheadTokens(10, 6, 4)).toBeNull();
+  });
+
+  it("needs used, system, and messages together", () => {
+    expect(contextOverheadTokens(100, 10, undefined)).toBeNull();
+    expect(contextOverheadTokens(100, undefined, 40)).toBeNull();
+    expect(contextOverheadTokens(undefined, 10, 40)).toBeNull();
+  });
+});
+
+describe("nextContextBreakdown", () => {
+  const snapshot = {
+    type: "contextUsage" as const,
+    used: 100,
+    window: 200000,
+    systemPromptTokens: 10,
+    messageTokens: 80,
+    freeTokens: 199890,
+  };
+
+  it("binds session/info addends to the used they arrived with", () => {
+    const next = nextContextBreakdown(null, snapshot);
+    expect(next).toMatchObject({ used: 100, window: 200000, systemPromptTokens: 10, messageTokens: 80, freeTokens: 199890 });
+    expect(contextBreakdownIsCurrent(next, 100, 200000)).toBe(true);
+    expect(contextOverheadTokens(next.used, next.systemPromptTokens, next.messageTokens)).toBe(10);
+  });
+
+  it("keeps the snapshot when a used-only frame moves occupancy", () => {
+    const prev = nextContextBreakdown(null, snapshot);
+    expect(nextContextBreakdown(prev, { type: "contextUsage", used: 130 })).toBe(prev);
+    expect(contextBreakdownIsCurrent(prev, 130, 200000)).toBe(false);
+    // Overhead stays bound to the snapshot's used, never live occupancy minus
+    // stale addends (100→130 would invent Reasoning/overhead 40).
+    expect(contextOverheadTokens(prev.used, prev.systemPromptTokens, prev.messageTokens)).toBe(10);
+    expect(contextOverheadTokens(130, prev.systemPromptTokens, prev.messageTokens)).toBe(40);
+  });
+
+  it("keeps the snapshot when a used-only frame restates the same used", () => {
+    const prev = nextContextBreakdown(null, snapshot);
+    expect(nextContextBreakdown(prev, { type: "contextUsage", used: 100 })).toBe(prev);
+    expect(contextBreakdownIsCurrent(prev, 100, 200000)).toBe(true);
+  });
+
+  it("keeps the snapshot when a window-only frame rescales the denominator", () => {
+    const prev = nextContextBreakdown(null, snapshot);
+    expect(nextContextBreakdown(prev, { type: "contextUsage", window: 1000000 })).toBe(prev);
+    expect(contextBreakdownIsCurrent(prev, 100, 1000000)).toBe(false);
+  });
+
+  it("replaces an older snapshot wholesale instead of merging fields", () => {
+    const prev = nextContextBreakdown(null, snapshot);
+    const next = nextContextBreakdown(prev, {
+      type: "contextUsage",
+      used: 110,
+      window: 200000,
+      systemPromptTokens: 10,
+      messageTokens: 100,
+      freeTokens: 199890,
+    });
+    expect(next).toMatchObject({ used: 110, messageTokens: 100, systemPromptTokens: 10 });
+    expect(next.toolDefinitionsTokens).toBeNull();
+    expect(contextBreakdownIsCurrent(next, 110, 200000)).toBe(true);
+  });
+
+  it("refuses a structured frame that cannot bind to a used value", () => {
+    expect(nextContextBreakdown(null, { type: "contextUsage", systemPromptTokens: 10, messageTokens: 80 })).toBeNull();
+  });
+});
 
 describe("createPendingOverlay", () => {
   it("paints until a frame for that key arrives, then dies", () => {
@@ -488,6 +566,15 @@ describe("parseImageTags", () => {
     expect(out.images).toEqual([
       { index: 1, path: undefined },
       { index: 3, path: "a b/c.png" },
+    ]);
+  });
+
+  it("round-trips a non-contiguous #2 / #5 set without inventing a sequence", () => {
+    const out = parseImageTags("edit both\n\n[Image #2] (two.png)\n[Image #5] (five.png)");
+    expect(out.body).toBe("edit both");
+    expect(out.images).toEqual([
+      { index: 2, path: "two.png" },
+      { index: 5, path: "five.png" },
     ]);
   });
 
@@ -1342,7 +1429,7 @@ describe("extractToolResultOutput (cursor/Composer self-executed command result)
       rawOutput: { type: "Bash", output: [1, 2, 3], exit_code: 0, truncated: false },
       content: [{ type: "content", content: { type: "text", text: "v20.19.0\n10.8.2" } }],
     });
-    expect(r).toEqual({ output: "v20.19.0\n10.8.2", exitCode: 0, truncated: false });
+    expect(r).toEqual({ output: "v20.19.0\n10.8.2", exitCode: 0, truncated: false, cancelled: false, agentSawCut: true });
   });
 
   it("decodes rawOutput.output bytes when there's no content text", () => {
@@ -1356,13 +1443,103 @@ describe("extractToolResultOutput (cursor/Composer self-executed command result)
       rawOutput: { type: "Bash", exit_code: 1, truncated: true },
       content: [{ type: "content", content: { type: "text", text: "boom" } }],
     });
-    expect(r).toEqual({ output: "boom", exitCode: 1, truncated: true });
+    expect(r).toEqual({ output: "boom", exitCode: 1, truncated: true, cancelled: false, agentSawCut: true });
   });
 
   it("returns null when there's no command result to show", () => {
     expect(extractToolResultOutput(null as unknown as object)).toBeNull();
     expect(extractToolResultOutput({})).toBeNull();
     expect(extractToolResultOutput({ rawOutput: {} })).toBeNull(); // no output, no exit code
+  });
+
+  it("prefers Claude's string rawOutput over fenced content and leaves exitCode null", () => {
+    expect(extractToolResultOutput({
+      status: "completed",
+      rawOutput: "REPLAY_MARKER_4b7c",
+      content: [{ type: "content", content: { type: "text", text: "```console\nREPLAY_MARKER_4b7c\n```" } }],
+    })).toEqual({ output: "REPLAY_MARKER_4b7c", exitCode: null, truncated: false, cancelled: false, agentSawCut: true });
+  });
+
+  it("applies the same 100K display cap as the host restore path", () => {
+    const huge = "x".repeat(MAX_COMMAND_OUTPUT_CHARS + 25);
+    const fromString = extractToolResultOutput({
+      rawOutput: huge,
+      content: [{ type: "content", content: { type: "text", text: "```console\n" + huge + "\n```" } }],
+    });
+    expect(fromString).toEqual({
+      output: "x".repeat(MAX_COMMAND_OUTPUT_CHARS),
+      exitCode: null,
+      truncated: true,
+      cancelled: false,
+      agentSawCut: true,
+    });
+    expect(fromString!.output).not.toContain("```");
+    const fromContent = extractToolResultOutput({
+      rawOutput: { type: "Bash", exit_code: 0, truncated: false },
+      content: [{ type: "content", content: { type: "text", text: huge } }],
+    });
+    expect(fromContent?.output).toHaveLength(MAX_COMMAND_OUTPUT_CHARS);
+    expect(fromContent?.truncated).toBe(true);
+    expect(capCommandOutput("short", false)).toEqual({ output: "short", truncated: false });
+    expect(capCommandOutput("already", true)).toEqual({ output: "already", truncated: true });
+  });
+
+  it("does not invent shell output for a host-normalized MCP row", () => {
+    expect(extractToolResultOutput({
+      detailInput: JSON.stringify({ message: "x" }, null, 2),
+      rawOutput: [{ type: "text", text: "Echo: x" }],
+      content: [{ type: "content", content: { type: "text", text: "Echo: x" } }],
+    })).toBeNull();
+    expect(extractToolResultOutput({
+      detailInput: null,
+      rawOutput: "REPLAY_MARKER_4b7c",
+    })).toBeNull();
+  });
+});
+
+describe("commandOutputWasCancelled", () => {
+  it("trusts an explicit cancelled flag from a host that states it", () => {
+    expect(commandOutputWasCancelled({ exitCode: null, cancelled: true })).toBe(true);
+    expect(commandOutputWasCancelled({ exitCode: null, cancelled: false })).toBe(false);
+    expect(commandOutputWasCancelled({ exitCode: 0, cancelled: false })).toBe(false);
+    expect(commandOutputWasCancelled({ exitCode: 1, cancelled: true })).toBe(true);
+  });
+
+  it("falls back to null exit when an older host omitted the field", () => {
+    expect(commandOutputWasCancelled({ exitCode: null })).toBe(true);
+    expect(commandOutputWasCancelled({ command: "sleep 999", output: "partial", exitCode: null, truncated: true })).toBe(true);
+    expect(commandOutputWasCancelled({ exitCode: 0 })).toBe(false);
+    expect(commandOutputWasCancelled({ exitCode: 1 })).toBe(false);
+  });
+
+  it("does not treat a missing payload as cancelled", () => {
+    expect(commandOutputWasCancelled(null)).toBe(false);
+    expect(commandOutputWasCancelled(undefined)).toBe(false);
+    expect(commandOutputWasCancelled({})).toBe(false);
+  });
+});
+
+describe("commandOutputTruncationNote", () => {
+  it("states the agent saw a shell cut when this host says so", () => {
+    expect(commandOutputTruncationNote({ truncated: true, agentSawCut: true }))
+      .toBe("output truncated — grok saw the same cut");
+  });
+
+  it("does not claim the agent saw an MCP display cut", () => {
+    expect(commandOutputTruncationNote({ truncated: true, agentSawCut: false }))
+      .toBe("output truncated — display only; the agent saw the full result");
+  });
+
+  it("does not attribute a cut when an older host omitted agentSawCut", () => {
+    expect(commandOutputTruncationNote({ truncated: true })).toBe("output truncated");
+    expect(commandOutputTruncationNote({ truncated: true, command: "x", output: "y" }))
+      .toBe("output truncated");
+  });
+
+  it("is empty when nothing was truncated", () => {
+    expect(commandOutputTruncationNote({ truncated: false, agentSawCut: true })).toBe("");
+    expect(commandOutputTruncationNote(null)).toBe("");
+    expect(commandOutputTruncationNote({})).toBe("");
   });
 });
 
@@ -1435,5 +1612,80 @@ describe("computeLineDiff", () => {
     expect(r.truncated).toBe(true);
     expect(r.removed).toBe(40);
     expect(r.added).toBe(40);
+  });
+});
+
+describe("middleElide", () => {
+  const title = "mcp.codex_apps.codex_document_control.list_documents";
+
+  it("keeps a short string untouched", () => {
+    expect(middleElide("mcp.canva.search-designs", TOOL_LABEL_MAX)).toBe("mcp.canva.search-designs");
+  });
+
+  it("keeps both ends of a long MCP title", () => {
+    const shown = middleElide(title, TOOL_LABEL_MAX);
+    expect(shown.length).toBe(TOOL_LABEL_MAX);
+    expect(shown).toContain("…");
+    expect(shown.startsWith("mcp.codex")).toBe(true);
+    expect(shown.endsWith("list_documents")).toBe(true);
+    expect(shown).not.toBe(title);
+    // Tail-only cut was "mcp.codex_apps.codex_document_control.list_docu…"
+    expect(shown.endsWith("…")).toBe(false);
+  });
+
+  it("gives an odd leftover character to the tail", () => {
+    expect(middleElide("abcdefghijklmnopqrstuvwxyz", 9)).toBe("abcd…wxyz");
+  });
+});
+
+describe("filterCommands (webview copy)", () => {
+  it("includes description-only matches after name matches", () => {
+    const skills = [
+      { name: "web-design", description: "UI components" },
+      { name: "ui-kit", description: "buttons" },
+      { name: "notes", description: "quick ui tips" },
+    ];
+    expect(filterCommands(skills, "ui").map((c: { name: string }) => c.name)).toEqual([
+      "ui-kit",
+      "web-design",
+      "notes",
+    ]);
+  });
+});
+
+describe("highlightQueryParts", () => {
+  it("splits on the first case-insensitive run", () => {
+    expect(highlightQueryParts("Compress conversation", "con")).toEqual([
+      { text: "Compress ", hit: false },
+      { text: "con", hit: true },
+      { text: "versation", hit: false },
+    ]);
+    expect(highlightQueryParts("/ui-kit", "UI")).toEqual([
+      { text: "/", hit: false },
+      { text: "ui", hit: true },
+      { text: "-kit", hit: false },
+    ]);
+  });
+
+  it("leaves angle brackets as text parts, not markup", () => {
+    expect(highlightQueryParts("<img src=x onerror=alert(1)> design", "design")).toEqual([
+      { text: "<img src=x onerror=alert(1)> ", hit: false },
+      { text: "design", hit: true },
+    ]);
+  });
+});
+
+describe("appendHighlightedText", () => {
+  it("paints a match with text nodes so markup in the source stays inert", () => {
+    const win = new Window();
+    const el = win.document.createElement("div");
+    appendHighlightedText(el, "<img src=x onerror=alert(1)> design", "design");
+    expect(el.querySelector("img")).toBeNull();
+    expect(el.textContent).toBe("<img src=x onerror=alert(1)> design");
+    const hit = el.querySelector(".slash-hl");
+    expect(hit).not.toBeNull();
+    expect(hit!.textContent).toBe("design");
+    expect(el.childNodes.length).toBe(2);
+    expect(el.childNodes[0].nodeType).toBe(win.document.TEXT_NODE);
   });
 });

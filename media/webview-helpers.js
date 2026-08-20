@@ -24,32 +24,32 @@
   // copy and test/protocol.test.ts asserts the two are set-equal in both
   // directions (and that chat.js actually handles every host type).
   const HOST_MESSAGE_TYPES = [
-    "initialState", "moveViewHint", "providerState", "codexInstallProgress", "planModeAvailability", "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "updateAvailable", "updateReady", "telemetryEnabled", "initialized",
+    "initialState", "moveViewHint", "providerState", "mcpServers", "mcpConnectors", "codexInstallProgress", "planModeAvailability", "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "updateAvailable", "updateReady", "telemetryEnabled", "thumbsFeedback", "initialized",
     "cliUpdating", "session", "sessionName", "modelChanged", "modeChanged", "modePolicy", "sandboxState", "openModePopover",
     "voiceState", "voiceConfigured", "voicePartial", "voiceSubmit", "voiceTranscript",
     "voiceError", "chips", "commandsUpdate", "mentionResults", "projectDirListing", "projectFileContent", "projectFileWriteResult", "userMessage", "agentStart", "thoughtChunk",
     "messageChunk", "media", "userMessageChunk", "historyReplay", "historyBatch", "permissionHistoryQueue",
     "planHistoryQueue", "toolCall", "toolCallUpdate", "permissionRequest", "permissionOptions",
     "permissionResolved", "exitPlanRequest", "planResolved", "questionRequest", "planNotice", "autoCompactNotice", "planBlocked",
-    "promptComplete", "contextUsage", "commandOutput", "expandCommandOutputs", "setAllToolDetails", "focusInput", "restoreComposer", "truncateMessages", "uiConfirmRequest", "agentReset", "agentError", "agentEnd", "exit", "setBusy", "summarizing",
+    "promptComplete", "contextUsage", "commandOutput", "expandCommandOutputs", "setAllToolDetails", "focusInput", "findInSession", "restoreComposer", "truncateMessages", "uiConfirmRequest", "agentReset", "agentError", "agentEnd", "exit", "setBusy", "summarizing",
     "sessionContext", "clearMessages", "onboarding", "error", "hostNotice", "xaiNotification", "subagentUpdate", "childStream", "runProgress", "sessions", "repoSessions", "pinnedSessions", "repos",
-    "sessionDot", "queuedSends", "submitQueuedSend", "steerUnavailable", "usage", "steerByDefault", "soundNotifications", "processingSound", "readRepliesAloud", "summarizeRepliesAloud", "speechSummary", "imageFull", "moveComposerCaret",
+    "sessionDot", "queuedSends", "submitQueuedSend", "steerUnavailable", "feedbackAvailability", "turnFeedbackAck", "usage", "steerByDefault", "soundNotifications", "processingSound", "readRepliesAloud", "summarizeRepliesAloud", "speechSummary", "imageFull", "moveComposerCaret",
     "remoteStatus",
   ];
   const WEBVIEW_MESSAGE_TYPES = [
     "ready", "remotePreferences", "send", "newSession", "cancel", "pickModel", "setMode", "setSandbox", "removeChip",
     "toggleChip", "openFile", "showInFolder", "openUrl", "openText", "openDiff", "exportExpr", "setEffort",
     "addProjectFolder", "removeProjectFolder",
-    "openGlobalConfig", "openProjectConfig", "runMcpList", "showLogs", "toggleDevTools", "openSettings", "openSettingsSurface", "closeSettingsSurface", "moveView",
+    "openGlobalConfig", "openProjectConfig", "listMcpServers", "connectMcpConnector", "disconnectMcpConnector", "showLogs", "toggleDevTools", "openSettings", "openSettingsSurface", "closeSettingsSurface", "moveView",
     "setShowThinking", "setAppPurpose", "setExpandCommandOutputs",
     "dropFile", "permissionAnswer", "exitPlanAnswer", "questionAnswer", "questionCancel",
     "setModel", "installCodex", "cancelCodexInstall", "runInstallCmd", "runGrokLogin", "logout", "checkGrokUpdate", "updateGrok",
     "recheckConnection", "refreshProviders", "retryProviderSession", "listSessions", "listRepoSessions", "selectRepo", "toggleRepoPin", "setRepoArchived", "setRepoColor", "toggleSessionPin", "resumeSession", "renameSession", "deleteSession",
       "clearAllSessions", "pickFile", "mentionQuery", "addMentionFile", "listProjectDir", "readProjectFile", "writeProjectFile", "pasteImage", "uploadFile", "voiceStart", "voiceStop",
       "remoteVoiceStart", "remoteVoiceChunk", "remoteVoiceStop",
-    "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "forkSession", "setSteerByDefault",
-    "setSoundNotifications", "setProcessingSound", "setReadRepliesAloud", "setSummarizeRepliesAloud", "setVoiceSendPhrase", "setVoiceKeyterms", "setTelemetryEnabled", "summarizeSpeech", "requestImageFull", "composerFocus",
-    "newWorktreeSession", "applyWorktree", "removeWorktree", "rewindSession", "editLastMessage", "uiConfirmAnswer", "workflowControl",
+    "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "turnFeedback", "forkSession", "setSteerByDefault",
+    "setSoundNotifications", "setProcessingSound", "setReadRepliesAloud", "setSummarizeRepliesAloud", "setVoiceSendPhrase", "setVoiceKeyterms", "setTelemetryEnabled", "setThumbsFeedback", "summarizeSpeech", "requestImageFull", "composerFocus",
+    "newWorktreeSession", "applyWorktree", "removeWorktree", "rewindSession", "editLastMessage", "uiConfirmAnswer", "workflowControl", "refreshContextDetails",
     "remoteSignIn", "remoteSignOut", "unlinkRemoteDevice", "openRemotePortal",
     "openUpdateRelease", "restartToUpdate",
   ];
@@ -59,6 +59,127 @@
    *  drift the sync test is designed to prevent, warned at runtime as a backstop. */
   function isKnownHostMessage(type) {
     return HOST_MESSAGE_TYPE_SET.has(type);
+  }
+
+  function isImplicitChipId(id) {
+    return String(id || "").startsWith("implicit:");
+  }
+
+  /** Explicit (user-staged) visible chips — images, files, @-mentions. */
+  function explicitVisibleChips(chips) {
+    return (chips || []).filter((chip) => chip && !chip.hidden && !isImplicitChipId(chip.id));
+  }
+
+  /** Typed text or a staged attachment — the implicit editor chip is not send-intent. */
+  function composerHasSendIntent(text, chips) {
+    if (String(text || "").trim()) return true;
+    return explicitVisibleChips(chips).length > 0;
+  }
+
+  /**
+   * Prefer additive `queued` entries (text + chips). Fall back to `items: string[]`
+   * so an older host still renders the text-only block.
+   */
+  function normalizeQueuedSends(msg) {
+    if (msg && Array.isArray(msg.queued)) {
+      return msg.queued.map((entry) => ({
+        text: typeof entry?.text === "string" ? entry.text : String(entry || ""),
+        chips: Array.isArray(entry?.chips) ? entry.chips : [],
+      }));
+    }
+    const items = msg && Array.isArray(msg.items) ? msg.items : [];
+    return items.map((text) => ({ text: String(text || ""), chips: [] }));
+  }
+
+  function queuedSendsText(entries) {
+    return (entries || []).map((entry) => entry.text || "").join("\n\n");
+  }
+
+  function queuedSendsChips(entries) {
+    const chips = [];
+    for (const entry of entries || []) {
+      if (Array.isArray(entry.chips)) chips.push(...entry.chips);
+    }
+    return chips;
+  }
+
+  /**
+   * CLI legend-row remainder: `used - (system + messages)`, floored at 0.
+   * Null when either input is missing or the remainder is 0 — tool
+   * definitions and usage categories are already inside those addends.
+   * Callers must pass addends from the same snapshot as `used`.
+   */
+  function contextOverheadTokens(used, system, messages) {
+    if (typeof used !== "number" || !Number.isFinite(used) || used < 0) return null;
+    if (typeof system !== "number" || !Number.isFinite(system) || system < 0) return null;
+    if (typeof messages !== "number" || !Number.isFinite(messages) || messages < 0) return null;
+    const overhead = used - (system + messages);
+    return overhead > 0 ? overhead : null;
+  }
+
+  function finiteNonNeg(value) {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+  }
+
+  /** True when a contextUsage frame carries session/info addends, not just occupancy. */
+  function contextUsageHasBreakdown(msg) {
+    if (!msg || typeof msg !== "object") return false;
+    return msg.systemPromptTokens != null
+      || msg.toolDefinitionsTokens != null
+      || msg.toolDefinitionsCount != null
+      || msg.messageTokens != null
+      || msg.freeTokens != null
+      || msg.autoCompactThresholdPercent != null
+      || (Array.isArray(msg.categories) && msg.categories.length > 0);
+  }
+
+  /**
+   * Bind structured session/info rows to the `used` they were measured with.
+   * Occupancy-only frames keep the previous snapshot (overhead is computed
+   * from that snapshot's used, never live occupancy minus stale addends).
+   * Currency is `contextBreakdownIsCurrent`; an open popover re-fetches
+   * rather than dropping the group. A live envelope that restates the same
+   * used/window keeps the snapshot.
+   */
+  function nextContextBreakdown(prev, msg) {
+    if (!msg || typeof msg !== "object") return prev || null;
+    if (contextUsageHasBreakdown(msg)) {
+      const used = finiteNonNeg(msg.used);
+      if (used == null) return null;
+      const win = typeof msg.window === "number" && Number.isFinite(msg.window) && msg.window > 0
+        ? msg.window
+        : null;
+      return {
+        used,
+        window: win,
+        systemPromptTokens: finiteNonNeg(msg.systemPromptTokens),
+        toolDefinitionsTokens: finiteNonNeg(msg.toolDefinitionsTokens),
+        toolDefinitionsCount: finiteNonNeg(msg.toolDefinitionsCount),
+        messageTokens: finiteNonNeg(msg.messageTokens),
+        freeTokens: finiteNonNeg(msg.freeTokens),
+        autoCompactPct: typeof msg.autoCompactThresholdPercent === "number"
+          && Number.isFinite(msg.autoCompactThresholdPercent)
+          && msg.autoCompactThresholdPercent > 0
+          ? msg.autoCompactThresholdPercent
+          : null,
+        categories: Array.isArray(msg.categories) && msg.categories.length ? msg.categories : null,
+      };
+    }
+    if (!prev) return null;
+    return prev;
+  }
+
+  /**
+   * True while live occupancy still matches the used (and window, when both
+   * known) the snapshot was measured with. promptComplete and modelChanged
+   * can move occupancy without a contextUsage frame; an open popover then
+   * re-fetches session/info instead of hiding the group.
+   */
+  function contextBreakdownIsCurrent(snapshot, used, window) {
+    if (!snapshot || typeof snapshot.used !== "number") return false;
+    if (snapshot.used !== used) return false;
+    if (snapshot.window != null && typeof window === "number" && snapshot.window !== window) return false;
+    return true;
   }
 
   /**
@@ -565,6 +686,121 @@
     return "Grok CLI /settings → Privacy → Coding data, retention, and training → Opt in.";
   }
 
+  // Unpredicted tool titles (MCP dotted names especially) share a long prefix,
+  // so tail-truncating them leaves a column of indistinguishable rows. Budget
+  // includes the ellipsis; an odd remainder goes to the tail (the distinguisher).
+  const TOOL_LABEL_MAX = 50;
+  function middleElide(text, max) {
+    const s = text == null ? "" : String(text);
+    const limit = Number(max);
+    if (!Number.isFinite(limit) || limit <= 0) return s;
+    if (s.length <= limit) return s;
+    if (limit === 1) return "…";
+    const keep = limit - 1;
+    const head = Math.floor(keep / 2);
+    const tail = keep - head;
+    return s.slice(0, head) + "…" + s.slice(s.length - tail);
+  }
+
+  // KEEP IN STEP with src/slash-filter.ts isAdvertisedSkill: grok advertises
+  // skills with `_meta.scope` + `_meta.path`; builtins omit those keys.
+  function isAdvertisedSkill(cmd) {
+    if (!cmd || typeof cmd !== "object") return false;
+    const meta = cmd._meta || cmd.meta;
+    if (!meta || typeof meta !== "object") return false;
+    const path = meta.path;
+    const scope = meta.scope;
+    return typeof path === "string" && path.length > 0 && typeof scope === "string" && scope.length > 0;
+  }
+
+  function isSlashBoundary(ch) {
+    return ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f" || ch === "\v";
+  }
+
+  // KEEP IN STEP with src/slash-filter.ts getSlashQuery. Skills load anywhere
+  // (`atStart: false` after whitespace); commands dispatch only at position 0.
+  function getSlashQuery(text, caret) {
+    const src = text == null ? "" : String(text);
+    const pos = Math.max(0, Math.min(Number(caret) || 0, src.length));
+    const before = src.slice(0, pos);
+    const m = before.match(/\/(\S*)$/);
+    if (!m) return null;
+    const slashIndex = before.length - m[0].length;
+    if (slashIndex > 0 && !isSlashBoundary(before.charAt(slashIndex - 1))) return null;
+    return { query: m[1], atStart: slashIndex === 0 };
+  }
+
+  // KEEP IN STEP with src/slash-filter.ts applySlashPick.
+  function applySlashPick(text, caret, name) {
+    const src = text == null ? "" : String(text);
+    const pos = Math.max(0, Math.min(Number(caret) || 0, src.length));
+    const before = src.slice(0, pos);
+    const after = src.slice(pos);
+    const hit = getSlashQuery(src, pos);
+    if (!hit) return { text: src, caret: pos };
+    const m = before.match(/\/(\S*)$/);
+    if (!m) return { text: src, caret: pos };
+    const slashIndex = before.length - m[0].length;
+    const newBefore = before.slice(0, slashIndex) + "/" + name + " ";
+    return { text: newBefore + after, caret: newBefore.length };
+  }
+
+  // KEEP IN STEP with src/slash-filter.ts filterCommands: name prefix, then
+  // mid-name, then description-only; advertised order inside each tier (#110).
+  function filterCommands(commands, query) {
+    const list = Array.isArray(commands) ? commands : [];
+    const q = String(query || "").toLowerCase();
+    if (!q) return list;
+    const prefix = [];
+    const substring = [];
+    const description = [];
+    for (const c of list) {
+      if (!c || typeof c.name !== "string") continue;
+      const name = c.name.toLowerCase();
+      if (name.startsWith(q)) prefix.push(c);
+      else if (name.includes(q)) substring.push(c);
+      else if (String(c.description || "").toLowerCase().includes(q)) description.push(c);
+    }
+    return prefix.concat(substring, description);
+  }
+
+  // First case-insensitive run of `query` in `text`, as text parts. Never
+  // markup — the caller turns `hit` parts into a textContent span.
+  function highlightQueryParts(text, query) {
+    const src = text == null ? "" : String(text);
+    const q = query == null ? "" : String(query);
+    if (!src) return [];
+    if (!q) return [{ text: src, hit: false }];
+    const i = src.toLowerCase().indexOf(q.toLowerCase());
+    if (i < 0) return [{ text: src, hit: false }];
+    const parts = [];
+    if (i > 0) parts.push({ text: src.slice(0, i), hit: false });
+    parts.push({ text: src.slice(i, i + q.length), hit: true });
+    if (i + q.length < src.length) parts.push({ text: src.slice(i + q.length), hit: false });
+    return parts;
+  }
+
+  function appendHighlightedText(el, text, query) {
+    if (!el) return;
+    const doc = el.ownerDocument;
+    el.textContent = "";
+    if (!doc) {
+      el.textContent = text == null ? "" : String(text);
+      return;
+    }
+    for (const part of highlightQueryParts(text, query)) {
+      if (!part.text) continue;
+      if (part.hit) {
+        const mark = doc.createElement("span");
+        mark.className = "slash-hl";
+        mark.textContent = part.text;
+        el.appendChild(mark);
+      } else {
+        el.appendChild(doc.createTextNode(part.text));
+      }
+    }
+  }
+
   // Scannable program label for a command tool row: the executable (first token,
   // path-stripped, de-quoted) plus one following BARE word when it isn't a flag —
   // so `git status` / `npm test` stay distinguishable while a long `node -e "…"`
@@ -632,6 +868,22 @@
     return sibling.href;
   }
 
+  // Same 100K display cap the host applies in `capCommandOutput` (acp-dispatch).
+  // The webview attach path must produce the identical payload so a live Claude
+  // row and an ACP session/load restore cannot disagree, and so the first
+  // arriver is already correct.
+  const MAX_COMMAND_OUTPUT_CHARS = 100000;
+
+  function capCommandOutput(output, truncated, maxChars) {
+    const cap = typeof maxChars === "number" ? maxChars : MAX_COMMAND_OUTPUT_CHARS;
+    const text = typeof output === "string" ? output : "";
+    const over = text.length > cap;
+    return {
+      output: over ? text.slice(0, cap) : text,
+      truncated: !!(truncated || over),
+    };
+  }
+
   // Pull a self-executed shell command's result off a completed `tool_call_update`.
   // The cursor/Composer agent runs commands in its OWN CLI-side persistent shell
   // and reports the result on the completed update (keyed by `toolCallId`) instead
@@ -639,11 +891,26 @@
   // terminal `commandOutput` path, never gets output for those rows. Recover the
   // output + exit code here so the box can render it, matched reliably by
   // `toolCallId` (Composer completes commands OUT of issue order, so no order-based
-  // guess is safe). Returns `{output, exitCode, truncated}` or null when the update
-  // carries no command result. Pure.
+  // guess is safe). Returns `{output, exitCode, truncated, cancelled, agentSawCut}`
+  // or null when the update carries no command result. Pure. Claude's string
+  // rawOutput is preferred over fenced `content`; the 100K cap matches the
+  // host restore path. Always states `cancelled: false` — this path is never
+  // a live terminal kill, and omitting the field would trip the old-host
+  // fallback. Always states `agentSawCut: true` — this is a shell result.
   function extractToolResultOutput(call) {
     if (!call || typeof call !== "object") return null;
+    // Host-normalized MCP rows carry `detailInput` (string or null). Their
+    // OUT arrives as commandOutput with `agentSawCut: false`. Do not invent
+    // a shell payload here — that would claim the agent saw a display cut.
+    if (Object.prototype.hasOwnProperty.call(call, "detailInput")) return null;
     const ro = call.rawOutput;
+    // Claude session/load (and the same live shape): rawOutput is the bare
+    // stdout string; content is that stdout wrapped in a ```console fence, or
+    // the tool description on the first row. Prefer the string.
+    if (typeof ro === "string") {
+      const capped = capCommandOutput(ro, false);
+      return { output: capped.output, exitCode: null, truncated: capped.truncated, cancelled: false, agentSawCut: true };
+    }
     // Output text: the decoded `content` text is cleanest; else decode rawOutput.output
     // (a byte array on the wire), else a plain string.
     let output = "";
@@ -663,7 +930,31 @@
       : ro && typeof ro.exitCode === "number" ? ro.exitCode
       : null;
     if (!output && exitCode == null) return null; // nothing to show
-    return { output, exitCode, truncated: !!(ro && ro.truncated) };
+    const capped = capCommandOutput(output, !!(ro && ro.truncated));
+    return { output: capped.output, exitCode, truncated: capped.truncated, cancelled: false, agentSawCut: true };
+  }
+
+  // Paint [Cancelled] only for a live kill. A host that distinguishes kill from
+  // "exit not reported" always includes `cancelled` (true or false) on every
+  // commandOutput. Absence is an older host, which never hydrated replay
+  // commandOutput, so null exit was a kill.
+  function commandOutputWasCancelled(msg) {
+    if (!msg || typeof msg !== "object") return false;
+    if (Object.prototype.hasOwnProperty.call(msg, "cancelled")) return msg.cancelled === true;
+    return msg.exitCode === null;
+  }
+
+  // Wording for a truncated OUT. This host always states `agentSawCut`
+  // (true = the agent already saw this cut; false = display cap only).
+  // Absence is an older host — do not attribute the cut either way.
+  function commandOutputTruncationNote(msg) {
+    if (!msg || typeof msg !== "object" || !msg.truncated) return "";
+    if (Object.prototype.hasOwnProperty.call(msg, "agentSawCut")) {
+      return msg.agentSawCut === true
+        ? "output truncated — grok saw the same cut"
+        : "output truncated — display only; the agent saw the full result";
+    }
+    return "output truncated";
   }
 
   // Parse the <vscode-context> envelope that prompt-builder.ts wraps around the
@@ -1287,9 +1578,15 @@
     const title = (typeof call.title === "string" && call.title.trim())
       || (typeof rec.kind === "string" && rec.kind)
       || "tool";
+    const detailInput = typeof call.detailInput === "string" && call.detailInput.trim()
+      ? call.detailInput.trim()
+      : "";
+    const parts = [];
+    if (detailInput) parts.push(detailInput);
+    if (rec.output) parts.push(rec.output);
     lines.push(`- ${title}`);
-    if (rec.output) {
-      lines.push("", exportFence(exportTrimmed(rec.output)));
+    if (parts.length) {
+      lines.push("", exportFence(exportTrimmed(parts.join("\n\n"))));
     }
     return lines;
   }
@@ -1328,6 +1625,19 @@
     };
 
     const attachCommand = (msg) => {
+      const id = typeof msg.toolCallId === "string" && msg.toolCallId.trim()
+        ? msg.toolCallId.trim()
+        : "";
+      if (id) {
+        let rec = tools.get(id);
+        if (!rec) {
+          rec = newToolRec(id);
+          tools.set(id, rec);
+          toolOrder.push(id);
+        }
+        if (typeof msg.output === "string") rec.output = msg.output;
+        return;
+      }
       const command = typeof msg.command === "string" ? msg.command : "";
       for (let i = toolOrder.length - 1; i >= 0; i--) {
         const rec = tools.get(toolOrder[i]);
@@ -1336,13 +1646,13 @@
           return;
         }
       }
-      const id = `cmd-${toolOrder.length}`;
-      const rec = newToolRec(id);
+      const fallbackId = `cmd-${toolOrder.length}`;
+      const rec = newToolRec(fallbackId);
       rec.command = command;
       rec.output = typeof msg.output === "string" ? msg.output : "";
       rec.kind = "execute";
-      tools.set(id, rec);
-      toolOrder.push(id);
+      tools.set(fallbackId, rec);
+      toolOrder.push(fallbackId);
     };
 
     const flushUser = () => {
@@ -1442,7 +1752,7 @@
     return header.join("\n") + (body ? body + "\n" : "");
   }
 
-  const api = { FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, createPendingOverlay, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelPickerLabel, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents };
+  const api = { FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, composerHasSendIntent, explicitVisibleChips, normalizeQueuedSends, queuedSendsText, queuedSendsChips, contextOverheadTokens, nextContextBreakdown, contextBreakdownIsCurrent, createPendingOverlay, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelPickerLabel, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, TOOL_LABEL_MAX, middleElide, isAdvertisedSkill, getSlashQuery, applySlashPick, filterCommands, highlightQueryParts, appendHighlightedText, commandProgramLabel, commandTextPreview, MAX_COMMAND_OUTPUT_CHARS, capCommandOutput, extractToolResultOutput, commandOutputWasCancelled, commandOutputTruncationNote, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;

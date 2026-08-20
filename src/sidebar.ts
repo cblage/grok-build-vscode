@@ -13,6 +13,7 @@ import { isCanonicallyInsideRoot } from "./file-tree";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawn } from "node:child_process";
 import { AcpClient, EffortLevel, ExitPlanRequest, PermissionRequest, QuestionRequest } from "./acp";
 import type { AcpProvider, BackendSessionListEntry } from "./acp-backend";
 import { isAdapterProvider, isAcpProvider, ACP_PROVIDERS } from "./acp-backend";
@@ -56,6 +57,7 @@ import {
   decideSessionStart,
   endTurn,
   finishQueuedSendCommit,
+  runExclusiveHistoryLoad,
   pendingPermissionOptions,
   preferredPermissionAllowOption,
   rehydrateBusyChrome,
@@ -65,12 +67,13 @@ import {
   turnIsInFlight,
 } from "./session";
 import { buildReapCandidates, selectReapable, computeDot, Dot } from "./session-pool";
-import { resolveVoiceKey, extractGrokAuthKey, parseVoiceCommand, buildSttKeyterms, voiceSettingForRepo, voiceSettingWriteTarget, sanitizeVoiceSendPhrase, sanitizeVoiceKeyterms, DEFAULT_SEND_PHRASE, MAX_RECORDING_SECONDS } from "./voice";
+import { resolveVoiceKey, extractGrokAuthKey, parseVoiceCommand, buildSttKeyterms, voiceSettingForRepo, voiceSettingWriteTarget, sanitizeVoiceSendPhrase, sanitizeVoiceKeyterms, voiceConfiguredFingerprint, DEFAULT_SEND_PHRASE, MAX_RECORDING_SECONDS } from "./voice";
 import { VoiceRecorder, transcribeAudio, resolveWindowsAudioDevice } from "./voice-recorder";
 import { PcmVoiceStreamer, VoiceStreamer } from "./voice-streamer";
 import { summarizeForSpeech } from "./speech-summary";
-import type { PromptResultMeta, PromptUsage } from "./acp-dispatch";
-import { MediaRef, adapterCompactSignal, adapterContextOccupancy, agentTimestampMsFromMeta, autoCompactStartedNote, childStreamFromRoute, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isRateLimitError, isSubagentLifecycleUpdate, occupancyFromAdapterTurn, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement, type UpdateRoute } from "./acp-dispatch";
+import type { PromptResultMeta, PromptUsage, SessionInfoContext } from "./acp-dispatch";
+import { MediaRef, adapterCompactSignal, adapterContextOccupancy, agentTimestampMsFromMeta, autoCompactStartedNote, childStreamFromRoute, commandOutputForToolCall, commandOutputFromLiveTerminal, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isRateLimitError, isSubagentLifecycleUpdate, occupancyFromAdapterTurn, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sessionInfoCacheFresh, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement, type UpdateRoute } from "./acp-dispatch";
+import { createMcpPrepareState, prepareMcpToolCall } from "./mcp-tool";
 import { modeToRemember, startsInYolo } from "./mode-prefs";
 import { beginAuthRecovery, oauthShadowsXaiApiKey } from "./auth-recovery";
 import {
@@ -142,9 +145,25 @@ import {
   removeChip,
   selectionLineRange,
   toggleChip,
-  withPerMessageImageIndices,
+  allocateImageIndex,
 } from "./chips";
-import { buildPromptWithImages, type PromptImageInput } from "./prompt-builder";
+import { buildPromptWithImages, buildQueuedPromptWithImages, type PromptImageInput, type QueuedPromptContribution } from "./prompt-builder";
+import {
+  chipsForQueueSend,
+  claimQueuedSendDispatch,
+  cloneChipForQueue,
+  dequeueQueuedSends,
+  enqueueQueuedSend,
+  explicitVisibleChips,
+  queuedFlushText,
+  queuedSendsContainChipIds,
+  queuedSendsHaveContent,
+  queuedSendsMessage,
+  queuedSendsText,
+  restoreQueuedChips,
+  type QueuedSendEntry,
+} from "./queued-send";
+
 import { matchSlashCommand } from "./slash-filter";
 import {
   MENTION_INDEX_LIMIT,
@@ -311,6 +330,13 @@ import {
   userFacingRewindPoints,
 } from "./rewind";
 import {
+  commandsAdvertiseFeedback,
+  decideFeedbackAvailability,
+  feedbackClientType,
+  isThumbsRating,
+  parseFeedbackEnabledMeta,
+} from "./feedback";
+import {
   parseRunProgressUpdate,
   workflowControlCommand,
 } from "./run-progress";
@@ -320,6 +346,35 @@ import {
   parseAppPurpose,
   type AppPurpose,
 } from "./app-purpose";
+import { MCP_GLOBAL_SCOPE_WARNING, mergeMcpNotification, parseMcpListResponse, mcpSettingsServersForCwd, type McpServerView } from "./mcp";
+import {
+  MCP_CONNECTORS_KEY,
+  collectMcpNameFiles,
+  collectMcpNameLayers,
+  collectReservedMcpIdentity,
+  connectConnector,
+  connectorById,
+  connectorViews,
+  disconnectConnector,
+  hostMcpServers,
+  isConnectorId,
+  mcpConfigLayer,
+  mcpConfigPaths,
+  mcpRemoteArgs,
+  mergeReserved,
+  parseConnectedConnectorStore,
+  reservedFromMcpInventory,
+  type ConnectedConnectorStore,
+  type ConnectorId,
+  type ReservedMcpIdentity,
+} from "./mcp-connectors";
+import {
+  authorizeMcpRemote,
+  listenFreeLoopbackPort,
+  npxSpawnPlan,
+  persistConnectorOAuthClientMetadata,
+  writeOAuthClientMetadataFile,
+} from "./mcp-connector-auth";
 
 // HostMsg (host -> webview) and WebviewMsg (webview -> host) both live in
 // src/protocol.ts now — the single source of truth for the message contract,
@@ -719,8 +774,9 @@ export class GrokSidebar {
   private readonly keepAwake = new KeepAwake((l) => this.host.appendLine(l), process.platform, process.pid, os.release());
   private static readonly DEVICE_GLOBAL_REMOTE_TYPES = new Set<HostMsg["type"]>([
     "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "cliUpdating",
-    "onboarding", "providerState", "expandCommandOutputs", "steerByDefault", "soundNotifications",
+    "onboarding", "providerState", "mcpServers", "mcpConnectors", "expandCommandOutputs", "steerByDefault", "soundNotifications",
     "telemetryEnabled",
+    "thumbsFeedback",
   ]);
   private cliPath?: string;
   private codexCliPath?: string;
@@ -740,6 +796,16 @@ export class GrokSidebar {
    *  coerced to false. Rebuilt on each refresh so removed keys cannot serve
    *  stale `true` forever. */
   private lastVoiceConfiguredByCwd = new Map<string, boolean>();
+  /**
+   * Last posted `voiceConfigured` fingerprint per destination (`local` or
+   * `remote:<clientId>`). The auth.json watcher matches a null filename, so
+   * every grok write under `~/.grok` used to fan identical frames to every
+   * phone. Writers seed or invalidate: snapshot and credential-failure seed
+   * so a skipped watcher post cannot starve a fresh tab or swallow a later
+   * genuine change; a replaced renderer drops its entry (`forgetPostedVoiceConfigured`)
+   * because the new JS state starts unconfigured.
+   */
+  private lastPostedVoiceConfigured = new Map<string, string>();
   /** VS Code settings tab. Desktop/remote keep the in-page overlay. */
   private settingsEditor?: HostEditorWebview;
   private static readonly SETTINGS_PANEL_TYPES = new Set<WebviewMsg["type"]>([
@@ -756,9 +822,12 @@ export class GrokSidebar {
     "setVoiceSendPhrase",
     "setVoiceKeyterms",
     "setTelemetryEnabled",
+    "setThumbsFeedback",
     "openGlobalConfig",
     "openProjectConfig",
-    "runMcpList",
+    "listMcpServers",
+    "connectMcpConnector",
+    "disconnectMcpConnector",
     "showLogs",
     "toggleDevTools",
     "openSettings",
@@ -779,6 +848,24 @@ export class GrokSidebar {
    *  the page's own open-refresh landing on top of a click) must not start a
    *  second round of CLI probes. */
   private providerRefreshInFlight = false;
+  /** Complete Grok inventory from the last `_x.ai/mcp/list`. Unfiltered — `hostMcpServers` dedup still needs project servers. */
+  private mcpServers: McpServerView[] = [];
+  /**
+   * Workspace the current `mcpServers` was read from. Classification uses this
+   * at read time only; the stored global-only view is then rendered anywhere.
+   */
+  private mcpServersCwd: string | undefined;
+  /**
+   * Global-only tagged view of the last catalog read. Project-file rows were
+   * filtered against `mcpServersCwd`; this is safe to render for any workspace.
+   */
+  private mcpServersView: McpServerView[] = [];
+  private mcpListSupported: boolean | undefined;
+  private grokMcpReserved: ReservedMcpIdentity = { names: [], urls: [] };
+  private mcpConnectingId: ConnectorId | undefined;
+  private mcpConnectError: { id: ConnectorId; message: string } | undefined;
+  /** Overlapping Connectors reads share one lazy Grok start. */
+  private grokSessionForMcpListInFlight: Promise<Session | undefined> | undefined;
   private grokVersionProbe?: Promise<string>;
   private codexVersionProbe?: Promise<string>;
   private claudeVersionProbe?: Promise<string>;
@@ -856,6 +943,16 @@ export class GrokSidebar {
 
   private providerConnections(): ProviderConnections {
     return this.providerConnectionState;
+  }
+
+  /** Session-start snapshot of `grok.acp.*` timeouts (#117). */
+  private acpClientTimeouts() {
+    const cfg = this.host.getConfiguration("grok");
+    return {
+      promptIdleTimeoutMs: cfg.get<number>("acp.promptIdleTimeoutMs"),
+      promptAbsoluteTimeoutMs: cfg.get<number>("acp.promptAbsoluteTimeoutMs"),
+      requestTimeoutMs: cfg.get<number>("acp.requestTimeoutMs"),
+    };
   }
 
   private locateProvider(provider: AcpProvider): string | undefined {
@@ -1086,10 +1183,18 @@ export class GrokSidebar {
     if (provider === "claude") return this.warmConnectedClaudeModels();
     const cliPath = this.locateProvider("grok");
     if (!cliPath) return false;
+    // session/new is what actually proves the account, but grok has no ACP
+    // session/delete (AcpClient.deleteSession always throws for this provider).
+    // A leftover lands in ~/.grok/sessions/<urlencoded-cwd>/ as a summary-only
+    // directory the catalog lists as "Untitled" and the CLI cannot load.
+    // Probe in a scratch cwd so a failed cleanup cannot appear in the user's
+    // project; still delete the dir after the process exits.
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "grok-cred-probe-"));
+    const envCwd = this.workspaceRoot() || scratch;
     const client = new AcpClient({
       cliPath,
-      cwd: this.workspaceRoot(),
-      env: this.buildEnv(this.workspaceRoot()),
+      cwd: scratch,
+      env: this.buildEnv(envCwd),
       log: (message) => this.host.appendLine(message),
       grokVersion: this.providerCliVersions.grok,
     });
@@ -1097,9 +1202,6 @@ export class GrokSidebar {
       await client.start();
       await client.newSession();
       this.setProviderNeedsLogin("grok", false);
-      if (client.sessionId) {
-        try { await client.deleteSession(client.sessionId); } catch { /* probe cleanup is best-effort */ }
-      }
       return true;
     } catch (error) {
       this.host.appendLine(`[grok] credential re-probe failed: ${errorDetail(error)}`);
@@ -1108,7 +1210,10 @@ export class GrokSidebar {
       }
       return false;
     } finally {
+      const probeId = client.sessionId;
       await client.dispose();
+      if (probeId) this.removeSessionFromDisk(probeId, scratch);
+      try { fs.rmSync(scratch, { recursive: true, force: true }); } catch { /* leftover temp dir is harmless */ }
     }
   }
 
@@ -1401,6 +1506,9 @@ export class GrokSidebar {
 
   resolveWebviewView(view: HostWebviewView): void {
     this.view = view;
+    // Assigning html boots a new renderer. The `local` cache entry belonged
+    // to the previous JS state and must not suppress the next identical frame.
+    this.forgetPostedVoiceConfigured("local");
     view.webview.options = {
       enableScripts: true,
       // Extension assets keep extensionUri identity (vscode-remote on remote hosts).
@@ -1523,6 +1631,12 @@ export class GrokSidebar {
           type: "telemetryEnabled",
           value: this.host.getConfiguration("grok").get<boolean>("telemetry.enabled", true),
         });
+      }
+      if (e.affectsConfiguration("grok.thumbsFeedback")) {
+        this.postThumbsFeedback();
+        for (const session of [this.focused, ...this.pool]) {
+          this.refreshFeedbackAvailability(session);
+        }
       }
     });
     const authWatcher = this.host.createFileSystemWatcher(
@@ -2503,9 +2617,7 @@ Only continue if you trust this code.`,
       recovered.push(pending.text);
     }
     if (!recovered.length) return;
-    const text = recovered.join("\n\n");
-    if (session.queuedSends.length) session.queuedSends[0] += "\n\n" + text;
-    else session.queuedSends.push(text);
+    session.queuedSends = enqueueQueuedSend(session.queuedSends, recovered.join("\n\n"), []);
   }
 
   /**
@@ -2724,8 +2836,9 @@ Only continue if you trust this code.`,
    *
    * Called when a message is sent and when a session is created — the two
    * moments a person would expect their conversation to jump to the top. The
-   * lists order by transcript mtime, and the CLI writes that file about 2.1
-   * seconds after a send (measured), so without this the row sits still through
+   * lists order by the recency clock (`updates.jsonl` mtime for grok; host
+   * `activeAt` for adapters), and grok writes that file about 2.1 seconds
+   * after a send (measured), so without this the row sits still through
    * the whole wait and a brand-new conversation is missing entirely.
    *
    * Every project and every session is treated the same; there is no special
@@ -2919,21 +3032,29 @@ Only continue if you trust this code.`,
    * for backgrounded sessions too.
    */
   private queuedSendReadyText(session: Session): string | undefined {
-    if (!session.queuedSends.length) return undefined;
     // Same readiness as handleSend — client without sessionId is still priming.
     if (!sessionReadyForPrompt(session)) return undefined;
     if (session.status === "working" || session.status === "needs-you") return undefined;
-    return session.queuedSends.join("\n\n");
+    // `""` is a ready image-only queue; `undefined` is "do not flush".
+    return queuedFlushText(session.queuedSends);
+  }
+
+  private emitQueuedSends(session: Session): void {
+    this.emit(session, queuedSendsMessage(session.queuedSends));
   }
 
   private async maybeFlushQueuedSends(session: Session): Promise<void> {
     const combined = this.queuedSendReadyText(session);
-    if (!combined) return;
+    if (combined === undefined) return;
     if (session.queuedSendCommit) return;
     if (session.queuedSendRequiresRelay) {
       if (this.remoteClients.clientsForActiveValue(session).length === 0) return;
-      if (session.queuedSendDispatch) return;
-      const dispatch = { id: randomUUID(), text: combined };
+      const dispatch = claimQueuedSendDispatch(
+        session.queuedSendDispatch,
+        combined,
+        () => randomUUID(),
+      );
+      if (!dispatch || session.queuedSendDispatch) return;
       session.queuedSendDispatch = dispatch;
       this.sendRemoteSession(session, { type: "submitQueuedSend", ...dispatch });
       return;
@@ -2948,48 +3069,188 @@ Only continue if you trust this code.`,
   }
 
   /**
-   * Steer (#52) — inject text into the RUNNING turn instead of waiting for it.
-   * Unlike a second `session/prompt` (which kills the in-flight turn), grok's
-   * `_x.ai/interject` queues into a buffer the agent drains at its next safe
-   * point, so no tool work is lost and the turn still ends normally.
+   * Steer (#52) — inject text (and attachments) into the RUNNING turn instead
+   * of waiting. Unlike a second `session/prompt` (which kills the in-flight
+   * turn), grok's `_x.ai/interject` queues into a buffer the agent drains at
+   * its next safe point, so no tool work is lost and the turn still ends
+   * normally.
    *
-   * Steering carries plain text ONLY: it bypasses `prompt-builder`, so there is
-   * no context envelope, no chips, and no `/command` dispatch — the interjection
-   * reaches the model as-is. The bubble is painted optimistically before the RPC
-   * so the UI feels immediate; a failure re-queues the text rather than losing
-   * it, which is the whole point of the host owning this (#37).
+   * Images ride additive `content` blocks built by `buildPromptWithImages` —
+   * the same encoder as `session/prompt`. A CLI old enough to ignore `content`
+   * never sees a silent drop: the whole item is queued instead. File chips
+   * stay in the text block and work on that legacy wire.
+   *
+   * The queue / composer snapshot is synchronous (VS Code does not serialize
+   * async webview handlers; a following `clearQueuedSends` can race). A
+   * failure restores that snapshot rather than losing the message.
    */
   private async steerSend(
     text: string,
     session: Session = this.focused,
     requester?: RemoteRequester,
+    requestedChips?: FileChip[],
+    fromQueue = false,
   ): Promise<void> {
-    const body = (text ?? "").trim();
-    if (!body) return;
+    const authored = text ?? "";
+    const takeQueue = (fromQueue && queuedSendsHaveContent(session.queuedSends))
+      || queuedSendsContainChipIds(session.queuedSends, requestedChips);
+
     if (!session.client || !session.activeSessionId) {
       // No live turn to steer — fall back to the queue rather than drop it.
       // Deliberately NOT flagged for a relay round-trip: the relay meters
       // steerSend on ingress exactly like send, so this text is already paid
       // for — re-submitting the queued fallback through the relay would
       // charge it twice. Same for the two fallbacks below.
-      session.queuedSends.length ? (session.queuedSends[0] += "\n\n" + body) : session.queuedSends.push(body);
-      this.emit(session, { type: "queuedSends", items: [...session.queuedSends] });
+      if (takeQueue) return;
+      const chips = chipsForQueueSend(session.chips, requestedChips);
+      if (!authored.trim() && !chips.length) return;
+      session.queuedSends = enqueueQueuedSend(session.queuedSends, authored, chips);
+      if (chips.length) {
+        session.chips = consumeChips(session.chips, chips);
+        if (session === this.focused) this.refreshImplicitChip(true);
+        else this.postChips(session);
+      }
+      this.emitQueuedSends(session);
       return;
     }
-    this.emit(session, { type: "userMessage", text: body, chips: [], steer: true });
+
+    const relayFlag = session.queuedSendRequiresRelay;
+    let contributions: QueuedSendEntry[];
+    let fromComposer = false;
+    if (takeQueue) {
+      contributions = session.queuedSends.map((item) => ({
+        text: item.text,
+        chips: item.chips.map(cloneChipForQueue),
+      }));
+      session.queuedSends = [];
+      session.queuedSendDispatch = undefined;
+      session.queuedSendCommit = undefined;
+      this.emitQueuedSends(session);
+    } else {
+      const chips = chipsForQueueSend(session.chips, requestedChips);
+      if (!authored.trim() && !chips.length) return;
+      contributions = [{ text: authored, chips }];
+      if (chips.length) {
+        fromComposer = true;
+        session.chips = consumeChips(session.chips, chips);
+        if (session === this.focused) this.refreshImplicitChip(true);
+        else this.postChips(session);
+      }
+    }
+
+    const putBackOnQueue = (): void => {
+      if (takeQueue) {
+        session.queuedSends = [...contributions, ...session.queuedSends];
+        session.queuedSendRequiresRelay = relayFlag;
+      } else {
+        for (const item of contributions) {
+          session.queuedSends = enqueueQueuedSend(session.queuedSends, item.text, item.chips);
+        }
+      }
+      this.emitQueuedSends(session);
+    };
+    const putBackOnComposer = (): void => {
+      if (takeQueue) {
+        session.queuedSends = [...contributions, ...session.queuedSends];
+        session.queuedSendRequiresRelay = relayFlag;
+        this.emitQueuedSends(session);
+        return;
+      }
+      if (fromComposer) {
+        session.chips = restoreQueuedChips(session.chips, contributions);
+        if (session === this.focused) this.refreshImplicitChip(true);
+        else this.postChips(session);
+      }
+    };
+
+    const client = session.client;
+    const gen = session.gen;
+    const promptDeps = {
+      readFile: (p: string) => fs.readFileSync(p, "utf8"),
+      extName: (p: string) => path.extname(p),
+    };
+
+    const builtContributions: QueuedPromptContribution[] = [];
+    for (const item of contributions) {
+      const itemImages: PromptImageInput[] = [];
+      for (const chip of item.chips) {
+        if (chip.hidden || !isImageChip(chip)) continue;
+        const read = await this.readImageChip(chip, session, gen);
+        if (read === "gone") {
+          putBackOnComposer();
+          return;
+        }
+        if (read === "failed") {
+          putBackOnComposer();
+          return;
+        }
+        itemImages.push(read);
+      }
+      builtContributions.push({ text: item.text, chips: item.chips, images: itemImages });
+    }
+    if (gen !== session.gen || session.client !== client) {
+      putBackOnComposer();
+      return;
+    }
+
+    const images = builtContributions.flatMap((item) => item.images);
+    if (images.length && !client.honorsInterjectContent()) {
+      // 0.2.x / unverified: interject still works, but `content` is ignored
+      // and the pixels would vanish. Queue the whole item instead.
+      putBackOnQueue();
+      this.reportRequester(
+        requester,
+        "warning",
+        "This Grok CLI cannot steer attachments mid-turn — your message was queued instead. It will send when the turn finishes.",
+      );
+      return;
+    }
+
+    const implicitChips = session.chips.filter((chip) => isImplicitChip(chip));
+    const slashCommand = matchSlashCommand(
+      queuedSendsText(contributions) || authored,
+      client.availableCommands.map((c) => c.name),
+    );
+    const built = builtContributions.length === 1
+      ? buildPromptWithImages(
+        builtContributions[0].text,
+        [...builtContributions[0].chips, ...implicitChips],
+        builtContributions[0].images,
+        promptDeps,
+        slashCommand != null,
+      )
+      : buildQueuedPromptWithImages(builtContributions, implicitChips, promptDeps, slashCommand != null);
+
+    await this.retainUploadedFilesForSession(
+      session,
+      contributions.flatMap((item) => item.chips),
+    );
+    if (gen !== session.gen || session.client !== client) {
+      putBackOnComposer();
+      return;
+    }
+
+    const displayText = queuedSendsText(contributions);
+    const displayChips = contributions.flatMap((item) => item.chips);
+    this.emit(session, {
+      type: "userMessage",
+      text: displayText,
+      chips: displayChips,
+      steer: true,
+    });
+    if (!session.queuedSends.length) session.queuedSendRequiresRelay = false;
+
+    const rpcText = images.length ? displayText : built.text;
     try {
-      const client = session.client;
-      const gen = session.gen;
-      const r = await client.interject(body, () => {
+      const r = await client.interject(rpcText, () => {
         if (gen === session.gen && session.client === client) session.interjectionCount += 1;
-      });
+      }, images.length ? built.blocks : undefined);
       if (r === "unsupported") {
-        // Pre-~0.2.96 CLI: latch the button off and hand the text to the queue,
+        // Pre-~0.2.96 CLI: latch the button off and hand the item to the queue,
         // which is exactly the behavior Steer was offering to skip.
         this.emit(session, { type: "steerUnavailable" });
         this.emit(session, { type: "agentReset" });
-        session.queuedSends.length ? (session.queuedSends[0] += "\n\n" + body) : session.queuedSends.push(body);
-        this.emit(session, { type: "queuedSends", items: [...session.queuedSends] });
+        putBackOnQueue();
         this.reportRequester(
           requester,
           "warning",
@@ -2997,12 +3258,113 @@ Only continue if you trust this code.`,
         );
         return;
       }
-      this.host.appendLine(`[steer] interjected ${body.length} chars into the running turn`);
+      this.host.appendLine(
+        images.length
+          ? `[steer] interjected ${rpcText.length} chars + ${images.length} image(s) into the running turn`
+          : `[steer] interjected ${rpcText.length} chars into the running turn`,
+      );
     } catch (e: any) {
       this.emit(session, { type: "agentReset" });
-      session.queuedSends.length ? (session.queuedSends[0] += "\n\n" + body) : session.queuedSends.push(body);
-      this.emit(session, { type: "queuedSends", items: [...session.queuedSends] });
+      putBackOnQueue();
       this.emit(session, { type: "error", text: `Steer failed: ${e?.message ?? e}. Your message was queued instead.` });
+    }
+  }
+
+  private refreshFeedbackAvailability(session: Session): void {
+    const available = decideFeedbackAvailability({
+      provider: session.provider,
+      metaEnabled: session.feedbackMetaEnabled,
+      commandsAdvertise: session.feedbackCommandsAdvertise,
+      latchedUnsupported: session.feedbackUnsupported,
+      userEnabled: this.thumbsFeedbackEnabled(),
+    });
+    if (session.feedbackAvailable === available) return;
+    session.feedbackAvailable = available;
+    this.emit(session, { type: "feedbackAvailability", available });
+  }
+
+  private latchFeedbackUnavailable(session: Session): void {
+    session.feedbackUnsupported = true;
+    this.refreshFeedbackAvailability(session);
+  }
+
+  private ackTurnFeedback(session: Session, rating: -1 | 0 | 1): void {
+    if (!session.liveFeedbackEligible) return;
+    session.turnRating = rating === 1 || rating === -1 ? rating : 0;
+    this.emit(session, { type: "turnFeedbackAck", rating });
+  }
+
+  /**
+   * A live (non-replay) prompt settled in this process. Thumbs may rate that
+   * turn and no earlier one; a cold `session/load` never sets this.
+   */
+  private noteLiveTurnEnded(session: Session): void {
+    if (session.replaying || session.suppressContent) return;
+    session.liveFeedbackEligible = true;
+    session.turnRating = 0;
+  }
+
+  /**
+   * Per-turn thumbs (#114). Rates the turn that just finished in this process.
+   * Does not send `turn_number` — the agent attributes the rating from its own
+   * session tracking. See research/turn-feedback.md.
+   */
+  private async handleTurnFeedback(
+    rating: unknown,
+    session: Session,
+    requester?: RemoteRequester,
+  ): Promise<void> {
+    const previous = session.turnRating;
+    const revert = () => this.ackTurnFeedback(session, previous);
+    if (!isThumbsRating(rating)) {
+      revert();
+      return;
+    }
+    // Setting off is not a capability gap — do not latch unsupported, or
+    // turning the opt-in on later could never restore thumbs.
+    if (!this.thumbsFeedbackEnabled()) {
+      revert();
+      return;
+    }
+    if (session.provider !== "grok" || !session.feedbackAvailable) {
+      this.latchFeedbackUnavailable(session);
+      revert();
+      return;
+    }
+    if (!session.liveFeedbackEligible) {
+      revert();
+      this.reportRequester(requester, "warning", "Only the latest reply in this session can be rated.");
+      return;
+    }
+    const client = session.client;
+    if (!client?.sessionId) {
+      revert();
+      this.reportRequester(requester, "warning", "Start a Grok session before rating a turn.");
+      return;
+    }
+    try {
+      const result = await client.submitFeedback({
+        ratingValue: rating,
+        clientType: feedbackClientType(!!this.host.canSwitchWorkspaceFolder),
+        clientVersion: this.context.extensionVersion,
+      });
+      if (result === "unsupported") {
+        this.latchFeedbackUnavailable(session);
+        revert();
+        this.reportRequester(
+          requester,
+          "warning",
+          "Turn ratings need a Grok Build CLI that accepts feedback.",
+        );
+        return;
+      }
+      // A later send already took the affordance. The RPC rated the turn that
+      // was current at click time; do not paint the next footer.
+      if (!session.liveFeedbackEligible) return;
+      this.ackTurnFeedback(session, rating);
+    } catch (e: any) {
+      revert();
+      this.reportRequester(requester, "error", `Couldn't send that rating: ${e?.message ?? e}`);
     }
   }
 
@@ -3567,7 +3929,9 @@ Only continue if you trust this code.`,
           const releaseCreator = async () => {
             if (creatorDisposed || !disposeAfter) return;
             creatorDisposed = true;
+            const probeId = client.sessionId;
             await client.dispose();
+            if (probeId) this.removeSessionFromDisk(probeId, sourcePath);
           };
           try {
             // The authoritative set BEFORE creating anything. Without it,
@@ -4138,7 +4502,11 @@ Only continue if you trust this code.`,
           r = { removed: true };
         }
       } finally {
-        if (disposeAfter) await client.dispose();
+        if (disposeAfter) {
+          const probeId = client.sessionId;
+          await client.dispose();
+          if (probeId) this.removeSessionFromDisk(probeId, this.workspaceRoot());
+        }
       }
       if (r === "unsupported") {
         return void this.host.showWarningMessage(
@@ -4674,7 +5042,7 @@ Only continue if you trust this code.`,
    * next session open, project switch or pin — all of which post a catalog.
    * Erring toward withholding is the safe direction and it self-heals.
    *
-   * The evidence is still the TRANSCRIPT and not the session directory
+   * The evidence is still `updates.jsonl` and not the session directory
    * ({@link newestTranscriptMtime}), because that part cost nothing and a
    * signal that moves when a conversation is merely loaded is simply wrong.
    * Activity in a WORKTREE counts for its project, since the rail merges those
@@ -4796,7 +5164,7 @@ Only continue if you trust this code.`,
   ): HostMsg {
     const authorized = this.remoteAuthorizedSessionCwds();
     const selectedCwd =
-      authorizedListCwd(this.remoteClients.cwd(clientId), authorized, pathsEqual) ?? "";
+      authorizedListCwd(this.remoteClients.cwdIfPresent(clientId), authorized, pathsEqual) ?? "";
     const active = this.remoteClients.active(clientId);
     let activeCwd = selectedCwd;
     if (active) {
@@ -6124,7 +6492,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     );
     if (choice !== "Sign Out") return;
     // shellPath/shellArgs, not sendText — a quoted path typed into PowerShell
-    // is a parser error (see runMcpList).
+    // is parsed as a string literal rather than an invocation.
     this.host.createTerminal({ name: "Grok Logout", shellPath: cliPath, shellArgs: ["logout"] });
     await this.finishProviderLogout("grok");
   }
@@ -6154,7 +6522,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       const active = this.remoteClients.active(clientId);
       return [clientId, {
         id: active?.activeSessionId,
-        text: active?.queuedSends.join("\n\n") ?? "",
+        text: active ? queuedSendsText(active.queuedSends) : "",
       }] as const;
     }));
     const connected = this.connectedProviders();
@@ -6176,7 +6544,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         replacement.priming = connected.length > 0;
         this.setSessionCwd(replacement, cwd, this.workspaceRoot());
         replacement.lastActiveAt = Date.now();
-        const queuedText = session.queuedSends.join("\n\n");
+        const queuedText = queuedSendsText(session.queuedSends);
         // Nothing will start this tab until an account comes back, so the draft
         // has to outlive the buffered notice below (a start clears the buffer).
         if (queuedText) {
@@ -6200,7 +6568,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     ]);
     if (this.focused.provider === provider) affectedSessions.add(this.focused);
     const replacingFocused = this.focused.provider === provider;
-    const focusedQueuedText = replacingFocused ? this.focused.queuedSends.join("\n\n") : "";
+    const focusedQueuedText = replacingFocused ? queuedSendsText(this.focused.queuedSends) : "";
     const focusedDraftId = replacingFocused ? this.focused.activeSessionId : undefined;
     const focusedCwd = replacingFocused ? this.sessionCwd(this.focused) : "";
     const backgroundQueued = [...affectedSessions]
@@ -6213,11 +6581,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       .map((session) => ({
         id: session.activeSessionId,
         name: this.sessionDisplayName(session) || "a background conversation",
-        text: session.queuedSends.join("\n\n"),
+        text: queuedSendsText(session.queuedSends),
       }));
 
     for (const affected of affectedSessions) {
-      const text = affected.queuedSends.join("\n\n");
+      const text = queuedSendsText(affected.queuedSends);
       if (text && affected.activeSessionId) {
         await this.rememberQueuedDraft(affected.activeSessionId, text);
       }
@@ -7126,6 +7494,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session.planActive = false;
     session.hasHistory = false;
     session.suppressContent = false;
+    session.captureAgentText = undefined;
+    session.lastSessionInfoAt = 0;
+    session.lastSessionInfoUsed = undefined;
+    session.sessionInfoStale = false;
+    session.sessionInfoUnsupported = false;
+    session.sawCompactNotification = false;
     session.lastPlanText = "";
     session.pendingExitPlans.clear();
     session.inFlightPlanComments.clear();
@@ -7138,6 +7512,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session.replayUserIsInterjection = false;
     session.userMessageCount = 0;
     session.inUserMessage = false;
+    session.feedbackAvailable = false;
+    session.feedbackUnsupported = false;
+    session.feedbackMetaEnabled = undefined;
+    session.feedbackCommandsAdvertise = undefined;
+    session.liveFeedbackEligible = false;
+    session.turnRating = 0;
     session.activeSessionId = undefined;
     session.titleGenerated = false;
     session.firstUserMessageForTitle = undefined;
@@ -7297,12 +7677,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       effort,
       sandbox,
       log: (msg) => this.host.appendLine(msg),
+      timeouts: this.acpClientTimeouts(),
+      mcpServers: () => this.hostMcpServersFor(session),
       ...(session.provider === "grok"
         ? { grokVersion: grokHandshakeVersion, grokVersionVerified }
         : { backend: this.createProviderBackend(session.provider) }),
     });
     brokerClient = client;
     session.client = client;
+    // A replacement process may have gained the capability after a CLI update.
+    session.lastSessionInfoAt = 0;
+    session.lastSessionInfoUsed = undefined;
+    session.sessionInfoStale = false;
+    session.sessionInfoUnsupported = false;
 
     // fs handlers. Still wired on every session: 0.2.x, unverified, and Codex
     // advertise readTextFile and will call them. A live-verified grok >= 1.0.4
@@ -7384,6 +7771,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         worktree: !!session.worktree,
         provider: session.provider,
       });
+      if (session.provider === "grok") {
+        const metaEnabled = parseFeedbackEnabledMeta(res);
+        if (metaEnabled !== undefined) session.feedbackMetaEnabled = metaEnabled;
+        this.refreshFeedbackAvailability(session);
+      }
     });
     client.on("sessionTitle", (title: string) => {
       if (gen !== session.gen || !title.trim()) return;
@@ -7438,9 +7830,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     client.on("commandsUpdate", (cmds) => {
       if (gen !== session.gen) return;
       this.emit(session, { type: "commandsUpdate", commands: cmds });
+      if (session.provider === "grok") {
+        session.feedbackCommandsAdvertise = commandsAdvertiseFeedback(cmds);
+        this.refreshFeedbackAvailability(session);
+      }
     });
     client.on("messageChunk", (text: string) => {
       if (gen !== session.gen) return;
+      if (session.captureAgentText !== undefined) {
+        session.captureAgentText += text;
+        return;
+      }
       session.inUserMessage = false;
       session.historyEventCount += 1;
       this.emit(session, { type: "messageChunk", text });
@@ -7512,10 +7912,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       session.historyEventCount += 1;
       this.emit(session, { type: "thoughtChunk", text });
     });
+    const mcpState = createMcpPrepareState();
     client.on("childStream", (ev: { childSessionId: string; route: UpdateRoute }) => {
       if (gen !== session.gen) return;
       const payload = childStreamFromRoute(ev.childSessionId, ev.route);
       if (!payload) return;
+      if (payload.event === "toolCall" || payload.event === "toolCallUpdate") {
+        const prepared = prepareMcpToolCall(payload.call, mcpState);
+        this.emit(session, { type: "childStream", ...payload, call: prepared.call });
+        return;
+      }
       this.emit(session, { type: "childStream", ...payload });
     });
     client.on("mediaContent", (m: MediaRef) => {
@@ -7545,19 +7951,40 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (choice === "Show Logs") this.host.showOutput();
       });
     });
-    client.on("toolCall", (u) => {
-      if (gen !== session.gen) return;
+    const replayedCommandOutputs = new Set<string>();
+    const replayedCommandsByToolCallId = new Map<string, string>();
+    const emitReplayedCommandOutput = (call: unknown) => {
+      const replayed = commandOutputForToolCall(call, {
+        replaying: session.replaying,
+        rememberedCommands: replayedCommandsByToolCallId,
+      });
+      if (!replayed) return;
+      const id = typeof (call as { toolCallId?: unknown })?.toolCallId === "string"
+        && (call as { toolCallId: string }).toolCallId
+        ? (call as { toolCallId: string }).toolCallId
+        : replayed.command;
+      if (replayedCommandOutputs.has(id)) return;
+      replayedCommandOutputs.add(id);
+      this.emit(session, { type: "commandOutput", ...replayed });
+    };
+    const emitToolCallEvent = (type: "toolCall" | "toolCallUpdate", u: unknown) => {
+      const prepared = prepareMcpToolCall(u, mcpState);
       session.inUserMessage = false;
       session.historyEventCount += 1;
-      this.emit(session, { type: "toolCall", call: u });
-      this.noteAdapterCompactSignal(session, u);
+      this.emit(session, { type, call: prepared.call });
+      this.noteAdapterCompactSignal(session, prepared.call);
+      if (prepared.commandOutput) {
+        this.emit(session, { type: "commandOutput", ...prepared.commandOutput });
+      }
+      emitReplayedCommandOutput(prepared.call);
+    };
+    client.on("toolCall", (u) => {
+      if (gen !== session.gen) return;
+      emitToolCallEvent("toolCall", u);
     });
     client.on("toolCallUpdate", (u) => {
       if (gen !== session.gen) return;
-      session.inUserMessage = false;
-      session.historyEventCount += 1;
-      this.emit(session, { type: "toolCallUpdate", call: u });
-      this.noteAdapterCompactSignal(session, u);
+      emitToolCallEvent("toolCallUpdate", u);
     });
     client.on("plan", (u) => {
       if (gen !== session.gen) return;
@@ -7584,9 +8011,18 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           meta: { ...gated, totalTokens: remembered?.used ?? gated.totalTokens },
         });
       } else {
+        if (
+          typeof gated.totalTokens === "number"
+          && session.lastSessionInfoUsed != null
+          && gated.totalTokens !== session.lastSessionInfoUsed
+        ) {
+          session.sessionInfoStale = true;
+        }
         this.emit(session, { type: "promptComplete", meta: gated });
       }
-      void this.accumulateUsage(session, meta);
+      // The hidden legacy `/session-info` fallback is a CLI-local meter, not a
+      // user turn. Do not add its zero-inference response to the billing ledger.
+      if (session.captureAgentText === undefined) void this.accumulateUsage(session, meta);
       session.adapterTurnCallUsed = [];
       // A zero report (stripped above) is /compact or /session-info; neither
       // warrants a donut update here. /session-info leaves the context
@@ -7605,6 +8041,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           ...(typeof window === "number" && Number.isFinite(window) && window > 0 ? { window } : {}),
         });
         return;
+      }
+      if (
+        typeof used === "number" && Number.isFinite(used) && used > 0
+        && session.lastSessionInfoUsed != null
+        && used !== session.lastSessionInfoUsed
+      ) {
+        session.sessionInfoStale = true;
       }
       this.emit(session, {
         type: "contextUsage",
@@ -7636,6 +8079,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.rememberAdapterContext(session, { window });
       }
     });
+    client.on("mcpNotification", (method: string, params: unknown) => {
+      if (gen !== session.gen) return;
+      this.applyMcpNotification(session, method, params);
+    });
     client.on("xaiNotification", (u) => {
       if (gen !== session.gen) return;
       // The post-compaction context size rides this live rail
@@ -7649,12 +8096,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       const compactUsed = contextUsedFromCompactNotification(u);
       if (compactUsed !== null) {
         this.emit(session, { type: "contextUsage", used: compactUsed });
+        session.sawCompactNotification = true;
       }
       // Compaction FAILED (either path — compaction.rs emits it on both). The
       // context is unchanged, so the donut needs no refresh; flag it so a manual
       // /compact paints the failure instead of a false "Compacted.", and surface
       // a note.
       if (kind === "auto_compact_failed") {
+        session.sawCompactNotification = true;
         session.sawCompactFailed = true;
         const err = (u as { error?: unknown })?.error;
         this.emit(session, {
@@ -7699,16 +8148,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (gen !== session.gen) return;
       // Defensive display cap on top of the terminal's own byte limit — a huge
       // buffer must not stall postMessage/DOM (#41). Grok saw the same capped
-      // buffer, so the cut is honest either way.
-      const MAX_OUTPUT_CHARS = 100_000;
-      const over = info.output.length > MAX_OUTPUT_CHARS;
-      this.emit(session, {
-        type: "commandOutput",
-        command: info.command,
-        output: over ? info.output.slice(0, MAX_OUTPUT_CHARS) : info.output,
-        exitCode: info.exitCode,
-        truncated: info.truncated || over,
-      });
+      // buffer, so the cut is honest either way. Shared with session/load restore.
+      // Null exit here is a real kill; `cancelled` is always stated so a later
+      // historyReplay rebuild still paints [Cancelled], and so absence can only
+      // mean an older host.
+      this.emit(session, { type: "commandOutput", ...commandOutputFromLiveTerminal(info) });
     });
     client.on("permissionRequest", (req: PermissionRequest) => {
       if (gen !== session.gen) return;
@@ -7761,7 +8205,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         session.queuedSendCommit = undefined;
         session.queuedSends = [];
         session.queuedSendRequiresRelay = false;
-        this.emit(session, { type: "queuedSends", items: [] });
+        this.emitQueuedSends(session);
       }
       this.setStatus(session, "error");
       this.pool.delete(session); // the process is gone; it's no longer a live pool member
@@ -7975,6 +8419,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // after loadSession so it lands after the donut-resetting `session`
         // event in the replay buffer.
         this.emitContextUsage(session);
+        if (session.provider === "grok") void this.refreshContextFromSessionInfo(session, gen, { force: true });
         // Same reason, for the billing breakdown (#53) — but from OUR store, as
         // grok persists no per-turn usage anywhere.
         this.restoreUsage(session);
@@ -8255,7 +8700,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "send":
-        let queuedSendCommit: { text: string } | undefined;
+        let queuedSendCommit: { text: string; items: QueuedSendEntry[] } | undefined;
         if (origin === "remote" && msg.queuedSendId) {
           if (session.completedQueuedSendIds.includes(msg.queuedSendId)) {
             this.host.appendLine(`[queue] ignored duplicate remote dequeue ${msg.queuedSendId}`);
@@ -8302,15 +8747,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "queueSend": {
-        // Host-owned per-session queue (#37): the webview renders a mirror from
-        // the queuedSends snapshots, so queued messages survive focus switches
-        // and flush even while their session is backgrounded. A SINGLE pending
-        // message is kept — composing more while one is queued APPENDS to it
-        // (blank-line separator, the exact flush format). Separate entries were
-        // a fiction: Stop and the flush both collapse them anyway, and per-entry
-        // editing broke ordering (an edited entry re-queued at the end).
+        // Host-owned per-session queue (#37): each contribution keeps the chips
+        // snapshotted here (image numbers already stamped at attach), then the
+        // flush sends them as one combined prompt with per-item tags. The
+        // webview renders a mirror from queuedSends snapshots, so queued
+        // messages survive focus switches and flush even while backgrounded.
         const s = session;
-        if (typeof msg.text === "string" && msg.text.trim()) {
+        const text = typeof msg.text === "string" ? msg.text : "";
+        const chips = chipsForQueueSend(s.chips, msg.chips);
+        if (text.trim() || chips.length) {
           s.queuedSendDispatch = undefined;
           // STICKY, never overwritten back to false: with desk↔remote
           // co-attach both views append to ONE queue, and the combined flush
@@ -8318,27 +8763,45 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           // round-trip the relay so it gets metered (a local overwrite here
           // would flush remote text through the unmetered local branch).
           if (origin === "remote") s.queuedSendRequiresRelay = true;
-          if (s.queuedSends.length) s.queuedSends[0] += "\n\n" + msg.text;
-          else s.queuedSends.push(msg.text);
-          this.emit(s, { type: "queuedSends", items: [...s.queuedSends] });
+          s.queuedSends = enqueueQueuedSend(s.queuedSends, text, chips);
+          s.chips = consumeChips(s.chips, chips);
+          if (s === this.focused) this.refreshImplicitChip(true);
+          else this.postChips(s);
+          this.emitQueuedSends(s);
           // If the turn ended while this message was in flight, fire it now.
           void this.maybeFlushQueuedSends(s);
         }
         break;
       }
       case "dequeueSend": {
+        // Old webviews render one pending block and send `index: 0` for Edit /
+        // Remove / Steer. Chip-aware clients use `clearQueuedSends` for that
+        // block, so this message keeps the pre-split meaning: the pending
+        // block, not the first of several entries. Passing `false` is the
+        // capability gate — we cannot see whether a remote honored
+        // `queueSendChips`, and every client that still sends `dequeueSend`
+        // is the old one.
         const s = session;
-        if (Number.isInteger(msg.index) && msg.index >= 0 && msg.index < s.queuedSends.length) {
+        const result = dequeueQueuedSends(s.queuedSends, msg.index, false);
+        if (result) {
           s.queuedSendDispatch = undefined;
           s.queuedSendCommit = undefined;
-          s.queuedSends.splice(msg.index, 1);
+          if (result.removed.some((item) => item.chips.length)) {
+            s.chips = restoreQueuedChips(s.chips, result.removed);
+          }
+          s.queuedSends = result.rest;
           if (!s.queuedSends.length) s.queuedSendRequiresRelay = false;
-          this.emit(s, { type: "queuedSends", items: [...s.queuedSends] });
+          if (s === this.focused) this.refreshImplicitChip(true);
+          else this.postChips(s);
+          this.emitQueuedSends(s);
         }
         break;
       }
       case "steerSend":
-        await this.steerSend(msg.text, session, requester);
+        await this.steerSend(msg.text, session, requester, msg.chips, msg.fromQueue === true);
+        break;
+      case "turnFeedback":
+        await this.handleTurnFeedback(msg.rating, session, requester);
         break;
       case "forkSession":
         if (this.refuseMismatchedSessionId(msg.sessionId, session, requester)) break;
@@ -8407,16 +8870,31 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       case "workflowControl":
         await this.controlWorkflow(msg.action, msg.displayName, session);
         break;
+      case "refreshContextDetails":
+        if (session.provider === "grok") {
+          void this.refreshContextFromSessionInfo(session, session.gen, {
+            force: session.sessionInfoStale,
+          });
+        }
+        break;
       case "clearQueuedSends": {
-        // Posted by the webview's Stop flow BEFORE the cancel — a halt must not
-        // auto-fire queued sends into the cancelled turn's wake.
+        // Posted by the webview's Stop/Edit/Remove flows. Stop and Edit set
+        // `restore: true` so queued chips return to the composer; Remove omits
+        // it and discards them. A halt must not auto-fire queued sends into
+        // the cancelled turn's wake — this runs BEFORE cancel on that path.
         const s = session;
         if (s.queuedSends.length) {
           s.queuedSendDispatch = undefined;
           s.queuedSendCommit = undefined;
+          const items = s.queuedSends;
           s.queuedSends = [];
           s.queuedSendRequiresRelay = false;
-          this.emit(s, { type: "queuedSends", items: [] });
+          if (msg.restore) {
+            s.chips = restoreQueuedChips(s.chips, items);
+          }
+          if (s === this.focused) this.refreshImplicitChip(true);
+          else this.postChips(s);
+          this.emitQueuedSends(s);
         }
         break;
       }
@@ -8672,22 +9150,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await this.host.openProjectConfig(this.sessionCwd(session));
         break;
       }
-      case "runMcpList": {
-        // Run grok as the terminal's own process (shellPath/shellArgs) rather than
-        // typing a quoted path into the user's shell. On Windows the default
-        // terminal is PowerShell, which parses `"C:\…\grok.exe" mcp list` as a
-        // string literal and errors "Unexpected token". Launching the binary
-        // directly sidesteps shell quoting entirely and behaves the same on
-        // PowerShell, cmd, and POSIX shells.
-        const mcpCli = this.locateProvider("grok");
-        const mcpCwd = this.sessionCwd(session);
-        const term = mcpCli
-          ? this.host.createTerminal({ name: "Grok MCP", shellPath: mcpCli, shellArgs: ["mcp", "list"], cwd: mcpCwd })
-          : this.host.createTerminal("Grok MCP");
-        term.show();
-        if (!mcpCli) term.sendText("grok mcp list");
+      case "listMcpServers": {
+        await this.refreshMcpServers(session);
         break;
       }
+      case "connectMcpConnector":
+        await this.connectMcpConnector(msg.id);
+        break;
+      case "disconnectMcpConnector":
+        await this.disconnectMcpConnector(msg.id);
+        break;
       case "showLogs":
         this.host.showOutput();
         break;
@@ -8770,6 +9242,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       case "setTelemetryEnabled":
         await this.host.getConfiguration("grok")
           .update("telemetry.enabled", !!msg.value, "global");
+        break;
+      case "setThumbsFeedback":
+        await this.host.getConfiguration("grok")
+          .update("thumbsFeedback", !!msg.value, "global");
         break;
       case "runInstallCmd": {
         // Host-owned confirmation, because this is one of the two messages that
@@ -9308,6 +9784,325 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   /**
+   * Merge a live MCP notification into reserved identity first so dedup does
+   * not wait on a catalog read, then into the stored inventory only when there
+   * is no catalog yet or the notifying session is that catalog's source.
+   */
+  private applyMcpNotification(session: Session, method: string, params: unknown): void {
+    if (this.mcpListSupported === false) return;
+    const next = mergeMcpNotification(this.mcpServers, method, params);
+    this.grokMcpReserved = reservedFromMcpInventory(next, this.connectedConnectorStore());
+    if (this.mcpServersCwd && !pathsEqual(this.sessionCwd(session), this.mcpServersCwd)) return;
+    this.mcpServers = next;
+    this.mcpServersView = this.filterMcpServers(this.mcpServers);
+    if (this.mcpListSupported === true) {
+      this.postMcpServers({
+        type: "mcpServers",
+        servers: this.mcpServersView,
+        warning: MCP_GLOBAL_SCOPE_WARNING,
+      });
+    }
+  }
+
+  private postMcpServers(message: Extract<HostMsg, { type: "mcpServers" }>): void {
+    const view = {
+      ...message,
+      servers: this.mcpServersView,
+    };
+    this.post(view);
+    void this.settingsEditor?.webview.postMessage(view);
+  }
+
+  private mcpServersMessage(): Extract<HostMsg, { type: "mcpServers" }> {
+    return {
+      type: "mcpServers",
+      servers: this.mcpServersView,
+      warning: MCP_GLOBAL_SCOPE_WARNING,
+    };
+  }
+
+  private connectedConnectorStore(): ConnectedConnectorStore {
+    return parseConnectedConnectorStore(this.state.get(MCP_CONNECTORS_KEY, {}));
+  }
+
+  private mcpConnectorsMessage(): Extract<HostMsg, { type: "mcpConnectors" }> {
+    return {
+      type: "mcpConnectors",
+      connectors: connectorViews(this.connectedConnectorStore(), {
+        connectingId: this.mcpConnectingId,
+        errorId: this.mcpConnectError?.id,
+        error: this.mcpConnectError?.message,
+      }),
+    };
+  }
+
+  private postMcpConnectors(): void {
+    const message = this.mcpConnectorsMessage();
+    this.post(message);
+    void this.settingsEditor?.webview.postMessage(message);
+  }
+
+  private mcpNameCatalogFor(cwd: string): {
+    nameLayer: Map<string, "project" | "user">;
+    nameFile: Map<string, string>;
+  } {
+    // `this.mcpServers` is Grok's inventory (`refreshMcpServers` only reads
+    // it through a Grok session). Classify against Grok's config files even
+    // when the focused conversation is Codex or Claude — otherwise project
+    // `.mcp.json` / `.grok/config.toml` are skipped and those rows fall
+    // through as user-level and appear on a page that is grok.com + user
+    // config only. The cwd is the catalog's source workspace, never the
+    // receiving/focused session's.
+    const opts = {
+      cwd,
+      provider: "grok" as const,
+      grokHome: resolveGrokHome(process.env),
+      userHome: process.env.USERPROFILE || process.env.HOME || os.homedir(),
+    };
+    const files: { layer: "project" | "user"; path: string; names: string[] }[] = [];
+    for (const filePath of mcpConfigPaths(opts)) {
+      try {
+        if (!fs.existsSync(filePath)) continue;
+        files.push({
+          layer: mcpConfigLayer(filePath, opts),
+          path: filePath,
+          names: collectReservedMcpIdentity(fs.readFileSync(filePath, "utf8")).names,
+        });
+      } catch {
+        // Unreadable configs must not block the inventory page.
+      }
+    }
+    return {
+      nameLayer: collectMcpNameLayers(files),
+      nameFile: collectMcpNameFiles(files),
+    };
+  }
+
+  private filterMcpServers(servers: readonly McpServerView[] = this.mcpServers): McpServerView[] {
+    return mcpSettingsServersForCwd({
+      servers,
+      catalogCwd: this.mcpServersCwd,
+      nameCatalogFor: (cwd) => this.mcpNameCatalogFor(cwd),
+    });
+  }
+
+  private reservedMcpIdentityFor(session: Session): ReservedMcpIdentity {
+    const cwd = this.sessionCwd(session);
+    const parts: ReservedMcpIdentity[] = [];
+    for (const filePath of mcpConfigPaths({
+      cwd,
+      provider: session.provider,
+      grokHome: resolveGrokHome(process.env),
+      userHome: process.env.USERPROFILE || process.env.HOME || os.homedir(),
+    })) {
+      try {
+        if (!fs.existsSync(filePath)) continue;
+        parts.push(collectReservedMcpIdentity(fs.readFileSync(filePath, "utf8")));
+      } catch {
+        // Unreadable configs must not block session/new.
+      }
+    }
+    if (session.provider === "grok") parts.push(this.grokMcpReserved);
+    return mergeReserved(...parts);
+  }
+
+  private hostMcpServersFor(session: Session) {
+    const store = this.connectedConnectorStore();
+    return hostMcpServers(
+      store,
+      this.reservedMcpIdentityFor(session),
+      persistConnectorOAuthClientMetadata(store),
+    );
+  }
+
+  private async connectMcpConnector(id: string): Promise<void> {
+    if (!isConnectorId(id)) return;
+    if (this.mcpConnectingId) {
+      this.mcpConnectError = {
+        id,
+        message: this.mcpConnectingId === id
+          ? "Sign-in is already in progress. Finish the browser prompt, or wait for it to time out."
+          : `Already connecting ${this.mcpConnectingId}. Wait for that to finish.`,
+      };
+      this.postMcpConnectors();
+      return;
+    }
+    const connector = connectorById(id);
+    if (!connector) return;
+    const store = this.connectedConnectorStore();
+    const endpoint = store[id]?.endpoint || connector.endpoint;
+    this.mcpConnectingId = id;
+    this.mcpConnectError = undefined;
+    this.postMcpConnectors();
+    const npx = npxSpawnPlan(process.platform);
+    let metadata: { path: string; dispose: () => void } | undefined;
+    try {
+      if (connector.oauthScope?.trim()) {
+        metadata = writeOAuthClientMetadataFile(connector.oauthScope.trim());
+      }
+      const result = await authorizeMcpRemote({
+        spawn,
+        command: npx.command,
+        args: mcpRemoteArgs(endpoint, undefined, metadata?.path),
+        shell: npx.shell,
+        env: npx.env,
+        pickFreeListenPort: listenFreeLoopbackPort,
+      });
+      if (this.mcpConnectingId !== id) return;
+      if (!result.ok) {
+        this.mcpConnectError = { id, message: result.message };
+        return;
+      }
+      // Re-read rather than writing the pre-await snapshot. The browser flow
+      // takes as long as the user takes, other rows stay actionable throughout,
+      // and `store` was captured before it began — so a Disconnect during
+      // sign-in would be undone by this write, silently handing every later
+      // agent a connector the user had explicitly removed.
+      await this.state.update(
+        MCP_CONNECTORS_KEY,
+        connectConnector(this.connectedConnectorStore(), id, endpoint),
+      );
+      this.mcpConnectError = undefined;
+    } catch (error) {
+      this.mcpConnectError = { id, message: (error as Error).message || "Could not connect." };
+    } finally {
+      try { metadata?.dispose(); } catch { /* best-effort */ }
+      if (this.mcpConnectingId === id) this.mcpConnectingId = undefined;
+      this.postMcpConnectors();
+    }
+  }
+
+  private async disconnectMcpConnector(id: string): Promise<void> {
+    if (!isConnectorId(id)) return;
+    if (this.mcpConnectingId === id) return;
+    await this.state.update(MCP_CONNECTORS_KEY, disconnectConnector(this.connectedConnectorStore(), id));
+    if (this.mcpConnectError?.id === id) this.mcpConnectError = undefined;
+    this.postMcpConnectors();
+  }
+
+  /**
+   * Live Grok ACP session to read `_x.ai/mcp/list` through. Prefers any pooled
+   * Grok conversation that already has a client — the focused session may be
+   * Codex or Claude. Does not mint a session.
+   */
+  private findLiveGrokSession(): Session | undefined {
+    const seen = new Set<Session>();
+    for (const candidate of [this.focused, ...this.pool]) {
+      if (!candidate || seen.has(candidate)) continue;
+      seen.add(candidate);
+      if (candidate.provider === "grok" && candidate.client) return candidate;
+    }
+    return undefined;
+  }
+
+  /**
+   * Session for the Connectors inventory. Reuses a live Grok client when one
+   * exists; otherwise, if Grok is connected, starts an empty Grok session
+   * (Connectors page only — never on boot). Overlapping callers await the same
+   * in-flight start — a newly created session is not in `pool` until startup
+   * completes. Empty-session recycling owns the rest: we do not dispose it here.
+   */
+  private async grokSessionForMcpList(requester: Session): Promise<Session | undefined> {
+    const live = this.findLiveGrokSession();
+    if (live) return live;
+    if (this.grokSessionForMcpListInFlight) return this.grokSessionForMcpListInFlight;
+    if (!this.connectedProviders().includes("grok")) return undefined;
+    const pending = (async (): Promise<Session | undefined> => {
+      const seen = new Set<Session>();
+      let grok: Session | undefined;
+      for (const candidate of [this.focused, ...this.pool]) {
+        if (!candidate || seen.has(candidate)) continue;
+        seen.add(candidate);
+        if (candidate.provider === "grok") {
+          grok = candidate;
+          break;
+        }
+      }
+      if (!grok) {
+        grok = this.newLocalSession();
+        grok.provider = "grok";
+        this.setSessionCwd(grok, this.sessionCwd(requester), this.workspaceRoot());
+      }
+      await this.startSession(undefined, grok, "ensure");
+      return grok.client ? grok : undefined;
+    })();
+    this.grokSessionForMcpListInFlight = pending;
+    // `then(clear, clear)` rather than `finally`: an ACP start can reject, and
+    // the promise `finally` derives would carry that rejection with nothing
+    // attached to it. Callers await `pending` itself, never the derived one.
+    const clear = () => {
+      if (this.grokSessionForMcpListInFlight === pending) {
+        this.grokSessionForMcpListInFlight = undefined;
+      }
+    };
+    void pending.then(clear, clear);
+    return pending;
+  }
+
+  /** Read MCP inventory through a Grok ACP session, not necessarily the focused one. */
+  private async refreshMcpServers(session: Session): Promise<void> {
+    this.postMcpServers({
+      type: "mcpServers",
+      servers: this.mcpServersView,
+      loading: true,
+      warning: MCP_GLOBAL_SCOPE_WARNING,
+    });
+    const grokConnected = this.connectedProviders().includes("grok");
+    const grok = await this.grokSessionForMcpList(session);
+    const client = grok?.client;
+    if (!grok || !client) {
+      this.mcpListSupported = undefined;
+      this.mcpServers = [];
+      this.mcpServersCwd = undefined;
+      this.mcpServersView = [];
+      this.postMcpServers({
+        type: "mcpServers",
+        servers: [],
+        error: grokConnected
+          ? "Could not load MCP servers from Grok."
+          : "Connect Grok to inspect MCP servers.",
+        warning: MCP_GLOBAL_SCOPE_WARNING,
+      });
+      return;
+    }
+    try {
+      const result = await client.listMcpServers();
+      if (grok.client !== client) return;
+      if (result === "unsupported") {
+        this.mcpListSupported = false;
+        this.mcpServers = [];
+        this.mcpServersCwd = undefined;
+        this.mcpServersView = [];
+        this.postMcpServers({
+          type: "mcpServers",
+          servers: [],
+          warning: MCP_GLOBAL_SCOPE_WARNING,
+        });
+        return;
+      }
+      this.mcpListSupported = true;
+      this.mcpServers = parseMcpListResponse(result);
+      this.mcpServersCwd = this.sessionCwd(grok) || undefined;
+      this.mcpServersView = this.filterMcpServers(this.mcpServers);
+      this.grokMcpReserved = reservedFromMcpInventory(this.mcpServers, this.connectedConnectorStore());
+      this.postMcpServers({
+        type: "mcpServers",
+        servers: this.mcpServersView,
+        warning: MCP_GLOBAL_SCOPE_WARNING,
+      });
+    } catch (error) {
+      const detail = errorDetail(error);
+      this.host.appendLine(`[mcp] _x.ai/mcp/list failed: ${detail}`);
+      this.postMcpServers({
+        type: "mcpServers",
+        servers: [],
+        error: detail || "Could not load MCP servers from Grok.",
+        warning: MCP_GLOBAL_SCOPE_WARNING,
+      });
+    }
+  }
+
+  /**
    * Send one page of session history to the webview. The cheap `indexSessions` stat pass orders
    * every session by last activity without reading content; only the visible window (or, for a
    * search, the matched window) is parsed — and even those come from {@link sessionCache} unless
@@ -9374,7 +10169,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     for (const clientId of this.remoteClients.clients()) {
       // Per-tab cwd may still name a closed project after revoke leaves it for
       // selectRepo — buildSessionsList enforces the live authorized set.
-      const cwd = this.remoteClients.cwd(clientId);
+      // Same landmine as the voice-config refresh: a mid-handshake tab is in
+      // the roster with no project, and this list rebuild is not a request
+      // from that tab.
+      const cwd = this.remoteClients.cwdIfPresent(clientId);
+      if (!cwd) continue;
       const activeId = this.remoteActiveSessionId(clientId);
       this.sendRemoteClient(clientId, this.buildSessionsList(cwd, undefined, activeId));
       const active = this.remoteClients.active(clientId);
@@ -9511,18 +10310,18 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       const result = await client.listSessions(cwd, process.platform);
       const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
       const stableOverrides: SessionMetaOverrides = { ...overrides };
-      // Codex restamps listing time on `session/load`; freeze first-seen
-      // `activeAt` so an open cannot promote the row. Claude reports the SDK's
-      // real lastModified — do not pin that to the first refresh.
-      if (provider === "codex") {
-        for (const entry of result.sessions) {
-          const previous = stableOverrides[entry.sessionId] ?? {};
-          if (typeof previous.activeAt === "number") continue;
-          stableOverrides[entry.sessionId] = {
-            ...previous,
-            activeAt: adapterListEntry(entry, {}, provider, Date.now()).updatedAt,
-          };
-        }
+      // First-seen adapter listing time is a baseline only. Claude restamps
+      // `updatedAt` on `session/load` (measured). Codex does not restamp, but
+      // pinning is still what we want: an open must not promote the row.
+      // Trade-off: work done outside this extension stops promoting the row.
+      // Unlike grok, neither adapter has a load-stable on-disk file to rank by.
+      for (const entry of result.sessions) {
+        const previous = stableOverrides[entry.sessionId] ?? {};
+        if (typeof previous.activeAt === "number") continue;
+        stableOverrides[entry.sessionId] = {
+          ...previous,
+          activeAt: adapterListEntry(entry, {}, provider, Date.now()).updatedAt,
+        };
       }
       const entries = result.sessions.map((entry) => adapterListEntry(entry, stableOverrides, provider));
       this.setProviderNeedsLogin(provider, false);
@@ -9538,13 +10337,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             ...previous,
             provider,
             providerCwd: entry.cwd,
-            ...(provider === "codex"
-              ? {
-                  activeAt: typeof previous.activeAt === "number"
-                    ? previous.activeAt
-                    : stableOverrides[entry.sessionId]?.activeAt,
-                }
-              : {}),
+            activeAt: typeof previous.activeAt === "number"
+              ? previous.activeAt
+              : stableOverrides[entry.sessionId]?.activeAt,
             ...(!previous.customName && title ? { autoName: title } : {}),
           };
           if (JSON.stringify(updated) !== JSON.stringify(previous)) {
@@ -10065,7 +10860,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const repoCwd = this.repoCatalog().find((r) => pathsEqual(r.cwd, cwd))?.cwd
       ?? this.repoOwningSessionCwd(cwd, overrides);
     if (!repoCwd) return;
-    if (pathsEqual(repoCwd, this.remoteClients.cwd(clientId))) return;
+    const clientCwd = this.remoteClients.cwdIfPresent(clientId);
+    if (!clientCwd || pathsEqual(repoCwd, clientCwd)) return;
     // The rail's expanded cap — matches what its own probe asks for, so a
     // refresh never returns fewer rows than the client already had.
     this.sendRepoSessionsPreview(clientId, repoCwd, 20);
@@ -10329,6 +11125,25 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const grokHome = resolveGrokHome(process.env);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const repoCwds = this.sessionCwdsForRepo(cwd, overrides);
+    // Tear ownerless live processes down BEFORE touching disk. deleteSession
+    // already does this: a grok process that still holds the directory makes
+    // the Windows delete fail (or the CLI re-persists the shell), and the row
+    // comes back as a live-empty "New session". Ownerless parked empties —
+    // New session clicks while the previous one was still priming — are the
+    // usual leftovers. Live-owned conversations stay protected below.
+    const repoCwdKeys = new Set(repoCwds.map(normalizeFsPath));
+    const exiting: Promise<void>[] = [];
+    for (const s of [...this.pool]) {
+      if (this.sessionHasLiveOwner(s)) continue;
+      if (!repoCwdKeys.has(normalizeFsPath(this.sessionCwd(s)))) continue;
+      exiting.push(this.disposeSession(s));
+    }
+    // AWAIT the exits. Firing dispose and moving on leaves `clearSessions`
+    // racing a Windows taskkill that still holds the directory — the delete
+    // then fails, or the CLI re-persists the shell, and the row returns as a
+    // live-empty "New session". That is the precise failure this block exists
+    // to prevent, so not waiting made it a no-op on the first clear.
+    if (exiting.length) await Promise.allSettled(exiting);
     // Adapter history is provider-owned, so make the cache authoritative before
     // a destructive combined-history action. Grok-only installs skip this.
     // A failed refresh must not fall through to the stale cache — that is how
@@ -10388,6 +11203,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         "info",
         "No history to clear.",
       );
+      // Ownerless live empties may have been disposed above without a catalog
+      // row. The rail still has to drop them.
+      this.postSessionsList();
+      this.sendLocalRepoSessionsPreview(cwd);
       this.refreshRemoteRepoPreview(clientId, cwd);
       return;
     }
@@ -10495,6 +11314,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // clearing any other one left the rail showing every row it had just deleted
     // — no confirmation, and a later delete on one of those ghosts failed with a
     // permissions error that was really "this is not there any more".
+    this.sendLocalRepoSessionsPreview(cwd);
     this.refreshRemoteRepoPreview(clientId, cwd);
     if (keptForAnotherOwner) this.reportProtectedSession(origin, clientId, "clear");
   }
@@ -10622,6 +11442,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.emit(this.focused, { type: "setAllToolDetails", open });
   }
 
+  /** Command Palette / Ctrl+F fallback: open in-webview find (#99). `post`
+   *  (not emit) so a focus-swap cannot replay it; host-local so a desk
+   *  invocation does not pop find on a linked phone. */
+  findInSession(): void {
+    this.view?.show?.(false);
+    this.post({ type: "findInSession" });
+  }
+
   /** grok.showThinking (#26) — whether grok's reasoning traces are shown. Off by
    *  default; hidden traces are replaced by a lightweight "Thinking…" indicator. */
   private showThinking(): boolean {
@@ -10630,6 +11458,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private postShowThinking(): void {
     this.post({ type: "showThinking", value: this.showThinking() });
+  }
+
+  /** grok.thumbsFeedback — Settings → General opt-in. Off by default. */
+  private thumbsFeedbackEnabled(): boolean {
+    return this.host.getConfiguration("grok").get<boolean>("thumbsFeedback", false);
+  }
+
+  private postThumbsFeedback(): void {
+    this.post({ type: "thumbsFeedback", value: this.thumbsFeedbackEnabled() });
   }
 
   /** Anonymous, per-install GUID — generated once and kept in shared client state
@@ -10719,32 +11556,74 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.lastVoiceConfiguredByCwd.set(normalizeRepoPath(cwd), value);
   }
 
+  private voiceConfiguredMsg(cwd: string, value: boolean): Extract<HostMsg, { type: "voiceConfigured" }> {
+    return {
+      type: "voiceConfigured",
+      value,
+      sendPhrase: this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE),
+      keyterms: sanitizeVoiceKeyterms(this.voiceSetting(cwd, "voiceKeyterms", [])),
+    };
+  }
+
+  /** Record that this destination already has `payload`. Watcher posts skip a match. */
+  private seedPostedVoiceConfigured(
+    destKey: string,
+    payload: Extract<HostMsg, { type: "voiceConfigured" }>,
+  ): void {
+    this.lastPostedVoiceConfigured.set(destKey, voiceConfiguredFingerprint(payload));
+  }
+
+  /** A replaced renderer is a new destination — drop the old view's cache entry. */
+  private forgetPostedVoiceConfigured(destKey: string): void {
+    this.lastPostedVoiceConfigured?.delete(destKey);
+  }
+
+  /**
+   * Post `voiceConfigured` unless this destination already received an identical
+   * frame. Returns whether a frame went out.
+   */
+  private deliverVoiceConfigured(
+    destKey: string,
+    payload: Extract<HostMsg, { type: "voiceConfigured" }>,
+    send: () => void,
+  ): boolean {
+    const fp = voiceConfiguredFingerprint(payload);
+    if (this.lastPostedVoiceConfigured.get(destKey) === fp) return false;
+    this.seedPostedVoiceConfigured(destKey, payload);
+    send();
+    return true;
+  }
+
   private postVoiceConfigured(): void {
     const cwd = this.sessionCwd(this.focused);
     const configured = !!this.resolveVoiceApiKey(cwd);
+    const localMsg = this.voiceConfiguredMsg(cwd, configured);
     // Refresh = rebuild: only the cwds this pass actually resolved stay in the
     // map. Point-writes between refreshes (voice-start failure paths) are
     // fresh by definition; accumulation is what made stale `true` immortal.
     this.lastVoiceConfiguredByCwd.clear();
     this.rememberVoiceConfigured(cwd, configured);
-    this.postLocal({
-      type: "voiceConfigured",
-      value: configured,
-      sendPhrase: this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE),
-      keyterms: sanitizeVoiceKeyterms(this.voiceSetting(cwd, "voiceKeyterms", [])),
-    });
+    this.deliverVoiceConfigured("local", localMsg, () => this.postLocal(localMsg));
     for (const clientId of this.remoteClients.clients()) {
       // Scope = the project whose config we resolved. Classification is "scope"
       // so a closed/re-homed tab cannot receive the prior project's prefs.
-      const remoteCwd = this.sessionCwd(this.remoteSessionFor(clientId));
+      //
+      // This refresh is a host-wide watcher/config event, not a request from
+      // this tab. A connected client can still have no project (desktop
+      // empty-workspace ready() stores ""). The strict cwd accessor throws
+      // for that state and would take down the desktop main process. Skip —
+      // the next snapshot carries voiceConfigured.
+      const active = this.remoteClients.active(clientId);
+      const remoteCwd = active
+        ? this.sessionCwd(active)
+        : this.remoteClients.cwdIfPresent(clientId);
+      if (!remoteCwd) continue;
       const remoteConfigured = !!this.resolveVoiceApiKey(remoteCwd);
       this.rememberVoiceConfigured(remoteCwd, remoteConfigured);
-      this.sendRemoteClient(clientId, {
-        type: "voiceConfigured",
-        value: remoteConfigured,
-        sendPhrase: this.voiceSetting(remoteCwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE),
-        keyterms: sanitizeVoiceKeyterms(this.voiceSetting(remoteCwd, "voiceKeyterms", [])),
-      }, remoteCwd);
+      const remoteMsg = this.voiceConfiguredMsg(remoteCwd, remoteConfigured);
+      this.deliverVoiceConfigured(`remote:${clientId}`, remoteMsg, () => {
+        this.sendRemoteClient(clientId, remoteMsg, remoteCwd);
+      });
     }
   }
 
@@ -11260,7 +12139,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const credentialCwd = this.sessionCwd(session);
     if (!this.resolveVoiceApiKey(credentialCwd)) {
       this.rememberVoiceConfigured(credentialCwd, false);
-      this.sendRemoteClient(clientId, { type: "voiceConfigured", value: false }, credentialCwd);
+      const payload = this.voiceConfiguredMsg(credentialCwd, false);
+      this.deliverVoiceConfigured(`remote:${clientId}`, payload, () => {
+        this.sendRemoteClient(clientId, payload, credentialCwd);
+      });
       this.sendRemoteClient(clientId, { type: "voiceError" });
       this.sendRemoteClient(clientId, {
         type: "error",
@@ -11573,6 +12455,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private applyRewindToView(session: Session, surviving: number): void {
     session.buffer = truncateReplayBuffer(session.buffer, surviving);
     session.userMessageCount = surviving;
+    session.liveFeedbackEligible = false;
+    session.turnRating = 0;
     session.historyEventCount = historyEventCount(session.buffer);
     // Positions for anything persisted after this point are counted against the
     // same number the webview now holds.
@@ -11811,11 +12695,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
   }
 
-  /** Write image bytes into staging and attach the chip. The `[Image #N]` index
-   *  is the chip's position among the images already staged for THIS message —
-   *  the numbering the CLI resolves references against (see
-   *  `withPerMessageImageIndices`). postChips re-derives it after every
-   *  mutation, so this only has to be right at the moment of attach. */
+  /** Write image bytes into staging and attach the chip. The `[Image #N]`
+   *  index is stamped once here (`allocateImageIndex`) and is never rewritten. */
   private async stageImageAttachment(
     bytes: Buffer,
     mimeType: string,
@@ -11843,8 +12724,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const originRelPath = rel && rel !== ".." && !rel.startsWith("../") && !path.isAbsolute(rel)
       ? rel
       : undefined;
-    const imageIndex = session.chips.filter((c) => isImageChip(c) && !c.hidden).length + 1;
-    session.chips.push(makeImageChip(absPath, imageIndex, mimeType, originRelPath, previewId));
+    const allocated = allocateImageIndex(session.imageIndexHighWater, [
+      ...session.chips,
+      ...session.queuedSends.flatMap((item) => item.chips),
+    ]);
+    session.imageIndexHighWater = allocated.highWater;
+    session.chips.push(makeImageChip(absPath, allocated.index, mimeType, originRelPath, previewId));
     this.postChips(session);
     return session;
   }
@@ -12039,7 +12924,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  delivery. Revisit when queued state can track every contribution id and
    *  one committed message can acknowledge all of them without changing the
    *  relay dequeue handshake. */
-  private divertRacingSend(session: Session, text: string, bare: boolean): void {
+  private divertRacingSend(
+    session: Session,
+    text: string,
+    bare: boolean,
+    chips: FileChip[] = explicitVisibleChips(session.chips),
+  ): void {
     if (bare) {
       this.emit(session, {
         type: "error",
@@ -12047,10 +12937,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       });
       return;
     }
+    if (!text.trim() && !chips.length) return;
     session.queuedSendDispatch = undefined;
-    if (session.queuedSends.length) session.queuedSends[0] += "\n\n" + text;
-    else session.queuedSends.push(text);
-    this.emit(session, { type: "queuedSends", items: [...session.queuedSends] });
+    session.queuedSends = enqueueQueuedSend(session.queuedSends, text, chips);
+    if (chips.length) {
+      session.chips = consumeChips(session.chips, chips);
+      if (session === this.focused) this.refreshImplicitChip(true);
+      else this.postChips(session);
+    }
+    this.emitQueuedSends(session);
     void this.maybeFlushQueuedSends(session);
   }
 
@@ -12059,7 +12954,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     bare = false,
     target?: Session,
     origin: MsgOrigin = "local",
-    queuedSendCommit?: { text: string },
+    queuedSendCommit?: { text: string; items: QueuedSendEntry[] },
     submissionId?: string,
   ): Promise<void> {
     // `target` lets a queued-send flush fire into a BACKGROUNDED session (its
@@ -12112,40 +13007,53 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (gen !== session.gen) return;
     }
 
-    // Snapshot the HOST's chips — the webview copy is a render mirror of these
-    // (every mutation routes through us + postChips).
-    // `bare` sends (gear-menu /compact) deliberately carry no attachments, and
-    // a background flush must not consume the FOCUSED view's composer chips.
-    // Renumbered here as well as in postChips, so the guarantee is local to the
-    // send rather than inherited from whoever last posted: the `[Image #N]`
-    // tags, the image blocks they name, and the chips painted on the bubble all
-    // come off THIS list, in this order.
-    const chips = bare ? [] : withPerMessageImageIndices([...session.chips]);
+    // Snapshot attachments. A live send reads the composer's chips; a queued
+    // flush uses the per-item copies snapshotted at queue time so a later
+    // composer remove cannot silently drop them. `bare` sends (gear-menu
+    // /compact) carry none. `[Image #N]` is the attach-time index on those
+    // chips — send does not renumber.
+    const queuedItems = !bare && queuedSendCommit?.items.length
+      ? queuedSendCommit.items.map((item) => ({ text: item.text, chips: item.chips ?? [] }))
+      : undefined;
+    const implicitChips = session.chips.filter((chip) => isImplicitChip(chip));
+    let chips: FileChip[] = [];
+    let contributions: QueuedPromptContribution[] | undefined;
+    if (bare) {
+      chips = [];
+    } else if (queuedItems) {
+      contributions = [];
+      const queuedChips: FileChip[] = [];
+      for (const item of queuedItems) {
+        const itemImages: PromptImageInput[] = [];
+        for (const chip of item.chips) {
+          if (chip.hidden || !isImageChip(chip)) continue;
+          const read = await this.readImageChip(chip, session, gen);
+          if (read === "gone") return;
+          if (read === "failed") return;
+          itemImages.push(read);
+        }
+        contributions.push({ text: item.text, chips: item.chips, images: itemImages });
+        queuedChips.push(...item.chips);
+      }
+      chips = [...queuedChips, ...implicitChips];
+    } else {
+      chips = [...session.chips];
+    }
 
     // Pre-read every visible image BEFORE anything is cleared or sent. Any
     // failure blocks the whole send with the chips intact — never a prompt
     // whose [Image #N] tag has no image block behind it (a dangling tag sends
     // grok hunting the workspace for an image it was never given).
-    const images: PromptImageInput[] = [];
-    for (const chip of chips) {
-      if (chip.hidden || !isImageChip(chip)) continue;
-      try {
-        const bytes = await fs.promises.readFile(chip.path);
-        if (bytes.length === 0) throw new Error("file is empty");
-        images.push({
-          index: chip.imageIndex!,
-          mimeType: chip.mimeType ?? "image/png",
-          data: bytes.toString("base64"),
-          path: chip.path,
-          relPath: chip.originRelPath,
-        });
-      } catch (e) {
-        if (gen !== session.gen) return;
-        this.emit(session, {
-          type: "agentError",
-          text: `Could not read ${chip.relPath} (${(e as Error).message}). Remove the attachment and try again.`,
-        });
-        return;
+    const images: PromptImageInput[] = contributions
+      ? contributions.flatMap((contribution) => contribution.images)
+      : [];
+    if (!contributions) {
+      for (const chip of chips) {
+        if (chip.hidden || !isImageChip(chip)) continue;
+        const read = await this.readImageChip(chip, session, gen);
+        if (read === "gone") return;
+        if (read === "failed") return;
+        images.push(read);
       }
     }
     // Mirror the failure path's guard: if the client was torn down during the
@@ -12162,16 +13070,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       text,
       client.availableCommands.map((c) => c.name),
     );
-    const { blocks: promptBlocks } = buildPromptWithImages(
-      text,
-      chips,
-      images,
-      {
-        readFile: (p) => fs.readFileSync(p, "utf8"),
-        extName: (p) => path.extname(p),
-      },
-      slashCommand != null,
-    );
+    const promptDeps = {
+      readFile: (p: string) => fs.readFileSync(p, "utf8"),
+      extName: (p: string) => path.extname(p),
+    };
+    const { blocks: promptBlocks } = contributions
+      ? buildQueuedPromptWithImages(contributions, implicitChips, promptDeps, slashCommand != null)
+      : buildPromptWithImages(text, chips, images, promptDeps, slashCommand != null);
 
     // Unlike images, document bytes are read lazily by Grok from the path in
     // the prompt. Persist ownership before consuming the chip or sending.
@@ -12185,18 +13090,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // would cancel the first turn. Runs before chips are consumed, so a
     // diverted send leaves its attachments staged for the queued flush.
     if (this.turnInFlight(session)) {
-      if (!queuedSendCommit) this.divertRacingSend(session, text, bare);
+      if (!queuedSendCommit) this.divertRacingSend(session, text, bare, explicitVisibleChips(chips));
       return;
     }
 
     if (queuedSendCommit) {
       if (!finishQueuedSendCommit(session, queuedSendCommit, true)) return;
-      this.emit(session, { type: "queuedSends", items: [...session.queuedSends] });
+      this.emitQueuedSends(session);
+      if (session === this.focused) this.refreshImplicitChip(true);
+      else this.postChips(session);
     }
 
     if (bare) {
       this.postChips(session);
-    } else {
+    } else if (!queuedSendCommit) {
       // One-shot attachments are consumed by the send; the implicit context
       // chip mirrors IDE state and stays resident (like Claude Code's). Keep
       // it through the clear so refreshImplicitChip sees `prev` — preserving
@@ -12258,6 +13165,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // auto_compact_completed / auto_compact_failed land DURING this turn.
       if (slashCommand === "compact") {
         session.sawCompactFailed = false;
+        session.sawCompactNotification = false;
         if (isAdapterProvider(session.provider)) {
           session.adapterCompactThisTurn = true;
           this.rememberAdapterContext(session, { compacted: true });
@@ -12280,8 +13188,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // not persisted: grok's own history has no such message, so re-focus keeps
         // it but a disk restore won't.
         if (!session.sawCompactFailed) this.emit(session, { type: "messageChunk", text: "Compacted." });
+        // The live compact rail is exact and wins. Older Grok CLIs fall through
+        // to the control-plane meter; only an explicit -32601 may use the hidden
+        // legacy prompt fallback.
+        if (session.provider === "grok" && !session.sawCompactNotification) {
+          await this.refreshContextAfterCompact(client, session, gen);
+          if (gen !== session.gen) return;
+        }
       }
       this.emit(session, { type: "agentEnd", meta });
+      this.noteLiveTurnEnded(session);
       this.setStatus(session, "done");
       // Again at the end: by now the transcript really has moved, so this is
       // the push that makes the row's position true rather than asserted.
@@ -12305,6 +13221,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // notice instead (#57).
       if (isRateLimitError(e)) {
         this.emit(session, { type: "agentError", text: rateLimitNoticeText(e) });
+        this.noteLiveTurnEnded(session);
         this.setStatus(session, "error");
         return;
       }
@@ -12316,6 +13233,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // promptErrorText keeps the copy consistent — the entitlement notice for
       // billing-flavored wording (#58), the raw detail otherwise.
       this.emit(session, { type: "agentError", text: promptErrorText(e) });
+      this.noteLiveTurnEnded(session);
       this.setStatus(session, "error");
     } finally {
       // Belt to the braces above: however this turn left — an early return on a
@@ -12387,6 +13305,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       if (!endTurn(session, turn)) return true;
       this.emit(session, { type: "agentEnd", meta });
+      this.noteLiveTurnEnded(session);
       this.setStatus(session, "done");
       session.authRecoveryTried = false; // recovered — re-arm for a future expiry
       this.maybeGenerateTitle(session);
@@ -12402,6 +13321,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // (#57): a fresh process with a fresh token hit the same wall.
       if (isRateLimitError(e2)) {
         this.emit(session, { type: "agentError", text: rateLimitNoticeText(e2) });
+        this.noteLiveTurnEnded(session);
         this.setStatus(session, "error");
         return true;
       }
@@ -12414,6 +13334,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // from the replay buffer on a later focus switch after the user has
         // already re-authed.
         this.emit(session, { type: "agentError", text: errorDetail(e2) });
+        this.noteLiveTurnEnded(session);
         this.setStatus(session, "error");
         this.post({ type: "onboarding", state: this.onboardingForSession(session) });
       } else {
@@ -12422,6 +13343,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // with the CLI's own actionable advice in chat (#58), never the login
         // overlay, which can't fix it.
         this.emit(session, { type: "agentError", text: promptErrorText(e2) });
+        this.noteLiveTurnEnded(session);
         this.setStatus(session, "error");
       }
     } finally {
@@ -12510,6 +13432,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       processingSound: cfg.get("processingSound", false),
       readRepliesAloud: cfg.get("readRepliesAloud", false),
       telemetryEnabled: cfg.get("telemetry.enabled", true),
+      thumbsFeedback: cfg.get("thumbsFeedback", false),
       appPurpose: this.appPurpose() || DEFAULT_APP_PURPOSE,
       ...(commandLanguage ? { commandLanguage } : {}),
       // For a remote's About page. A phone is looking at neither GUI,
@@ -12537,6 +13460,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // OPT-IN: unpackaged desktop only. Gear → Advanced offers the control so
         // DevTools is discoverable without the auto-hidden application menu.
         toggleDevTools: this.host.canToggleDevTools,
+        // OPT-IN: absent/false hides Settings → Connectors.
+        ...(this.host.canShowMcpSettings ? { mcpSettings: true } : {}),
         // Absent/true = host opens files in an editor tab; false = no editor
         // (desktop → in-app lightbox for generated images). See Host.canOpenInEditor.
         openInEditor: this.host.canOpenInEditor,
@@ -12559,8 +13484,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private postInitialState(): void {
+    // `ready` means the local renderer just booted (including Electron
+    // document reload, which does not re-enter resolveWebviewView). Drop the
+    // cache so postVoiceConfigured below is not swallowed against the old view.
+    this.forgetPostedVoiceConfigured("local");
     this.post(this.buildInitialStateMsg());
     this.postProviderState();
+    this.postMcpConnectors();
     for (const provider of this.connectedProviders()) void this.probeProviderVersion(provider);
     this.post({
       type: "summarizeRepliesAloud",
@@ -12690,13 +13620,32 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.postSessionName(session);
   }
 
+  private async readImageChip(
+    chip: FileChip,
+    session: Session,
+    gen: number,
+  ): Promise<PromptImageInput | "failed" | "gone"> {
+    try {
+      const bytes = await fs.promises.readFile(chip.path);
+      if (bytes.length === 0) throw new Error("file is empty");
+      return {
+        index: chip.imageIndex!,
+        mimeType: chip.mimeType ?? "image/png",
+        data: bytes.toString("base64"),
+        path: chip.path,
+        relPath: chip.originRelPath,
+      };
+    } catch (e) {
+      if (gen !== session.gen) return "gone";
+      this.emit(session, {
+        type: "agentError",
+        text: `Could not read ${chip.relPath} (${(e as Error).message}). Remove the attachment and try again.`,
+      });
+      return "failed";
+    }
+  }
+
   private postChips(session: Session = this.focused): void {
-    // The single chokepoint every chip mutation passes through, so it is where
-    // the `[Image #N]` labels are re-derived: removing the first of three
-    // attachments must renumber the rest to #1..#2 rather than leave a gap the
-    // send would then close silently, showing the user a number the agent was
-    // never told. See `withPerMessageImageIndices`.
-    session.chips = withPerMessageImageIndices(session.chips);
     const remoteMessage: HostMsg = { type: "chips", chips: session.chips };
     if (session === this.focused && this.view) {
       const webview = this.view.webview;
@@ -12720,6 +13669,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           ? { previewSrc: webview.asWebviewUri(Uri.file(chip.path)) }
           : {}) }
         : chip) };
+    }
+    if (message.type === "queuedSends" && message.queued) {
+      return {
+        ...message,
+        queued: message.queued.map((item) => ({
+          ...item,
+          ...(item.chips ? { chips: item.chips.map((chip) => isImageChip(chip)
+            ? { ...chip, ...(fs.existsSync(chip.path)
+              ? { previewSrc: webview.asWebviewUri(Uri.file(chip.path)) }
+              : {}) }
+            : chip) } : {}),
+        })),
+      };
     }
     if (message.type === "userMessageChunk" && message.images) {
       return {
@@ -12748,7 +13710,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  return to that conversation. The other two would re-steal focus and re-open
    *  the mode picker on reconnect. */
   private static readonly TRANSIENT_TYPES = new Set([
-    "restoreComposer", "focusInput", "openModePopover",
+    "restoreComposer", "focusInput", "findInSession", "openModePopover",
+    // Replayed mid-buffer it would stamp the then-current footer, not the live
+    // one. `sessionUiSnapshot` restores eligibility after historyReplay ends.
+    "turnFeedbackAck",
   ]);
   /**
    * Host→rail catalog surface. Everything else stays chat-only so a user who
@@ -13104,7 +14069,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // Priming: client may exist without a session id (spawn window).
         session.client = { dispose() {} } as AcpClient;
         session.priming = true;
-        session.queuedSends = [queuedText];
+        session.queuedSends = [{ text: queuedText, chips: [] }];
         session.queuedSendRequiresRelay = true;
         this.pool.add(session);
         this.remoteClients.setActive(clientId, session);
@@ -13129,15 +14094,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         } as unknown as AcpClient;
         session.hasHistory = true;
         session.status = "done";
-        session.chips = chips;
-        session.queuedSends = [queuedText];
+        session.chips = [];
+        session.queuedSends = [{ text: queuedText, chips: chips.map((chip) => ({ ...chip })) }];
         session.queuedSendRequiresRelay = true;
         this.pool.add(session);
         this.remoteClients.setActive(clientId, session);
         void this.maybeFlushQueuedSends(session);
         return {
           promptCount: () => prompts,
-          queuedSends: () => [...session.queuedSends],
+          queuedSends: () => session.queuedSends.map((item) => item.text),
           lastPromptBlocks: () => lastBlocks,
         };
       },
@@ -13350,6 +14315,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     if (message.type === "clearMessages") session.buffer = [];
     else if (!GrokSidebar.TRANSIENT_TYPES.has(message.type)) session.buffer.push(message);
+    if (message.type === "userMessage" && !message.steer) {
+      session.liveFeedbackEligible = false;
+      session.turnRating = 0;
+    }
     if (session === this.focused) {
       this.postTap?.("local", message);
       const webview = this.view?.webview;
@@ -13374,6 +14343,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     if (message.type === "clearMessages") session.buffer = [];
     else if (!GrokSidebar.TRANSIENT_TYPES.has(message.type)) session.buffer.push(message);
+    if (message.type === "userMessage" && !message.steer) {
+      session.liveFeedbackEligible = false;
+      session.turnRating = 0;
+    }
     if (session !== this.focused) return;
     this.postTap?.("local", message);
     const webview = this.view?.webview;
@@ -13392,15 +14365,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private async replayLoadedHistory(session: Session, load: () => Promise<void>): Promise<void> {
-    session.replaying = true;
-    this.emit(session, { type: "historyReplay", active: true });
-    try {
-      await load();
-    } finally {
-      this.emit(session, { type: "historyReplay", active: false });
-      session.replaying = false;
-      this.sendRemoteHistorySnapshot(session);
-    }
+    // Join an in-flight load rather than superseding it: session/load cannot
+    // be aborted, and a second stream would interleave into the same buffer.
+    // `replaying` stays a boolean so remotes still see "any replay in progress".
+    await runExclusiveHistoryLoad(session, load, {
+      onStart: () => this.emit(session, { type: "historyReplay", active: true }),
+      onFinish: () => {
+        this.emit(session, { type: "historyReplay", active: false });
+        this.sendRemoteHistorySnapshot(session);
+      },
+    });
   }
 
   // ---------- session pool ----------
@@ -13634,6 +14608,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   /** The sole remote-client release path: abandon its session before deleting ownership. */
   private releaseRemoteClient(clientId: string): void {
+    this.forgetPostedVoiceConfigured(`remote:${clientId}`);
     const current = this.remoteClients.active(clientId);
     const preserveLogicalTab = !!current && (
       current.needsProvider ||
@@ -13700,11 +14675,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  Runs on activation and after every new/opened session, so at most one empty
    *  session — the live one you are looking at — survives in the repo you are
    *  working in. Scans the newest slice by mtime so it stays bounded on a large
-   *  store, and reads content only for directories it has not already cleared.
-   *  Never touches a live session, one being loaded right now, one younger than
-   *  {@link SWEEP_MIN_AGE_MS}, a renamed or pinned one, a worktree session, or a
-   *  subagent's transcript. Best-effort throughout: a locked directory is logged
-   *  and skipped. */
+   *  store, plus every summary-only (`hasTranscript === false`) entry even when
+   *  it has aged out of that slice, and reads content only for directories it
+   *  has not already cleared. Never touches a live session, one being loaded
+   *  right now, one younger than {@link SWEEP_MIN_AGE_MS}, a renamed or pinned
+   *  one, a worktree session, or a subagent's transcript. Best-effort
+   *  throughout: a locked directory is logged and skipped. */
   private sweepEmptySessions(cwd: string = this.workspaceRoot()): void {
     if (!cwd) return;
     const grokHome = resolveGrokHome(process.env);
@@ -13735,7 +14711,27 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const index = indexSessions({ fs: defaultFs, grokHome, cwd, log });
     const removed: string[] = [];
     const now = Date.now();
-    for (const { id, mtimeMs } of index.slice(0, GrokSidebar.SWEEP_SCAN_LIMIT)) {
+    // Newest-N as before, PLUS every summary-only shell even when it has aged
+    // out of that window. The 300 cap is what let 312 transcript-less
+    // directories accumulate on a large store: they fall off the slice and
+    // are never looked at again. A dir with no events.jsonl is cheap to
+    // judge and is the shape a credential probe leaves behind.
+    const considered = new Set<string>();
+    const candidates: typeof index = [];
+    for (const entry of index.slice(0, GrokSidebar.SWEEP_SCAN_LIMIT)) {
+      considered.add(entry.id);
+      candidates.push(entry);
+    }
+    // DELIBERATELY not extended past that slice. Walking every
+    // `hasTranscript === false` entry would reach the shells that already fell
+    // off the scan — but `hasTranscript` is a snapshot, and another window can
+    // begin a session's first prompt after it was taken. The age gate does not
+    // help there: an OLD session that stayed open still looks stale, so an
+    // in-progress first write could be deleted, unrecoverably, from a second
+    // window. Historical shells are inert; a deleted conversation is not.
+    // Stopping their creation (see the probe's scratch cwd) is the fix that
+    // does not risk data to collect a tidier directory listing.
+    for (const { id, mtimeMs } of candidates) {
       if (liveIds.has(id) || proven.has(id)) continue;
       // The index is already sorted newest-first, so this could break — but a
       // clock skew or a touched file would then silently end the scan early.
@@ -13827,12 +14823,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  generation so any in-flight handlers/awaits bound to the old client bail.
    *  Recomputes the dot after removal — a reaped session that's still unread stays
    *  green; an idle/read one goes gray. */
-  private disposeSession(session: Session): void {
+  private disposeSession(session: Session): Promise<void> {
     const id = session.activeSessionId;
-    this.detachClient(session)?.dispose();
+    // Returned, not dropped. `dispose()` resolves when the process is actually
+    // gone — on Windows that is a `taskkill` still running — and a caller about
+    // to DELETE the session's directory must wait for it. Callers that only
+    // want the pool entry gone can keep ignoring this, exactly as before.
+    const exited = this.detachClient(session)?.dispose();
     this.pool.delete(session);
     this.remoteClients.deleteActiveValue(session);
     if (id) this.post({ type: "sessionDot", id, dot: this.dotForId(id) });
+    return exited ?? Promise.resolve();
   }
 
   /** Stamp a session's recency for LRU/TTL reaping (created / focused / made busy). */
@@ -13952,7 +14953,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const sent = new Set<string>();
     for (const clientId of this.remoteClients.clients()) {
-      const repoCwd = this.remoteClients.cwd(clientId);
+      const repoCwd = this.remoteClients.cwdIfPresent(clientId);
+      if (!repoCwd) continue;
       const key = normalizeRepoPath(repoCwd);
       if (sent.has(key)) continue;
       if (!this.sessionCwdsForRepo(repoCwd, overrides).some((cwd) => pathsEqual(cwd, this.sessionCwd(session)))) continue;
@@ -14177,6 +15179,81 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const cwd = this.sessionCwd(session);
     const usage = readContextUsage({ fs: defaultFs, grokHome: resolveGrokHome(process.env), cwd, id });
     if (usage) this.emit(session, { type: "contextUsage", used: usage.used, window: usage.window });
+  }
+
+  /** Publish a control-plane session/info snapshot without touching accounting. */
+  private emitSessionInfoContext(session: Session, info: SessionInfoContext): void {
+    session.lastSessionInfoAt = Date.now();
+    session.lastSessionInfoUsed = info.used;
+    session.sessionInfoStale = false;
+    this.emit(session, {
+      type: "contextUsage",
+      used: info.used,
+      window: info.window,
+      categories: info.categories,
+      systemPromptTokens: info.systemPromptTokens,
+      toolDefinitionsTokens: info.toolDefinitionsTokens,
+      toolDefinitionsCount: info.toolDefinitionsCount,
+      messageTokens: info.messageTokens,
+      freeTokens: info.freeTokens,
+      autoCompactThresholdPercent: info.autoCompactThresholdPercent,
+    });
+  }
+
+  /**
+   * Read Grok's structured context meter. This is intentionally separate from
+   * the adapter usageLog/contextUsageFromLog seam: those entries reconstruct
+   * Claude/Codex occupancy and never describe Grok's live categories.
+   */
+  private async refreshContextFromSessionInfo(
+    session: Session,
+    gen: number,
+    opts: { force?: boolean } = {},
+  ): Promise<boolean> {
+    if (session.provider !== "grok" || gen !== session.gen || session.sessionInfoUnsupported) return false;
+    const client = session.client;
+    if (!client?.sessionId) return false;
+    if (!opts.force && !session.sessionInfoStale && sessionInfoCacheFresh(session.lastSessionInfoAt, Date.now())) {
+      return false;
+    }
+    try {
+      const info = await client.getSessionInfo();
+      if (gen !== session.gen) return false;
+      if (info === "unsupported") {
+        session.sessionInfoUnsupported = true;
+        return false;
+      }
+      this.emitSessionInfoContext(session, info);
+      return true;
+    } catch (error) {
+      this.host.appendLine(`[context] session/info failed: ${(error as Error).message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Post-compact compatibility chain: live notification → session/info →
+   * legacy `/session-info`. The prompt fallback is only permitted after the
+   * RPC explicitly returned -32601; a transient RPC error must not manufacture
+   * a hidden model turn.
+   */
+  private async refreshContextAfterCompact(client: AcpClient, session: Session, gen: number): Promise<void> {
+    if (await this.refreshContextFromSessionInfo(session, gen, { force: true })) return;
+    if (gen !== session.gen || !session.sessionInfoUnsupported) return;
+    if (!client.availableCommands.some((command) => command?.name === "session-info")) return;
+    session.suppressContent = true;
+    session.captureAgentText = "";
+    try {
+      await client.prompt("/session-info");
+      if (gen !== session.gen) return;
+      const info = parseSessionInfoContext(session.captureAgentText);
+      if (info) this.emit(session, { type: "contextUsage", used: info.used, window: info.window });
+    } catch (error) {
+      this.host.appendLine(`[compact] hidden /session-info failed: ${(error as Error).message}`);
+    } finally {
+      if (gen === session.gen) session.suppressContent = false;
+      session.captureAgentText = undefined;
+    }
   }
 
   /** Clear a session's unread badge (it's being opened/viewed) and refresh its dot. */
@@ -15241,6 +16318,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // remoteVoice, so reconnect cannot resurrect a host-only listening state.
     this.dropRemoteVoice(clientId);
     this.remoteClients.ready(clientId);
+    // Empty default cwd (no desktop project yet) is not a bound repo. The
+    // snapshot still goes out unbound; adopting/starting here would throw.
+    if (!this.remoteClients.cwdIfPresent(clientId)) return;
     const session = this.remoteSessionFor(clientId);
     if (session.client && !session.needsProvider) {
       this.restorePersistedDraft(session);
@@ -15324,7 +16404,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         scopeCwdForClient: (clientId) => {
           const active = this.remoteClients.active(clientId);
           if (active) return this.sessionCwd(active);
-          return this.remoteClients.cwd(clientId);
+          return this.remoteClients.cwdIfPresent(clientId);
         },
         // Repo fan-out uses selected cwd; session fan-out uses active session
         // cwd. Either counts as ownership of that scope (default ownership
@@ -15548,56 +16628,49 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   /** Ordered catch-up built from this client's cwd and active remote session. */
   private buildRemoteSnapshot(clientId: string): HostMsg[] {
-    const cwd = this.remoteClients.cwd(clientId);
+    const cwd = this.remoteClients.cwdIfPresent(clientId) ?? "";
     // Live authorized set for this host — not "whatever the tab last selected".
     // Remote-narrowed, so a tab reconnecting into a project archived while it
     // was away comes back unbound rather than resuming inside it.
     const authorized = this.remoteAuthorizedSessionCwds();
     const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
-    const session = this.remoteSessionFor(clientId);
+    const session = cwd ? this.remoteSessionFor(clientId) : this.remoteClients.active(clientId);
     // Catalog is already open-folder-filtered on desktop; still the sole source.
     const entries = this.localRepoCatalogEntries();
     // Never put a closed cwd on the wire (choke point rejects it); empty = unbound.
     const initial = this.messageForRemote({ ...this.buildInitialStateMsg(), cwd: listCwd ?? "" });
-    const sessionCwd = this.sessionCwd(session);
-    const sessionCwdOk = !!authorizedListCwd(sessionCwd, authorized, pathsEqual);
-    const phrase = this.voiceSetting(
-      sessionCwdOk ? sessionCwd : this.workspaceRoot(),
-      "voiceSendPhrase",
-      DEFAULT_SEND_PHRASE,
-    );
+    const sessionCwd = session ? this.sessionCwd(session) : "";
+    const sessionCwdOk = !!session && !!authorizedListCwd(sessionCwd, authorized, pathsEqual);
     const snap: HostMsg[] = [];
     snap.push(initial);
     snap.push(this.providerStateMessage());
+    snap.push(this.mcpConnectorsMessage());
+    snap.push(this.mcpServersMessage());
     snap.push({ type: "clearMessages" });
     // Conversation buffer only when the bound session still lives under an
     // authorized cwd (revoke disposes doomed sessions; this is the belt).
-    if (sessionCwdOk && !session.replaying) {
+    if (session && sessionCwdOk && !session.replaying) {
       snap.push(...bracketRemoteSnapshot(session.buffer));
     }
-    if (sessionCwdOk) {
+    if (session && sessionCwdOk) {
       snap.push(...sessionUiSnapshot(session, this.displayMode(session)));
     }
-    if (sessionCwdOk && session.queuedSendRequiresRelay && !session.queuedSendDispatch) {
-      const text = this.queuedSendReadyText(session);
-      if (text) session.queuedSendDispatch = { id: randomUUID(), text };
+    if (session && sessionCwdOk && session.queuedSendRequiresRelay) {
+      session.queuedSendDispatch = claimQueuedSendDispatch(
+        session.queuedSendDispatch,
+        this.queuedSendReadyText(session),
+        () => randomUUID(),
+      );
     }
-    if (sessionCwdOk && session.queuedSendDispatch) {
+    if (session && sessionCwdOk && session.queuedSendDispatch) {
       snap.push({ type: "submitQueuedSend", ...session.queuedSendDispatch });
     }
     const voiceCwd = sessionCwdOk ? sessionCwd : this.workspaceRoot();
     const voiceConfigured = !!this.resolveVoiceApiKey(voiceCwd);
     this.rememberVoiceConfigured(voiceCwd, voiceConfigured);
-    snap.push({
-      type: "voiceConfigured",
-      value: voiceConfigured,
-      sendPhrase: phrase,
-      keyterms: sanitizeVoiceKeyterms(this.voiceSetting(
-        voiceCwd,
-        "voiceKeyterms",
-        [],
-      )),
-    });
+    const voicePayload = this.voiceConfiguredMsg(voiceCwd, voiceConfigured);
+    this.seedPostedVoiceConfigured(`remote:${clientId}`, voicePayload);
+    snap.push(voicePayload);
     const activeVoice = this.remoteVoice.get(clientId);
     if (activeVoice) {
       snap.push({ type: "voiceState", status: activeVoice.finalizing ? "transcribing" : "listening" });
@@ -15612,7 +16685,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         sessionCwdOk ? this.remoteActiveSessionId(clientId) : null,
       ),
     );
-    if (sessionCwdOk && session.activeSessionId) {
+    if (session && sessionCwdOk && session.activeSessionId) {
       snap.push({
         type: "sessionName",
         sessionId: session.activeSessionId,
@@ -15746,6 +16819,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           this.voiceSetting(this.workspaceRoot(), "voiceKeyterms", []),
         ),
         telemetryEnabled: cfg.get("telemetry.enabled", true),
+        thumbsFeedback: cfg.get("thumbsFeedback", false),
         providers: this.providerStateMessage().providers,
         providersChecking: this.providerRefreshInFlight,
         extVersion: this.context.extensionVersion,
@@ -15753,6 +16827,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         hostKind: "extension" as const,
         hostName: deviceDisplayName(os.hostname(), process.platform, os.release()),
         grokUpdate: null,
+        mcpServers: this.mcpServersView,
+        mcpLoading: false,
+        mcpError: "",
+        mcpWarning: MCP_GLOBAL_SCOPE_WARNING,
+        mcpConnectors: this.mcpConnectorsMessage().connectors,
       },
       category: opts.category || "general",
       env: {
@@ -15768,6 +16847,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           showOutput: this.host.canShowOutput,
           toggleDevTools: this.host.canToggleDevTools,
           settingsEditor: true,
+          ...(this.host.canShowMcpSettings ? { mcpSettings: true } : {}),
         },
       },
     };
@@ -15812,6 +16892,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         if (msg.type === "providerState" && Array.isArray(msg.providers)) {
           surface.update({ providers: msg.providers, providersChecking: msg.checking === true });
+        }
+        if (msg.type === "mcpServers") {
+          surface.update({
+            mcpServers: Array.isArray(msg.servers) ? msg.servers : [],
+            mcpLoading: msg.loading === true,
+            mcpError: msg.error || "",
+            mcpWarning: msg.warning || "",
+          });
+        }
+        if (msg.type === "mcpConnectors") {
+          surface.update({
+            mcpConnectors: Array.isArray(msg.connectors) ? msg.connectors : [],
+          });
         }
         if (msg.type === "settingsCategory" && msg.category) surface.setCategory(msg.category);
       });

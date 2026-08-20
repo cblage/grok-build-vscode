@@ -13,7 +13,12 @@
     { id: "voice", title: "Voice", restore: true },
     { id: "notifications", title: "Notifications", restore: true },
     { id: "providers", title: "Providers", restore: false },
-    { id: "account", title: "Account", restore: false },
+    { id: "connectors", title: "Connectors", restore: false },
+    // "Remote control" rather than "Account": the page is about driving this
+    // desk from a phone or browser — linking, the device list, the AFK Pilot
+    // sign-in that enables it. "Account" invited confusion with the agent
+    // accounts (Grok / Codex / Claude), which live under Providers.
+    { id: "account", title: "Remote control", restore: false },
     { id: "advanced", title: "Advanced", restore: false },
     { id: "about", title: "About", restore: false },
   ];
@@ -24,8 +29,12 @@
     general: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>',
     voice: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>',
     notifications: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>',
-    providers: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg>',
-    account: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+    providers: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>',
+    connectors: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg>',
+    // The lucide phone the top bar uses for Continue remotely (chat.js ICON
+    // .smartphone). Same shape on both so the nav row and the button read as
+    // one feature — which is the point of calling this page Remote control.
+    account: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg>',
     advanced: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>',
     about: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>',
   };
@@ -42,6 +51,23 @@
     claude: "M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z",
   };
 
+  /**
+   * Row marks for the About links. Lucide strokes like NAV_ICONS, plus the
+   * GitHub octicon, which is a FILLED path rather than a stroke — hence its
+   * own shape here instead of a line in the lucide set. Every one is
+   * currentColor, so they inherit .settings-row-logo's --vscode-foreground
+   * and dim with .is-disabled along with the copy beside them.
+   *
+   * The octicon ships with a 1024 viewBox but 0-16 coordinates (an export
+   * artifact); drawn at 0 0 16 16, which is the space the path is actually in.
+   */
+  const ROW_ICONS = {
+    bug: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 2 1.88 1.88"/><path d="M14.12 3.88 16 2"/><path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"/><path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6"/><path d="M12 20v-9"/><path d="M6.53 9C4.6 8.8 3 7.1 3 5"/><path d="M6 13H2"/><path d="M3 21c0-2.1 1.7-3.9 3.8-4"/><path d="M20.97 5c0 2.1-1.6 3.8-3.5 4"/><path d="M22 13h-4"/><path d="M17.2 17c2.1.1 3.8 1.9 3.8 4"/></svg>',
+    lightbulb: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>',
+    mail: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>',
+    github: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8C0 11.54 2.29 14.53 5.47 15.59C5.87 15.66 6.02 15.42 6.02 15.21C6.02 15.02 6.01 14.39 6.01 13.72C4 14.09 3.48 13.23 3.32 12.78C3.23 12.55 2.84 11.84 2.5 11.65C2.22 11.5 1.82 11.13 2.49 11.12C3.12 11.11 3.57 11.7 3.72 11.94C4.44 13.15 5.59 12.81 6.05 12.6C6.12 12.08 6.33 11.73 6.56 11.53C4.78 11.33 2.92 10.64 2.92 7.58C2.92 6.71 3.23 5.99 3.74 5.43C3.66 5.23 3.38 4.41 3.82 3.31C3.82 3.31 4.49 3.1 6.02 4.13C6.66 3.95 7.34 3.86 8.02 3.86C8.7 3.86 9.38 3.95 10.02 4.13C11.55 3.09 12.22 3.31 12.22 3.31C12.66 4.41 12.38 5.23 12.3 5.43C12.81 5.99 13.12 6.7 13.12 7.58C13.12 10.65 11.25 11.33 9.47 11.53C9.76 11.78 10.01 12.26 10.01 13.01C10.01 14.08 10 14.94 10 15.21C10 15.42 10.15 15.67 10.55 15.59C13.71 14.53 16 11.53 16 8C16 3.58 12.42 0 8 0Z"></path></svg>',
+  };
+
   function providerLogoMarkup(id) {
     const path = PROVIDER_LOGO_PATHS[id];
     if (!path) return "";
@@ -49,6 +75,35 @@
   }
 
   const GITHUB_REPO_URL = "https://github.com/phuryn/grok-build-vscode";
+  const GROK_CONNECTORS_URL = "https://grok.com/connectors";
+  const CONNECTOR_SECTION_HERE = "On this computer";
+  const CONNECTOR_SECTION_GROK = "Grok.com connectors";
+  const CONNECTOR_SECTION_LOCAL = "Local Grok connectors";
+  const CONNECTOR_BLURB_HERE =
+    "These apps are available to Grok, Codex, and Claude. Connecting opens a browser to sign in. Tokens stay on this machine.";
+  const CONNECTOR_BLURB_HERE_REMOTE =
+    "These apps are connected on the desk machine. Sign-in happens there — a phone cannot change which tools an agent has.";
+  const CONNECTOR_BLURB_GROK =
+    "These follow your Grok account, so they are shared across every Grok session on every machine.";
+  const CONNECTOR_BLURB_LOCAL =
+    "Declared in this machine's Grok config files. Grok only.";
+  const CONNECTOR_BLURB_LOCAL_REMOTE =
+    "Declared in this machine's Grok config files. Grok only. These are managed on the desk machine only.";
+  const ICON_EXTERNAL_LINK =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>';
+  // lucide `settings` — same path as chat.js ICON.gear. Local Open is config,
+  // not a document, so the cog rather than a file-type glyph.
+  const ICON_SETTINGS =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>';
+  const CONNECTOR_LOGO_IDS = {
+    atlassian: true,
+    canva: true,
+    cloudflare: true,
+    linear: true,
+    notion: true,
+    sentry: true,
+    stripe: true,
+  };
   const GITHUB_ISSUE_BUG_URL = GITHUB_REPO_URL + "/issues/new?labels=bug";
   const GITHUB_ISSUE_FEATURE_URL = GITHUB_REPO_URL + "/issues/new?labels=enhancement";
   const SUPPORT_MAILTO = "mailto:support@productcompass.pm";
@@ -59,6 +114,9 @@
 
   const TELEMETRY_COPY =
     "Anonymous usage stats only: a single session-start event with an anonymous install id — never prompts, code, file paths or names, and no identity. The IP address is discarded, never stored.";
+
+  const THUMBS_COPY =
+    "Show thumbs on a finished Grok turn so you can send a rating to SpaceXAI. Off by default. On, thumbs appear only when this Grok session supports feedback — never on Codex or Claude.";
 
   function escapeHtml(s) {
     return String(s ?? "")
@@ -184,40 +242,6 @@
       message: (value) => ({ type: "setAppPurpose", value }),
     },
     {
-      id: "telemetryDesktop",
-      category: "general",
-      title: "Anonymous usage stats",
-      description: TELEMETRY_COPY,
-      kind: "toggle",
-      defaultValue: true,
-      visible: (s, env) => !!(env && env.isDesktop && !env.isRemote),
-      get: (s) => !s || s.telemetryEnabled !== false,
-      message: (value) => ({ type: "setTelemetryEnabled", value }),
-    },
-    {
-      id: "telemetryVsCode",
-      category: "general",
-      title: "Anonymous usage stats",
-      description: TELEMETRY_COPY,
-      kind: "action",
-      actionLabel: "Open VS Code settings",
-      visible: (s, env) => !!(env && !env.isRemote && !env.isDesktop),
-      message: () => ({ type: "openSettings", section: "grok.telemetry.enabled" }),
-    },
-    {
-      id: "telemetryRemote",
-      category: "general",
-      title: "Anonymous usage stats",
-      description: "",
-      kind: "status",
-      visible: (s, env) => !!(env && env.isRemote),
-      describe: (s) => {
-        const known = s && typeof s.telemetryEnabled === "boolean";
-        const state = known ? (s.telemetryEnabled ? "On. " : "Off. ") : "";
-        return state + TELEMETRY_COPY;
-      },
-    },
-    {
       id: "chatFontScale",
       category: "general",
       title: "Text size",
@@ -273,6 +297,64 @@
       visible: (s, env) => !env || env.steerSupported !== false,
       get: (s) => !!(s && s.steerByDefault),
       message: (value) => ({ type: "setSteerByDefault", value }),
+    },
+    {
+      id: "telemetryDesktop",
+      category: "general",
+      title: "Anonymous usage stats",
+      description: TELEMETRY_COPY,
+      kind: "toggle",
+      defaultValue: true,
+      visible: (s, env) => !!(env && env.isDesktop && !env.isRemote),
+      get: (s) => !s || s.telemetryEnabled !== false,
+      message: (value) => ({ type: "setTelemetryEnabled", value }),
+    },
+    {
+      id: "telemetryVsCode",
+      category: "general",
+      title: "Anonymous usage stats",
+      description: TELEMETRY_COPY,
+      kind: "action",
+      actionLabel: "Open VS Code settings",
+      visible: (s, env) => !!(env && !env.isRemote && !env.isDesktop),
+      message: () => ({ type: "openSettings", section: "grok.telemetry.enabled" }),
+    },
+    {
+      id: "telemetryRemote",
+      category: "general",
+      title: "Anonymous usage stats",
+      description: "",
+      kind: "status",
+      visible: (s, env) => !!(env && env.isRemote),
+      describe: (s) => {
+        const known = s && typeof s.telemetryEnabled === "boolean";
+        const state = known ? (s.telemetryEnabled ? "On. " : "Off. ") : "";
+        return state + TELEMETRY_COPY;
+      },
+    },
+    {
+      id: "thumbsFeedback",
+      category: "general",
+      title: "Thumbs feedback to SpaceXAI",
+      description: THUMBS_COPY,
+      kind: "toggle",
+      defaultValue: false,
+      visible: (s, env) => !env || !env.isRemote,
+      get: (s) => !!(s && s.thumbsFeedback),
+      message: (value) => ({ type: "setThumbsFeedback", value }),
+    },
+    {
+      id: "thumbsFeedbackRemote",
+      category: "general",
+      title: "Thumbs feedback to SpaceXAI",
+      description: "",
+      kind: "status",
+      visible: (s, env) => !!(env && env.isRemote),
+      describe: (s) => {
+        const known = s && typeof s.thumbsFeedback === "boolean";
+        const state = known ? (s.thumbsFeedback ? "On. " : "Off. ") : "";
+        return state + THUMBS_COPY;
+      },
     },
     {
       id: "voiceSendPhrase",
@@ -543,14 +625,20 @@
       message: () => ({ type: "openProjectConfig" }),
     },
     {
-      id: "runMcpList",
-      category: "advanced",
-      title: "MCP servers",
-      description: "List the MCP servers configured for the Grok CLI.",
-      kind: "action",
-      actionLabel: "Open",
-      hostLocal: true,
-      message: () => ({ type: "runMcpList" }),
+      id: "connectorsCatalog",
+      category: "connectors",
+      title: "Connectors",
+      description: CONNECTOR_BLURB_HERE,
+      kind: "connectors",
+      visible: (s, env) => mcpSettingsEnabled(env),
+    },
+    {
+      id: "mcpCatalog",
+      category: "connectors",
+      title: "Grok connectors",
+      description: CONNECTOR_BLURB_GROK,
+      kind: "mcp",
+      visible: (s, env) => mcpSettingsEnabled(env),
     },
     {
       id: "showLogs",
@@ -667,17 +755,6 @@
       },
     },
     {
-      id: "aboutCodexAdapter",
-      category: "about",
-      title: "Codex ACP adapter",
-      kind: "value",
-      visible: (s) => !!codexProvider(s),
-      get: (s) => {
-        const p = codexProvider(s);
-        return versionLabel(p && p.adapterVersion);
-      },
-    },
-    {
       id: "aboutClaudeCli",
       category: "about",
       title: "Claude Code CLI",
@@ -688,37 +765,17 @@
         return versionLabel(p && p.cliVersion);
       },
     },
-    {
-      id: "aboutClaudeAdapter",
-      category: "about",
-      title: "Claude ACP adapter",
-      kind: "value",
-      visible: (s) => !!claudeProvider(s),
-      get: (s) => {
-        const p = claudeProvider(s);
-        return versionLabel(p && p.adapterVersion);
-      },
-    },
-    {
-      id: "aboutCodexUpdate",
-      category: "about",
-      title: "Codex updates",
-      kind: "status",
-      visible: (s) => !!codexProvider(s),
-      describe: (s, env) => {
-        const p = codexProvider(s);
-        if (p && p.updateAvailable) {
-          const latest = p.latestCliVersion ? ` · v${p.latestCliVersion}` : "";
-          const where = env && env.isRemote
-            ? "Update it at the desk — this device can’t."
-            : "Update it at its install source.";
-          return `Codex update available${latest}. ${where}`;
-        }
-        return env && env.isRemote
-          ? "Codex updates are managed at the desk."
-          : "Codex updates are managed at its install source.";
-      },
-    },
+    // Deliberately absent: "Codex ACP adapter", "Claude ACP adapter" and
+    // "Codex updates". The two adapters are pinned dependencies of THIS
+    // extension (@agentclientprotocol/codex-acp, @agentclientprotocol/
+    // claude-agent-acp, exact versions in package.json) and ship inside the
+    // vsix, so they move only when the extension does — a version the reader
+    // cannot act on reads as one more thing to keep current. And "Codex
+    // updates are managed at its install source" was true only when the user
+    // installed Codex themselves; when they let us install it the source is
+    // us, pinned at CODEX_MANAGED_TAG, and there is nowhere for them to go.
+    // One sentence, two meanings. Grok is the only CLI this extension
+    // actually updates, so it is the only one with an update row.
     {
       id: "aboutGrokUpdateStatus",
       category: "about",
@@ -773,6 +830,7 @@
     {
       id: "reportBug",
       category: "about",
+      icon: "bug",
       title: "Report a bug",
       description: "Open a new issue on the GitHub tracker.",
       kind: "action",
@@ -782,6 +840,7 @@
     {
       id: "requestFeature",
       category: "about",
+      icon: "lightbulb",
       title: "Request a feature",
       description: "Open a new issue on the GitHub tracker.",
       kind: "action",
@@ -791,6 +850,7 @@
     {
       id: "contactSupport",
       category: "about",
+      icon: "mail",
       title: "Contact",
       description: "support@productcompass.pm",
       kind: "action",
@@ -800,6 +860,7 @@
     {
       id: "aboutRepo",
       category: "about",
+      icon: "github",
       title: "phuryn/grok-build-vscode",
       description: "Source repository on GitHub.",
       kind: "action",
@@ -807,6 +868,20 @@
       href: GITHUB_REPO_URL,
     },
   ];
+
+  function mcpSettingsEnabled(env) {
+    return !!(env && env.hostCaps && env.hostCaps.mcpSettings);
+  }
+
+  function connectorSection(row) {
+    if (row.id === "connectorsCatalog") return CONNECTOR_SECTION_HERE;
+    return "";
+  }
+
+  function catalogCategories(env) {
+    if (mcpSettingsEnabled(env)) return CATEGORIES;
+    return CATEGORIES.filter((cat) => cat.id !== "connectors");
+  }
 
   function rowVisible(row, snapshot, env) {
     if (row.hostLocal && env && env.isRemote) return false;
@@ -850,14 +925,31 @@
   function visibleCategories(snapshot, env) {
     const rows = visibleRows(snapshot, env);
     const ids = new Set(rows.map((row) => row.category));
-    return CATEGORIES.filter((cat) => ids.has(cat.id));
+    return catalogCategories(env).filter((cat) => ids.has(cat.id));
   }
 
   function searchHaystack(row, snapshot, env) {
     const cat = CATEGORIES.find((c) => c.id === row.category);
+    const extraConnectors = row.kind === "connectors" && Array.isArray(snapshot && snapshot.mcpConnectors)
+      ? snapshot.mcpConnectors.map((c) => [c.name, c.description].join(" ")).join(" ")
+      : "";
+    const extraMcp = row.kind === "mcp" && Array.isArray(snapshot && snapshot.mcpServers)
+      ? [
+          CONNECTOR_SECTION_GROK,
+          CONNECTOR_SECTION_LOCAL,
+          GROK_CONNECTORS_URL,
+          CONNECTOR_BLURB_GROK,
+          CONNECTOR_BLURB_LOCAL,
+          ...snapshot.mcpServers.map((s) => [s.displayName, s.name, s.scopeName, s.configFile].filter(Boolean).join(" ")),
+        ].join(" ")
+      : "";
+    const section = connectorSection(row);
     return [
       rowTitle(row, snapshot, env),
       rowDescription(row, snapshot, env),
+      extraConnectors,
+      extraMcp,
+      section,
       cat ? cat.title : "",
       row.id,
     ].join(" ").toLowerCase();
@@ -956,6 +1048,9 @@
       case "telemetryDesktop":
         next.telemetryEnabled = !!value;
         break;
+      case "thumbsFeedback":
+        next.thumbsFeedback = !!value;
+        break;
       default:
         break;
     }
@@ -992,6 +1087,7 @@
       voiceSendPhrase: "grok send",
       voiceKeyterms: [],
       telemetryEnabled: true,
+      thumbsFeedback: false,
       providers: [],
       // Host-owned, never latched locally: an older host that ignores
       // refreshProviders leaves this false and the button stays idle rather
@@ -1002,6 +1098,11 @@
       hostKind: "",
       hostName: "",
       grokUpdate: null,
+      mcpServers: [],
+      mcpLoading: false,
+      mcpError: "",
+      mcpWarning: "",
+      mcpConnectors: [],
       ...(partial || {}),
     };
   }
@@ -1066,6 +1167,18 @@
     if (el.classList.contains("settings-restore-confirm-cancel")) return { kind: "restore-cancel" };
     if (el.classList.contains("settings-back")) return { kind: "back" };
     return null;
+  }
+
+  /** Focus plus whether the phone category <select> is the live control.
+   *  Destroying that node while its native picker is open closes the picker. */
+  function describeChrome(container) {
+    const doc = container.ownerDocument;
+    const active = doc && doc.activeElement;
+    const focus = describeFocus(container, active);
+    return {
+      focus,
+      navMenuOpen: !!(focus && focus.kind === "nav-select"),
+    };
   }
 
   function applyFocus(container, desc) {
@@ -1142,7 +1255,284 @@
     return `<button type="button" class="settings-switch${on ? " on" : ""}" role="switch" aria-checked="${on ? "true" : "false"}"${disabled ? " disabled" : ""}><span class="settings-switch-knob"></span></button>`;
   }
 
+  function mcpDetail(server) {
+    const parts = [];
+    if (server.enabled === false) parts.push("Disabled");
+    if (server.status) parts.push(server.status);
+    if (Number.isFinite(server.toolCount)) {
+      parts.push(`${server.toolCount} ${server.toolCount === 1 ? "tool" : "tools"}`);
+    }
+    if (server.url) parts.push(server.url);
+    else if (server.command) parts.push([server.command].concat(server.args || []).join(" "));
+    if (server.error) parts.push(server.error);
+    return parts.join(" · ");
+  }
+
+  function mcpIsManagedServer(server) {
+    return !!(server && (server.managed === true || server.source === "managed"));
+  }
+
+  function settingsMediaSibling(dir) {
+    try {
+      const scripts = document.getElementsByTagName("script");
+      for (let i = 0; i < scripts.length; i++) {
+        const src = scripts[i].src || "";
+        if (src.indexOf("settings.js") !== -1) return new URL(dir, src).href;
+      }
+    } catch (_) { /* */ }
+    return "";
+  }
+
+  /**
+   * Connected first, then disconnected; each group A–Z by display name.
+   * Display-only — TIER1_CONNECTORS order is left alone (hostMcpServers walks it).
+   */
+  function sortConnectorsForDisplay(connectors) {
+    return (connectors || []).slice().sort((a, b) => {
+      const ac = a && a.connected ? 0 : 1;
+      const bc = b && b.connected ? 0 : 1;
+      if (ac !== bc) return ac - bc;
+      return String(a && a.name || "").localeCompare(String(b && b.name || ""), undefined, { sensitivity: "base" });
+    });
+  }
+
+  function connectorLogoSrc(id) {
+    if (!CONNECTOR_LOGO_IDS[id]) return "";
+    const base = settingsMediaSibling("connector-logos/");
+    if (!base) return "";
+    return base + id + ".webp";
+  }
+
+  function appendConnectorLogo(titleEl, connector) {
+    const src = connectorLogoSrc(connector && connector.id);
+    if (!src) return;
+    const chip = document.createElement("span");
+    chip.className = "settings-connector-logo";
+    chip.setAttribute("aria-hidden", "true");
+    const img = document.createElement("img");
+    img.alt = "";
+    img.draggable = false;
+    img.addEventListener("load", function () {
+      chip.classList.add("is-ready");
+    });
+    img.addEventListener("error", function () {
+      if (chip.parentNode) chip.parentNode.removeChild(chip);
+      if (!titleEl.querySelector(".settings-connector-logo")) titleEl.classList.remove("has-logo");
+    });
+    img.src = src;
+    chip.appendChild(img);
+    titleEl.classList.add("has-logo");
+    titleEl.insertBefore(chip, titleEl.firstChild);
+  }
+
+  function appendMcpServerRows(list, servers, opts) {
+    for (const server of servers) {
+      const row = document.createElement("div");
+      row.className = "settings-mcp-server";
+      const copy = document.createElement("div");
+      copy.className = "settings-mcp-copy";
+      const name = document.createElement("div");
+      name.className = "settings-mcp-name settings-row-title";
+      const status = document.createElement("span");
+      status.className = "settings-mcp-status" + (server.status === "ready" ? " is-ready" : (server.error || server.status === "unavailable" ? " is-error" : ""));
+      status.setAttribute("aria-hidden", "true");
+      name.appendChild(status);
+      const label = document.createElement("span");
+      label.textContent = server.displayName || server.name;
+      name.appendChild(label);
+      if (opts.managed && server.scopeName) {
+        const scope = document.createElement("span");
+        scope.className = "settings-mcp-scope";
+        scope.textContent = server.scopeName;
+        name.appendChild(scope);
+      }
+      const detail = document.createElement("div");
+      detail.className = "settings-row-desc";
+      detail.textContent = mcpDetail(server) || (server.enabled ? "Enabled" : "Disabled");
+      copy.append(name, detail);
+      row.appendChild(copy);
+      list.appendChild(row);
+    }
+  }
+
+  function renderMcpSectionState(text, error) {
+    const el = document.createElement("div");
+    el.className = "settings-mcp-state" + (error ? " is-error" : "");
+    if (error) el.setAttribute("role", "alert");
+    else el.setAttribute("aria-live", "polite");
+    el.textContent = text;
+    return el;
+  }
+
+  function renderMcpCatalog(snapshot, env) {
+    const el = document.createElement("div");
+    el.className = "settings-mcp settings-mcp-split";
+    el.dataset.id = "mcpCatalog";
+    const servers = Array.isArray(snapshot.mcpServers) ? snapshot.mcpServers : [];
+    const managed = servers.filter(mcpIsManagedServer);
+    const local = servers.filter((server) => !mcpIsManagedServer(server));
+    const loading = !!snapshot.mcpLoading;
+    const error = snapshot.mcpError ? String(snapshot.mcpError) : "";
+
+    const grokHead = document.createElement("div");
+    grokHead.className = "settings-group-row";
+    const grokTitle = document.createElement("h2");
+    grokTitle.className = "settings-group";
+    grokTitle.textContent = CONNECTOR_SECTION_GROK;
+    grokHead.appendChild(grokTitle);
+    const grokOpen = document.createElement("button");
+    grokOpen.type = "button";
+    grokOpen.className = "settings-action settings-mcp-web";
+    grokOpen.dataset.href = GROK_CONNECTORS_URL;
+    const grokIcon = document.createElement("span");
+    grokIcon.className = "settings-file-icon";
+    grokIcon.setAttribute("aria-hidden", "true");
+    grokIcon.innerHTML = ICON_EXTERNAL_LINK;
+    grokOpen.appendChild(grokIcon);
+    grokOpen.appendChild(document.createTextNode("Open"));
+    grokHead.appendChild(grokOpen);
+    el.appendChild(grokHead);
+    const grokBlurb = document.createElement("div");
+    grokBlurb.className = "settings-mcp-warning";
+    grokBlurb.textContent = CONNECTOR_BLURB_GROK;
+    el.appendChild(grokBlurb);
+    if (loading) {
+      el.appendChild(renderMcpSectionState("Loading Grok connectors…"));
+    } else if (error) {
+      el.appendChild(renderMcpSectionState(error, true));
+    } else if (!managed.length) {
+      el.appendChild(renderMcpSectionState("No grok.com connectors reported."));
+    } else {
+      const grokList = document.createElement("div");
+      grokList.className = "settings-mcp-list";
+      appendMcpServerRows(grokList, managed, { managed: true });
+      el.appendChild(grokList);
+    }
+
+    const localHead = document.createElement("div");
+    localHead.className = "settings-group-row";
+    const localTitle = document.createElement("h2");
+    localTitle.className = "settings-group";
+    localTitle.textContent = CONNECTOR_SECTION_LOCAL;
+    localHead.appendChild(localTitle);
+    if (!(env && env.isRemote)) {
+      const localOpen = document.createElement("button");
+      localOpen.type = "button";
+      localOpen.className = "settings-action settings-mcp-open";
+      localOpen.title = "config.toml";
+      const localIcon = document.createElement("span");
+      localIcon.className = "settings-file-icon";
+      localIcon.setAttribute("aria-hidden", "true");
+      localIcon.innerHTML = ICON_SETTINGS;
+      localOpen.appendChild(localIcon);
+      localOpen.appendChild(document.createTextNode("Open"));
+      localHead.appendChild(localOpen);
+    }
+    el.appendChild(localHead);
+    const localBlurb = document.createElement("div");
+    localBlurb.className = "settings-mcp-warning";
+    localBlurb.textContent = env && env.isRemote ? CONNECTOR_BLURB_LOCAL_REMOTE : CONNECTOR_BLURB_LOCAL;
+    el.appendChild(localBlurb);
+    if (loading) {
+      el.appendChild(renderMcpSectionState("Loading Grok connectors…"));
+    } else if (error) {
+      el.appendChild(renderMcpSectionState(error, true));
+    } else if (!local.length) {
+      el.appendChild(renderMcpSectionState("No local Grok connectors reported."));
+    } else {
+      const localList = document.createElement("div");
+      localList.className = "settings-mcp-list";
+      appendMcpServerRows(localList, local, {});
+      el.appendChild(localList);
+    }
+    return el;
+  }
+
+  function connectorDescription(connector, env) {
+    if (connector.status === "connecting") {
+      return "Waiting for the browser sign-in to finish…";
+    }
+    if (connector.status === "error" && connector.error) return connector.error;
+    if (env && env.isRemote) {
+      return connector.connected
+        ? connector.description + " Connected on the desk machine."
+        : connector.description + " Sign-in happens on the desk.";
+    }
+    if (connector.connected) {
+      return connector.description + " Applies to new conversations and when you reopen one.";
+    }
+    return connector.description;
+  }
+
+  function renderConnectorsCatalog(snapshot, env) {
+    const el = document.createElement("div");
+    el.className = "settings-mcp";
+    el.dataset.id = "connectorsCatalog";
+    const warning = document.createElement("div");
+    warning.className = "settings-mcp-warning";
+    warning.textContent = env && env.isRemote
+      ? CONNECTOR_BLURB_HERE_REMOTE
+      : CONNECTOR_BLURB_HERE;
+    el.appendChild(warning);
+    const connectors = sortConnectorsForDisplay(
+      Array.isArray(snapshot.mcpConnectors) ? snapshot.mcpConnectors : [],
+    );
+    if (!connectors.length) {
+      const empty = document.createElement("div");
+      empty.className = "settings-mcp-state";
+      empty.textContent = "Connector list has not arrived from the host yet.";
+      el.appendChild(empty);
+      return el;
+    }
+    const list = document.createElement("div");
+    list.className = "settings-mcp-list";
+    for (const connector of connectors) {
+      const row = document.createElement("div");
+      row.className = "settings-row settings-connector" + (connector.connected ? " is-connected" : "");
+      row.dataset.id = "connector-" + connector.id;
+      const copy = document.createElement("div");
+      copy.className = "settings-row-copy";
+      const name = document.createElement("div");
+      name.className = "settings-row-title";
+      appendConnectorLogo(name, connector);
+      const status = document.createElement("span");
+      status.className = "settings-mcp-status" + (connector.connected ? " is-ready" : (connector.status === "error" ? " is-error" : ""));
+      status.setAttribute("aria-hidden", "true");
+      name.appendChild(status);
+      name.appendChild(document.createTextNode(connector.name));
+      const desc = document.createElement("div");
+      desc.className = "settings-row-desc";
+      desc.textContent = connectorDescription(connector, env);
+      copy.append(name, desc);
+      const control = document.createElement("div");
+      control.className = "settings-row-control";
+      if (!(env && env.isRemote)) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "settings-action settings-connector-action";
+        btn.dataset.id = connector.id;
+        btn.dataset.connected = connector.connected ? "true" : "false";
+        const connecting = connector.status === "connecting";
+        btn.textContent = connecting ? "Connecting…" : (connector.connected ? "Disconnect" : "Connect");
+        btn.disabled = connecting;
+        if (connecting) btn.setAttribute("aria-busy", "true");
+        control.appendChild(btn);
+      } else {
+        const span = document.createElement("span");
+        span.className = "settings-value";
+        span.textContent = connector.connected ? "Connected" : "Not connected";
+        control.appendChild(span);
+      }
+      row.append(copy, control);
+      list.appendChild(row);
+    }
+    el.appendChild(list);
+    return el;
+  }
+
   function renderRow(row, snapshot, env) {
+    if (row.kind === "mcp") return renderMcpCatalog(snapshot, env);
+    if (row.kind === "connectors") return renderConnectorsCatalog(snapshot, env);
     const el = document.createElement("div");
     el.className = "settings-row";
     el.dataset.id = row.id;
@@ -1156,7 +1546,7 @@
     // The mark rides the title rather than a column of its own: the row is a
     // two-column grid (copy | control) and a third column would re-space every
     // other page. has-logo carries the flex, so rows without one are untouched.
-    const logoMark = row.logo ? providerLogoMarkup(row.logo) : "";
+    const logoMark = row.logo ? providerLogoMarkup(row.logo) : (row.icon ? ROW_ICONS[row.icon] || "" : "");
     if (logoMark) {
       name.classList.add("has-logo");
       const mark = document.createElement("span");
@@ -1271,11 +1661,14 @@
     let pendingRestore = null;
     let aboutChecked = false;
     let providersChecked = false;
+    let mcpChecked = false;
     const post = typeof opts.post === "function" ? opts.post : () => {};
     const apply = typeof opts.apply === "function" ? opts.apply : null;
     const onLocal = typeof opts.onLocal === "function" ? opts.onLocal : null;
     const onClose = typeof opts.onClose === "function" ? opts.onClose : null;
     let phoneNav = matchPhoneNav(container.ownerDocument);
+    let lastPaintedKey = "";
+    let paintDeferred = false;
 
     const modal = !opts.standalone;
     container.classList.add("settings-surface");
@@ -1385,6 +1778,17 @@
       requestProvidersRefresh();
     }
 
+    function requestMcpRefresh() {
+      snapshot = { ...snapshot, mcpLoading: true, mcpError: "" };
+      post({ type: "listMcpServers" });
+    }
+
+    function maybeRefreshMcp() {
+      if (mcpChecked || categoryId !== "connectors" || query.trim()) return;
+      mcpChecked = true;
+      requestMcpRefresh();
+    }
+
     function runAction(row) {
       if (row.local) {
         if (onClose && !opts.standalone) onClose();
@@ -1400,11 +1804,31 @@
       if (opts.closeOnAction && onClose) onClose();
     }
 
+    function paintKey() {
+      return JSON.stringify({
+        snapshot,
+        env,
+        categoryId,
+        query,
+        pendingRestore: pendingRestore ? pendingRestore.map((row) => row.id) : null,
+        phoneNav,
+      });
+    }
+
     function paint() {
-      const focus = describeFocus(container, container.ownerDocument && container.ownerDocument.activeElement);
+      const chrome = describeChrome(container);
       ensureCategory();
       maybeCheckAbout();
       maybeRefreshProviders();
+      maybeRefreshMcp();
+      const key = paintKey();
+      if (key === lastPaintedKey && container.firstChild) {
+        paintDeferred = false;
+        return;
+      }
+      lastPaintedKey = key;
+      paintDeferred = false;
+      const focus = chrome.focus;
       const searching = !!query.trim();
       const shownCats = cats();
       const page = CATEGORIES.find((c) => c.id === categoryId) || shownCats[0];
@@ -1506,6 +1930,16 @@
         refresh.onclick = (e) => { e.stopPropagation(); requestProvidersRefresh(); };
         headActions.appendChild(refresh);
       }
+      if (!searching && page && page.id === "connectors") {
+        const refresh = document.createElement("button");
+        refresh.type = "button";
+        refresh.className = "settings-refresh";
+        refresh.textContent = snapshot.mcpLoading ? "Loading…" : "Refresh";
+        refresh.disabled = snapshot.mcpLoading === true;
+        if (refresh.disabled) refresh.setAttribute("aria-busy", "true");
+        refresh.onclick = (e) => { e.stopPropagation(); requestMcpRefresh(); paint(); };
+        headActions.appendChild(refresh);
+      }
       const changes = !searching && page && page.restore
         ? restoreChanges(page.id, snapshot, env)
         : [];
@@ -1573,7 +2007,18 @@
           body.appendChild(renderRow(row, snapshot, env));
         }
       } else {
-        for (const row of rows) body.appendChild(renderRow(row, snapshot, env));
+        let lastSection = "";
+        for (const row of rows) {
+          const section = connectorSection(row);
+          if (section && section !== lastSection) {
+            lastSection = section;
+            const heading = document.createElement("h2");
+            heading.className = "settings-group";
+            heading.textContent = section;
+            body.appendChild(heading);
+          }
+          body.appendChild(renderRow(row, snapshot, env));
+        }
         if (categoryId === "about") {
           const disclaimer = document.createElement("p");
           disclaimer.className = "settings-about-disclaimer";
@@ -1600,6 +2045,7 @@
         if (!next) return;
         if (next !== "about") aboutChecked = false;
         if (next !== "providers") providersChecked = false;
+        if (next !== "connectors") mcpChecked = false;
         categoryId = next;
         query = "";
         dismissRestoreConfirm();
@@ -1679,6 +2125,32 @@
           btn.onclick = (e) => { e.stopPropagation(); runAction(row); };
         }
       });
+      body.querySelectorAll(".settings-connector-action").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (env.isRemote || btn.disabled) return;
+          const id = btn.dataset.id;
+          if (!id) return;
+          post({
+            type: btn.dataset.connected === "true" ? "disconnectMcpConnector" : "connectMcpConnector",
+            id,
+          });
+        });
+      });
+      body.querySelectorAll(".settings-mcp-web").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const url = btn.dataset.href;
+          if (url) openExternalHref(url);
+        });
+      });
+      body.querySelectorAll(".settings-mcp-open").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (env.isRemote) return;
+          post({ type: "openGlobalConfig" });
+        });
+      });
       applyFocus(container, focus);
     }
 
@@ -1727,6 +2199,12 @@
 
     container._onKey = onKey;
     document.addEventListener("keydown", onKey, true);
+    container.addEventListener("blur", (e) => {
+      if (!paintDeferred) return;
+      const target = e.target;
+      if (!target || !target.classList || !target.classList.contains("settings-nav-select")) return;
+      paint();
+    }, true);
     const view = container.ownerDocument && container.ownerDocument.defaultView;
     const phoneMq = view && view.matchMedia ? view.matchMedia(PHONE_NAV_MQ) : null;
     function onPhoneNavChange() {
@@ -1745,6 +2223,11 @@
       update(nextSnapshot, nextEnv) {
         if (nextSnapshot) snapshot = defaultSnapshot({ ...snapshot, ...nextSnapshot });
         if (nextEnv) Object.assign(env, nextEnv);
+        if (container.firstChild && paintKey() === lastPaintedKey) return;
+        if (describeChrome(container).navMenuOpen) {
+          paintDeferred = true;
+          return;
+        }
         paint();
       },
       focusSearch() {
@@ -1754,6 +2237,7 @@
       setCategory(id) {
         if (id !== "about") aboutChecked = false;
         if (id !== "providers") providersChecked = false;
+        if (id !== "connectors") mcpChecked = false;
         categoryId = id || "general";
         query = "";
         dismissRestoreConfirm();
@@ -1777,8 +2261,21 @@
     CATEGORIES,
     NAV_ICONS,
     TELEMETRY_COPY,
+    THUMBS_COPY,
     ABOUT_DISCLAIMER,
     GITHUB_REPO_URL,
+    GROK_CONNECTORS_URL,
+    ICON_SETTINGS,
+    CONNECTOR_LOGO_IDS,
+    sortConnectorsForDisplay,
+    CONNECTOR_SECTION_HERE,
+    CONNECTOR_SECTION_GROK,
+    CONNECTOR_SECTION_LOCAL,
+    CONNECTOR_BLURB_HERE,
+    CONNECTOR_BLURB_HERE_REMOTE,
+    CONNECTOR_BLURB_GROK,
+    CONNECTOR_BLURB_LOCAL,
+    CONNECTOR_BLURB_LOCAL_REMOTE,
     GITHUB_ISSUE_BUG_URL,
     GITHUB_ISSUE_FEATURE_URL,
     SUPPORT_MAILTO,

@@ -29,6 +29,7 @@ describe("host <-> webview message contract (src/protocol.ts is the source of tr
       // Older hosts refuse to delete the conversation the requester is reading,
       // so the client has to be told rather than assume. Capability, not version.
       deleteActiveSession: true,
+      queueSendChips: true,
       // Project file browse for AFK Pilot. Absent on older hosts.
       browseProjectFiles: true,
       // Edit+save existing files — separate from browse so a host can offer
@@ -47,6 +48,9 @@ describe("host <-> webview message contract (src/protocol.ts is the source of tr
     expect(
       packageJson.contributes.configuration.properties["grok.summarizeRepliesAloud"].default,
     ).toBe(true);
+    expect(
+      packageJson.contributes.configuration.properties["grok.thumbsFeedback"].default,
+    ).toBe(false);
   });
 
   it("scopes the macOS Emacs composer bindings to composer focus", () => {
@@ -60,6 +64,19 @@ describe("host <-> webview message contract (src/protocol.ts is the source of tr
       command: "grok.composerPreviousLine",
       key: "ctrl+p",
       when: "isMac && grok.composerFocus",
+    });
+  });
+
+  it("contributes find-in-conversation as a palette command and a Cmd/Ctrl+F fallback", () => {
+    expect(packageJson.contributes.commands).toContainEqual({
+      command: "grok.findInSession",
+      title: "Grok: Find in Conversation",
+    });
+    expect(packageJson.contributes.keybindings).toContainEqual({
+      command: "grok.findInSession",
+      key: "ctrl+f",
+      mac: "cmd+f",
+      when: "focusedView == grok.chat",
     });
   });
 

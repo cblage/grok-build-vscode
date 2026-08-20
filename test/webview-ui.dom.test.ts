@@ -1725,7 +1725,7 @@ describe("gear menu — AFK Pilot onboarding", () => {
     click(window, $(doc, "gear-btn"));
     expect(gearItem(doc, "Unlink this device…")).toBeUndefined();
     openSettingsOverlay(window, doc);
-    clickSettingsNav(window, doc, "Account");
+    clickSettingsNav(window, doc, "Remote control");
     const unlink = doc.querySelector('[data-id="unlinkDevice"] .settings-action') as HTMLElement;
     expect(unlink).toBeTruthy();
     click(window, unlink);
@@ -2317,6 +2317,7 @@ describe("gear menu — Other group + About / Settings", () => {
         deleteActiveSession: true,
         relocateView: true,
         showOutput: true,
+        mcpSettings: true,
       },
     });
     dispatch(h.window, { type: "initialized", info: { version: "0.2.33" } });
@@ -2376,10 +2377,14 @@ describe("gear menu — Other group + About / Settings", () => {
     expect(text).toContain("v0.2.117");
     expect(text).toContain("Codex CLI");
     expect(text).toContain("v0.146.0");
-    expect(text).toContain("Codex ACP adapter");
-    expect(text).toContain("v1.1.14");
-    expect(text).toContain("at its install source");
-    expect(text).toContain("Codex update available");
+    // The ACP adapters and the "Codex updates" status left About on 2026-08-19.
+    // The adapters are pinned deps of this extension and ship in the vsix, so
+    // they move only when it does; and "managed at its install source" pointed
+    // at US whenever the user let us install the managed Codex. Grok is the
+    // only CLI this extension updates, so it is the only one with an update row.
+    expect(text).not.toContain("Codex ACP adapter");
+    expect(text).not.toContain("at its install source");
+    expect(text).not.toContain("Codex update available");
     expect(overlay.querySelector('[data-id="aboutUpdateGrok"]')).toBeNull();
   });
 
@@ -2396,7 +2401,7 @@ describe("gear menu — Other group + About / Settings", () => {
 
     const text = overlay.textContent || "";
     expect(text).toContain("Codex CLI");
-    expect(text).toContain("Codex ACP adapter");
+    expect(text).not.toContain("Codex ACP adapter");
     expect(overlay.querySelector('[data-id="aboutGrokCli"]')).toBeNull();
     expect(overlay.querySelector('[data-id="aboutUpdateGrok"]')).toBeNull();
     expect(types(h.posted)).not.toContain("checkGrokUpdate");
@@ -2474,9 +2479,8 @@ describe("gear menu — Other group + About / Settings", () => {
       const text = overlay.textContent || "";
       expect(text).toContain("Grok Build CLI");
       expect(text).toContain("Codex CLI");
-      expect(text).toContain("Codex ACP adapter");
-      expect(text).toContain("Codex update available");
-      expect(text).toContain("at the desk");
+      expect(text).not.toContain("Codex ACP adapter");
+      expect(text).not.toContain("Codex update available");
       expect(types(h.posted)).not.toContain("checkGrokUpdate");
       expect(overlay.querySelector('[data-id="aboutUpdateGrok"]')).toBeNull();
     });
@@ -2542,11 +2546,27 @@ describe("gear menu — Other group + About / Settings", () => {
     const overlay = h.doc.getElementById("settings-overlay")!;
     expect(overlay.querySelector('[data-id="openGlobalConfig"]')).toBeTruthy();
     expect(overlay.querySelector('[data-id="openProjectConfig"]')).toBeTruthy();
-    expect(overlay.querySelector('[data-id="runMcpList"]')).toBeTruthy();
     expect(overlay.querySelector('[data-id="showLogs"]')).toBeTruthy();
 
     click(h.window, overlay.querySelector('[data-id="showLogs"] .settings-action')!);
     expect(types(h.posted)).toContain("showLogs");
+  });
+
+  it("Settings → Connectors is a read-only live Grok inventory plus host-owned apps", () => {
+    const h = boot();
+    openSettingsOverlay(h.window, h.doc);
+    clickSettingsNav(h.window, h.doc, "Connectors");
+    expect(types(h.posted)).toContain("listMcpServers");
+    expect(h.doc.querySelector('#settings-overlay [data-id="mcpCatalog"] .settings-mcp-state')?.textContent).toContain("Loading");
+    dispatch(h.window, {
+      type: "mcpServers",
+      servers: [{ name: "managed_gateway:canva", displayName: "Canva", managed: true, enabled: true, status: "ready", toolCount: 32 }],
+      warning: "This list is read-only. Connector enable/disable is machine-global and is not controlled here.",
+    });
+    expect(h.doc.querySelector("#settings-overlay")?.textContent).toContain("Grok.com connectors");
+    expect(h.doc.querySelector("#settings-overlay")?.textContent).toContain("Local Grok connectors");
+    expect(h.doc.querySelector("#settings-overlay")?.textContent).not.toContain("grok.com managed");
+    expect(h.doc.querySelector("#settings-overlay .settings-switch")).toBeNull();
   });
 });
 
@@ -3433,16 +3453,177 @@ describe("gear entry: Move view (Settings → Advanced)", () => {
 
 describe("context popover (donut click, #39)", () => {
   it("opens on donut click with the context line, closes on outside click", () => {
-    const { window, doc } = bootWebview();
+    const { window, doc, posted } = bootWebview();
     dispatch(window, { type: "promptComplete", meta: { totalTokens: 44123 } });
 
     click(window, $(doc, "donut"));
     const pop = $(doc, "context-popover");
     expect((pop as any).hidden).toBe(false);
     expect(pop.textContent).toContain("Context used");
+    expect(posted).toContainEqual({ type: "refreshContextDetails" });
 
     click(window, $(doc, "messages"));
     expect((pop as any).hidden).toBe(true);
+  });
+
+  it("renders a structured session/info breakdown without changing adapter occupancy", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "contextUsage", used: 16017, window: 512000 });
+    dispatch(window, {
+      type: "contextUsage",
+      used: 16017,
+      window: 512000,
+      systemPromptTokens: 1039,
+      toolDefinitionsTokens: 812,
+      messageTokens: 12166,
+      freeTokens: 495983,
+      autoCompactThresholdPercent: 92,
+      categories: [{ label: "Skills", tokens: 1200 }, { label: "MCP", tokens: 800, detail: "2 servers" }],
+    });
+    click(window, $(doc, "donut"));
+    const text = $(doc, "context-popover").textContent!;
+    expect(text).toContain("In this window");
+    expect(text).toContain("System");
+    expect(text).toContain("Messages");
+    expect(text).toContain("Free");
+    expect(text).toContain("Auto-compact at");
+    expect(text).toContain("Already counted above");
+    expect(text).toContain("Tool definitions");
+    expect(text).not.toContain("Tool definitions (");
+    expect(text).toContain("Skills");
+    expect(text).toContain("MCP (2 servers)");
+    // 16,017 used − 1,039 system − 12,166 messages = 2,812 overhead.
+    expect(text).toMatch(/Reasoning\/overhead\s*2,812/);
+    const windowAt = text.indexOf("In this window");
+    const countedAt = text.indexOf("Already counted above");
+    expect(text.indexOf("System")).toBeGreaterThan(windowAt);
+    expect(text.indexOf("Messages")).toBeGreaterThan(windowAt);
+    expect(text.indexOf("Messages")).toBeLessThan(countedAt);
+    expect(text.indexOf("Reasoning/overhead")).toBeLessThan(countedAt);
+    expect(text.indexOf("Tool definitions")).toBeGreaterThan(countedAt);
+    expect(text.indexOf("Skills")).toBeGreaterThan(countedAt);
+  });
+
+  it("does not mix a used-only occupancy update into a stale session/info snapshot", () => {
+    // Authoritative 100 / 10 system / 80 messages → overhead 10. Keep the
+    // group (overhead stays 10, not an invented 40) and re-fetch session/info.
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, {
+      type: "contextUsage",
+      used: 100,
+      window: 200000,
+      systemPromptTokens: 10,
+      messageTokens: 80,
+      freeTokens: 199890,
+      toolDefinitionsTokens: 50,
+      categories: [{ label: "Skills", tokens: 20 }],
+    });
+    click(window, $(doc, "donut"));
+    const first = $(doc, "context-popover").textContent!;
+    expect(first).toMatch(/Context used\s*100/);
+    expect(first).toContain("In this window");
+    expect(first).toMatch(/System\s*10/);
+    expect(first).toMatch(/Messages\s*80/);
+    expect(first).toMatch(/Reasoning\/overhead\s*10/);
+    expect(first).toMatch(/Free\s*199,890/);
+    expect(first).toContain("Already counted above");
+    expect(first).toContain("Tool definitions");
+    expect(first).toContain("Skills");
+
+    posted.length = 0;
+    dispatch(window, { type: "contextUsage", used: 130 });
+    const after = $(doc, "context-popover").textContent!;
+    expect(after).toMatch(/Context used\s*130/);
+    expect(after).toContain("In this window");
+    expect(after).toMatch(/System\s*10/);
+    expect(after).toMatch(/Messages\s*80/);
+    expect(after).toMatch(/Reasoning\/overhead\s*10/);
+    expect(after).not.toMatch(/Reasoning\/overhead\s*40/);
+    expect(after).toContain("Already counted above");
+    expect(posted).toContainEqual({ type: "refreshContextDetails" });
+  });
+
+  it("keeps the snapshot when a used-only frame restates the same used", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "contextUsage",
+      used: 100,
+      window: 200000,
+      systemPromptTokens: 10,
+      messageTokens: 80,
+      freeTokens: 199890,
+    });
+    click(window, $(doc, "donut"));
+    dispatch(window, { type: "contextUsage", used: 100 });
+    const text = $(doc, "context-popover").textContent!;
+    expect(text).toContain("In this window");
+    expect(text).toMatch(/Reasoning\/overhead\s*10/);
+    expect(text).toMatch(/Free\s*199,890/);
+  });
+
+  it("keeps the snapshot after promptComplete moves used and re-fetches session/info", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, {
+      type: "contextUsage",
+      used: 100,
+      window: 200000,
+      systemPromptTokens: 10,
+      messageTokens: 80,
+      freeTokens: 199890,
+    });
+    click(window, $(doc, "donut"));
+    expect($(doc, "context-popover").textContent).toContain("In this window");
+    posted.length = 0;
+    dispatch(window, { type: "promptComplete", meta: { totalTokens: 130 } });
+    const text = $(doc, "context-popover").textContent!;
+    expect(text).toMatch(/Context used\s*130/);
+    expect(text).toContain("In this window");
+    expect(text).toMatch(/Reasoning\/overhead\s*10/);
+    expect(text).toContain("Free");
+    expect(posted).toContainEqual({ type: "refreshContextDetails" });
+  });
+
+  it("shows Reasoning/overhead only when used exceeds system + messages", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "contextUsage",
+      used: 25000,
+      window: 100000,
+      systemPromptTokens: 2000,
+      toolDefinitionsTokens: 8000,
+      messageTokens: 20000,
+      freeTokens: 75000,
+    });
+    click(window, $(doc, "donut"));
+    const text = $(doc, "context-popover").textContent!;
+    expect(text).toMatch(/Reasoning\/overhead\s*3,000/);
+    const windowAt = text.indexOf("In this window");
+    const countedAt = text.indexOf("Already counted above");
+    expect(text.indexOf("Reasoning/overhead")).toBeGreaterThan(windowAt);
+    expect(text.indexOf("Reasoning/overhead")).toBeLessThan(countedAt);
+    expect(text.indexOf("Tool definitions")).toBeGreaterThan(countedAt);
+  });
+
+  it("labels Tool definitions with the CLI's tool count when present", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, {
+      type: "contextUsage",
+      used: 24273,
+      window: 500000,
+      systemPromptTokens: 1516,
+      toolDefinitionsTokens: 8471,
+      toolDefinitionsCount: 51,
+      messageTokens: 22757,
+      freeTokens: 475727,
+      categories: [{ label: "Skills", tokens: 4886, detail: "51 skills" }],
+    });
+    click(window, $(doc, "donut"));
+    const text = $(doc, "context-popover").textContent!;
+    expect(text).toContain("Tool definitions (51 tools)");
+    expect(text).not.toContain("Reasoning/overhead");
+    expect(text.indexOf("Messages")).toBeLessThan(text.indexOf("Already counted above"));
+    expect(text.indexOf("Tool definitions")).toBeGreaterThan(text.indexOf("Already counted above"));
+    expect(text.indexOf("Skills (51 skills)")).toBeGreaterThan(text.indexOf("Already counted above"));
   });
 
   it("labels Claude and Codex occupancy as context used, not last prompt", () => {

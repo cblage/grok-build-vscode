@@ -725,6 +725,101 @@ export function autoCompactStartedNote(update: unknown): string | null {
     : `Auto-compacting context…`;
 }
 
+/** Parse the context line returned by the legacy `/session-info` command. */
+export function parseSessionInfoContext(text: string): { used: number; window: number } | null {
+  const match = /context:\*{0,2}\s*([\d][\d,]*)\s*\/\s*([\d][\d,]*)\s*tokens/i.exec(text ?? "");
+  if (!match) return null;
+  const number = (value: string) => Number(value.replace(/,/g, ""));
+  const used = number(match[1]);
+  const window = number(match[2]);
+  if (!Number.isFinite(used) || used < 0 || !Number.isFinite(window) || window <= 0) return null;
+  return { used, window };
+}
+
+export interface ContextUsageCategory {
+  label: string;
+  tokens: number;
+  detail?: string;
+}
+
+/** Structured context snapshot returned by `_x.ai/session/info`. */
+export interface SessionInfoContext {
+  used: number;
+  window: number;
+  categories?: ContextUsageCategory[];
+  systemPromptTokens?: number;
+  toolDefinitionsTokens?: number;
+  toolDefinitionsCount?: number;
+  messageTokens?: number;
+  freeTokens?: number;
+  autoCompactThresholdPercent?: number;
+}
+
+/** Keep a popover re-open from issuing another control-plane RPC immediately. */
+export const SESSION_INFO_TTL_MS = 3000;
+
+function finiteNonNegative(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function parseSessionInfoCategories(raw: unknown): ContextUsageCategory[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const categories: ContextUsageCategory[] = [];
+  for (const row of raw) {
+    if (!row || typeof row !== "object") continue;
+    const category = row as { label?: unknown; tokens?: unknown; detail?: unknown };
+    if (typeof category.label !== "string" || !category.label.trim()) continue;
+    if (typeof category.tokens !== "number" || !Number.isFinite(category.tokens) || category.tokens < 0) continue;
+    const parsed: ContextUsageCategory = { label: category.label.trim(), tokens: category.tokens };
+    if (typeof category.detail === "string" && category.detail.trim()) parsed.detail = category.detail.trim();
+    categories.push(parsed);
+  }
+  return categories.length ? categories : undefined;
+}
+
+/**
+ * Normalize `_x.ai/session/info` into the context snapshot consumed by the
+ * donut and popover. Unlike a prompt result's `totalTokens: 0`, an RPC
+ * `context.used: 0` is a valid authoritative reading.
+ */
+export function parseSessionInfoRpcResult(raw: unknown): SessionInfoContext | null {
+  if (!raw || typeof raw !== "object") return null;
+  let body = raw as Record<string, unknown>;
+  const nested = body.result;
+  if (nested && typeof nested === "object" && (nested as { context?: unknown }).context != null && body.context == null) {
+    body = nested as Record<string, unknown>;
+  }
+  const context = body.context;
+  if (!context || typeof context !== "object") return null;
+  const values = context as Record<string, unknown>;
+  const used = finiteNonNegative(values.used);
+  const window = values.total;
+  if (used === undefined || typeof window !== "number" || !Number.isFinite(window) || window <= 0) return null;
+
+  const parsed: SessionInfoContext = { used, window };
+  const categories = parseSessionInfoCategories(values.usageCategories);
+  if (categories) parsed.categories = categories;
+  const system = finiteNonNegative(values.systemPromptTokens);
+  if (system !== undefined) parsed.systemPromptTokens = system;
+  const tools = finiteNonNegative(values.toolDefinitionsTokens);
+  if (tools !== undefined) parsed.toolDefinitionsTokens = tools;
+  const toolCount = finiteNonNegative(values.toolDefinitionsCount);
+  if (toolCount !== undefined) parsed.toolDefinitionsCount = toolCount;
+  const messages = finiteNonNegative(values.messageTokens);
+  if (messages !== undefined) parsed.messageTokens = messages;
+  const free = finiteNonNegative(values.freeTokens);
+  if (free !== undefined) parsed.freeTokens = free;
+  const threshold = values.autoCompactThresholdPercent;
+  if (typeof threshold === "number" && Number.isFinite(threshold) && threshold > 0) {
+    parsed.autoCompactThresholdPercent = threshold;
+  }
+  return parsed;
+}
+
+export function sessionInfoCacheFresh(fetchedAt: number, now: number, ttlMs = SESSION_INFO_TTL_MS): boolean {
+  return fetchedAt > 0 && now - fetchedAt < ttlMs;
+}
+
 export function makePermissionResponse(id: number | string, optionId: string) {
   return {
     jsonrpc: "2.0",
@@ -811,6 +906,209 @@ export function summarizeBackgroundCommand(cmd: string, max = 80): string {
   const flat = (cmd || "").replace(/\s+/g, " ").trim();
   if (flat.length <= max) return flat;
   return flat.slice(0, max - 1).trimEnd() + "…";
+}
+
+/** Display cap shared by the live terminal snapshot and session/load restore. */
+export const MAX_COMMAND_OUTPUT_CHARS = 100_000;
+
+export type CommandOutputPayload = {
+  command: string;
+  output: string;
+  exitCode: number | null;
+  truncated: boolean;
+  /**
+   * Always stated by this host. `true` is a live terminal kill (`commandDone`
+   * with no exit). `false` is everything else, including session/load
+   * hydration whose null exit means "not reported". Older hosts omit the
+   * field; the client treats that absence as the previous null-exit rule.
+   */
+  cancelled: boolean;
+  /**
+   * Always stated on MCP `commandOutput` (the ACP `toolCallId`). The webview
+   * joins IN to OUT by this id. Shell `commandOutput` omits the field —
+   * absence means join by `command`.
+   */
+  toolCallId?: string;
+  /**
+   * Always stated by this host. `true` is a cut the agent already saw
+   * (terminal byte cap, or the CLI's own `truncated` on a replayed
+   * execute). `false` is this host's 100K display cap applied after the
+   * provider returned the full result (MCP). Older hosts omit the field;
+   * the client must not attribute that cut either way.
+   */
+  agentSawCut?: boolean;
+};
+
+export function capCommandOutput(
+  output: string,
+  truncated: boolean,
+  maxChars = MAX_COMMAND_OUTPUT_CHARS,
+): { output: string; truncated: boolean } {
+  const over = output.length > maxChars;
+  return {
+    output: over ? output.slice(0, maxChars) : output,
+    truncated: truncated || over,
+  };
+}
+
+/** Live `terminal/release` snapshot. Null exit is a real cancel, not a missing report. */
+export function commandOutputFromLiveTerminal(info: {
+  command: string;
+  output: string;
+  exitCode: number | null;
+  truncated: boolean;
+}): CommandOutputPayload {
+  const capped = capCommandOutput(info.output, info.truncated);
+  return {
+    command: info.command,
+    output: capped.output,
+    exitCode: info.exitCode,
+    truncated: capped.truncated,
+    cancelled: info.exitCode == null,
+    agentSawCut: true,
+  };
+}
+
+function commandStringFromToolCall(call: any): string {
+  const rawIn = call?.rawInput;
+  if (rawIn && typeof rawIn === "object") {
+    if (typeof rawIn.command === "string" && rawIn.command.trim()) return rawIn.command.trim();
+    if (typeof rawIn.cmd === "string" && rawIn.cmd.trim()) return rawIn.cmd.trim();
+  }
+  const rawOut = call?.rawOutput;
+  if (rawOut && typeof rawOut === "object" && typeof rawOut.command === "string" && rawOut.command.trim()) {
+    return rawOut.command.trim();
+  }
+  return "";
+}
+
+function toolCallIdOf(call: unknown): string {
+  const id = (call as { toolCallId?: unknown } | null | undefined)?.toolCallId;
+  return typeof id === "string" ? id : "";
+}
+
+function executeKindOf(call: unknown): string {
+  const kind = (call as { kind?: unknown } | null | undefined)?.kind;
+  return typeof kind === "string" ? kind.toLowerCase() : "";
+}
+
+/** Claude's completed update has no rawInput; the command lives on the earlier tool_call. */
+function rememberReplayedExecuteCommand(
+  remembered: Map<string, string>,
+  call: unknown,
+): void {
+  if (!call || typeof call !== "object") return;
+  const kind = executeKindOf(call);
+  if (kind && kind !== "execute") return;
+  const id = toolCallIdOf(call);
+  if (!id) return;
+  const title = typeof (call as { title?: unknown }).title === "string"
+    ? (call as { title: string }).title.trim()
+    : "";
+  const command = commandStringFromToolCall(call) || title;
+  if (command) remembered.set(id, command);
+}
+
+function recognizedRawOutput(ro: unknown): {
+  output: unknown;
+  formatted: unknown;
+  exitCode: number | null;
+  truncated: boolean;
+} | null {
+  if (!ro || typeof ro !== "object") return null;
+  const rec = ro as Record<string, unknown>;
+  const exitCode =
+    typeof rec.exit_code === "number" ? rec.exit_code
+    : typeof rec.exitCode === "number" ? rec.exitCode
+    : null;
+  const hasOutput =
+    typeof rec.output === "string"
+    || Array.isArray(rec.output)
+    || ArrayBuffer.isView(rec.output)
+    || typeof rec.formatted_output === "string";
+  if (exitCode == null && !hasOutput) return null;
+  return {
+    output: rec.output,
+    formatted: rec.formatted_output,
+    exitCode,
+    truncated: rec.truncated === true,
+  };
+}
+
+function textFromToolContent(call: any): string | undefined {
+  if (!Array.isArray(call?.content)) return undefined;
+  const block = call.content.find((b: any) => b && b.content && typeof b.content.text === "string");
+  return block ? block.content.text as string : undefined;
+}
+
+function decodeCommandOutputBytes(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  try {
+    if (value instanceof Uint8Array) return new TextDecoder().decode(value);
+    if (ArrayBuffer.isView(value)) {
+      const view = value as ArrayBufferView;
+      return new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+    }
+    if (Array.isArray(value)) return new TextDecoder().decode(Uint8Array.from(value));
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Hydrate a `commandOutput` payload from a replayed execute tool_call.
+ *
+ * Provider fields are inverted (research/replay-shapes.md):
+ * - grok: `content` is raw stdout; never read `rawOutput.output_for_prompt`
+ *   (it prefixes `exit: N`).
+ * - claude: `rawOutput` is a plain string; `content` is either the tool
+ *   description (first row) or stdout wrapped in a ```console fence
+ *   (completed update). Prefer the string. No exit code is reported.
+ * - A completed Claude update has no `rawInput`; pass the command remembered
+ *   from the earlier `tool_call` by `toolCallId`.
+ * Unknown / unmeasured shapes return null. Always states `cancelled: false`
+ * — a hydrated null exit is "not reported", not a live kill. Omitting the
+ * field would be indistinguishable from an older host's live kill.
+ */
+export function commandOutputFromReplayedToolCall(
+  call: unknown,
+  rememberedCommands?: ReadonlyMap<string, string>,
+): CommandOutputPayload | null {
+  if (!call || typeof call !== "object") return null;
+  const kind = executeKindOf(call);
+  if (kind && kind !== "execute") return null;
+  const id = toolCallIdOf(call);
+  const command = commandStringFromToolCall(call)
+    || (id && rememberedCommands ? rememberedCommands.get(id) ?? "" : "");
+  if (!command) return null;
+  const rawOutput = (call as { rawOutput?: unknown }).rawOutput;
+  // Measured Claude restore: stdout is the string itself. Do not fall through
+  // to content (fenced on the completed row, a description on the first).
+  if (typeof rawOutput === "string") {
+    const capped = capCommandOutput(rawOutput, false);
+    return { command, exitCode: null, ...capped, cancelled: false, agentSawCut: true };
+  }
+  const raw = recognizedRawOutput(rawOutput);
+  if (!raw) return null;
+  const fromContent = textFromToolContent(call);
+  const output =
+    fromContent !== undefined ? fromContent
+    : typeof raw.output === "string" ? raw.output
+    : typeof raw.formatted === "string" ? raw.formatted
+    : decodeCommandOutputBytes(raw.output) ?? "";
+  const capped = capCommandOutput(output, raw.truncated);
+  return { command, exitCode: raw.exitCode, ...capped, cancelled: false, agentSawCut: true };
+}
+
+/** Live turns must not emit from the tool_call — only session/load replay. */
+export function commandOutputForToolCall(
+  call: unknown,
+  opts: { replaying: boolean; rememberedCommands?: Map<string, string> },
+): CommandOutputPayload | null {
+  if (!opts.replaying) return null;
+  if (opts.rememberedCommands) rememberReplayedExecuteCommand(opts.rememberedCommands, call);
+  return commandOutputFromReplayedToolCall(call, opts.rememberedCommands);
 }
 
 /**

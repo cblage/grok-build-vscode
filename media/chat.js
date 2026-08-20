@@ -362,6 +362,7 @@
     voiceSendPhrase: "grok send",
     voiceKeyterms: [],
     telemetryEnabled: undefined,
+    thumbsFeedback: false,
     // Client-owned zoom (remote + desktop). VS Code uses hostFontScale only.
     remoteFontScale: CLIENT_OWNS_FONT_SCALE
       ? clampClientFontScale(storedNumber(CLIENT_FONT_SCALE_KEY, 1))
@@ -377,10 +378,11 @@
     remotePreferencesSupported: false,
     ttsTurnText: "",
     // Render MIRROR of the focused session's host-owned send queue (#37) —
-    // messages typed/dictated while Grok was busy. All mutations route through
-    // the host (queueSend/dequeueSend/clearQueuedSends) and come back as a
-    // queuedSends snapshot, so the queue survives focus switches and the HOST
-    // flushes it (one combined prompt) when the session's turn ends.
+    // messages typed/dictated while Grok was busy. Entries are `{text, chips}`.
+    // All mutations route through the host (queueSend/dequeueSend/clearQueuedSends)
+    // and come back as a queuedSends snapshot, so the queue survives focus
+    // switches and the HOST flushes it (one combined prompt) when the session's
+    // turn ends.
     sendQueue: [],
     queuedWrapEl: null, // the .queued-msgs container pinned to the end of the chat
     queuedSubmissionPending: false,
@@ -397,12 +399,19 @@
     // whether it works — we offer it and let the host latch this off the first
     // time the CLI answers -32601 (the text falls back to the queue, never lost).
     steerSupported: true,
+    // Grok thumbs (#114). Off until the host advertises feedbackAvailability.
+    // Only the live-process turn that just finished is rateable (not session/load).
+    feedbackAvailable: false,
+    turnRating: 0,
     // Claude Code has no mid-turn interject, so a message typed while it is
     // working is always SCHEDULED, never steered — whatever the steer-by-default
     // setting says (owner, 2026-08-17). Offering Steer there would promise the
     // running turn hears you now, and it does not. See steerableProvider().
     lastTurnUsage: null, // last prompt's billing split (#53), for the donut popover
     sessionUsage: null, // session-cumulative billing — summed by the host, not grok
+    // Structured session/info addends, bound to the `used` they arrived with.
+    // Occupancy-only frames keep this; an open popover re-fetches session/info.
+    contextBreakdown: null,
     activeAgentEl: null,
     activeAgentRaw: "",
     activeUserEl: null,
@@ -425,6 +434,7 @@
     thoughtStartTime: null,
     activeToolGroupEl: null,
     slashFiltered: [],
+    slashQuery: "",
     slashActive: 0,
     // "@" file popover: the rows the host sent for the current token
     // (mentionResults), the highlighted row, and the token the rows answer —
@@ -637,6 +647,11 @@
     // Latest `grok update --check` result for Settings → About: { checking } while
     // in flight, then { current, latest, updateAvailable, error }.
     grokUpdate: null,
+    mcpServers: [],
+    mcpLoading: false,
+    mcpError: "",
+    mcpWarning: "",
+    mcpConnectors: [],
     // While replaying an older session, suppress a legacy primer user turn and
     // grok's response until the next user message starts.
     suppressReplayTurn: false,
@@ -738,9 +753,13 @@
     listTree: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12h-8"/><path d="M21 6H8"/><path d="M21 18h-8"/><path d="M3 6v4c0 1.1.9 2 2 2h3"/><path d="M3 10v6c0 1.1.9 2 2 2h3"/></svg>`,
     zap: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>`,
     copy: `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`,
+    thumbsUp: `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/></svg>`,
+    thumbsDown: `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 14V2"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/></svg>`,
     check: `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`,
+    squareChevronRight: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m10 8 4 4-4 4"/></svg>`,
     chevronRight: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`,
     chevronDown: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>`,
+    chevronUp: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>`,
     ellipsis: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>`,
     search: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>`,
     clock: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`,
@@ -1099,7 +1118,7 @@
 
   // ---------- markdown ----------
 
-  const { looksLikeFileRef, formatRelativeTime, modelPickerLabel, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, commandProgramLabel, commandTextPreview, extractToolResultOutput, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, createPendingOverlay, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents } = globalThis.GrokWebviewHelpers;
+  const { looksLikeFileRef, formatRelativeTime, modelPickerLabel, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, TOOL_LABEL_MAX, middleElide, isAdvertisedSkill, getSlashQuery, applySlashPick, filterCommands, appendHighlightedText, commandProgramLabel, commandTextPreview, extractToolResultOutput, commandOutputWasCancelled, commandOutputTruncationNote, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, composerHasSendIntent, explicitVisibleChips, normalizeQueuedSends, queuedSendsText, queuedSendsChips, contextOverheadTokens, nextContextBreakdown, contextBreakdownIsCurrent, createPendingOverlay, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents } = globalThis.GrokWebviewHelpers;
 
   function escapeAttr(s) {
     return String(s == null ? "" : s)
@@ -1848,6 +1867,14 @@
 
   function openContextPopover() {
     closePopovers();
+    // The control-plane meter is independent of model prompts and is TTL-gated
+    // by the host. Render the cached snapshot immediately, then re-render when
+    // a fresh structured response arrives.
+    vscode.postMessage({ type: "refreshContextDetails" });
+    renderContextPopover();
+  }
+
+  function renderContextPopover() {
     contextPopover.innerHTML = "";
     // A `↳ ` label marks a sub-row (a component of the line above it) — indented
     // via CSS rather than padding the string, so the value column stays aligned.
@@ -1902,6 +1929,53 @@
       };
     }
     contextPopover.appendChild(act);
+
+    // Snapshot addends are internally consistent (overhead from snapshot.used).
+    // Occupancy that has moved does not hide the group: an open popover
+    // re-fetches session/info so header and rows become current together.
+    const breakdown = state.contextBreakdown;
+    const hasBreakdown = breakdown && (
+      breakdown.systemPromptTokens != null ||
+      breakdown.toolDefinitionsTokens != null ||
+      breakdown.messageTokens != null ||
+      breakdown.freeTokens != null ||
+      (breakdown.categories && breakdown.categories.length)
+    );
+    if (hasBreakdown) {
+      // Same split as the CLI TUI: legend rows fill the bar; informational
+      // rows sit below it because their tokens are already in those addends
+      // (tool definitions in Reasoning/overhead, usage categories in Messages).
+      // Overhead is derived from THIS snapshot's used, never live occupancy.
+      const overheadTokens = contextOverheadTokens(
+        breakdown.used,
+        breakdown.systemPromptTokens,
+        breakdown.messageTokens,
+      );
+      section("In this window");
+      if (breakdown.systemPromptTokens != null) info("System", tok(breakdown.systemPromptTokens));
+      if (breakdown.messageTokens != null) info("Messages", tok(breakdown.messageTokens));
+      if (overheadTokens != null) info("Reasoning/overhead", tok(overheadTokens));
+      if (breakdown.freeTokens != null) info("Free", tok(breakdown.freeTokens));
+      if (breakdown.autoCompactPct != null) info("Auto-compact at", `${breakdown.autoCompactPct}%`);
+      const hasCounted =
+        breakdown.toolDefinitionsTokens != null ||
+        (breakdown.categories && breakdown.categories.length);
+      if (hasCounted) {
+        section("Already counted above");
+        if (breakdown.toolDefinitionsTokens != null) {
+          const n = breakdown.toolDefinitionsCount;
+          const toolsLabel = typeof n === "number"
+            ? `Tool definitions (${n} ${n === 1 ? "tool" : "tools"})`
+            : "Tool definitions";
+          info(toolsLabel, tok(breakdown.toolDefinitionsTokens));
+        }
+        if (breakdown.categories) {
+          for (const category of breakdown.categories) {
+            info(category.detail ? `${category.label} (${category.detail})` : category.label, tok(category.tokens));
+          }
+        }
+      }
+    }
 
     // Billing rows only when the CLI actually reported usage — an older build or
     // a session with no completed turn shows the context row alone rather than a
@@ -2356,6 +2430,7 @@
       voiceSendPhrase: typeof state.voiceSendPhrase === "string" ? state.voiceSendPhrase : "grok send",
       voiceKeyterms: Array.isArray(state.voiceKeyterms) ? state.voiceKeyterms : [],
       telemetryEnabled: state.telemetryEnabled,
+      thumbsFeedback: !!state.thumbsFeedback,
       providers: state.providers || [],
       providersChecking: !!state.providersChecking,
       extVersion: state.extVersion,
@@ -2363,6 +2438,11 @@
       hostKind: state.hostKind,
       hostName: state.hostName,
       grokUpdate: state.grokUpdate,
+      mcpServers: state.mcpServers,
+      mcpLoading: state.mcpLoading,
+      mcpError: state.mcpError,
+      mcpWarning: state.mcpWarning,
+      mcpConnectors: state.mcpConnectors,
     };
   }
 
@@ -2433,6 +2513,9 @@
         break;
       case "telemetryDesktop":
         state.telemetryEnabled = !!value;
+        break;
+      case "thumbsFeedback":
+        state.thumbsFeedback = !!value;
         break;
       default:
         break;
@@ -2806,13 +2889,16 @@
     // ── Use this app for ──────────────────────────────────────────────────
     // Progressive disclosure: Knowledge work (default) hides worktrees,
     // thinking traces and tool details; Coding unlocks them (still default off).
+    // Icons here only. The same choice in Settings is a <select>, where an
+    // option cannot carry markup — so it stays text and the two surfaces
+    // differ deliberately rather than by neglect.
     addSection("Use this app for");
     addGearItem(
-      `<span title="Hides worktrees, thinking traces, and tool details. The default for knowledge work.">Knowledge work</span>${state.appPurpose !== "coding" ? '<span class="popover-check">✓</span>' : ""}`,
+      `<span class="gear-lead" title="Hides worktrees, thinking traces, and tool details. The default for knowledge work.">${ICON.brain}<span>Knowledge work</span></span>${state.appPurpose !== "coding" ? '<span class="popover-check">✓</span>' : ""}`,
       () => { setAppPurpose("knowledge"); renderGearMain(); gearPopover.hidden = false; },
     );
     addGearItem(
-      `<span title="Adds worktrees, thinking traces, and tool details (still off by default).">Coding</span>${state.appPurpose === "coding" ? '<span class="popover-check">✓</span>' : ""}`,
+      `<span class="gear-lead" title="Adds worktrees, thinking traces, and tool details (still off by default).">${ICON.squareChevronRight}<span>Coding</span></span>${state.appPurpose === "coding" ? '<span class="popover-check">✓</span>' : ""}`,
       () => { setAppPurpose("coding"); renderGearMain(); gearPopover.hidden = false; },
     );
 
@@ -3452,13 +3538,19 @@
       let startX = 0;
       let startW = 0;
       let lastW = 0;
+      // Body `--chat-zoom` scales VISUAL rects and clientX, while --rail-width
+      // is layout px. Convert both ends of the gesture so the edge tracks the
+      // cursor (a no-op at zoom 1). Converting only the delta jumps on grab.
+      const zoomOf = typeof chatZoomFactor === "function" ? chatZoomFactor : () => 1;
+      const unzoom = typeof unzoomClientPx === "function" ? unzoomClientPx : (px) => px;
+      const layoutPx = (clientPx) => unzoom(clientPx, zoomOf());
       handle.addEventListener("pointerdown", (e) => {
         // getBoundingClientRect, not the stored value: the rail may be sitting
         // at its CSS default having never been dragged.
-        startW = rail.getBoundingClientRect().width;
+        startW = layoutPx(rail.getBoundingClientRect().width);
         if (!startW) return;
         dragging = true;
-        startX = e.clientX;
+        startX = layoutPx(e.clientX);
         lastW = startW;
         document.body.classList.add("rail-resizing");
         handle.classList.add("rail-resizing");
@@ -3467,7 +3559,7 @@
       });
       handle.addEventListener("pointermove", (e) => {
         // Rail is on the left: drag right → wider.
-        if (dragging) lastW = applyRailWidth(startW + (e.clientX - startX), false);
+        if (dragging) lastW = applyRailWidth(startW + (layoutPx(e.clientX) - startX), false);
       });
       const end = (e) => {
         if (!dragging) return;
@@ -6118,6 +6210,11 @@
           icon: ICON.download,
           onSelect: () => exportCurrentSession(),
         },
+        {
+          label: "Find in conversation",
+          icon: ICON.search,
+          onSelect: () => openFind(),
+        },
       ],
       "vscode-session-head",
     ));
@@ -6821,6 +6918,11 @@
         icon: ICON.download,
         onSelect: () => exportCurrentSession(),
       });
+      items.push({
+        label: "Find in conversation",
+        icon: ICON.search,
+        onSelect: () => openFind(),
+      });
       // Worktree upkeep rides along for the same reason, and only while you are
       // in one — you cannot apply a checkout you are not standing in.
       //
@@ -7228,10 +7330,13 @@
     state.planHistoryQueue = [];
     state.permissionHistoryQueue = [];
     state.userMsgCount = 0;
+    state.feedbackAvailable = false;
+    state.turnRating = 0;
     state.interjectionCount = 0;
     state.historyEventCount = 0;
     state.lastTurnUsage = null;
     state.sessionUsage = null;
+    state.contextBreakdown = null;
     state.suppressReplayTurn = false;
     state.skipUserBubble = false;
     cancelPendingSpeech();
@@ -7265,6 +7370,7 @@
     // (confirm-overlay / uiPrompt are action-scoped and remove themselves.)
     closeImagePreview();
     closePreviewOverlay();
+    onFindSessionReset();
   }
 
   /** Acts that open a terminal we cannot observe finishing. */
@@ -7708,8 +7814,15 @@
       } else {
         // A user message starts a new turn; the previous turn's footer (if the
         // replay never emitted an explicit turn end) becomes final now.
+        // A steer is still the same turn — keep the footer pointer so agentEnd
+        // can attach thumbs to it. Nulling it here dropped the only handle
+        // after more agent chunks reused the same bubble.
         revealTurnFooter();
-        state.turnAgentActionsEl = null;
+        if (!(opts && opts.steer)) {
+          retireLiveTurnFeedback(state.turnAgentActionsEl);
+          state.turnAgentActionsEl = null;
+          state.turnRating = 0;
+        }
       }
     }
 
@@ -7785,6 +7898,98 @@
     }
   }
 
+  function feedbackOffered() {
+    return state.feedbackAvailable === true && state.activeProvider !== "codex" && state.activeProvider !== "claude";
+  }
+
+  function stripTurnThumbs(actions) {
+    if (!actions) return;
+    const existing = actions.querySelector(".msg-thumbs");
+    if (existing) existing.remove();
+    actions.classList.remove("has-rating");
+    delete actions.dataset.feedbackPending;
+  }
+
+  function retireLiveTurnFeedback(actions) {
+    if (!actions) return;
+    stripTurnThumbs(actions);
+    delete actions.dataset.feedbackLive;
+  }
+
+  function liveTurnActions() {
+    const a = state.turnAgentActionsEl;
+    if (!a || a.hidden || a.dataset.feedbackLive !== "1") return null;
+    return a;
+  }
+
+  function insertTurnThumbs(actions) {
+    if (actions.querySelector(".msg-thumbs")) return;
+    const wrap = document.createElement("span");
+    wrap.className = "msg-thumbs";
+    wrap.appendChild(makeThumbButton("up", 1, "Good response", ICON.thumbsUp));
+    wrap.appendChild(makeThumbButton("down", -1, "Bad response", ICON.thumbsDown));
+    const ts = actions.querySelector(".msg-timestamp");
+    if (ts) actions.insertBefore(wrap, ts);
+    else actions.appendChild(wrap);
+    paintTurnThumbs(actions);
+  }
+
+  function makeThumbButton(kind, rating, label, glyph) {
+    const btn = document.createElement("button");
+    btn.className = `msg-action-btn msg-thumb-btn msg-thumb-${kind}`;
+    btn.type = "button";
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    btn.setAttribute("aria-pressed", "false");
+    btn.dataset.rating = String(rating);
+    btn.innerHTML = `<span class="msg-action-glyph">${glyph}</span>`;
+    return btn;
+  }
+
+  function paintTurnThumbs(actions) {
+    const rating = state.turnRating === 1 || state.turnRating === -1 ? state.turnRating : 0;
+    actions.classList.toggle("has-rating", rating === 1 || rating === -1);
+    const up = actions.querySelector(".msg-thumb-up");
+    const down = actions.querySelector(".msg-thumb-down");
+    if (up) up.setAttribute("aria-pressed", rating === 1 ? "true" : "false");
+    if (down) down.setAttribute("aria-pressed", rating === -1 ? "true" : "false");
+  }
+
+  function syncFeedbackButtons() {
+    const live = liveTurnActions();
+    for (const actions of messagesEl.querySelectorAll(".msg.agent .msg-actions")) {
+      if (actions === live && feedbackOffered()) {
+        if (!actions.querySelector(".msg-thumbs")) insertTurnThumbs(actions);
+        else paintTurnThumbs(actions);
+      } else {
+        stripTurnThumbs(actions);
+      }
+    }
+  }
+
+  /** Thumbs rate only the turn that just finished in this process. */
+  function markLiveTurnFeedback() {
+    if (state.replaying) return;
+    const a = state.turnAgentActionsEl;
+    if (!a) return;
+    for (const other of messagesEl.querySelectorAll(".msg.agent .msg-actions")) {
+      if (other !== a) retireLiveTurnFeedback(other);
+    }
+    a.dataset.feedbackLive = "1";
+    state.turnRating = 0;
+    syncFeedbackButtons();
+  }
+
+  function applyTurnFeedbackAck(rating) {
+    if (state.replaying) return;
+    const a = state.turnAgentActionsEl;
+    if (!a) return;
+    a.dataset.feedbackLive = "1";
+    state.turnRating = rating === 1 || rating === -1 ? rating : 0;
+    delete a.dataset.feedbackPending;
+    syncFeedbackButtons();
+  }
+
   const TOOL_VERB = {
     read_file: "Read", file_read: "Read",
     write_file: "Write", file_write: "Write", write: "Write",
@@ -7825,6 +8030,34 @@
       r.target_directory || r.directory || r.dir ||
       (Array.isArray(r.paths) ? r.paths[0] : "") ||
       pathFromToolTitle(call);
+  }
+  function isReadTool(call) {
+    if (!call) return false;
+    const name = toolName(call);
+    const kind = toolKind(call);
+    return name === "read_file" || name === "file_read" || kind === "read";
+  }
+  function asLineNum(v) {
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }
+  // Line range for a Read row. Prefer requested offset/limit (1-based; 0 → 1),
+  // then FileContent.{offset,limit,total_lines} on the completed update.
+  // Do not invent numbers when none of those are on the wire.
+  function readLineRange(call) {
+    const r = (call && (call.rawInput || call.input)) || {};
+    const ro = call && call.rawOutput;
+    const fc = ro && (ro.FileContent || ro.file_content) || {};
+    let start = asLineNum(r.offset) ?? asLineNum(r.start_line) ?? asLineNum(r.startLine) ?? asLineNum(fc.offset);
+    const endHint = asLineNum(r.end_line) ?? asLineNum(r.endLine);
+    const limit = asLineNum(r.limit) ?? asLineNum(fc.limit);
+    const total = asLineNum(fc.total_lines) ?? asLineNum(fc.totalLines);
+    if (start === 0) start = 1;
+    if (start != null && endHint != null && endHint >= start) return { start, end: endHint };
+    if (start != null && limit != null && limit > 0) return { start, end: start + limit - 1 };
+    if (start == null && limit != null && limit > 0) return { start: 1, end: limit };
+    if (start != null && total != null && total >= start) return { start, end: total };
+    if (start == null && total != null && total > 0) return { start: 1, end: total };
+    return null;
   }
   function toolRenamePaths(call) {
     const r = call && (call.rawInput || call.input) || {};
@@ -7945,7 +8178,7 @@
     return name && name.length < 30 ? `Running ${name}` : "Running tool";
   }
 
-  function toolLabel(call) {
+  function toolLabel(call, opts) {
     const name = toolName(call);
     const kind = toolKind(call);
     const verb = TOOL_VERB[name] || KIND_VERB[kind] || null;
@@ -7978,9 +8211,11 @@
       const isRead = name === "read_file" || name === "file_read" || kind === "read";
       if (isList) {
         target = prettyDir(filePath);
-      } else if (isRead && r.offset != null && r.limit != null) {
-        const end = Number(r.offset) + Number(r.limit) - 1;
-        target = `${prettyPath(filePath)} lines ${r.offset}-${end}`;
+      } else if (isRead) {
+        const range = readLineRange(call);
+        target = range
+          ? `${prettyPath(filePath)} lines ${range.start}-${range.end}`
+          : prettyPath(filePath);
       } else {
         target = prettyPath(filePath);
       }
@@ -7999,8 +8234,16 @@
     if (verb && target) return `${verb} ${target}`;
     if (verb) return verb;
     const title = (call.title || "").trim();
-    if (title) return title.length > 50 ? title.slice(0, 47) + "…" : title;
+    if (title) return opts && opts.full ? title : middleElide(title, TOOL_LABEL_MAX);
     return name || "tool";
+  }
+
+  // Flatten rebuilds the label span (details/chevron nodes move; the label
+  // does not), so title has to be painted wherever textContent is set.
+  function applyToolLabel(el, call) {
+    if (!el) return;
+    el.textContent = toolLabel(call);
+    el.title = toolLabel(call, { full: true });
   }
 
   // Category icon for a tool row (lucide outline; sized + colored by CSS via
@@ -8048,7 +8291,7 @@
       flat.innerHTML = toolIconFor(calls); // icon first
       const lbl = document.createElement("span");
       lbl.className = "tool-label";
-      lbl.textContent = toolLabel(calls[0]);
+      applyToolLabel(lbl, calls[0]);
       flat.appendChild(lbl);
       // #41: a lone command's expandable detail (full command + output) moves
       // into the flat row — moving the NODES keeps the pendingCommandDetails
@@ -8124,16 +8367,21 @@
     // still breaks onto its own full-width row.
     const itemLabel = document.createElement("span");
     itemLabel.className = "tool-item-label";
-    itemLabel.textContent = toolLabel(call);
+    applyToolLabel(itemLabel, call);
     item.appendChild(itemLabel);
     item._call = call;
     body.appendChild(item);
     if (call.toolCallId) state.toolItemsByToolCallId.set(call.toolCallId, item);
     // #41: a shell command's row carries an expandable detail — the FULL
     // command text immediately (grok truncates its titles), and the complete
-    // captured output once the terminal finishes.
-    const cmd = call.rawInput && typeof call.rawInput.command === "string" ? call.rawInput.command.trim() : "";
+    // captured output once the terminal finishes. MCP rows reuse this
+    // shell via host-normalized `detailInput` (never an empty pending block).
+    const cmd = commandDetailText(call);
     if (cmd) attachCommandDetails(item, cmd, call.toolCallId);
+    else if (isReadTool(call) && !item.querySelector(".cmd-block")) {
+      const path = String(toolFilePath(call) || "");
+      if (path || extractToolResultOutput(call)) attachCommandDetails(item, path, call.toolCallId);
+    }
 
     hdr.innerHTML =
       toolIconFor(el._calls) +
@@ -8150,7 +8398,7 @@
     // full command mid-run.
     el.classList.toggle(
       "cmd-single",
-      el._calls.length === 1 && !!(call.rawInput && (call.rawInput.command || call.rawInput.cmd)),
+      el._calls.length === 1 && !!(commandDetailText(call) || isReadTool(call)),
     );
     hdr.onclick = () => {
       const expanded = !body.hidden;
@@ -8184,9 +8432,9 @@
   // Effective expand state, given the per-session latch (toolExpandOverride)
   // takes precedence over the persisted grok.expandCommandOutputs default.
   //   - override set  → force everything to the override (all groups, all boxes).
-  //   - override null → the setting: every detail box (command IN/OUT, edit diff)
-  //                     opens, and only GROUPS that HOLD a detail auto-open —
-  //                     command or edit groups, but not read/explore-only ones.
+  //   - override null → the setting: every detail box (command IN/OUT, Read
+  //                     file text, edit diff) opens, and only GROUPS that HOLD
+  //                     a detail auto-open — search/list-only groups stay collapsed.
   // `groupShouldExpand` needs the element to decide the has-detail case;
   // `detailShouldExpand` is group-agnostic.
   function groupShouldExpand(el) {
@@ -8431,6 +8679,17 @@
    * sends an update carrying ONLY a toolCallId and `_meta` (the tool response),
    * which would erase everything gathered so far.
    */
+  // IN text for the shared command-detail shell. Shell rows use
+  // `rawInput.command` / `.cmd`. MCP rows use the host-stamped `detailInput`
+  // (`null` / absent = pending or not MCP; `{}` is a no-argument call).
+  function commandDetailText(call) {
+    const raw = (call && (call.rawInput || call.input)) || {};
+    if (typeof raw.command === "string" && raw.command.trim()) return raw.command.trim();
+    if (typeof raw.cmd === "string" && raw.cmd.trim()) return raw.cmd.trim();
+    if (typeof call.detailInput === "string" && call.detailInput.trim()) return call.detailInput.trim();
+    return "";
+  }
+
   function refreshToolRowFromUpdate(update) {
     const id = update && update.toolCallId;
     if (!id) return;
@@ -8448,18 +8707,32 @@
         merged[key] = { ...(item._call[key] || {}), ...update[key] };
       }
     }
-    item._call = merged;
-    const labelEl = item.querySelector(".tool-item-label");
-    if (labelEl) {
-      const next = toolLabel(merged);
-      if (next && next !== labelEl.textContent) labelEl.textContent = next;
+    if (Object.prototype.hasOwnProperty.call(update, "detailInput")) {
+      merged.detailInput = update.detailInput;
     }
+    item._call = merged;
+    // Flatten / summarize read `_calls`, not `item._call`. Grok's first
+    // use_tool row is titled "use_tool" until this update; leave the
+    // group's copy stale and the flat label stays the wrapper name.
+    const groupCalls = item.closest(".tool-group");
+    if (groupCalls && Array.isArray(groupCalls._calls)) {
+      const idx = groupCalls._calls.findIndex((c) => c && c.toolCallId === id);
+      if (idx >= 0) groupCalls._calls[idx] = merged;
+    }
+    const labelEl = item.querySelector(".tool-item-label");
+    if (labelEl) applyToolLabel(labelEl, merged);
     // A shell command that only shows up on the update still earns its IN/OUT
     // box; attachCommandDetails is a no-op once the row already has one.
-    const args = merged.rawInput || merged.input || {};
-    const cmd = typeof args.command === "string" ? args.command.trim()
-      : typeof args.cmd === "string" ? args.cmd.trim() : "";
+    // MCP args that arrive after a pending row use the same attach.
+    const cmd = commandDetailText(merged);
     if (cmd && !item.querySelector(".cmd-block")) attachCommandDetails(item, cmd, id);
+    else if (isReadTool(merged) && !item.querySelector(".cmd-block")) {
+      const path = String(toolFilePath(merged) || "");
+      if (path || extractToolResultOutput(merged)) attachCommandDetails(item, path, id);
+    }
+    if (groupCalls && groupCalls.classList.contains("in-progress") && groupCalls._calls && groupCalls._calls.length === 1) {
+      groupCalls.classList.toggle("cmd-single", !!(cmd || isReadTool(merged)));
+    }
   }
 
   function attachCommandOutput(details, msg) {
@@ -8493,12 +8766,16 @@
         const group = row.closest && row.closest(".tool-group");
         if (group) group.classList.add("has-error");
       }
-    } else if (msg.exitCode == null) {
+    } else if (commandOutputWasCancelled(msg)) {
+      // Live kill. This host always states `cancelled` (true/false). Absence is
+      // an older host, which never hydrated replay commandOutput, so null exit
+      // was a kill. Do not infer from state.replaying: historyReplay also
+      // wraps buffer rebuilds.
       const mark = document.createElement("div");
       mark.className = "cmd-out-marker muted";
       mark.textContent = "[Cancelled] no exit code";
       body.appendChild(mark);
-    } else if (!hasOutput) {
+    } else if (msg.exitCode === 0 && !hasOutput) {
       // exit 0 with nothing on stdout: a bare "(no output)" pre read as broken.
       // A muted "done" marker (process success, not a claim about the task) is
       // clearer, and there's no empty <pre> to feel like a gap.
@@ -8515,7 +8792,7 @@
     if (msg.truncated) {
       const note = document.createElement("div");
       note.className = "cmd-out-marker muted";
-      note.textContent = "output truncated — grok saw the same cut";
+      note.textContent = commandOutputTruncationNote(msg);
       body.appendChild(note);
     }
     outRow.appendChild(body);
@@ -8532,6 +8809,8 @@
   function maybeAttachToolResultOutput(call) {
     const id = call && call.toolCallId;
     if (!id) return false;
+    // A pending Claude row's `content` is the tool description — not stdout.
+    if (String(call.status || "").toLowerCase() === "pending") return false;
     // Use the pendingCommandDetails entry (a direct `details` node reference that
     // survives a lone command's flatten-move) rather than re-querying the item —
     // the item's details node is relocated to the .tool-flat wrapper.
@@ -8539,9 +8818,17 @@
     if (!entry) return false;
     const block = entry.details.querySelector(".cmd-block");
     if (!block || block.querySelector(".cmd-out")) return false; // OUT already present (grok-build)
+    // Live Claude/Composer have no commandDone, so this is the only OUT source.
+    // extractToolResultOutput already prefers the unfenced string and applies
+    // the same 100K cap as the host commandOutput path — first arriver is
+    // correct; attachCommandOutput is idempotent if both land. Do not gate on
+    // state.replaying: historyReplay also wraps in-memory buffer rebuilds
+    // (focusSession / rehydrateWebviewFromFocused), which have no commandOutput.
     const res = extractToolResultOutput(call);
     if (!res) return false;
-    attachCommandOutput(entry.details, res);
+    // Read rows reuse this OUT chrome. The 100K cap is display-only —
+    // grok already saw the full FileContent (same polarity as MCP).
+    attachCommandOutput(entry.details, isReadTool(call) ? { ...res, agentSawCut: false } : res);
     return true;
   }
 
@@ -8721,7 +9008,7 @@
       item._call.rawInput = { ...(item._call.rawInput || {}), path: diffPath };
     }
     const itemLabel = item.querySelector(".tool-item-label");
-    if (itemLabel && item._call) itemLabel.textContent = toolLabel(item._call);
+    if (itemLabel && item._call) applyToolLabel(itemLabel, item._call);
     const group = item.closest && item.closest(".tool-group");
     if (group && group.classList.contains("in-progress") && item._call) {
       const groupLabel = group.querySelector(".tool-group-label");
@@ -9368,7 +9655,7 @@
     const row = document.createElement("div");
     row.className = "subagent-tool";
     if (id) row.dataset.toolCallId = id;
-    row.textContent = toolLabel(call);
+    applyToolLabel(row, call);
     stream.appendChild(row);
     if (id) el._childTools.set(id, row);
     setSubagentLiveStatus(el, toolLabel(call));
@@ -9382,7 +9669,7 @@
       return;
     }
     const label = toolLabel(call);
-    if (label && label !== "tool") row.textContent = label;
+    if (label && label !== "tool") applyToolLabel(row, call);
     const status = String(call && call.status || "").toLowerCase();
     if (status === "failed") row.classList.add("subagent-tool-failed");
   }
@@ -10264,9 +10551,11 @@
   // `.msg.thinking` block at once — so it covers replayed/old sessions too and
   // toggling is instant with no reload — and turning traces back on drops the
   // stand-in indicator.
+  let onFindPreferenceChange = () => {};
   function applyThinkingVisibility() {
     document.body.classList.toggle("thinking-hidden", !effectiveShowThinking());
     if (effectiveShowThinking()) hideThinkingIndicator();
+    onFindPreferenceChange();
   }
 
   // True when *something* already tells the user grok is mid-work or awaiting
@@ -10298,8 +10587,12 @@
   // Follow streaming output only while the user is pinned to the bottom. Once
   // they gesture away (the listener below clears state.stickToBottom) this
   // becomes a no-op, so they can read history while grok keeps thinking (#16).
+  // Replay (ACP session/load *and* in-memory buffer rebuilds) must not do this
+  // per element: each assignment forces layout, and a large load looks like
+  // infinite scroll. historyReplay end force-scrolls once.
   function scrollToBottom() {
-    if (state.stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (state.replaying || !state.stickToBottom) return;
+    messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
   // The floating "Scroll to bottom" button (#28) shows exactly when we've stopped
@@ -10313,8 +10606,10 @@
 
   // Always pull the view to the bottom and re-pin. For interactive activity the
   // user needs to see regardless of where they've scrolled: permission/question
-  // cards and their own just-sent message.
+  // cards and their own just-sent message. No-op during replay — the closing
+  // historyReplay frame is what lands the loaded conversation at the bottom.
   function forceScrollToBottom() {
+    if (state.replaying) return;
     setStickToBottom(true);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     updateScrollBtn();
@@ -10343,7 +10638,7 @@
     const h = messagesEl.clientHeight;
     if (h === lastScrollportHeight) return;
     lastScrollportHeight = h;
-    if (state.stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (state.stickToBottom && !state.replaying) messagesEl.scrollTop = messagesEl.scrollHeight;
   }).observe(messagesEl);
 
   // The scrollport's own border-box does not resize when content inside an
@@ -10352,10 +10647,10 @@
   // pinned; a deliberate scroll-up has cleared stickToBottom and is untouched.
   let contentFollowFrame = 0;
   new MutationObserver(() => {
-    if (!state.stickToBottom || contentFollowFrame) return;
+    if (state.replaying || !state.stickToBottom || contentFollowFrame) return;
     contentFollowFrame = requestAnimationFrame(() => {
       contentFollowFrame = 0;
-      if (state.stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+      if (state.stickToBottom && !state.replaying) messagesEl.scrollTop = messagesEl.scrollHeight;
     });
   }).observe(messagesEl, {
     childList: true,
@@ -11467,27 +11762,28 @@
     donutLabel.textContent = `${toK(used)}/${toK(max)}`;
     donutLabel.title = `${used.toLocaleString()} / ${max.toLocaleString()} tokens`;
     donutEl.title = `Context usage — ${used.toLocaleString()} / ${max.toLocaleString()} tokens`;
+    // Occupancy can move without a contextUsage frame (promptComplete,
+    // modelChanged). Re-paint, then re-fetch session/info while the popover
+    // is open so the group stays and catches up instead of vanishing.
+    if (!contextPopover.hidden) {
+      renderContextPopover();
+      if (!contextBreakdownIsCurrent(state.contextBreakdown, used, state.contextWindow)) {
+        vscode.postMessage({ type: "refreshContextDetails" });
+      }
+    }
   }
 
   // ---------- slash autocomplete ----------
 
   function updateSlash() {
-    const m = (input.value.slice(0, input.selectionStart || 0)).match(/(?:^|\n)\/(\S*)$/);
-    if (!m) { slashPopover.hidden = true; state.slashFiltered = []; return; }
-    const q = m[1].toLowerCase();
-    // Prefix first, then mid-name substring; advertised order within each tier.
-    if (!q) {
-      state.slashFiltered = state.commands;
-    } else {
-      const prefix = [];
-      const substring = [];
-      for (const c of state.commands) {
-        const name = c.name.toLowerCase();
-        if (name.startsWith(q)) prefix.push(c);
-        else if (name.includes(q)) substring.push(c);
-      }
-      state.slashFiltered = prefix.concat(substring);
-    }
+    // Skills load anywhere in the prompt; commands dispatch only at position 0
+    // of the text block (owner-measured; grok `available_commands` stamps
+    // `_meta.scope`+`_meta.path` on skills). Offer accordingly — #110.
+    const hit = getSlashQuery(input.value, input.selectionStart || 0);
+    if (!hit) { slashPopover.hidden = true; state.slashFiltered = []; state.slashQuery = ""; return; }
+    const pool = hit.atStart ? state.commands : state.commands.filter(isAdvertisedSkill);
+    state.slashQuery = hit.query;
+    state.slashFiltered = filterCommands(pool, hit.query);
     if (!state.slashFiltered.length) { slashPopover.hidden = true; return; }
     state.slashActive = 0;
     renderSlash();
@@ -11497,18 +11793,19 @@
   function renderSlash() {
     slashPopover.innerHTML = "";
     let activeEl = null;
+    const q = state.slashQuery || "";
     state.slashFiltered.forEach((cmd, i) => {
       const el = document.createElement("div");
       el.className = `slash-item${i === state.slashActive ? " active" : ""}`;
       if (i === state.slashActive) activeEl = el;
       const name = document.createElement("div");
       name.className = "slash-name";
-      name.textContent = `/${cmd.name}`;
+      appendHighlightedText(name, `/${cmd.name}`, q);
       el.appendChild(name);
       if (cmd.description) {
         const d = document.createElement("div");
         d.className = "slash-desc";
-        d.textContent = cmd.description;
+        appendHighlightedText(d, cmd.description, q);
         el.appendChild(d);
       }
       el.onclick = () => pickSlash(cmd);
@@ -11518,11 +11815,12 @@
   }
 
   function pickSlash(cmd) {
-    input.value = input.value.replace(/(?:^|\n)\/(\S*)$/, (full) =>
-      full.startsWith("\n") ? `\n/${cmd.name} ` : `/${cmd.name} `,
-    );
+    const next = applySlashPick(input.value, input.selectionStart || 0, cmd.name);
+    input.value = next.text;
+    input.selectionStart = input.selectionEnd = next.caret;
     slashPopover.hidden = true;
     input.focus();
+    renderInputHighlight();
   }
 
   // ---------- "@" file autocomplete ----------
@@ -11633,7 +11931,7 @@
       sendBtn.title = "Initializing…";
       sendBtn.classList.add("initializing");
       sendBtn.disabled = true;
-    } else if (input.value.trim()) {
+    } else if (composerHasSendIntent(input.value, state.chips)) {
       sendBtn.innerHTML = ICON.arrowUp;
       sendBtn.title = "Queue — sends when Grok finishes";
       sendBtn.disabled = false;
@@ -11645,18 +11943,28 @@
     }
   }
 
-  // Queue whatever is typed for send-at-turn-end. Returns true if something was
-  // queued. The one busy-path helper both Enter and the button click funnel
-  // through, so typed text can never turn into a cancel (#37).
+  // Queue whatever is staged for send-at-turn-end. Returns true if something was
+  // queued (or refused with a reason — never a cancel). The one busy-path helper
+  // both Enter and the button click funnel through, so send-intent can never
+  // turn into a cancel (#37). A composer holding only an attachment is send-intent.
   function queueFromComposer() {
+    if (state.pendingPaste > 0) return true;
     const t = input.value.trim();
-    if (!t) return false;
+    const chips = explicitVisibleChips(state.chips);
+    if (!composerHasSendIntent(t, state.chips)) return false;
+    // Everything or nothing: an older host would ignore extra chips and queue
+    // the text alone. Refuse rather than silently drop attachments.
+    if (chips.length && !(state.hostCaps && state.hostCaps.queueSendChips)) {
+      addError("This host cannot queue attachments. Wait until Grok finishes, then send.");
+      return true;
+    }
     stopVoiceForManualSend();
-    queueOutgoing(t);
+    queueOutgoing(t, chips);
     input.value = "";
     renderInputHighlight(); // also flips the busy button back to Stop (empty composer)
     updateSlash();
     updateMention();
+    updateSendButton();
     return true;
   }
 
@@ -11728,12 +12036,12 @@
       // cancelled turn actually ends (agentEnd / agentError), so the button
       // stays as "Stop" until the CLI confirms.
       if (state.sendQueue.length) {
-        input.value = state.sendQueue.join("\n\n");
+        input.value = queuedSendsText(state.sendQueue);
         state.sendQueue = [];
         state.queuedSubmissionPending = false;
         state.queuedSubmissionRejected = false;
         renderQueuedBlocks();
-        vscode.postMessage({ type: "clearQueuedSends" });
+        vscode.postMessage({ type: "clearQueuedSends", restore: true });
         renderInputHighlight();
       }
       vscode.postMessage({ type: "cancel" });
@@ -12237,12 +12545,20 @@
   // (session-start priming — no session id to interject against yet), a CLI that
   // can't interject, and (defensively) not being busy at all. Any of those fall
   // back to the queue, which is the safe home for the text either way.
-  function queueOutgoing(text) {
-    if (state.steerByDefault && state.steerSupported && steerableProvider() && state.busy && !state.busyLocked) {
-      vscode.postMessage({ type: "steerSend", text });
+  // Attachments ride `_x.ai/interject` `content` (same encoder as a send).
+  function queueOutgoing(text, chips) {
+    const attachments = Array.isArray(chips) ? chips : explicitVisibleChips(state.chips);
+    if (
+      state.steerByDefault && state.steerSupported && steerableProvider() && state.busy && !state.busyLocked
+    ) {
+      const msg = { type: "steerSend", text };
+      if (attachments.length) msg.chips = attachments;
+      vscode.postMessage(msg);
       return;
     }
-    vscode.postMessage({ type: "queueSend", text });
+    const msg = { type: "queueSend", text };
+    if (state.hostCaps && state.hostCaps.queueSendChips) msg.chips = attachments;
+    vscode.postMessage(msg);
   }
 
   // THE pending user block (the host keeps at most one queued message —
@@ -12264,21 +12580,23 @@
    *  queued something. A "no" leaves a stale placeholder beside the queued block
    *  until the next refresh, which is cosmetic; a wrong "yes" would retire a
    *  submission that is still in flight, which is not. */
-  function queueHoldsContribution(items, text) {
+  function queueHoldsContribution(entries, text) {
     if (!text) return false;
-    for (var i = 0; i < items.length; i++) {
-      if (String(items[i] || "") === text) return true;
+    for (var i = 0; i < entries.length; i++) {
+      const entryText = typeof entries[i] === "string" ? entries[i] : (entries[i] && entries[i].text) || "";
+      if (entryText === text) return true;
     }
     return false;
   }
 
   function renderQueuedBlocks() {
     let wrap = state.queuedWrapEl;
-    // Defensive join: the host's invariant is a single entry, but render
-    // whatever arrives the way the flush would send it.
+    // One visual block: the flush is still one combined prompt. Text is joined
+    // the way it will send; chips from every contribution are shown on it.
     const rejected = !!state.rejectedSubmissionText;
-    const text = rejected ? state.rejectedSubmissionText : state.sendQueue.join("\n\n");
-    if (!text) {
+    const text = rejected ? state.rejectedSubmissionText : queuedSendsText(state.sendQueue);
+    const chips = rejected ? [] : queuedSendsChips(state.sendQueue);
+    if (!text && !chips.length) {
       if (wrap) wrap.remove();
       state.queuedWrapEl = null;
       return;
@@ -12316,7 +12634,7 @@
         state.rejectedSubmissionText = "";
         renderQueuedBlocks();
       } else {
-        vscode.postMessage({ type: "dequeueSend", index: 0 });
+        vscode.postMessage({ type: "clearQueuedSends", restore: true });
       }
       input.value = input.value.trim() ? text + "\n\n" + input.value : text;
       renderInputHighlight();
@@ -12333,7 +12651,7 @@
         state.rejectedSubmissionText = "";
         renderQueuedBlocks();
       } else {
-        vscode.postMessage({ type: "dequeueSend", index: 0 });
+        vscode.postMessage({ type: "clearQueuedSends" });
       }
     };
     // Steer (#52): send this into the RUNNING turn instead of waiting for it.
@@ -12342,6 +12660,9 @@
     // still ends up with the button once busy lands.
     // Not for Claude Code: it has no mid-turn interject, so the button would
     // offer to do something the agent cannot do. Its messages stay scheduled.
+    // Attachments ride `_x.ai/interject` `content` — the host encodes them the
+    // same way as a send. An older CLI that ignores `content` gets the whole
+    // item queued rather than a silent drop.
     if (state.steerSupported && steerableProvider()) {
       const steerBtn = document.createElement("button");
       steerBtn.className = "queued-action queued-steer";
@@ -12357,8 +12678,12 @@
       steerBtn.onpointerdown = (e) => {
         e.preventDefault();
         e.stopPropagation();
-        vscode.postMessage({ type: "dequeueSend", index: 0 });
-        vscode.postMessage({ type: "steerSend", text });
+        // steerSend first so the host can snapshot the queue before this
+        // clear races (webview handlers are not serialized across awaits).
+        const msg = { type: "steerSend", text, fromQueue: true };
+        if (chips.length) msg.chips = chips;
+        vscode.postMessage(msg);
+        vscode.postMessage({ type: "clearQueuedSends" });
       };
       actions.appendChild(steerBtn);
     }
@@ -12366,17 +12691,848 @@
     actions.appendChild(rmBtn);
     hdr.appendChild(tag);
     hdr.appendChild(actions);
-    const body = document.createElement("div");
-    body.className = "queued-text";
-    body.textContent = text;
-    body.title = text; // body is line-clamped; full text on hover
+    // Same order as a sent user bubble (`addMessage`): header, then text, then
+    // chips. The pending block is a preview of that bubble, not of the composer.
     bubble.appendChild(hdr);
-    bubble.appendChild(body);
+    if (text) {
+      const body = document.createElement("div");
+      body.className = "queued-text";
+      body.textContent = text;
+      body.title = text; // body is line-clamped; full text on hover
+      bubble.appendChild(body);
+    }
+    if (chips.length) {
+      const chipsRow = document.createElement("div");
+      chipsRow.className = "msg-chips";
+      for (const chip of chips) chipsRow.appendChild(makeMsgChipTag(chip.relPath, chip));
+      bubble.appendChild(chipsRow);
+    }
     msg.appendChild(bubble);
     wrap.appendChild(msg);
     messagesEl.appendChild(wrap); // (re)pin to the end of the conversation
     scrollToBottom();
   }
+
+  // ---------- find in conversation (#99) ----------
+  // One in-webview find serves VS Code, desktop, and the browser client.
+  // VS Code's enableFindWidget is a createWebviewPanel API and does not exist
+  // on WebviewView; even if it did it would do nothing for desktop or AFK Pilot.
+  //
+  // Paint uses CSS.highlights + Range. Wrapping matches in <mark> would force
+  // a full re-layout of a multi-megabyte transcript and detach the click
+  // handlers tool rows, diffs, and images depend on.
+  //
+  // Collapsed tool / command / subagent rows stay in the DOM (`hidden` / class),
+  // so a TreeWalker reaches them. A match inside one expands that row. Content
+  // hidden by a standing preference (`body.thinking-hidden` — "Show thinking
+  // traces" off, or Knowledge work forcing that off) is counted but kept out
+  // of next/prev until the user clicks the hint. Expanding a collapsed row is
+  // fine; silently flipping a preference is not.
+  //
+  // Navigation scrolls the match without calling forceScrollToBottom or
+  // noteUserScrollIntent. Programmatic scroll then cannot re-arm stick-to-bottom,
+  // so a live turn arriving while find is open cannot yank the view off the hit.
+
+  const FIND_DEBOUNCE_MS = 80;
+  const FIND_SLICE_MS = 8;
+  const FIND_QUERY_MAX = 200;
+  const FIND_MAX_MATCHES = 10000;
+  const FIND_HL = "grok-find";
+  const FIND_HL_CUR = "grok-find-current";
+
+  const find = {
+    open: false,
+    bar: null,
+    input: null,
+    countEl: null,
+    hiddenBtn: null,
+    caseBtn: null,
+    regexBtn: null,
+    prevBtn: null,
+    nextBtn: null,
+    query: "",
+    caseSensitive: false,
+    regex: false,
+    includeHidden: false,
+    invalid: false,
+    matches: [],
+    nav: [],
+    hiddenCount: 0,
+    index: -1,
+    timer: 0,
+    sliceTimer: 0,
+    gen: 0,
+    lastFocus: null,
+    memoryBySession: new Map(),
+    lastHaystackKey: "",
+    lastNodes: null,
+    lastQuery: "",
+    lastFlags: "",
+    lastComplete: false,
+    lastCapped: false,
+  };
+
+  function findHasHighlightApi() {
+    return !!(typeof CSS !== "undefined" && CSS.highlights && typeof Highlight === "function");
+  }
+
+  function findSessionKey() {
+    return state.activeSessionId || "";
+  }
+
+  function rememberFindQuery() {
+    find.memoryBySession.set(findSessionKey(), {
+      query: find.query,
+      caseSensitive: find.caseSensitive,
+      regex: find.regex,
+    });
+  }
+
+  function recalledFindQuery() {
+    return find.memoryBySession.get(findSessionKey()) || null;
+  }
+
+  function transcriptSelectionText() {
+    const sel = typeof window.getSelection === "function" ? window.getSelection() : null;
+    if (!sel || sel.isCollapsed || !sel.anchorNode) return "";
+    if (!messagesEl.contains(sel.anchorNode)) return "";
+    const text = String(sel.toString() || "").replace(/\s+/g, " ").trim();
+    if (!text || text.length > FIND_QUERY_MAX) return "";
+    return text;
+  }
+
+  function isMacPlatform() {
+    const plat = typeof navigator !== "undefined" ? (navigator.platform || "") : "";
+    if (/Mac|iPhone|iPad|iPod/.test(plat)) return true;
+    const ua = typeof navigator !== "undefined" ? (navigator.userAgent || "") : "";
+    return /Mac OS X/.test(ua);
+  }
+
+  function isFindHotkey(e) {
+    // Remote: the browser owns Ctrl/Cmd+F (and the primary device is a phone).
+    if (IS_REMOTE) return false;
+    if (e.altKey || e.shiftKey) return false;
+    if (String(e.key).toLowerCase() !== "f") return false;
+    // Cmd+F is find on every desk. Ctrl+F is find except on Mac, where it is
+    // grok.composerForward (package.json, composer-focused). Do not steal it.
+    if (e.metaKey && !e.ctrlKey) return true;
+    if (e.ctrlKey && !e.metaKey) return !isMacPlatform();
+    return false;
+  }
+
+  /**
+   * Payload bodies find deliberately does NOT search (owner, 2026-08-19).
+   * `.tool-item-details` is the one container every expandable payload renders
+   * into — tool IN/OUT, command IN/OUT, MCP IN/OUT, and the file-edit diffs
+   * (`.tool-item-details.tool-item-diff`, whose content is `.tool-diff-region`).
+   *
+   * The issue asked for the opposite ("including text inside collapsed tool and
+   * command rows"), and that is what shipped first. In use it made results
+   * chaotic: a search for an ordinary word matched dozens of times inside
+   * command output and diff hunks, burying the prose hits, and a diff match is
+   * not much use anyway because the full diff is not on screen. Row LABELS stay
+   * searchable, so "find the command I ran" and "find that file path" still
+   * work — it is only the payload bodies that drop out.
+   */
+  const FIND_SKIP_SEL = ".tool-item-details, .tool-diff-region";
+
+  function findCollectNodes() {
+    const nodes = [];
+    const root = messagesEl;
+    if (!root) return nodes;
+    const SHOW_TEXT = (typeof NodeFilter !== "undefined" && NodeFilter.SHOW_TEXT) || 4;
+    const REJECT = (typeof NodeFilter !== "undefined" && NodeFilter.FILTER_REJECT) || 2;
+    const ACCEPT = (typeof NodeFilter !== "undefined" && NodeFilter.FILTER_ACCEPT) || 1;
+    if (typeof document.createTreeWalker === "function") {
+      const walker = document.createTreeWalker(root, SHOW_TEXT, {
+        acceptNode(node) {
+          if (!node || !node.data) return REJECT;
+          const parent = node.parentElement;
+          if (!parent) return REJECT;
+          const tag = parent.tagName;
+          if (tag === "SCRIPT" || tag === "STYLE") return REJECT;
+          if (parent.closest("#welcome, .welcome")) return REJECT;
+          if (parent.closest(FIND_SKIP_SEL)) return REJECT;
+          return ACCEPT;
+        },
+      });
+      let n = walker.nextNode();
+      while (n) {
+        nodes.push(n);
+        n = walker.nextNode();
+      }
+      return nodes;
+    }
+    const stack = [root];
+    while (stack.length) {
+      const el = stack.pop();
+      if (!el) continue;
+      if (el.nodeType === 3) {
+        if (el.data) nodes.push(el);
+        continue;
+      }
+      if (el.nodeType !== 1) continue;
+      const tag = el.tagName;
+      if (tag === "SCRIPT" || tag === "STYLE") continue;
+      if (el.id === "welcome" || el.classList.contains("welcome")) continue;
+      if (typeof el.matches === "function" && el.matches(FIND_SKIP_SEL)) continue;
+      for (let i = el.childNodes.length - 1; i >= 0; i--) stack.push(el.childNodes[i]);
+    }
+    return nodes;
+  }
+
+  function findMatchIsHidden(node) {
+    // Preference-hidden, not collapsed. Collapsed tool rows stay in the
+    // navigation set; thinking traces with body.thinking-hidden do not.
+    if (!document.body.classList.contains("thinking-hidden")) return false;
+    const el = node.nodeType === 3 ? node.parentElement : node;
+    return !!(el && el.closest(".msg.thinking"));
+  }
+
+  function compileFindRegex(source, caseSensitive) {
+    if (source.length > FIND_QUERY_MAX) return { error: "long" };
+    // Nested quantifiers are the usual catastrophic-backtracking shape.
+    // Treat as no-match rather than hanging the UI on a 5 MB haystack.
+    if (/\([^()]*[+*][^()]*\)[+*{]/.test(source)) return { error: "unsafe" };
+    try {
+      // `m` so ^ / $ mean line (the issue's `^_+build$` example), not the
+      // whole concatenated transcript.
+      return { re: new RegExp(source, caseSensitive ? "gm" : "gim") };
+    } catch {
+      return { error: "invalid" };
+    }
+  }
+
+  function searchNodeLiteral(node, query, caseSensitive, into) {
+    const raw = node.data;
+    const text = caseSensitive ? raw : raw.toLowerCase();
+    const q = caseSensitive ? query : query.toLowerCase();
+    if (!q) return;
+    let i = 0;
+    while (i <= text.length - q.length) {
+      const found = text.indexOf(q, i);
+      if (found < 0) break;
+      into.push({ node, start: found, end: found + q.length });
+      if (into.length >= FIND_MAX_MATCHES) return;
+      i = found + q.length;
+    }
+  }
+
+  function searchNodeRegex(node, re, into) {
+    const text = node.data;
+    re.lastIndex = 0;
+    let m = re.exec(text);
+    while (m) {
+      if (!m[0]) {
+        re.lastIndex += 1;
+        if (re.lastIndex > text.length) break;
+        m = re.exec(text);
+        continue;
+      }
+      into.push({ node, start: m.index, end: m.index + m[0].length });
+      if (into.length >= FIND_MAX_MATCHES) return;
+      m = re.exec(text);
+    }
+  }
+
+  function canNarrowFind(nodes, query) {
+    if (find.regex || !find.lastComplete || find.invalid) return false;
+    if (!find.lastQuery || !query.startsWith(find.lastQuery)) return false;
+    if (find.lastFlags !== findFlagsKey()) return false;
+    if (find.lastNodes !== nodes) return false;
+    return true;
+  }
+
+  function findFlagsKey() {
+    return (find.caseSensitive ? "c" : "") + (find.regex ? "r" : "") + (find.includeHidden ? "h" : "");
+  }
+
+  function rangeForFindMatch(m) {
+    if (!m || !m.node || !m.node.parentNode) return null;
+    try {
+      const r = document.createRange();
+      const len = m.node.data ? m.node.data.length : 0;
+      r.setStart(m.node, Math.max(0, Math.min(m.start, len)));
+      r.setEnd(m.node, Math.max(0, Math.min(m.end, len)));
+      return r;
+    } catch {
+      return null;
+    }
+  }
+
+  function clearFindHighlights() {
+    if (findHasHighlightApi()) {
+      try {
+        CSS.highlights.delete(FIND_HL);
+        CSS.highlights.delete(FIND_HL_CUR);
+      } catch { /* ignore */ }
+    }
+    for (const el of messagesEl.querySelectorAll(".msg.thinking.find-reveal")) {
+      el.classList.remove("find-reveal");
+    }
+  }
+
+  function paintFindHighlights() {
+    clearFindHighlights();
+    if (!find.open || !find.nav.length) return;
+    if (!findHasHighlightApi()) return;
+    const others = new Highlight();
+    const current = new Highlight();
+    for (let i = 0; i < find.nav.length; i++) {
+      const range = rangeForFindMatch(find.nav[i]);
+      if (!range) continue;
+      if (i === find.index) current.add(range);
+      else others.add(range);
+    }
+    try {
+      CSS.highlights.set(FIND_HL, others);
+      CSS.highlights.set(FIND_HL_CUR, current);
+    } catch { /* older Highlight impl */ }
+  }
+
+  function updateFindChrome() {
+    if (!find.bar) return;
+    const q = find.query;
+    const n = find.nav.length;
+    const hidden = find.hiddenCount;
+    if (find.input) {
+      find.input.classList.toggle("find-input-invalid", !!find.invalid);
+      find.input.setAttribute("aria-invalid", find.invalid ? "true" : "false");
+    }
+    if (find.countEl) {
+      if (!q) find.countEl.textContent = "";
+      else if (find.invalid) find.countEl.textContent = "—";
+      else if (!n) find.countEl.textContent = find.lastCapped ? "0/" + FIND_MAX_MATCHES + "+" : "0/0";
+      else {
+        const cap = find.lastCapped ? "+" : "";
+        find.countEl.textContent = (find.index + 1) + "/" + n + cap;
+      }
+    }
+    if (find.hiddenBtn) {
+      if (!q || find.invalid || hidden <= 0) {
+        find.hiddenBtn.hidden = true;
+      } else {
+        find.hiddenBtn.hidden = false;
+        find.hiddenBtn.setAttribute("aria-pressed", find.includeHidden ? "true" : "false");
+        find.hiddenBtn.textContent = find.includeHidden
+          ? "Including " + hidden + " in hidden thinking traces"
+          : hidden + " in hidden thinking traces";
+        find.hiddenBtn.title = find.includeHidden
+          ? "Stop navigating matches inside hidden thinking traces"
+          : "Include matches inside hidden thinking traces";
+      }
+    }
+    if (find.caseBtn) find.caseBtn.setAttribute("aria-pressed", find.caseSensitive ? "true" : "false");
+    if (find.regexBtn) find.regexBtn.setAttribute("aria-pressed", find.regex ? "true" : "false");
+    const dead = !n;
+    if (find.prevBtn) find.prevBtn.disabled = dead;
+    if (find.nextBtn) find.nextBtn.disabled = dead;
+  }
+
+  function rebuildFindNav() {
+    const nav = [];
+    let hidden = 0;
+    for (const m of find.matches) {
+      const isHidden = findMatchIsHidden(m.node);
+      if (isHidden) hidden += 1;
+      if (!isHidden || find.includeHidden) nav.push(m);
+    }
+    find.nav = nav;
+    find.hiddenCount = hidden;
+    if (!nav.length) find.index = -1;
+    else if (find.index < 0 || find.index >= nav.length) find.index = 0;
+  }
+
+  function revealFindMatch(m) {
+    if (!m || !m.node) return;
+    const el = m.node.parentElement;
+    if (!el) return;
+    const thinking = el.closest(".msg.thinking");
+    if (thinking) {
+      thinking.classList.add("find-reveal");
+      const body = thinking.querySelector(".thinking-body");
+      if (body && body.hidden) {
+        body.hidden = false;
+        thinking.classList.add("expanded");
+      }
+    }
+    const group = el.closest(".tool-group");
+    if (group) setGroupExpanded(group, true);
+    const details = el.closest(".tool-item-details");
+    if (details) {
+      const row = details.closest(".has-details");
+      if (row) setDetailExpanded(row, true);
+    }
+    const sub = el.closest(".subagent-card");
+    if (sub) {
+      const stream = sub.querySelector(".subagent-stream");
+      const result = sub.querySelector(".subagent-result");
+      if (stream && stream.contains(el)) stream.hidden = false;
+      if (result && result.contains(el)) result.hidden = false;
+    }
+  }
+
+  function scrollToFindMatch(m) {
+    // Unpin first. A programmatic scrollTop fires `scroll`, but that handler
+    // only recomputes stick after a user gesture (wheel/touch/keys). If stick
+    // stayed true, the content MutationObserver / ResizeObserver would yank
+    // back to the bottom the moment we expand a tool row or a chunk arrives.
+    setStickToBottom(false);
+    updateScrollBtn();
+    const range = rangeForFindMatch(m);
+    // Centre the MATCH, not the element containing it. scrollIntoView centres
+    // the BLOCK, and a message body wraps to well over a screen on a phone —
+    // measured at 1017px inside a 727px viewport. Centring that block puts the
+    // phrase off the TOP when it sits near the block's start and off the BOTTOM
+    // when it sits near the end, so stepping next/prev showed some hits and
+    // scrolled past others. Both directions reproduced under Pixel-5 emulation.
+    const scroller = messagesEl;
+    const rect = range && typeof range.getBoundingClientRect === "function"
+      ? range.getBoundingClientRect()
+      : null;
+    if (scroller && rect && (rect.height > 0 || rect.width > 0)
+        && typeof scroller.getBoundingClientRect === "function") {
+      const box = scroller.getBoundingClientRect();
+      const centred = (scroller.clientHeight - rect.height) / 2;
+      const delta = (rect.top - box.top) - centred;
+      if (delta) scroller.scrollTop += delta;
+      return;
+    }
+    // No usable Range geometry (jsdom, or a detached node): the block is still
+    // a better answer than nothing.
+    const target = (range && range.startContainer && range.startContainer.parentElement) || m.node.parentElement;
+    if (!target || typeof target.scrollIntoView !== "function") return;
+    try {
+      target.scrollIntoView({ block: "center", inline: "nearest" });
+    } catch {
+      try { target.scrollIntoView(true); } catch { /* ignore */ }
+    }
+  }
+
+  function goToFindMatch(index, opts) {
+    if (!find.nav.length) {
+      find.index = -1;
+      paintFindHighlights();
+      updateFindChrome();
+      return;
+    }
+    const n = find.nav.length;
+    find.index = ((index % n) + n) % n;
+    const m = find.nav[find.index];
+    revealFindMatch(m);
+    if (!opts || opts.scroll !== false) {
+      // Unpin synchronously. The actual scroll waits a frame so a just-expanded
+      // [hidden] row can layout; if stick stayed true until then, the content
+      // MutationObserver would yank back to the bottom first.
+      setStickToBottom(false);
+      updateScrollBtn();
+      requestAnimationFrame(() => scrollToFindMatch(m));
+    }
+    paintFindHighlights();
+    updateFindChrome();
+  }
+
+  function findStep(dir) {
+    if (!find.nav.length) return;
+    goToFindMatch(find.index < 0 ? 0 : find.index + dir);
+  }
+
+  function finishFindSearch(matches, invalid, capped) {
+    find.matches = matches;
+    find.invalid = !!invalid;
+    find.lastCapped = !!capped;
+    find.lastComplete = !invalid;
+    find.lastQuery = find.query;
+    find.lastFlags = findFlagsKey();
+    rebuildFindNav();
+    if (find.nav.length) {
+      if (find.index < 0) find.index = 0;
+      goToFindMatch(find.index, { scroll: false });
+    } else {
+      find.index = -1;
+      paintFindHighlights();
+      updateFindChrome();
+    }
+  }
+
+  function cancelFindSearch() {
+    if (find.timer) {
+      clearTimeout(find.timer);
+      find.timer = 0;
+    }
+    if (find.sliceTimer) {
+      clearTimeout(find.sliceTimer);
+      find.sliceTimer = 0;
+    }
+    find.gen += 1;
+  }
+
+  function runFindSearchNow() {
+    cancelFindSearch();
+    const query = find.query;
+    if (!find.open) return;
+    if (!query) {
+      find.matches = [];
+      find.nav = [];
+      find.hiddenCount = 0;
+      find.invalid = false;
+      find.lastComplete = false;
+      find.lastCapped = false;
+      find.index = -1;
+      clearFindHighlights();
+      updateFindChrome();
+      return;
+    }
+    const nodes = findCollectNodes();
+    find.lastNodes = nodes;
+    if (canNarrowFind(nodes, query)) {
+      const next = [];
+      const q = find.caseSensitive ? query : query.toLowerCase();
+      for (const m of find.matches) {
+        if (!m.node || !m.node.parentNode) continue;
+        const slice = m.node.data.slice(m.start, m.start + q.length);
+        const have = find.caseSensitive ? slice : slice.toLowerCase();
+        if (have === q) next.push({ node: m.node, start: m.start, end: m.start + q.length });
+      }
+      finishFindSearch(next, false, false);
+      return;
+    }
+    if (find.regex) {
+      const compiled = compileFindRegex(query, find.caseSensitive);
+      if (compiled.error) {
+        finishFindSearch([], true, false);
+        return;
+      }
+      const gen = find.gen;
+      const acc = [];
+      let i = 0;
+      const step = () => {
+        if (gen !== find.gen) return;
+        const t0 = typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+        while (i < nodes.length && acc.length < FIND_MAX_MATCHES) {
+          searchNodeRegex(nodes[i], compiled.re, acc);
+          i += 1;
+          const now = typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+          if (now - t0 > FIND_SLICE_MS) break;
+        }
+        if (i < nodes.length && acc.length < FIND_MAX_MATCHES) {
+          find.matches = acc;
+          find.invalid = false;
+          rebuildFindNav();
+          if (find.countEl) find.countEl.textContent = find.nav.length + "…";
+          find.sliceTimer = setTimeout(step, 0);
+          return;
+        }
+        finishFindSearch(acc, false, acc.length >= FIND_MAX_MATCHES);
+      };
+      step();
+      return;
+    }
+    const gen = find.gen;
+    const acc = [];
+    let i = 0;
+    const step = () => {
+      if (gen !== find.gen) return;
+      const t0 = typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+      while (i < nodes.length && acc.length < FIND_MAX_MATCHES) {
+        searchNodeLiteral(nodes[i], query, find.caseSensitive, acc);
+        i += 1;
+        const now = typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+        if (now - t0 > FIND_SLICE_MS) break;
+      }
+      if (i < nodes.length && acc.length < FIND_MAX_MATCHES) {
+        find.matches = acc;
+        find.invalid = false;
+        rebuildFindNav();
+        if (find.countEl) find.countEl.textContent = find.nav.length + "…";
+        find.sliceTimer = setTimeout(step, 0);
+        return;
+      }
+      finishFindSearch(acc, false, acc.length >= FIND_MAX_MATCHES);
+    };
+    step();
+  }
+
+  function scheduleFindSearch() {
+    cancelFindSearch();
+    find.timer = setTimeout(runFindSearchNow, FIND_DEBOUNCE_MS);
+  }
+
+  function setFindQuery(value, opts) {
+    const next = String(value || "").slice(0, FIND_QUERY_MAX);
+    find.query = next;
+    if (find.input && find.input.value !== next) find.input.value = next;
+    rememberFindQuery();
+    if (opts && opts.immediate) runFindSearchNow();
+    else scheduleFindSearch();
+  }
+
+  function ensureFindBar() {
+    if (find.bar) return find.bar;
+    const bar = document.createElement("div");
+    bar.id = "find-bar";
+    bar.className = "find-bar";
+    bar.hidden = true;
+    bar.setAttribute("role", "search");
+    bar.setAttribute("aria-label", "Find in this conversation");
+
+    const row = document.createElement("div");
+    row.className = "find-bar-row";
+    const icon = document.createElement("span");
+    icon.className = "find-bar-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.innerHTML = ICON.search;
+    const field = document.createElement("input");
+    field.id = "find-input";
+    field.type = "search";
+    field.placeholder = "Find in this conversation";
+    field.autocomplete = "off";
+    field.spellcheck = false;
+    field.setAttribute("enterkeyhint", "search");
+    const count = document.createElement("span");
+    count.className = "find-count";
+    count.setAttribute("aria-live", "polite");
+    const prev = document.createElement("button");
+    prev.type = "button";
+    prev.className = "icon-btn";
+    prev.title = "Previous match";
+    prev.setAttribute("aria-label", "Previous match");
+    prev.innerHTML = ICON.chevronUp;
+    const next = document.createElement("button");
+    next.type = "button";
+    next.className = "icon-btn";
+    next.title = "Next match";
+    next.setAttribute("aria-label", "Next match");
+    next.innerHTML = ICON.chevronDown;
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "icon-btn";
+    close.title = "Close find";
+    close.setAttribute("aria-label", "Close find");
+    close.innerHTML = ICON.x;
+    row.appendChild(icon);
+    row.appendChild(field);
+    row.appendChild(count);
+    row.appendChild(prev);
+    row.appendChild(next);
+    row.appendChild(close);
+
+    const opts = document.createElement("div");
+    opts.className = "find-bar-row";
+    const caseBtn = document.createElement("button");
+    caseBtn.type = "button";
+    caseBtn.className = "find-toggle";
+    caseBtn.textContent = "Aa";
+    caseBtn.title = "Match case";
+    caseBtn.setAttribute("aria-label", "Match case");
+    caseBtn.setAttribute("aria-pressed", "false");
+    const regexBtn = document.createElement("button");
+    regexBtn.type = "button";
+    regexBtn.className = "find-toggle";
+    regexBtn.textContent = ".*";
+    regexBtn.title = "Use regular expression";
+    regexBtn.setAttribute("aria-label", "Use regular expression");
+    regexBtn.setAttribute("aria-pressed", "false");
+    const hiddenBtn = document.createElement("button");
+    hiddenBtn.type = "button";
+    hiddenBtn.className = "find-hidden-hint";
+    hiddenBtn.hidden = true;
+    hiddenBtn.setAttribute("aria-pressed", "false");
+    opts.appendChild(caseBtn);
+    opts.appendChild(regexBtn);
+    opts.appendChild(hiddenBtn);
+
+    bar.appendChild(row);
+    bar.appendChild(opts);
+    const parent = messagesEl.parentNode;
+    if (parent) parent.insertBefore(bar, messagesEl);
+    else document.body.insertBefore(bar, document.body.firstChild);
+
+    field.addEventListener("input", () => setFindQuery(field.value));
+    field.addEventListener("keydown", (e) => {
+      if (e.isComposing) return;
+      if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        findStep(e.shiftKey ? -1 : 1);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        closeFind();
+      }
+    });
+    prev.addEventListener("click", () => findStep(-1));
+    next.addEventListener("click", () => findStep(1));
+    close.addEventListener("click", () => closeFind());
+    caseBtn.addEventListener("click", () => {
+      find.caseSensitive = !find.caseSensitive;
+      find.lastComplete = false;
+      rememberFindQuery();
+      runFindSearchNow();
+    });
+    regexBtn.addEventListener("click", () => {
+      find.regex = !find.regex;
+      find.lastComplete = false;
+      rememberFindQuery();
+      runFindSearchNow();
+    });
+    hiddenBtn.addEventListener("click", () => {
+      find.includeHidden = !find.includeHidden;
+      rebuildFindNav();
+      if (find.nav.length && find.index < 0) find.index = 0;
+      if (find.includeHidden && find.hiddenCount && find.nav.length) {
+        const firstHidden = find.nav.findIndex((m) => findMatchIsHidden(m.node));
+        if (firstHidden >= 0) goToFindMatch(firstHidden);
+        else {
+          paintFindHighlights();
+          updateFindChrome();
+        }
+      } else {
+        paintFindHighlights();
+        updateFindChrome();
+      }
+    });
+
+    find.bar = bar;
+    find.input = field;
+    find.countEl = count;
+    find.hiddenBtn = hiddenBtn;
+    find.caseBtn = caseBtn;
+    find.regexBtn = regexBtn;
+    find.prevBtn = prev;
+    find.nextBtn = next;
+    return bar;
+  }
+
+  function onFindDocKey(e) {
+    if (!find.open) return;
+    if (isFindHotkey(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      openFind();
+      return;
+    }
+    if (e.key !== "Escape") return;
+    if (e.target && e.target.closest && e.target.closest(".toolbar-popover, .confirm-overlay, .rail-menu, #gear-popover")) return;
+    e.preventDefault();
+    closeFind();
+  }
+
+  function openFind() {
+    ensureFindBar();
+    const wasOpen = find.open;
+    if (!wasOpen) {
+      find.lastFocus = document.activeElement;
+      find.bar.hidden = false;
+      find.open = true;
+      document.addEventListener("keydown", onFindDocKey, true);
+    }
+    const selected = transcriptSelectionText();
+    const recalled = recalledFindQuery();
+    if (selected) {
+      find.caseSensitive = !!(recalled && recalled.caseSensitive);
+      find.regex = !!(recalled && recalled.regex);
+      setFindQuery(selected, { immediate: true });
+    } else if (!wasOpen && recalled) {
+      find.caseSensitive = !!recalled.caseSensitive;
+      find.regex = !!recalled.regex;
+      setFindQuery(recalled.query || "", { immediate: true });
+    } else if (!wasOpen) {
+      updateFindChrome();
+    }
+    find.input.focus({ preventScroll: true });
+    try { find.input.select(); } catch { /* ignore */ }
+  }
+
+  function closeFind() {
+    if (!find.open) return;
+    rememberFindQuery();
+    cancelFindSearch();
+    find.open = false;
+    if (find.bar) find.bar.hidden = true;
+    clearFindHighlights();
+    document.removeEventListener("keydown", onFindDocKey, true);
+    const back = find.lastFocus;
+    find.lastFocus = null;
+    if (back && back !== find.input && typeof back.focus === "function" && document.contains(back)) {
+      try { back.focus({ preventScroll: true }); } catch { try { back.focus(); } catch { /* ignore */ } }
+    } else {
+      input.focus({ preventScroll: true });
+    }
+  }
+
+  function onFindSessionReset() {
+    cancelFindSearch();
+    find.matches = [];
+    find.nav = [];
+    find.hiddenCount = 0;
+    find.index = -1;
+    find.lastComplete = false;
+    find.lastNodes = null;
+    find.includeHidden = false;
+    clearFindHighlights();
+    if (find.open) {
+      const recalled = recalledFindQuery();
+      if (recalled) {
+        find.caseSensitive = !!recalled.caseSensitive;
+        find.regex = !!recalled.regex;
+        if (find.input) find.input.value = recalled.query || "";
+        find.query = recalled.query || "";
+      }
+      updateFindChrome();
+    }
+  }
+
+  function onFindTranscriptSettled() {
+    if (find.open && find.query) runFindSearchNow();
+  }
+
+  if (!IS_REMOTE) {
+    document.addEventListener("keydown", (e) => {
+      if (!isFindHotkey(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      openFind();
+    }, true);
+  }
+
+  onFindPreferenceChange = () => {
+    if (find.open) runFindSearchNow();
+  };
+
+  window.__grokFind = {
+    open: openFind,
+    close: closeFind,
+    isOpen: () => !!find.open,
+    query: () => find.query,
+    setQuery: (q) => setFindQuery(q, { immediate: true }),
+    next: () => findStep(1),
+    prev: () => findStep(-1),
+    matchCount: () => find.nav.length,
+    totalCount: () => find.matches.length,
+    hiddenCount: () => find.hiddenCount,
+    index: () => find.index,
+    includeHidden: (on) => {
+      find.includeHidden = !!on;
+      rebuildFindNav();
+      paintFindHighlights();
+      updateFindChrome();
+    },
+    caseSensitive: () => find.caseSensitive,
+    setCaseSensitive: (on) => {
+      find.caseSensitive = !!on;
+      find.lastComplete = false;
+      runFindSearchNow();
+    },
+    regex: () => find.regex,
+    setRegex: (on) => {
+      find.regex = !!on;
+      find.lastComplete = false;
+      runFindSearchNow();
+    },
+    invalid: () => !!find.invalid,
+    hasHighlightApi: findHasHighlightApi,
+  };
 
   // ---------- inbound ----------
 
@@ -12400,7 +13556,7 @@
     "initialState", "showThinking", "appPurpose", "expandCommandOutputs",
     "steerByDefault", "steerUnavailable", "soundNotifications", "processingSound",
     "readRepliesAloud", "summarizeRepliesAloud", "fontScale", "voiceConfigured",
-    "providerState", "remoteStatus", "telemetryEnabled", "grokUpdateStatus", "initialized",
+    "providerState", "mcpServers", "mcpConnectors", "remoteStatus", "telemetryEnabled", "thumbsFeedback", "grokUpdateStatus", "initialized",
   ]);
 
   function handleHostMessage(msg) {
@@ -12444,6 +13600,7 @@
           }
         }
         if (typeof msg.telemetryEnabled === "boolean") state.telemetryEnabled = msg.telemetryEnabled;
+        if (typeof msg.thumbsFeedback === "boolean") state.thumbsFeedback = msg.thumbsFeedback;
         applyThinkingVisibility();
         applyExpandCommandOutputs();
         syncGearPlacement();
@@ -12482,6 +13639,17 @@
         if (!gearPopover.hidden && state.gearView === "main") renderGearMain();
         if (!historyPopover.hidden) renderSessionRows();
         renderRail();
+        break;
+      case "mcpServers":
+        state.mcpServers = Array.isArray(msg.servers) ? msg.servers : [];
+        state.mcpLoading = msg.loading === true;
+        state.mcpError = msg.error || "";
+        state.mcpWarning = msg.warning || "";
+        refreshSettingsOverlay();
+        break;
+      case "mcpConnectors":
+        state.mcpConnectors = Array.isArray(msg.connectors) ? msg.connectors : [];
+        refreshSettingsOverlay();
         break;
       case "codexInstallProgress":
         state.codexInstall = {
@@ -12555,6 +13723,9 @@
       case "telemetryEnabled":
         state.telemetryEnabled = !!msg.value;
         break;
+      case "thumbsFeedback":
+        state.thumbsFeedback = !!msg.value;
+        break;
       case "speechSummary": {
         const pending = pendingSpeechSummary;
         if (
@@ -12601,6 +13772,12 @@
         // fixed chrome — html must never scroll to reveal it (boot-layout fix).
         input.focus({ preventScroll: true });
         break;
+      case "findInSession":
+        // Command Palette / workbench Ctrl+F fallback. The keystroke path is
+        // untested inside a WebviewView, so this message must open find on its
+        // own. Idempotent: a second open focuses the field.
+        openFind();
+        break;
       case "moveComposerCaret":
         moveComposerCaret(msg.direction);
         break;
@@ -12640,6 +13817,7 @@
         // Nothing streaming survives a truncation — drop the per-turn handles so
         // the next turn starts clean rather than appending into a removed node.
         state.userMsgCount = msg.surviving;
+        state.turnRating = 0;
         state.activeAgentEl = null;
         state.activeAgentRaw = "";
         state.activeUserEl = null;
@@ -12742,12 +13920,14 @@
         // grok.defaultEffort is intentionally empty ("CLI default").
         if (typeof msg.effort === "string") state.effort = msg.effort;
         state.activeProvider = msg.provider === "codex" || msg.provider === "claude" ? msg.provider : "grok";
+        syncFeedbackButtons();
         syncProviderVoice();
         if (state.railTransition?.kind === "new") renderRail();
         state.isWorktree = !!msg.worktree; // gates the gear Apply/Remove worktree items
         state.availableModels = msg.models || [];
         const m = state.availableModels.find((x) => x.modelId === msg.currentModelId && (!x.provider || x.provider === state.activeProvider));
         if (m?.totalContextTokens) state.contextWindow = m.totalContextTokens;
+        state.contextBreakdown = null;
         updateDonut(0);
         reportRemotePreferences();
         break;
@@ -12905,6 +14085,7 @@
       case "chips":
         state.chips = msg.chips;
         renderChips();
+        updateSendButton();
         break;
       case "commandsUpdate":
         state.commands = msg.commands || [];
@@ -12964,7 +14145,11 @@
         break;
       case "agentStart":
         // A user-initiated turn began. Show Grokking until content replaces it.
+        // Previous completed turn keeps its footer but loses thumbs — only the
+        // turn that just finished is rateable.
+        retireLiveTurnFeedback(state.turnAgentActionsEl);
         state.turnAgentActionsEl = null; // new turn → previous turn keeps its footer
+        if (!state.replaying) state.turnRating = 0;
         state.ttsTurnText = "";
         showGrokking();
         // Busy is event-sourced through the session buffer so a re-focus lands
@@ -13008,6 +14193,8 @@
       case "historyReplay":
         if (msg.active) {
           if (state.replayDepth === 0) {
+            // Raise before any veil DOM so MutationObserver cannot pin-scroll.
+            state.replaying = true;
             state.suppressReplayTurn = false; // fresh outer replay starts unsuppressed
             state.skipUserBubble = false;
             state.repoSwitchPending = true;
@@ -13056,6 +14243,10 @@
           // Remote reconnect/cold-load delivers only a recent window. Label
           // the export so it cannot be read as the whole transcript.
           if (IS_REMOTE) state.exportWindowed = true;
+          // One layout after the whole transcript is in the DOM — not one per
+          // replayed row. Live streaming keeps using scrollToBottom per chunk.
+          forceScrollToBottom();
+          onFindTranscriptSettled();
         }
         break;
       case "historyBatch":
@@ -13110,6 +14301,9 @@
           state.mediaGenCallIds.add(msg.call.toolCallId);
         }
         addToToolGroup(msg.call);
+        // Reads replay as a completed tool_call with the file text in `content`.
+        // Shell rows wait for host `commandOutput` (grok) or a later update (Claude).
+        if (isReadTool(msg.call)) maybeAttachToolResultOutput(msg.call);
         // On session/load a completed edit replays as a single `tool_call` that
         // already carries its diff (no follow-up update) — attach the preview here
         // or the restored edit has no "open diff →" (#30).
@@ -13171,12 +14365,18 @@
             break;
           }
         }
+        // Fold the refined title and arguments into the row before OUT / diffs
+        // — Claude's first call is a bare verb; the path (and Read details)
+        // arrive on this update. Attach the IN box first so maybeAttach can
+        // fill OUT from this same completed payload.
+        refreshToolRowFromUpdate(msg.call);
         // A self-executed command (cursor/Composer runs it in its own shell and
         // reports the result here, not via terminal/create) — fill the row's #41
-        // IN/OUT box by toolCallId. Takes precedence over the generic failure path
-        // so a non-zero command reads as an [Error] exit N in its OUT box, matching
-        // grok-build's terminal-fed rows. No-op (returns false) for grok-build,
-        // whose row already has OUT.
+        // IN/OUT box by toolCallId. Same path now fills a Read row's View all.
+        // Takes precedence over the generic failure path so a non-zero command
+        // reads as an [Error] exit N in its OUT box, matching grok-build's
+        // terminal-fed rows. No-op (returns false) for grok-build, whose row
+        // already has OUT.
         if (String(msg.call?.status).toLowerCase() === "completed" && maybeAttachToolResultOutput(msg.call)) {
           break;
         }
@@ -13194,9 +14394,6 @@
           markToolFailed(id, hint ? failure + "\n" + hint : failure);
           break;
         }
-        // Fold the refined title and arguments into the row before the diff
-        // pass — for Claude this is where a row stops being a bare verb.
-        refreshToolRowFromUpdate(msg.call);
         applyToolDiffs(msg.call);
         break;
       }
@@ -13367,6 +14564,9 @@
         // Host-authoritative occupancy: grok's signals.json / live envelope,
         // or the remembered adapter prompt size. A window-only frame updates
         // the denominator without inventing a used count.
+        // Structured addends are one snapshot (`nextContextBreakdown`). A
+        // used-only frame keeps them; currency is `contextBreakdownIsCurrent`.
+        state.contextBreakdown = nextContextBreakdown(state.contextBreakdown, msg);
         if (msg.window) state.contextWindow = msg.window;
         if (msg.used != null) updateDonut(msg.used);
         else updateDonut();
@@ -13385,6 +14585,28 @@
         setAllToolDetails(!!msg.open);
         break;
       case "commandOutput": {
+        // MCP output is keyed by toolCallId (always stated on that path).
+        // Do not fall back to a fabricated "Run …" shell row — the tool_call
+        // already owns the row, and argument text is not a correlation key.
+        const wantedId = typeof msg.toolCallId === "string" ? msg.toolCallId.trim() : "";
+        if (wantedId) {
+          let pending = state.pendingCommandDetails.find((p) => !p.done && p.toolCallId === wantedId);
+          if (!pending) {
+            const item = state.toolItemsByToolCallId.get(wantedId);
+            if (item) {
+              const cmd = commandDetailText(item._call)
+                || (typeof msg.command === "string" && msg.command.trim())
+                || "{}";
+              if (!item.querySelector(".cmd-block")) attachCommandDetails(item, cmd, wantedId);
+              pending = state.pendingCommandDetails.find((p) => p.toolCallId === wantedId);
+            }
+          }
+          if (pending) {
+            pending.done = true;
+            attachCommandOutput(pending.details, msg);
+          }
+          break;
+        }
         // A finished shell command's captured output (#41). grok-build delegates
         // commands via terminal/create, so this path fires for it — attach to the
         // oldest un-served row with the exact same command; if none matches
@@ -13437,6 +14659,9 @@
         hideGrokking(); // turn ended (possibly before any content)
         hideThinkingIndicator();
         revealTurnFooter();
+        // Image-read failures fire agentError before a turn starts — don't
+        // restamp the previous reply. A prompt that actually failed is busy.
+        if (state.busy) markLiveTurnFeedback();
         addError(msg.text);
         state.busy = false;
         state.busyLocked = false; // an error ends any startup lock too
@@ -13452,6 +14677,7 @@
         // empty) would otherwise orphan the dots forever — content-based
         // clearing never fires.
         revealTurnFooter();
+        markLiveTurnFeedback();
         state.busy = false;
         updateSendButton();
         if (!state.replaying) maybeNotifySound("done"); // #59 — live turns only, and only when away
@@ -13489,7 +14715,7 @@
         // fixes the surface where the loss was actually reported and where a
         // phone has nothing else to fall back on.
         if (IS_REMOTE && state.sendQueue.length) {
-          state.rejectedSubmissionText = state.sendQueue.join("\n\n");
+          state.rejectedSubmissionText = queuedSendsText(state.sendQueue);
           state.sendQueue = [];
           renderQueuedBlocks();
         }
@@ -13500,7 +14726,8 @@
       case "queuedSends":
         // Snapshot of the focused session's host-owned send queue — replayed on
         // re-focus like everything else, so queued blocks survive session swaps.
-        state.sendQueue = Array.isArray(msg.items) ? msg.items : [];
+        // Prefer additive `queued` (text + chips); `items` is the text-only fallback.
+        state.sendQueue = normalizeQueuedSends(msg);
         if (!state.sendQueue.length) {
           state.queuedSubmissionPending = false;
           state.queuedSubmissionRejected = false;
@@ -13541,7 +14768,6 @@
           typeof msg.id === "string" &&
           msg.id &&
           typeof msg.text === "string" &&
-          msg.text.trim() &&
           !state.submittedQueuedSendIds.has(msg.id)
         ) {
           state.submittedQueuedSendIds.add(msg.id);
@@ -13563,6 +14789,18 @@
         state.steerSupported = false;
         state.steerByDefault = false;
         renderQueuedBlocks();
+        break;
+      case "feedbackAvailability":
+        state.feedbackAvailable = msg.available === true;
+        if (!state.feedbackAvailable) {
+          for (const actions of messagesEl.querySelectorAll(".msg.agent .msg-actions")) {
+            delete actions.dataset.feedbackPending;
+          }
+        }
+        syncFeedbackButtons();
+        break;
+      case "turnFeedbackAck":
+        applyTurnFeedbackAck(msg.rating);
         break;
       case "usage":
         // Billing split (#53). `turn` is absent on a restore (we only stored the
@@ -13960,6 +15198,16 @@
       // freshly streamed content.
       if (state.sendQueue.length && state.queuedWrapEl) messagesEl.appendChild(state.queuedWrapEl);
     }
+    if (find.open && (
+      TURN_PROGRESS_MSGS.has(msg.type) ||
+      msg.type === "userMessage" ||
+      msg.type === "commandOutput" ||
+      msg.type === "agentEnd"
+    )) {
+      // Debounced — a 5 MB live turn must not re-scan on every token, and
+      // finishFindSearch does not scroll, so the current match stays put.
+      scheduleFindSearch();
+    }
     if (shouldRecordExportEvent(msg)) {
       state.exportEvents.push(msg);
     }
@@ -14349,6 +15597,22 @@
           onbCopy.classList.remove("copied");
         }, 1500);
       });
+      return;
+    }
+    const thumbBtn = e.target.closest(".msg-thumb-btn");
+    if (thumbBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (state.replaying || !feedbackOffered()) return;
+      const actions = thumbBtn.closest(".msg-actions");
+      if (!actions || actions.dataset.feedbackPending === "1") return;
+      if (actions !== liveTurnActions()) return;
+      const clicked = Number(thumbBtn.dataset.rating);
+      if (clicked !== 1 && clicked !== -1) return;
+      const current = state.turnRating === 1 || state.turnRating === -1 ? state.turnRating : 0;
+      const next = current === clicked ? 0 : clicked;
+      actions.dataset.feedbackPending = "1";
+      vscode.postMessage({ type: "turnFeedback", rating: next });
       return;
     }
     const msgCopyBtn = e.target.closest(".msg-copy-btn");

@@ -52,7 +52,19 @@ function collect<T>(client: AcpClient, event: string): T[] {
 
 /** Wait for a single event, with a small timeout so a hung subprocess fails the
  *  test instead of hanging vitest. */
-function waitFor<T>(client: AcpClient, event: string, timeoutMs = 2000): Promise<T> {
+/**
+ * These bounds exist to fail a HUNG subprocess, not to measure how fast one
+ * starts. At 2000ms this was the latter: `npm test` runs one worker per core
+ * (20 here) and several files spawn real processes, so a cold Node start plus
+ * an ACP handshake routinely lost the race. Measured 2026-08-19 on one commit:
+ * 3-4 tests failed per run and a DIFFERENT set each time, while the same suite
+ * with `--no-file-parallelism` was 168 files / 3818 tests green. A gate that
+ * reports the machine's mood is worse than a slow one — a genuinely failing
+ * test that day was first waved off as another flake.
+ */
+const SUBPROCESS_WAIT_MS = 15_000;
+
+function waitFor<T>(client: AcpClient, event: string, timeoutMs = SUBPROCESS_WAIT_MS): Promise<T> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`timed out waiting for "${event}"`)), timeoutMs);
     client.once(event, (v) => { clearTimeout(t); resolve(v); });
@@ -63,7 +75,7 @@ function waitFor<T>(client: AcpClient, event: string, timeoutMs = 2000): Promise
  *  *_RESPONSE marker to stderr just before the stdout response that resolves the
  *  prompt; stderr can lag stdout across pipes (reliably so on Linux), so asserting
  *  synchronously after the prompt resolves is racy. */
-async function waitForStderr(arr: string[], re: RegExp, timeoutMs = 3000): Promise<void> {
+async function waitForStderr(arr: string[], re: RegExp, timeoutMs = SUBPROCESS_WAIT_MS): Promise<void> {
   const start = Date.now();
   while (!re.test(arr.join(""))) {
     if (Date.now() - start > timeoutMs) {
@@ -71,6 +83,36 @@ async function waitForStderr(arr: string[], re: RegExp, timeoutMs = 3000): Promi
     }
     await new Promise((r) => setTimeout(r, 20));
   }
+}
+
+/** Bounded temp-dir removal. Windows refuses rmdir while a child still has
+ *  the path as cwd; `kill()` does not wait for that, so a swallowed `rmSync`
+ *  leaves an empty `grok-int-ws-*` behind (34,175 of them had accumulated).
+ *  Retry after the process has exited, then fail visibly rather than leak.
+ *
+ *  The bound is generous on purpose. Failing loudly is the point — a silent
+ *  catch is what let the leak grow — but the OS can hold the handle for
+ *  seconds when the machine is busy running other agents, and a test that
+ *  fails because the box was loaded is worse than the leak it prevents. At
+ *  15s this throws only when removal is genuinely stuck. */
+async function removeTempDir(dir: string | undefined, timeoutMs = 15000): Promise<void> {
+  if (!dir) return;
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown;
+  for (;;) {
+    try {
+      await fs.promises.rm(dir, { recursive: true, force: true });
+      if (!fs.existsSync(dir)) return;
+      lastErr = new Error("directory still exists");
+    } catch (err) {
+      lastErr = err;
+      if (!fs.existsSync(dir)) return;
+    }
+    if (Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const detail = lastErr instanceof Error ? lastErr.message : String(lastErr);
+  throw new Error(`failed to remove temp dir ${dir}: ${detail}`);
 }
 
 describe("ACP integration (real subprocess, fake CLI)", () => {
@@ -130,12 +172,18 @@ describe("ACP integration (real subprocess, fake CLI)", () => {
     await client.newSession();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     // Stop the old client emitting into anything before the next test starts.
-    try { client.removeAllListeners(); } catch { /* */ }
-    try { (client as any).proc?.kill(); } catch { /* best-effort */ }
-    try { fs.rmSync(workspace, { recursive: true, force: true }); } catch { /* */ }
-    try { fs.rmSync(planHome, { recursive: true, force: true }); } catch { /* */ }
+    // `client` / dirs may be unset if beforeEach failed before assignment.
+    const toStop = client as AcpClient | undefined;
+    const ws = workspace as string | undefined;
+    const home = planHome as string | undefined;
+    try { toStop?.removeAllListeners(); } catch { /* */ }
+    // Await the real exit (bounded). `kill()` only signals; on Windows the
+    // workspace stays the live cwd until the process actually goes away.
+    try { await toStop?.dispose(); } catch { /* process already gone */ }
+    await removeTempDir(ws);
+    await removeTempDir(home);
   });
 
   it("lifecycle: spawn → initialize → session/new succeeds and a basic prompt round-trips", async () => {
@@ -192,6 +240,15 @@ describe("ACP integration (real subprocess, fake CLI)", () => {
     expect(acceptedAtExit).toBe(true);
   });
 
+  it("forwards interject content image blocks to the CLI", async () => {
+    const b64 = Buffer.from("fake-png-bytes").toString("base64");
+    await client.interject("look at this", undefined, [
+      { type: "text", text: "look at [Image #1]" },
+      { type: "image", mimeType: "image/png", data: b64 },
+    ]);
+    await waitForStderr(stderr, /INTERJECT_CONTENT:1:image\/png/);
+  });
+
   it("vision: image content blocks cross the wire verbatim alongside the text block", async () => {
     const chunks: string[] = [];
     client.on("messageChunk", (t: string) => chunks.push(t));
@@ -213,6 +270,20 @@ describe("ACP integration (real subprocess, fake CLI)", () => {
     expect(compact?.tokens_after).toBe(12345);
     // The host derives the donut's fresh `used` from exactly this payload.
     expect(contextUsedFromCompactNotification(compact)).toBe(12345);
+  });
+
+  it("reads the structured session/info meter without sending a prompt", async () => {
+    const info = await client.getSessionInfo();
+    expect(info).toEqual({
+      used: 16017,
+      window: 512000,
+      systemPromptTokens: 1039,
+      toolDefinitionsTokens: 812,
+      messageTokens: 12166,
+      freeTokens: 495983,
+      autoCompactThresholdPercent: 92,
+      categories: [{ label: "Skills", tokens: 1200 }],
+    });
   });
 
   it("effort: setReasoningEffort sends set_model with _meta.reasoningEffort live (no restart), gated on the advertised capability", async () => {

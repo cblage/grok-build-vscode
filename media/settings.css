@@ -306,6 +306,44 @@ body.settings-page .settings-surface {
   color: var(--vscode-descriptionForeground);
 }
 
+.settings-group-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.settings-group-row .settings-group {
+  margin: 0;
+}
+
+.settings-body > .settings-group:first-child,
+.settings-body > .settings-group-row:first-child {
+  margin-top: 8px;
+}
+
+.settings-mcp-web,
+.settings-mcp-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.settings-file-icon {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.settings-file-icon img,
+.settings-file-icon svg {
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+
 .settings-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(8rem, max-content);
@@ -344,10 +382,40 @@ body.settings-page .settings-surface {
 
 /* currentColor marks, so they follow the row — including the dimmed
    .is-disabled state — instead of staying vivid over greyed-out copy. */
-.settings-row-logo .provider-logo {
+.settings-row-logo .provider-logo,
+.settings-row-logo svg {
   display: block;
   width: 16px;
   height: 16px;
+}
+
+/* Vendor marks on On this computer rows. Hidden until the image loads so a
+   missing file never paints an empty chip (e2e:screens blank-icon gate). */
+.settings-connector-logo {
+  display: none;
+  flex: none;
+  box-sizing: border-box;
+  width: 24px;
+  height: 24px;
+  padding: 3px;
+  border-radius: 5px;
+  background: #fff;
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--vscode-widget-border, rgba(127, 127, 127, .35)) 70%, transparent);
+}
+.settings-connector-logo.is-ready {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.settings-connector-logo img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.settings-connector:not(.is-connected) .settings-connector-logo {
+  filter: grayscale(1);
+  opacity: 0.55;
 }
 
 .settings-row-desc {
@@ -355,6 +423,103 @@ body.settings-page .settings-surface {
   max-width: 48em;
   color: var(--vscode-descriptionForeground);
   line-height: 1.4;
+}
+
+.settings-mcp {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-mcp-warning {
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--vscode-focusBorder, #007fd4) 35%, transparent);
+  border-radius: 8px;
+  color: var(--vscode-descriptionForeground, #969696);
+  background: color-mix(in srgb, var(--vscode-focusBorder, #007fd4) 7%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.settings-mcp-list {
+  overflow: hidden;
+  border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, .25));
+  border-radius: 8px;
+}
+
+.settings-mcp-server {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 12px;
+  align-items: center;
+  min-height: 46px;
+  padding: 12px 14px;
+}
+
+.settings-mcp-server + .settings-mcp-server {
+  border-top: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, .2));
+}
+
+.settings-mcp-copy {
+  min-width: 0;
+}
+
+.settings-mcp-copy .settings-row-desc {
+  overflow-wrap: anywhere;
+}
+
+.settings-mcp-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-mcp-scope {
+  flex: none;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.settings-mcp-status {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--vscode-descriptionForeground, #969696);
+  vertical-align: 1px;
+}
+
+.settings-mcp-status.is-ready {
+  background: var(--vscode-testing-iconPassed, #73c991);
+}
+
+.settings-mcp-status.is-error {
+  background: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
+.settings-mcp-state {
+  padding: 28px 16px;
+  border: 1px dashed var(--vscode-widget-border, rgba(127, 127, 127, .3));
+  border-radius: 8px;
+  color: var(--vscode-descriptionForeground, #969696);
+  text-align: center;
+}
+
+.settings-mcp-state.is-error {
+  color: var(--vscode-errorForeground, #f48771);
+  border-color: color-mix(in srgb, var(--vscode-errorForeground, #f48771) 45%, transparent);
+}
+
+.settings-mcp-list .settings-connector {
+  margin: 0;
+  padding: 12px 14px;
+  border-bottom: 0;
+}
+
+.settings-mcp-list .settings-connector + .settings-connector {
+  border-top: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, .2));
 }
 
 .settings-row-control {

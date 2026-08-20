@@ -2,7 +2,7 @@
   "name": "grok-vscode-phuryn",
   "displayName": "Grok Build for VS Code (Community)",
   "description": "GUI for Grok Build CLI (incl. Grok 4.6). Remote Control from your phone, voice control, multiple sessions, images and videos, Mermaid diagrams, and LaTeX. Works with SuperGrok, X Premium+, and xAI API key. Fair Source (FSL-1.1-MIT). Not affiliated with or endorsed by SpaceXAI (formerly xAI).",
-  "version": "3.12.2-sandbox.1",
+  "version": "3.13.2-sandbox.1",
   "publisher": "PawelHuryn",
   "author": {
     "name": "Paweł Huryn",
@@ -160,6 +160,10 @@
         "title": "Grok: Collapse All Tool Details (This Session)"
       },
       {
+        "command": "grok.findInSession",
+        "title": "Grok: Find in Conversation"
+      },
+      {
         "command": "grok.logout",
         "title": "Grok: Log Out"
       },
@@ -204,6 +208,12 @@
         "command": "grok.composerPreviousLine",
         "key": "ctrl+p",
         "when": "isMac && grok.composerFocus"
+      },
+      {
+        "command": "grok.findInSession",
+        "key": "ctrl+f",
+        "mac": "cmd+f",
+        "when": "focusedView == grok.chat"
       }
     ],
     "menus": {
@@ -299,6 +309,24 @@
           "minimum": 100,
           "markdownDescription": "Max workspace files indexed for composer **@** file autocomplete. Default 5000 keeps a cold index build bounded; raise it (no upper limit) if files are missing from the `@` list in large repos. Applies on the next `@` after the setting changes. Very large values cost more time on the first rebuild."
         },
+        "grok.acp.promptIdleTimeoutMs": {
+          "type": "number",
+          "default": 1800000,
+          "minimum": 0,
+          "markdownDescription": "How long a live `session/prompt` may stay silent before the extension reports **ACP request timed out**. Any `session/update` or in-turn server request (permission, terminal, …) resets this idle clock. Default 1800000 (30 minutes). `0` disables the idle cap. Applies to newly started sessions (#117)."
+        },
+        "grok.acp.promptAbsoluteTimeoutMs": {
+          "type": "number",
+          "default": 86400000,
+          "minimum": 0,
+          "markdownDescription": "Hard wall-clock cap for one `session/prompt`, even while the turn is still streaming. Default 86400000 (24 hours). `0` disables the absolute cap. Applies to newly started sessions (#117)."
+        },
+        "grok.acp.requestTimeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 1000,
+          "markdownDescription": "Timeout for ACP methods other than `session/prompt` (`initialize`, `session/new`, `session/set_model`, …). Default 120000 (2 minutes). Applies to newly started sessions."
+        },
         "grok.defaultEffort": {
           "type": "string",
           "enum": [
@@ -386,6 +414,11 @@
           "default": true,
           "markdownDescription": "Keep this machine awake while it's linked to an **AFK Pilot** account, so a remote turn isn't cut off by idle sleep. Only active once you've signed in (gear → AFK Pilot → *Sign in*); unlinking releases the lock immediately. The display is still free to sleep — only system/idle sleep is blocked. Uses `caffeinate` on macOS, `SetThreadExecutionState` on Windows and `systemd-inhibit` on Linux. **A closed laptop lid still sleeps** on every platform — that's an OS-level decision no application can override."
         },
+        "grok.thumbsFeedback": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Show thumbs on a finished Grok turn so you can send a rating to SpaceXAI. **Off by default.** On, thumbs appear only when this Grok session actually supports feedback — never on Codex or Claude. Ratings are not stored. Toggle live from Settings → General → **Thumbs feedback to SpaceXAI**."
+        },
         "grok.telemetry.enabled": {
           "type": "boolean",
           "default": true,
@@ -450,7 +483,7 @@
     "test:integration": "npm run compile && npm run compile:integration && vscode-test",
     "test:live": "tsc -p . && node scripts/live-tests.cjs",
     "desktop": "npm run compile && node scripts/run-desktop.cjs",
-    "desktop-dev": "npm run compile && node scripts/run-desktop.cjs --relay-dev --open-devtools",
+    "desktop-dev": "npm run compile && node scripts/run-desktop.cjs --relay-dev --open-devtools --remote-debugging-port=9333",
     "test:desktop": "npm run compile && vitest run --config vitest.desktop.config.ts",
     "e2e:screens": "npm run compile && node scripts/desk-screens-check.mjs",
     "e2e:lifecycle-host": "npm run compile && node scripts/lifecycle-host.mjs",

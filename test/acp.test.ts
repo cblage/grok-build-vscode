@@ -7,6 +7,8 @@ import {
   ACP_IMAGE_READ_FS_CAPABILITIES,
   acpClientCapabilities,
   buildGrokAgentArgs,
+  buildInterjectParams,
+  cliHonorsInterjectContent,
 } from "../src/acp";
 import type { AcpBackend } from "../src/acp-backend";
 import { ClaudeBackend } from "../src/claude-backend";
@@ -18,6 +20,11 @@ import { CodexBackend } from "../src/codex-backend";
 function clientWithFakeProc(opts?: {
   backend?: AcpBackend;
   effort?: "high";
+  timeouts?: {
+    promptIdleTimeoutMs?: number;
+    promptAbsoluteTimeoutMs?: number;
+    requestTimeoutMs?: number;
+  };
 }): { client: AcpClient; written: string[] } {
   const client = new AcpClient({
     cliPath: "x",
@@ -25,6 +32,7 @@ function clientWithFakeProc(opts?: {
     log: () => {},
     ...(opts?.backend ? { backend: opts.backend } : {}),
     ...(opts?.effort ? { effort: opts.effort } : {}),
+    ...(opts?.timeouts ? { timeouts: opts.timeouts } : {}),
   });
   const written: string[] = [];
   (client as any).proc = {
@@ -144,6 +152,182 @@ describe("AcpClient notification metadata", () => {
       update: { sessionUpdate: "turn_completed", prompt_id: "p1" },
       meta: { agentTimestampMs: 1_783_845_299_456, isReplay: true },
     }]);
+  });
+});
+
+describe("AcpClient submitFeedback", () => {
+  it("sends _x.ai/feedback with snake_case thumbs params", async () => {
+    const { client, written } = clientWithFakeProc();
+    client.sessionId = "s1";
+    const pending = client.submitFeedback({
+      ratingValue: 1,
+      clientType: "extension",
+      clientVersion: "3.13.0",
+    });
+    const msg = JSON.parse(written[0]);
+    expect(msg).toMatchObject({
+      method: "_x.ai/feedback",
+      params: {
+        session_id: "s1",
+        client_type: "extension",
+        rating_type: "thumbs",
+        rating_value: 1,
+        client_version: "3.13.0",
+      },
+    });
+    expect(msg.params.request_id).toBeUndefined();
+    expect(msg.params.turn_number).toBeUndefined();
+    (client as any).onLine(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }));
+    await expect(pending).resolves.toBe("ok");
+  });
+
+  it("degrades -32601 and disabled-feedback to unsupported", async () => {
+    const { client } = clientWithFakeProc();
+    client.sessionId = "s1";
+    (client as any).request = vi.fn().mockRejectedValue({ code: -32601, message: "Method not found" });
+    await expect(client.submitFeedback({
+      ratingValue: -1,
+      clientType: "desktop",
+    })).resolves.toBe("unsupported");
+
+    (client as any).request = vi.fn().mockRejectedValue({
+      code: -32603,
+      message: "Internal error",
+      data: "Feedback is disabled. To enable, set GROK_FEEDBACK_ENABLED=true",
+    });
+    await expect(client.submitFeedback({
+      ratingValue: 1,
+      clientType: "desktop",
+    })).resolves.toBe("unsupported");
+  });
+
+  it("does not call the RPC for Codex or Claude", async () => {
+    const { client } = clientWithFakeProc({ backend: new ClaudeBackend() });
+    client.sessionId = "s1";
+    const request = vi.fn();
+    (client as any).request = request;
+    await expect(client.submitFeedback({
+      ratingValue: 1,
+      clientType: "extension",
+    })).resolves.toBe("unsupported");
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("does not treat -32602 as a capability gap", async () => {
+    const { client } = clientWithFakeProc();
+    client.sessionId = "s1";
+    (client as any).request = vi.fn().mockRejectedValue({ code: -32602, message: "Invalid params" });
+    await expect(client.submitFeedback({
+      ratingValue: 1,
+      clientType: "extension",
+    })).rejects.toMatchObject({ code: -32602 });
+  });
+});
+
+describe("AcpClient session/info", () => {
+  it("returns the structured control-plane context without prompting", async () => {
+    const { client } = clientWithFakeProc();
+    client.sessionId = "s1";
+    const request = vi.fn().mockResolvedValue({ context: { used: 16017, total: 512000 } });
+    (client as any).request = request;
+
+    await expect(client.getSessionInfo()).resolves.toEqual({ used: 16017, window: 512000 });
+    expect(request).toHaveBeenCalledWith("_x.ai/session/info", { sessionId: "s1" });
+  });
+
+  it("degrades only a JSON-RPC method-not-found response to unsupported", async () => {
+    const { client } = clientWithFakeProc();
+    client.sessionId = "s1";
+    (client as any).request = vi.fn().mockRejectedValue({ code: -32601, message: "Method not found" });
+    await expect(client.getSessionInfo()).resolves.toBe("unsupported");
+
+    (client as any).request = vi.fn().mockRejectedValue({ code: -32602, message: "Invalid params" });
+    await expect(client.getSessionInfo()).rejects.toMatchObject({ code: -32602 });
+  });
+
+  it("does not probe Grok's private RPC for an adapter session", async () => {
+    const { client } = clientWithFakeProc({ backend: new ClaudeBackend() });
+    client.sessionId = "s1";
+    const request = vi.fn();
+    (client as any).request = request;
+    await expect(client.getSessionInfo()).resolves.toBe("unsupported");
+    expect(request).not.toHaveBeenCalled();
+  });
+});
+
+describe("AcpClient session mcpServers", () => {
+  it("sends the host-owned list on session/new and session/load", async () => {
+    const servers = [{ name: "linear", command: "npx", args: ["-y", "mcp-remote", "https://mcp.linear.app/mcp"] }];
+    const { client, written } = clientWithFakeProc();
+    (client as any).opts.mcpServers = () => servers;
+    replyToWrites(client, written, (msg) => {
+      if (msg.method === "session/new" || msg.method === "session/load") {
+        return { sessionId: "s1", models: { currentModelId: "grok-build", availableModels: [] } };
+      }
+      return {};
+    });
+    await client.newSession();
+    expect(JSON.parse(written[0])).toMatchObject({
+      method: "session/new",
+      params: { mcpServers: servers },
+    });
+    written.length = 0;
+    await client.loadSession("s1");
+    expect(JSON.parse(written[0])).toMatchObject({
+      method: "session/load",
+      params: { sessionId: "s1", mcpServers: servers },
+    });
+  });
+
+  it("still sends an empty array when nothing is connected", async () => {
+    const { client, written } = clientWithFakeProc();
+    replyToWrites(client, written, () => ({
+      sessionId: "s1",
+      models: { currentModelId: "grok-build", availableModels: [] },
+    }));
+    await client.newSession();
+    expect(JSON.parse(written[0]).params.mcpServers).toEqual([]);
+  });
+});
+
+describe("AcpClient MCP surface", () => {
+  it("calls the active-session inventory RPC and degrades -32601 to unsupported", async () => {
+    const { client, written } = clientWithFakeProc();
+    (client as any).sessionId = "session-1";
+    const request = client.listMcpServers();
+    const msg = JSON.parse(written[0]);
+    expect(msg).toMatchObject({ method: "_x.ai/mcp/list", params: {} });
+    (client as any).onLine(JSON.stringify({
+      jsonrpc: "2.0", id: msg.id, result: { servers: [{ name: "docs" }] },
+    }));
+    await expect(request).resolves.toEqual({ servers: [{ name: "docs" }] });
+
+    const unsupported = client.listMcpServers();
+    const missing = JSON.parse(written[1]);
+    (client as any).onLine(JSON.stringify({
+      jsonrpc: "2.0", id: missing.id, error: { code: -32601, message: "Method not found" },
+    }));
+    await expect(unsupported).resolves.toBe("unsupported");
+  });
+
+  it("forwards the four MCP health notifications", () => {
+    const { client } = clientWithFakeProc();
+    const seen: unknown[] = [];
+    client.on("mcpNotification", (...args) => seen.push(args));
+    for (const method of [
+      "_x.ai/mcp/servers_updated",
+      "_x.ai/mcp/init_progress",
+      "_x.ai/mcp_initialized",
+      "_x.ai/mcp/server_status",
+    ]) {
+      (client as any).onLine(JSON.stringify({ jsonrpc: "2.0", method, params: { name: "docs" } }));
+    }
+    expect(seen.map((entry: any) => entry[0])).toEqual([
+      "_x.ai/mcp/servers_updated",
+      "_x.ai/mcp/init_progress",
+      "_x.ai/mcp_initialized",
+      "_x.ai/mcp/server_status",
+    ]);
   });
 });
 
@@ -378,6 +562,105 @@ describe("AcpClient.request timer lifecycle", () => {
       vi.useRealTimers();
     }
   });
+
+  it("times out a silent session/prompt on the idle cap (#117)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client } = clientWithFakeProc({
+        timeouts: { promptIdleTimeoutMs: 1_000, promptAbsoluteTimeoutMs: 10_000 },
+      });
+      const p = (client as any).request("session/prompt", { sessionId: "s", prompt: [] });
+      const timedOut = expect(p).rejects.toThrow(/ACP request timed out: session\/prompt/);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await timedOut;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not time out a session/prompt that still receives session/update (#117)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client } = clientWithFakeProc({
+        timeouts: { promptIdleTimeoutMs: 1_000, promptAbsoluteTimeoutMs: 10_000 },
+      });
+      let settled = false;
+      const p = (client as any).request("session/prompt", { sessionId: "s", prompt: [] });
+      void p.then(() => { settled = true; }, () => { settled = true; });
+
+      await vi.advanceTimersByTimeAsync(800);
+      (client as any).onLine(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "x" } },
+        },
+      }));
+      await vi.advanceTimersByTimeAsync(800);
+      expect(settled).toBe(false);
+
+      (client as any).onLine(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { stopReason: "end_turn" } }));
+      await p;
+      expect(settled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not time out a session/prompt when a concurrent request gets a response (#117)", async () => {
+    // A response is ACP traffic. During a long silent turn the only proof of
+    // life can be a reply to an in-turn call (`_x.ai/interject`,
+    // `session/set_mode`) — that must extend the prompt's idle window.
+    vi.useFakeTimers();
+    try {
+      const { client } = clientWithFakeProc({
+        timeouts: { promptIdleTimeoutMs: 1_000, promptAbsoluteTimeoutMs: 10_000 },
+      });
+      let settled = false;
+      const prompt = (client as any).request("session/prompt", { sessionId: "s", prompt: [] });
+      void prompt.then(() => { settled = true; }, () => { settled = true; });
+
+      // A second, concurrent call while the prompt is still open.
+      const other = (client as any).request("_x.ai/interject", { sessionId: "s", text: "hi" });
+      void other.catch(() => undefined);
+
+      await vi.advanceTimersByTimeAsync(800);
+      // Only the concurrent call answers — no session/update at all.
+      (client as any).onLine(JSON.stringify({ jsonrpc: "2.0", id: 2, result: {} }));
+      await other;
+
+      await vi.advanceTimersByTimeAsync(800);
+      expect(settled).toBe(false); // would already have timed out without the re-arm
+
+      (client as any).onLine(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { stopReason: "end_turn" } }));
+      await prompt;
+      expect(settled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still enforces the absolute cap even when updates keep arriving (#117)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client } = clientWithFakeProc({
+        timeouts: { promptIdleTimeoutMs: 10_000, promptAbsoluteTimeoutMs: 1_000 },
+      });
+      const p = (client as any).request("session/prompt", { sessionId: "s", prompt: [] });
+      (client as any).onLine(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "x" } },
+        },
+      }));
+      const timedOut = expect(p).rejects.toThrow(/ACP request timed out: session\/prompt/);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await timedOut;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("AcpClient execution backend", () => {
@@ -463,6 +746,83 @@ describe("acpClientCapabilities", () => {
     expect(acpClientCapabilities("grok", "")).toEqual(ACP_DELEGATED_FS_CAPABILITIES);
     expect(acpClientCapabilities("grok", "unparseable", true)).toEqual(ACP_DELEGATED_FS_CAPABILITIES);
     expect(acpClientCapabilities("grok", null, true)).toEqual(ACP_DELEGATED_FS_CAPABILITIES);
+  });
+});
+
+describe("cliHonorsInterjectContent", () => {
+  it("is true only for a live-verified grok 1.x", () => {
+    expect(cliHonorsInterjectContent("1.0.0", true)).toBe(true);
+    expect(cliHonorsInterjectContent("grok 1.0.5 (x) [stable]", true)).toBe(true);
+    expect(cliHonorsInterjectContent("1.0.5", false)).toBe(false);
+    expect(cliHonorsInterjectContent("0.2.117", true)).toBe(false);
+    expect(cliHonorsInterjectContent("unparseable", true)).toBe(false);
+    expect(cliHonorsInterjectContent()).toBe(false);
+  });
+});
+
+describe("buildInterjectParams", () => {
+  it("omits content when there are no image blocks — legacy wire", () => {
+    expect(buildInterjectParams("s1", "steer")).toEqual({ sessionId: "s1", text: "steer" });
+    expect(buildInterjectParams("s1", "steer", [{ type: "text", text: "steer" }])).toEqual({
+      sessionId: "s1",
+      text: "steer",
+    });
+    expect(Object.keys(buildInterjectParams("s1", "steer"))).toEqual(["sessionId", "text"]);
+  });
+
+  it("includes content when an image block is present", () => {
+    const content = [
+      { type: "text" as const, text: "look at [Image #1]" },
+      { type: "image" as const, mimeType: "image/png", data: "aGVsbG8=" },
+    ];
+    expect(buildInterjectParams("s1", "look at this", content)).toEqual({
+      sessionId: "s1",
+      text: "look at this",
+      content,
+    });
+  });
+});
+
+describe("AcpClient.interject wire", () => {
+  it("sends text-only params without a content key", async () => {
+    const { client, written } = clientWithFakeProc();
+    (client as any).sessionId = "s1";
+    replyToWrites(client, written, () => ({ status: "queued" }));
+    await expect(client.interject("steer left")).resolves.toBe("ok");
+    const sent = JSON.parse(written[0]);
+    expect(sent).toMatchObject({
+      method: "_x.ai/interject",
+      params: { sessionId: "s1", text: "steer left" },
+    });
+    expect(sent.params).not.toHaveProperty("content");
+  });
+
+  it("sends additive content when image blocks are provided", async () => {
+    const { client, written } = clientWithFakeProc();
+    (client as any).sessionId = "s1";
+    replyToWrites(client, written, () => ({ status: "queued" }));
+    const content = [
+      { type: "text" as const, text: "look at [Image #1]" },
+      { type: "image" as const, mimeType: "image/png", data: "aGVsbG8=" },
+    ];
+    await expect(client.interject("look at this", undefined, content)).resolves.toBe("ok");
+    const sent = JSON.parse(written[0]);
+    expect(sent.params).toEqual({
+      sessionId: "s1",
+      text: "look at this",
+      content,
+    });
+  });
+
+  it("honorsInterjectContent follows the live-verified 1.x floor", () => {
+    const yes = new AcpClient({
+      cliPath: "x", cwd: "/", log: () => {}, grokVersion: "1.0.5", grokVersionVerified: true,
+    });
+    const no = new AcpClient({
+      cliPath: "x", cwd: "/", log: () => {}, grokVersion: "0.2.117", grokVersionVerified: true,
+    });
+    expect(yes.honorsInterjectContent()).toBe(true);
+    expect(no.honorsInterjectContent()).toBe(false);
   });
 });
 

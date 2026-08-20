@@ -80,7 +80,13 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "removeProjectFolder":
     case "openGlobalConfig":
     case "openProjectConfig":
-    case "runMcpList":
+    case "listMcpServers":
+    case "connectMcpConnector":
+    case "disconnectMcpConnector":
+      if ((type === "connectMcpConnector" || type === "disconnectMcpConnector") && !isString(raw.id)) {
+        return null;
+      }
+      break;
     case "showLogs":
     case "toggleDevTools":
     case "restartToUpdate":
@@ -101,7 +107,6 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "pickFile":
     case "voiceStart":
     case "remoteVoiceStart":
-    case "clearQueuedSends":
     case "forkSession":
     case "newWorktreeSession":
     case "applyWorktree":
@@ -171,6 +176,7 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "setExpandCommandOutputs":
     case "setSteerByDefault":
     case "setTelemetryEnabled":
+    case "setThumbsFeedback":
     case "composerFocus":
       if (type === "composerFocus") {
         if (!isBoolean(raw.focused)) return null;
@@ -311,8 +317,19 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       if (!opt(raw.cancel, isBoolean)) return null;
       break;
     case "queueSend":
+      if (!isString(raw.text)) return null;
+      if (raw.chips !== undefined && !Array.isArray(raw.chips)) return null;
+      break;
     case "steerSend":
       if (!isString(raw.text)) return null;
+      if (raw.chips !== undefined && !Array.isArray(raw.chips)) return null;
+      if (!opt(raw.fromQueue, isBoolean)) return null;
+      break;
+    case "clearQueuedSends":
+      if (!opt(raw.restore, isBoolean)) return null;
+      break;
+    case "turnFeedback":
+      if (raw.rating !== -1 && raw.rating !== 0 && raw.rating !== 1) return null;
       break;
     case "dequeueSend":
       if (!isNumber(raw.index)) return null;

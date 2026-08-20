@@ -182,3 +182,65 @@ export function buildPromptWithImages(
   }
   return { text: promptText, blocks };
 }
+
+/**
+ * One queued contribution's prompt ingredients. Image indices are the numbers
+ * stamped at attach — never rewritten. The combined builder copies `text`
+ * verbatim and emits tags from those indices.
+ */
+export interface QueuedPromptContribution {
+  text: string;
+  chips: FileChip[];
+  images: PromptImageInput[];
+}
+
+/**
+ * Build one `session/prompt` from discrete queued contributions, each keeping
+ * its own attachments. Tags sit with the contribution they belong to rather
+ * than dumping a union at the end. Numbering is the attach-time index on each
+ * chip — gaps survive a prefix flush or a removed contribution, and `text`
+ * is copied as authored, never rewritten.
+ *
+ * Implicit (ambient editor) chips are applied once, on the last contribution,
+ * matching a live send's single context envelope.
+ */
+export function buildQueuedPromptWithImages(
+  contributions: QueuedPromptContribution[],
+  implicitChips: FileChip[],
+  deps: PromptBuilderDeps,
+  slashCommand = false,
+): { text: string; blocks: PromptContentBlock[] } {
+  if (contributions.length === 0) {
+    const plain = buildPrompt("", implicitChips, deps, slashCommand);
+    return { text: plain, blocks: [{ type: "text", text: plain }] };
+  }
+  if (contributions.length === 1) {
+    const only = contributions[0];
+    return buildPromptWithImages(
+      only.text,
+      [...only.chips, ...implicitChips],
+      only.images,
+      deps,
+      slashCommand,
+    );
+  }
+  const parts: string[] = [];
+  const imageBlocks: PromptContentBlock[] = [];
+  for (let i = 0; i < contributions.length; i++) {
+    const contribution = contributions[i];
+    const extraImplicit = i === contributions.length - 1 ? implicitChips : [];
+    const built = buildPromptWithImages(
+      contribution.text,
+      [...contribution.chips, ...extraImplicit],
+      contribution.images,
+      deps,
+      slashCommand && i === 0,
+    );
+    if (built.text) parts.push(built.text);
+    for (const block of built.blocks) {
+      if (block.type === "image") imageBlocks.push(block);
+    }
+  }
+  const promptText = parts.join("\n\n");
+  return { text: promptText, blocks: [{ type: "text", text: promptText }, ...imageBlocks] };
+}
