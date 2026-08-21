@@ -575,6 +575,16 @@
     sessionProviderCursor: null,
     replaying: false,
     replayDepth: 0,
+    // Open-path window (#102): hold the replay stream and render only the last
+    // HISTORY_WINDOW_USER_TURNS. Older turns live here as raw host messages and
+    // prepend as the reader scrolls up. Live sessions never enter this path.
+    replayHold: false,
+    replayHeld: [],
+    historyPrefix: [],
+    historyPrefixUserCount: 0,
+    historyPrefixPlans: [],
+    historyPrefixPermissions: [],
+    historyHydrating: false,
     // Host events this client has actually rendered — the export source. A
     // remote snapshot is only the recent window; exportWindowed labels that.
     exportEvents: [],
@@ -1118,7 +1128,7 @@
 
   // ---------- markdown ----------
 
-  const { looksLikeFileRef, formatRelativeTime, modelPickerLabel, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, TOOL_LABEL_MAX, middleElide, isAdvertisedSkill, getSlashQuery, applySlashPick, filterCommands, appendHighlightedText, commandProgramLabel, commandTextPreview, extractToolResultOutput, commandOutputWasCancelled, commandOutputTruncationNote, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, composerHasSendIntent, explicitVisibleChips, normalizeQueuedSends, queuedSendsText, queuedSendsChips, contextOverheadTokens, nextContextBreakdown, contextBreakdownIsCurrent, createPendingOverlay, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents } = globalThis.GrokWebviewHelpers;
+  const { looksLikeFileRef, formatRelativeTime, modelPickerLabel, modelDisplayName, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, TOOL_LABEL_MAX, middleElide, isAdvertisedSkill, getSlashQuery, applySlashPick, filterCommands, appendHighlightedText, commandProgramLabel, commandTextPreview, extractToolResultOutput, commandOutputWasCancelled, commandOutputTruncationNote, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, isKnownHostMessage, composerHasSendIntent, explicitVisibleChips, normalizeQueuedSends, queuedSendsText, queuedSendsChips, contextOverheadTokens, nextContextBreakdown, contextBreakdownIsCurrent, createPendingOverlay, getMentionQuery, applyMentionPick, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents, flattenHistoryMessages, splitHistoryWindow, countHistoryReplayCounters, partitionHistoryCards } = globalThis.GrokWebviewHelpers;
 
   function escapeAttr(s) {
     return String(s == null ? "" : s)
@@ -6144,11 +6154,11 @@
     const previousSessionId = state.activeSessionId;
     const repoCwd = state.selectedRepoCwd || state.activeRepoCwd || "";
     saveRememberedRemoteSession(null);
-    resetForNewSession();
-    // After reset so setConversationLoading wins over the "Starting" welcome
-    // status resetForNewSession paints. The placeholder is renderer-local and
-    // never enters state.sessions.
+    // Veil before the host-style reset so the click can unhide the welcome.
+    // resetForNewSession marks the old nodes pending-clear, and a pending-clear
+    // transcript must not grow an empty-state panel on top of it.
     startRailNewTransition(repoCwd, "creating", previousSessionId);
+    resetForNewSession();
     vscode.postMessage({ type: "newSession" });
   }
 
@@ -7119,6 +7129,9 @@
    *  tell "the conversation finished loading" from "startup finished" without
    *  comparing display strings. */
   function setWelcomeStatus(text, busy) {
+    // body.identity-restoring: the wrapper's "Restoring conversation…" is the
+    // only copy. Call sites already skip a painted-conversation hold.
+    if (identityRestoring()) return;
     const ver = $("welcome-version");
     if (!ver) return;
     ver.classList.toggle("welcome-status-busy", !!busy);
@@ -7137,17 +7150,22 @@
   /**
    * Hide the current transcript without deleting it. Opening B must not leave
    * A's messages under B's title; aborting B must be able to put A's messages
-   * back. Host `clearMessages` still destroys the nodes when the open is real.
+   * back. Host `clearMessages` marks nodes pending-clear; they are destroyed
+   * when replacement content arrives (`appendTranscriptChild`) or on the next
+   * frame (`flushPendingTranscriptClear`) if none does.
    */
   function veilTranscriptForPendingOpen() {
     const welcome = $("welcome");
     for (const child of Array.from(messagesEl.children)) {
       if (child.id === "welcome") continue;
+      if (child.getAttribute("data-pending-clear") === "1") continue;
       if (child.hasAttribute("data-pending-open-hide")) continue;
       child.setAttribute("data-pending-open-hide", "1");
       child.hidden = true;
     }
-    if (welcome) {
+    // A host clear already owns these nodes; revealing the empty state on top
+    // of them is the reconnect flash. The click path veils *before* that clear.
+    if (welcome && !hasPendingClearNodes() && !identityRestoring()) {
       welcome.hidden = false;
       state.welcomeVisible = true;
     }
@@ -7157,6 +7175,9 @@
     let restored = 0;
     for (const child of Array.from(messagesEl.children)) {
       if (child.getAttribute("data-pending-open-hide") !== "1") continue;
+      // A committed host clear owns these nodes now; putting them back would
+      // resurrect a conversation the next-frame flush is about to drop.
+      if (child.getAttribute("data-pending-clear") === "1") continue;
       child.removeAttribute("data-pending-open-hide");
       child.hidden = false;
       restored++;
@@ -7169,6 +7190,10 @@
   }
 
   function setConversationLoading(active) {
+    // Either branch stamps the empty-state line. A painted conversation must
+    // not pick up Connected / Loading conversation, including when those
+    // messages arrive before clearMessages has marked the nodes.
+    if (welcomeHoldActive()) return;
     if (active) {
       // Deliberately the only indicator. A second banner above the transcript
       // used to double it up, and the transcript arrives as one batch anyway \u2014
@@ -7256,30 +7281,519 @@
     }
   }
 
+  // clearMessages marks existing transcript nodes instead of destroying them.
+  // Destroy at the first replacement append (same task) or on the next frame
+  // if nothing replaces it. body.identity-restoring suspends that next-frame
+  // flush: a restore is a replacement we already know is coming, so wait for
+  // the class to lift and flush then only if nothing arrived. Welcome, title,
+  // composer focus, and the reader's pin stay put while a conversation is
+  // still on screen — a resync must not blank, refocus, re-pin, or paint
+  // "Starting" over it, even before those nodes are marked pending-clear.
+  const PENDING_CLEAR_ATTR = "data-pending-clear";
+  let pendingTranscriptClear = false;
+  let pendingTranscriptClearRaf = 0;
+  // Status resetForNewSession would have stamped immediately. Held while a
+  // conversation is still on screen (pending-clear or not) or while
+  // body.identity-restoring is set; applied in the flush if nothing replaces
+  // them, dropped if a replacement arrives.
+  // "loading" / "no-project" / "starting" match the three special cases at
+  // the welcome block.
+  let pendingWelcomeReveal = null;
+  // Title, worktree flag, in-progress rename, composer focus, and the
+  // reader's pin: same hold. A resync must not blank the name, move focus
+  // (a returning phone tab would pop the keyboard), or yank a scrolled-up
+  // reader to the bottom. Flush still applies them for an empty swap; a
+  // sessionName with a different id applies focus + pin for a real swap.
+  let pendingSessionChromeReset = false;
+  // Desktop launch is a different event from that resync: the app just opened
+  // and the caret belongs in the composer, restored conversation or not. One
+  // shot, consumed on the first focused-window claim. VS Code never sets this.
+  let desktopLaunchFocusPending = IS_DESKTOP_CLIENT;
+
+  function isPendingClearNode(el) {
+    return !!(el && typeof el.closest === "function" && el.closest("[" + PENDING_CLEAR_ATTR + "]"));
+  }
+
+  function hasPendingClearNodes() {
+    for (const child of messagesEl.children) {
+      if (child.id === "welcome") continue;
+      if (child.getAttribute(PENDING_CLEAR_ATTR) === "1") return true;
+    }
+    return false;
+  }
+
+  function welcomeRevealKind() {
+    if (state.railTransition) return "loading";
+    if (state.onboardingMode === "no-project") return "no-project";
+    return "starting";
+  }
+
+  function applyWelcomeRevealKind(kind) {
+    if (kind === "loading") setConversationLoading(true);
+    else if (kind === "no-project") setWelcomeStatus("No project folder", false);
+    else setWelcomeStatus("Starting", true);
+  }
+
+  function revealWelcome() {
+    if (welcomeHoldActive()) return;
+    const welcome = $("welcome");
+    if (welcome) welcome.hidden = false;
+    state.welcomeVisible = true;
+  }
+
+  function identityRestoring() {
+    return !!(document.body && document.body.classList.contains("identity-restoring"));
+  }
+
+  function welcomeHoldActive() {
+    // Cold load of a remembered conversation: the wrapper owns the wait
+    // ("Restoring conversation…") and the welcome starts visible with no .msg
+    // nodes, so the painted-conversation hold below would not apply. Hide it
+    // in syncIdentityRestoreHold — this predicate only refuses to stamp/reveal.
+    if (identityRestoring()) return true;
+    const welcome = $("welcome");
+    if (!welcome || !welcome.hidden) return false;
+    // A painted conversation, whether already marked pending-clear or not.
+    // Remote snapshots send initialState first; local sends clearMessages first.
+    // Keying the hold on the mark made the phone's order stamp the empty state.
+    for (const child of messagesEl.children) {
+      if (child.id === "welcome") continue;
+      if (isPendingClearNode(child)) return true;
+    }
+    return liveTranscriptQueryAll(".msg").length > 0;
+  }
+
+  function liveTranscriptQueryAll(sel) {
+    return [...messagesEl.querySelectorAll(sel)].filter((el) => !isPendingClearNode(el));
+  }
+
+  function cancelPendingTranscriptClearRaf() {
+    if (!pendingTranscriptClearRaf) return;
+    cancelAnimationFrame(pendingTranscriptClearRaf);
+    pendingTranscriptClearRaf = 0;
+  }
+
+  function schedulePendingTranscriptClearFlush() {
+    if (pendingTranscriptClearRaf) return;
+    pendingTranscriptClearRaf = requestAnimationFrame(() => {
+      pendingTranscriptClearRaf = 0;
+      flushPendingTranscriptClear();
+    });
+  }
+
+  function markTranscriptPendingClear() {
+    pendingTranscriptClear = true;
+    for (const child of Array.from(messagesEl.children)) {
+      if (child.id === "welcome") continue;
+      child.setAttribute(PENDING_CLEAR_ATTR, "1");
+    }
+    cancelPendingTranscriptClearRaf();
+    if (identityRestoring()) return;
+    schedulePendingTranscriptClearFlush();
+  }
+
+  function focusComposerIfAllowed() {
+    // Guarded on document.hasFocus(): a host-initiated clear can arrive while
+    // the user is typing in the editor, and focusing then would yank keyboard
+    // focus across panels. The same argument keeps a resync from focusing —
+    // that path never reaches here because the chrome reset is held.
+    if (typeof document.hasFocus !== "function" || document.hasFocus()) input.focus();
+  }
+
+  function takeDesktopLaunchComposerFocus() {
+    // The desktop app IS the chat. First time this document is the focused
+    // surface, put the caret in the composer — including a boot that restores
+    // a conversation (the pending-clear hold would otherwise skip it). A
+    // reconnect/resync of an already-open surface has already consumed this.
+    // Do not consume while the window is unfocused: show:false boot would
+    // burn the shot before the first real window-focus.
+    if (!desktopLaunchFocusPending) return false;
+    if (typeof document.hasFocus === "function" && !document.hasFocus()) return false;
+    desktopLaunchFocusPending = false;
+    input.focus({ preventScroll: true });
+    return true;
+  }
+
+  function resetSessionChrome() {
+    pendingSessionChromeReset = false;
+    if (state.sessionNameEditing) finishSessionNameEdit(false);
+    state.isWorktree = false;
+    state.sessionName = null;
+    renderSessionName();
+    if (IS_REMOTE) renderSessionHead();
+    focusComposerIfAllowed();
+    setStickToBottom(true); // a fresh/loaded session starts pinned
+    updateScrollBtn();
+  }
+
+  /** Empty-state path: no replacement arrived, so the welcome must appear. */
+  function flushPendingTranscriptClear() {
+    if (!pendingTranscriptClear) return;
+    // Replay has started: replacement is in flight even if the first append
+    // has not landed yet. Keep the conversation until it does, or until the
+    // replay ends empty and calls us again.
+    if (state.replaying) return;
+    // Same for the wrapper's restore veil: stay armed until the class lifts.
+    if (identityRestoring()) return;
+    pendingTranscriptClear = false;
+    const kind = pendingWelcomeReveal;
+    pendingWelcomeReveal = null;
+    const chrome = pendingSessionChromeReset;
+    cancelPendingTranscriptClearRaf();
+    for (const child of Array.from(messagesEl.children)) {
+      if (child.getAttribute(PENDING_CLEAR_ATTR) === "1") child.remove();
+    }
+    if (kind) {
+      applyWelcomeRevealKind(kind);
+      renderWelcomeTip();
+    }
+    if (chrome) resetSessionChrome();
+    revealWelcome();
+  }
+
+  // The relay wrapper sets body.identity-restoring while it restores a
+  // remembered session on a fresh page. Both layers share this document, so
+  // read the class rather than waiting for a host frame.
+  let identityRestoreHeld = false;
+
+  function scheduleEmptyWelcomeFlush() {
+    pendingTranscriptClear = true;
+    if (pendingWelcomeReveal == null) pendingWelcomeReveal = welcomeRevealKind();
+    schedulePendingTranscriptClearFlush();
+  }
+
+  function syncIdentityRestoreHold() {
+    const now = identityRestoring();
+    if (now) {
+      const welcome = $("welcome");
+      if (welcome) welcome.hidden = true;
+      if (pendingWelcomeReveal == null) pendingWelcomeReveal = welcomeRevealKind();
+      identityRestoreHeld = true;
+      cancelPendingTranscriptClearRaf();
+      return;
+    }
+    if (!identityRestoreHeld) return;
+    identityRestoreHeld = false;
+    // Pending-clear nodes still count as painted, so welcomeHoldActive cannot
+    // decide this. Flag dropped → replacement landed. Still armed → flush.
+    if (!pendingTranscriptClear && welcomeHoldActive()) {
+      pendingWelcomeReveal = null;
+      return;
+    }
+    scheduleEmptyWelcomeFlush();
+  }
+
+  syncIdentityRestoreHold();
+  if (typeof MutationObserver === "function" && document.body) {
+    new MutationObserver(syncIdentityRestoreHold).observe(document.body, {
+      attributes: true,
+      attributeFilter: ["class"],
+    });
+  }
+
+  // Last N counted user bubbles render on open; earlier turns prepend on scroll
+  // (#102). 80 is several screens even on a phone, 8× the remote snapshot of 10,
+  // and small conversations fall through unchanged. Tests may shrink it via
+  // `window.__grokHistoryWindow`.
+  const HISTORY_WINDOW_USER_TURNS = 80;
+  const HISTORY_PREPEND_USER_TURNS = 40;
+  const HISTORY_PREPEND_PX = 720;
+  let historyPark = null;
+  let prependLock = 0;
+
+  function historyWindowTurns() {
+    const override = window.__grokHistoryWindow;
+    if (typeof override === "number" && override > 0 && Number.isFinite(override)) return Math.floor(override);
+    return HISTORY_WINDOW_USER_TURNS;
+  }
+
+  function firstLiveTranscriptChild() {
+    for (const child of messagesEl.children) {
+      if (child.id === "welcome" || child.id === "history-head") continue;
+      if (isPendingClearNode(child)) continue;
+      return child;
+    }
+    return null;
+  }
+
+  function syncHistoryHead() {
+    let head = $("history-head");
+    const more = !!(state.historyPrefix && state.historyPrefix.length);
+    if (!more) {
+      if (head) head.remove();
+      return null;
+    }
+    if (!head) {
+      head = document.createElement("div");
+      head.id = "history-head";
+      head.setAttribute("aria-hidden", "true");
+      const welcome = $("welcome");
+      if (welcome && welcome.parentElement === messagesEl) {
+        messagesEl.insertBefore(head, welcome.nextSibling);
+      } else {
+        messagesEl.insertBefore(head, messagesEl.firstChild);
+      }
+    }
+    head.hidden = false;
+    return head;
+  }
+
+  function clearHistoryWindow() {
+    state.replayHold = false;
+    state.replayHeld = [];
+    state.historyPrefix = [];
+    state.historyPrefixUserCount = 0;
+    state.historyPrefixPlans = [];
+    state.historyPrefixPermissions = [];
+    state.historyHydrating = false;
+    historyPark = null;
+    const head = $("history-head");
+    if (head) head.remove();
+  }
+
+  const REPLAY_HOLD_TYPES = new Set([
+    "userMessage", "agentStart", "thoughtChunk", "messageChunk", "media",
+    "userMessageChunk", "historyBatch", "toolCall", "toolCallUpdate",
+    "permissionRequest", "permissionOptions", "permissionResolved",
+    "exitPlanRequest", "planResolved", "questionRequest", "planNotice",
+    "autoCompactNotice", "planBlocked", "promptComplete", "commandOutput",
+    "agentReset", "agentError", "agentEnd", "exit", "sessionContext",
+    "xaiNotification", "subagentUpdate", "childStream", "runProgress",
+    "summarizing",
+  ]);
+
+  function recordPrefixExport(msgs) {
+    for (const m of flattenHistoryMessages(msgs)) {
+      if (isExportableSessionEvent(m)) state.exportEvents.push(m);
+    }
+  }
+
+  function applyHistoryWindow(held) {
+    const split = splitHistoryWindow(held, historyWindowTurns());
+    state.historyPrefix = split.prefix;
+    state.historyPrefixUserCount = split.prefixUserCount;
+    if (split.prefixUserCount > 0) {
+      const counters = countHistoryReplayCounters(split.prefix);
+      state.userMsgCount = counters.userMsgCount;
+      state.interjectionCount = counters.interjectionCount;
+      state.historyEventCount = counters.historyEventCount;
+      const plans = state.planHistoryQueue || [];
+      state.historyPrefixPlans = plans.filter((p) =>
+        typeof p.afterUserMessage === "number" && p.afterUserMessage <= split.prefixUserCount);
+      state.planHistoryQueue = plans.filter((p) =>
+        typeof p.afterUserMessage !== "number" || p.afterUserMessage > split.prefixUserCount);
+      const perms = state.permissionHistoryQueue || [];
+      state.historyPrefixPermissions = perms.filter((p) =>
+        typeof p.afterUserMessage === "number" && p.afterUserMessage <= split.prefixUserCount);
+      state.permissionHistoryQueue = perms.filter((p) =>
+        typeof p.afterUserMessage !== "number" || p.afterUserMessage > split.prefixUserCount);
+      recordPrefixExport(split.prefix);
+    }
+    for (const m of split.suffix) handleHostMessage(m);
+    syncHistoryHead();
+  }
+
+  function restorePrependAnchor(sentinel, y) {
+    if (!sentinel || !sentinel.isConnected) return 0;
+    const delta = sentinel.getBoundingClientRect().top - y;
+    if (delta) messagesEl.scrollTop += delta;
+    return delta;
+  }
+
+  function prependHistoryNodes(nodes) {
+    if (!nodes.length) {
+      state.historyHydrating = false;
+      return;
+    }
+    const insertAt = firstLiveTranscriptChild();
+    const sentinel = insertAt;
+    const anchorY = sentinel ? sentinel.getBoundingClientRect().top : 0;
+    const prevHeight = messagesEl.scrollHeight;
+    const prevTop = messagesEl.scrollTop;
+    // Native anchoring is off while pinned and would double-count a height-delta
+    // write while unpinned. Hold the visible line in JS instead.
+    prependLock += 1;
+    messagesEl.classList.add("history-prepending");
+    const head = syncHistoryHead();
+    const before = (head && head.nextSibling) || insertAt;
+    for (const node of nodes) {
+      if (before) messagesEl.insertBefore(node, before);
+      else HTMLElement.prototype.appendChild.call(messagesEl, node);
+    }
+    if (sentinel && sentinel.isConnected) restorePrependAnchor(sentinel, anchorY);
+    else {
+      const grown = messagesEl.scrollHeight - prevHeight;
+      if (grown) messagesEl.scrollTop = prevTop + grown;
+    }
+    state.historyHydrating = false;
+    const finish = () => {
+      if (sentinel && sentinel.isConnected) restorePrependAnchor(sentinel, anchorY);
+      messagesEl.classList.remove("history-prepending");
+      prependLock = Math.max(0, prependLock - 1);
+    };
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(finish);
+    else finish();
+  }
+
+  function loadEarlierHistory(all) {
+    if (state.replaying || state.historyHydrating) return false;
+    if (!state.historyPrefix.length) return false;
+    const turns = all ? state.historyPrefixUserCount : HISTORY_PREPEND_USER_TURNS;
+    const split = splitHistoryWindow(state.historyPrefix, Math.max(1, turns));
+    const chunk = split.suffix.length ? split.suffix : split.prefix;
+    const remain = split.suffix.length ? split.prefix : [];
+    const remainUsers = split.suffix.length ? split.prefixUserCount : 0;
+    const remainCounters = countHistoryReplayCounters(remain);
+    state.historyPrefix = remain;
+    state.historyPrefixUserCount = remainUsers;
+    hydrateHistoryChunkWithCounters(chunk, remainUsers, remainCounters);
+    return true;
+  }
+
+  function hydrateHistoryChunkWithCounters(chunk, startUserCount, remainCounters) {
+    if (!chunk.length) return;
+    const saved = {
+      userMsgCount: state.userMsgCount,
+      interjectionCount: state.interjectionCount,
+      historyEventCount: state.historyEventCount,
+      planHistoryQueue: state.planHistoryQueue,
+      permissionHistoryQueue: state.permissionHistoryQueue,
+      busy: state.busy,
+      busyLocked: state.busyLocked,
+      grokkingEl: state.grokkingEl,
+      thinkingIndicatorEl: state.thinkingIndicatorEl,
+      activeAgentEl: state.activeAgentEl,
+      activeAgentRaw: state.activeAgentRaw,
+      activeUserEl: state.activeUserEl,
+      activeUserRaw: state.activeUserRaw,
+      activeThoughtEl: state.activeThoughtEl,
+      activeThoughtHdrEl: state.activeThoughtHdrEl,
+      thoughtBuffer: state.thoughtBuffer,
+      activeToolGroupEl: state.activeToolGroupEl,
+      turnAgentActionsEl: state.turnAgentActionsEl,
+      turnRating: state.turnRating,
+      suppressReplayTurn: state.suppressReplayTurn,
+      skipUserBubble: state.skipUserBubble,
+      replaying: state.replaying,
+    };
+    historyPark = document.createElement("div");
+    state.historyHydrating = true;
+    state.replaying = true;
+    state.busy = false;
+    state.grokkingEl = null;
+    state.thinkingIndicatorEl = null;
+    state.activeAgentEl = null;
+    state.activeAgentRaw = "";
+    state.activeUserEl = null;
+    state.activeUserRaw = "";
+    state.activeThoughtEl = null;
+    state.activeThoughtHdrEl = null;
+    state.thoughtBuffer = "";
+    state.activeToolGroupEl = null;
+    state.turnAgentActionsEl = null;
+    state.suppressReplayTurn = false;
+    state.skipUserBubble = false;
+    state.userMsgCount = startUserCount;
+    state.interjectionCount = remainCounters.interjectionCount;
+    state.historyEventCount = remainCounters.historyEventCount;
+    const endUserCount = startUserCount + countHistoryReplayCounters(chunk).userMsgCount;
+    const plans = partitionHistoryCards(state.historyPrefixPlans, startUserCount, endUserCount);
+    const perms = partitionHistoryCards(state.historyPrefixPermissions, startUserCount, endUserCount);
+    state.planHistoryQueue = plans.inChunk;
+    state.permissionHistoryQueue = perms.inChunk;
+    for (const m of chunk) handleHostMessage(m);
+    flushPlanHistory();
+    flushPermissionHistory();
+    if (!state.historyPrefix.length) {
+      state.planHistoryQueue = plans.rest;
+      state.permissionHistoryQueue = perms.rest;
+      flushPlanHistory();
+      flushPermissionHistory();
+    }
+    const nodes = [...historyPark.children];
+    historyPark = null;
+    state.historyPrefixPlans = state.historyPrefix.length ? plans.rest : [];
+    state.historyPrefixPermissions = state.historyPrefix.length ? perms.rest : [];
+    state.userMsgCount = saved.userMsgCount;
+    state.interjectionCount = saved.interjectionCount;
+    state.historyEventCount = saved.historyEventCount;
+    state.planHistoryQueue = saved.planHistoryQueue;
+    state.permissionHistoryQueue = saved.permissionHistoryQueue;
+    state.busy = saved.busy;
+    state.busyLocked = saved.busyLocked;
+    state.grokkingEl = saved.grokkingEl;
+    state.thinkingIndicatorEl = saved.thinkingIndicatorEl;
+    state.activeAgentEl = saved.activeAgentEl;
+    state.activeAgentRaw = saved.activeAgentRaw;
+    state.activeUserEl = saved.activeUserEl;
+    state.activeUserRaw = saved.activeUserRaw;
+    state.activeThoughtEl = saved.activeThoughtEl;
+    state.activeThoughtHdrEl = saved.activeThoughtHdrEl;
+    state.thoughtBuffer = saved.thoughtBuffer;
+    state.activeToolGroupEl = saved.activeToolGroupEl;
+    state.turnAgentActionsEl = saved.turnAgentActionsEl;
+    state.turnRating = saved.turnRating;
+    state.suppressReplayTurn = saved.suppressReplayTurn;
+    state.skipUserBubble = saved.skipUserBubble;
+    state.replaying = saved.replaying;
+    prependHistoryNodes(nodes);
+    refreshUserRewindButtons();
+    syncHistoryHead();
+    updateSendButton();
+  }
+
+  function expandHistoryAll() {
+    while (state.historyPrefix.length) loadEarlierHistory(true);
+  }
+
+  function maybeLoadEarlierHistory() {
+    if (state.replaying || state.historyHydrating) return;
+    if (!state.historyPrefix.length) return;
+    if (state.stickToBottom) return;
+    if (messagesEl.scrollTop > HISTORY_PREPEND_PX) return;
+    loadEarlierHistory(false);
+  }
+
+  /** Append replacement content. Drops pending-clear nodes in the same task
+   *  AFTER the new node is in, so the transcript is never empty mid-paint. */
+  function appendTranscriptChild(el) {
+    if (historyPark) {
+      historyPark.appendChild(el);
+      return el;
+    }
+    if (!pendingTranscriptClear) {
+      HTMLElement.prototype.appendChild.call(messagesEl, el);
+      return el;
+    }
+    const scrollTop = messagesEl.scrollTop;
+    pendingTranscriptClear = false;
+    pendingWelcomeReveal = null;
+    pendingSessionChromeReset = false;
+    cancelPendingTranscriptClearRaf();
+    HTMLElement.prototype.appendChild.call(messagesEl, el);
+    for (const child of Array.from(messagesEl.children)) {
+      if (child.getAttribute(PENDING_CLEAR_ATTR) === "1") child.remove();
+    }
+    messagesEl.scrollTop = scrollTop;
+    return el;
+  }
+
   function resetForNewSession() {
     stopProcessingCue();
     cancelPendingSpeech();
     // The transcript is about to be emptied wholesale; drop the reference so a
     // later echo can't try to remove a node from the previous session.
     state.optimisticSendEl = null;
-    state.isWorktree = false; // re-set by the incoming session's `session` message
-    state.sessionName = null;
-    state.sessionNameEditing = null;
-    renderSessionName();
-    if (IS_REMOTE) renderSessionHead();
-    // The caret belongs in the box after any session swap — new session, a
-    // history-row re-focus, a disk restore (all funnel through here via the
-    // host's clearMessages). Guarded on document.hasFocus(): user-initiated
-    // swaps start with a click inside this webview, but a host-initiated clear
-    // (an automatic restart) can arrive while the user is typing in the editor,
-    // and focusing then would yank keyboard focus across panels.
-    if (typeof document.hasFocus !== "function" || document.hasFocus()) input.focus();
-    for (const child of Array.from(messagesEl.children)) {
-      if (child.id !== "welcome") child.remove();
-    }
+    markTranscriptPendingClear();
+    // Incoming `session` / `sessionName` re-set these. Clearing them first is
+    // why a resync blanks the title and then paints it back. Hold while the
+    // previous conversation is still on screen — title, caret, and the
+    // reader's pin. Flush applies the reset if this was an empty swap; a
+    // replacement drops it.
+    if (hasPendingClearNodes()) pendingSessionChromeReset = true;
+    else resetSessionChrome();
     const welcome = $("welcome");
     if (welcome) {
-      welcome.hidden = false;
       const onb = $("welcome-onboarding");
       // Keep a just-shown "Connected" confirmation. Connecting an agent starts a
       // fresh session for it, and that session swap arrives as clearMessages —
@@ -7294,12 +7808,18 @@
       // no-project is the other hold: last-folder-removed emits clearMessages
       // then the empty-state card, and flipping to Starting in between is the
       // hang that card exists to replace.
-      if (state.railTransition) setConversationLoading(true);
-      else if (state.onboardingMode === "no-project") setWelcomeStatus("No project folder", false);
-      else setWelcomeStatus("Starting", true);
-      // The empty state is rebuilt on every new session, so the tip is too —
-      // until the host stops advertising it.
-      renderWelcomeTip();
+      //
+      // Do not unhide or stamp while the previous conversation is still on
+      // screen (pending-clear or not). flushPendingTranscriptClear applies the
+      // same status once the nodes actually go; a replacement drops it so the
+      // empty state never appears over a conversation that is about to come back.
+      if (welcomeHoldActive() || hasPendingClearNodes()) {
+        pendingWelcomeReveal = welcomeRevealKind();
+      } else {
+        pendingWelcomeReveal = null;
+        applyWelcomeRevealKind(welcomeRevealKind());
+        renderWelcomeTip();
+      }
     }
     state.welcomeVisible = true;
     state.pendingDiffByToolCallId.clear();
@@ -7325,6 +7845,7 @@
     state.activeToolGroupEl = null;
     state.replaying = false;
     state.replayDepth = 0;
+    clearHistoryWindow();
     state.exportEvents = [];
     state.exportWindowed = false;
     state.planHistoryQueue = [];
@@ -7340,8 +7861,6 @@
     state.suppressReplayTurn = false;
     state.skipUserBubble = false;
     cancelPendingSpeech();
-    setStickToBottom(true); // a fresh/loaded session starts pinned
-    updateScrollBtn();
     hideGrokking();
     hideThinkingIndicator();
     // Busy is per-session UI state — a swap must not leak the previous
@@ -7353,9 +7872,11 @@
     state.busy = false;
     state.busyLocked = false;
     // The send queue is HOST-owned per session — do NOT post a clear here.
-    // Reset only the local render mirror (the transcript wipe above removed the
-    // blocks); the replay delivers the focused session's own queuedSends
-    // snapshot, so its queued messages reappear when you swap back.
+    // Reset only the local render mirror. The deferred transcript wipe would
+    // otherwise leave the queued block visible until the next frame; the replay
+    // delivers the focused session's own queuedSends snapshot, so its queued
+    // messages reappear when you swap back.
+    if (state.queuedWrapEl) state.queuedWrapEl.remove();
     state.sendQueue = [];
     state.queuedWrapEl = null;
     state.queuedSubmissionPending = false;
@@ -7465,9 +7986,16 @@
     state.onboardingMode = mode;
     state.onboardingInfo = info;
     if (beforeRender) beforeRender();
-    const welcome = $("welcome");
-    if (welcome) welcome.hidden = false;
-    state.welcomeVisible = true;
+    // Onboarding is the empty-state card. Flush a pending transcript wipe so
+    // the card cannot sit above leftover conversation nodes for a frame —
+    // unless a replay is already putting the conversation back, in which case
+    // revealing now is the reconnect flash (a buffered provider-connected
+    // confirmation used to unhide on top of the messages still waiting to go).
+    const holdWelcome = identityRestoring() || (state.replaying && welcomeHoldActive());
+    if (!holdWelcome) {
+      flushPendingTranscriptClear();
+      revealWelcome();
+    }
     const onb = $("welcome-onboarding");
     const ver = $("welcome-version");
     if (!onb) return;
@@ -7826,7 +8354,7 @@
       }
     }
 
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     if (role === "user") refreshUserRewindButtons();
     scrollToBottom();
     if (role === "user" && text) {
@@ -7846,8 +8374,9 @@
   // as the rewind map counts them). Sent with every rewind/edit so the host can
   // verify its point list still lines up before acting — see bubbleMapIsConsistent.
   function visibleUserBubbleCount() {
-    return [...messagesEl.querySelectorAll(".msg.user:not(.queued)")]
+    const rendered = liveTranscriptQueryAll(".msg.user:not(.queued)")
       .filter((el) => el.dataset.steer !== "1").length;
+    return (state.historyPrefixUserCount || 0) + rendered;
   }
 
   function refreshUserRewindButtons() {
@@ -7856,17 +8385,18 @@
     // Rewind at the wrong turn (and reverted the wrong files) and made Edit
     // fail outright. Both actions are hidden on a steer bubble for the same
     // reason: there is nothing on the wire to roll back to.
-    const users = [...messagesEl.querySelectorAll(".msg.user:not(.queued)")]
+    const users = liveTranscriptQueryAll(".msg.user:not(.queued)")
       .filter((el) => el.dataset.steer !== "1");
-    for (const el of messagesEl.querySelectorAll('.msg.user[data-steer="1"]')) {
+    for (const el of liveTranscriptQueryAll('.msg.user[data-steer="1"]')) {
       delete el.dataset.userBubbleIndex;
       const r = el.querySelector(".msg-rewind-btn");
       const ed = el.querySelector(".msg-edit-btn");
       if (r) r.hidden = true;
       if (ed) ed.hidden = true;
     }
+    const prefixCount = state.historyPrefixUserCount || 0;
     users.forEach((el, i) => {
-      el.dataset.userBubbleIndex = String(i);
+      el.dataset.userBubbleIndex = String(prefixCount + i);
       const isLast = i === users.length - 1;
       const btn = el.querySelector(".msg-rewind-btn");
       if (btn) {
@@ -7957,7 +8487,7 @@
 
   function syncFeedbackButtons() {
     const live = liveTurnActions();
-    for (const actions of messagesEl.querySelectorAll(".msg.agent .msg-actions")) {
+    for (const actions of liveTranscriptQueryAll(".msg.agent .msg-actions")) {
       if (actions === live && feedbackOffered()) {
         if (!actions.querySelector(".msg-thumbs")) insertTurnThumbs(actions);
         else paintTurnThumbs(actions);
@@ -7972,7 +8502,7 @@
     if (state.replaying) return;
     const a = state.turnAgentActionsEl;
     if (!a) return;
-    for (const other of messagesEl.querySelectorAll(".msg.agent .msg-actions")) {
+    for (const other of liveTranscriptQueryAll(".msg.agent .msg-actions")) {
       if (other !== a) retireLiveTurnFeedback(other);
     }
     a.dataset.feedbackLive = "1";
@@ -8348,7 +8878,7 @@
       body.hidden = true;
       el.appendChild(hdr);
       el.appendChild(body);
-      messagesEl.appendChild(el);
+      appendTranscriptChild(el);
       state.activeToolGroupEl = el;
       // Expand-all latched → open the group the moment it appears, mid-run
       // (setGroupExpanded's `.expanded` class also reveals the chevron via CSS).
@@ -8478,10 +9008,10 @@
   // the latch via the effective helpers; touches the in-progress group too so a
   // running batch opens/closes live (the reported gap).
   function applyExpandCommandOutputs() {
-    for (const row of messagesEl.querySelectorAll(".has-details")) {
+    for (const row of liveTranscriptQueryAll(".has-details")) {
       setDetailExpanded(row, detailShouldExpand());
     }
-    for (const group of messagesEl.querySelectorAll(".tool-group")) {
+    for (const group of liveTranscriptQueryAll(".tool-group")) {
       setGroupExpanded(group, groupShouldExpand(group));
     }
   }
@@ -9268,7 +9798,7 @@
     const el = document.createElement("div");
     el.className = "session-context-banner";
     el.textContent = "Context from previous session applied";
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     scrollToBottom();
   }
 
@@ -9278,7 +9808,7 @@
     el.className = "msg error";
     el.textContent = text;
     if (typeof code === "string" && code) el.setAttribute("data-error-code", code);
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     scrollToBottom();
   }
 
@@ -9425,7 +9955,7 @@
       link.onclick = () => vscode.postMessage({ type: "openUrl", url: msg.url });
       el.appendChild(link);
     }
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     scrollToBottom();
   }
 
@@ -9711,7 +10241,7 @@
     // card with the new run's duration/output. Mark them so live spawn-tagging
     // and the no-id finish fallback skip them.
     if (state.replaying) el.dataset.subagentReplayed = "1";
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     if (call && call.toolCallId) state.subagentCards.set(call.toolCallId, el);
     applySubagentUpdate(call, el); // a replayed call may already be completed
     scrollToBottom();
@@ -9846,7 +10376,7 @@
         `<div class="run-progress-detail" hidden></div>` +
         `<div class="run-progress-actions" hidden></div>`;
       state.runProgressCards.set(id, el);
-      messagesEl.appendChild(el);
+      appendTranscriptChild(el);
     }
 
     const kindLabel = update.kind === "goal" ? "Goal" : "Workflow";
@@ -9938,7 +10468,7 @@
     const el = document.createElement("div");
     el.className = "plan-notice";
     el.innerHTML = `${ICON.listTree}<span>${escapeHtml(text)}</span>`;
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     scrollToBottom();
   }
 
@@ -9956,7 +10486,7 @@
     const el = document.createElement("div");
     el.className = "plan-notice";
     el.innerHTML = `${ICON.zap}<span>${escapeHtml(text)}</span>`;
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     scrollToBottom();
   }
 
@@ -9988,7 +10518,7 @@
       };
       el.appendChild(hdr);
       el.appendChild(body);
-      messagesEl.appendChild(el);
+      appendTranscriptChild(el);
       state.activeThoughtEl = body;
       state.activeThoughtHdrEl = hdr;
     }
@@ -10216,7 +10746,7 @@
     // The agent copy affordance identifies the newest narration segment for the
     // current turn. Use that same pointer so neither plain nor summarized speech
     // can target an older rendered message.
-    const agentActions = messagesEl.querySelectorAll(".msg.agent .msg-actions");
+    const agentActions = liveTranscriptQueryAll(".msg.agent .msg-actions");
     if (
       !state.turnAgentActionsEl ||
       agentActions[agentActions.length - 1] !== state.turnAgentActionsEl
@@ -10429,7 +10959,7 @@
     clearWelcome();
     const el = document.createElement("div");
     collapsePermissionCard(el, outcome === "rejected" ? "reject_once" : "allow_once", title);
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     scrollToBottom();
   }
 
@@ -10477,6 +11007,7 @@
   // the Thinking header's look (blink-dots, same muted font) without the
   // chevron, and is not expandable.
   function showGrokking() {
+    if (state.historyHydrating) return;
     hideGrokking(); // dedupe
     hideThinkingIndicator();
     clearWelcome();
@@ -10488,7 +11019,7 @@
     el.innerHTML = `<span class="grokking-icon">${ICON.orbit}</span><span class="grokking-label">${verb}</span>`;
     el.setAttribute("aria-label", activityAriaLabel());
     el.title = "Waiting for response";
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     state.grokkingEl = el;
     scrollToBottom();
   }
@@ -10535,7 +11066,7 @@
     el.className = "thinking-indicator";
     el.innerHTML = `<span class="thinking-indicator-icon">${ICON.brain}</span><span class="thinking-indicator-label">Thinking</span>${BLINK_DOTS}`;
     el.setAttribute("aria-label", "Grok is thinking");
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     state.thinkingIndicatorEl = el;
     scrollToBottom();
   }
@@ -10569,7 +11100,7 @@
       state.activeToolGroupEl ||
       (state.activeAgentEl && (state.activeAgentRaw || "").trim()) ||
       (effectiveShowThinking() && state.activeThoughtEl) ||
-      messagesEl.querySelector(".card:not(.resolved)")
+      liveTranscriptQueryAll(".card:not(.resolved)")[0]
     );
   }
 
@@ -10589,7 +11120,7 @@
   // becomes a no-op, so they can read history while grok keeps thinking (#16).
   // Replay (ACP session/load *and* in-memory buffer rebuilds) must not do this
   // per element: each assignment forces layout, and a large load looks like
-  // infinite scroll. historyReplay end force-scrolls once.
+  // infinite scroll. historyReplay end follows the pin once.
   function scrollToBottom() {
     if (state.replaying || !state.stickToBottom) return;
     messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -10607,7 +11138,7 @@
   // Always pull the view to the bottom and re-pin. For interactive activity the
   // user needs to see regardless of where they've scrolled: permission/question
   // cards and their own just-sent message. No-op during replay — the closing
-  // historyReplay frame is what lands the loaded conversation at the bottom.
+  // historyReplay frame follows the pin instead of re-pinning.
   function forceScrollToBottom() {
     if (state.replaying) return;
     setStickToBottom(true);
@@ -10647,10 +11178,10 @@
   // pinned; a deliberate scroll-up has cleared stickToBottom and is untouched.
   let contentFollowFrame = 0;
   new MutationObserver(() => {
-    if (state.replaying || !state.stickToBottom || contentFollowFrame) return;
+    if (state.replaying || state.historyHydrating || prependLock || !state.stickToBottom || contentFollowFrame) return;
     contentFollowFrame = requestAnimationFrame(() => {
       contentFollowFrame = 0;
-      if (state.stickToBottom && !state.replaying) messagesEl.scrollTop = messagesEl.scrollHeight;
+      if (state.stickToBottom && !state.replaying && !prependLock) messagesEl.scrollTop = messagesEl.scrollHeight;
     });
   }).observe(messagesEl, {
     childList: true,
@@ -10712,12 +11243,14 @@
         return;
       }
     }
-    if (!hasUserScrollIntent()) return;
-    setStickToBottom(shouldStickToBottom(
-      messagesEl.scrollTop, messagesEl.scrollHeight, messagesEl.clientHeight,
-      currentStickThreshold(),
-    ));
-    updateScrollBtn();
+    if (hasUserScrollIntent()) {
+      setStickToBottom(shouldStickToBottom(
+        messagesEl.scrollTop, messagesEl.scrollHeight, messagesEl.clientHeight,
+        currentStickThreshold(),
+      ));
+      updateScrollBtn();
+    }
+    maybeLoadEarlierHistory();
   });
 
   scrollBottomBtn.onclick = () => {
@@ -10845,7 +11378,7 @@
   }
 
   function updatePermissionOptions(requestId, options) {
-    const cards = [...messagesEl.querySelectorAll(".card.permission")];
+    const cards = liveTranscriptQueryAll(".card.permission");
     const el = cards.find((card) =>
       card.dataset.permReqId === String(requestId) &&
       !card.classList.contains("perm-resolved") &&
@@ -10895,7 +11428,7 @@
 
     const { buttons, defaultIndex } =
       renderPermissionActions(el, req.id, el._permTitle, req.options);
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     el.querySelectorAll("pre").forEach((pre) => pre._syncOverflowAffordance?.());
     forceScrollToBottom();
     if (
@@ -10962,7 +11495,7 @@
 
     const { buttons, defaultIndex } =
       renderPermissionActions(el, req.id, cardTitle, req.options);
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     el.querySelectorAll("pre").forEach((pre) => pre._syncOverflowAffordance?.());
     forceScrollToBottom(); // a pending permission must be visible (#16)
 
@@ -11243,7 +11776,7 @@
     };
     el.appendChild(skip);
 
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     forceScrollToBottom(); // a pending question must be visible (#16)
   }
 
@@ -11348,7 +11881,7 @@
       block.appendChild(qText);
       el.appendChild(block);
     });
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     if (answerText) fillRestoredAnswer(el, answerText);
     scrollToBottom();
     return el;
@@ -11502,7 +12035,7 @@
     actions.appendChild(mk("Reject", "", "rejected", true));
     actions.appendChild(mk("Cancel", "secondary", "abandoned", true));
     el.appendChild(actions);
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     scrollToBottom();
   }
 
@@ -11556,7 +12089,7 @@
       el.appendChild(status);
     }
 
-    messagesEl.appendChild(el);
+    appendTranscriptChild(el);
     scrollToBottom();
   }
 
@@ -12709,7 +13242,7 @@
     }
     msg.appendChild(bubble);
     wrap.appendChild(msg);
-    messagesEl.appendChild(wrap); // (re)pin to the end of the conversation
+    appendTranscriptChild(wrap); // (re)pin to the end of the conversation
     scrollToBottom();
   }
 
@@ -12852,6 +13385,7 @@
           const tag = parent.tagName;
           if (tag === "SCRIPT" || tag === "STYLE") return REJECT;
           if (parent.closest("#welcome, .welcome")) return REJECT;
+          if (parent.closest("[" + PENDING_CLEAR_ATTR + "]")) return REJECT;
           if (parent.closest(FIND_SKIP_SEL)) return REJECT;
           return ACCEPT;
         },
@@ -12875,6 +13409,7 @@
       const tag = el.tagName;
       if (tag === "SCRIPT" || tag === "STYLE") continue;
       if (el.id === "welcome" || el.classList.contains("welcome")) continue;
+      if (el.getAttribute && el.getAttribute(PENDING_CLEAR_ATTR) === "1") continue;
       if (typeof el.matches === "function" && el.matches(FIND_SKIP_SEL)) continue;
       for (let i = el.childNodes.length - 1; i >= 0; i--) stack.push(el.childNodes[i]);
     }
@@ -13183,6 +13718,7 @@
       updateFindChrome();
       return;
     }
+    if (state.historyPrefix && state.historyPrefix.length) expandHistoryAll();
     const nodes = findCollectNodes();
     find.lastNodes = nodes;
     if (canNarrowFind(nodes, query)) {
@@ -13500,6 +14036,13 @@
     if (find.open) runFindSearchNow();
   };
 
+  window.__grokHistory = {
+    prefixRemaining: () => state.historyPrefixUserCount || 0,
+    prefixLength: () => (state.historyPrefix && state.historyPrefix.length) || 0,
+    expandMore: () => loadEarlierHistory(false),
+    expandAll: () => expandHistoryAll(),
+  };
+
   window.__grokFind = {
     open: openFind,
     close: closeFind,
@@ -13560,6 +14103,11 @@
   ]);
 
   function handleHostMessage(msg) {
+    if (!msg || typeof msg !== "object") return;
+    if (state.replayHold && msg.type !== "historyReplay" && REPLAY_HOLD_TYPES.has(msg.type)) {
+      state.replayHeld.push(msg);
+      return;
+    }
     switch (msg.type) {
       case "initialState":
         state.useCtrlEnter = msg.useCtrlEnter;
@@ -13799,24 +14347,43 @@
         // panel and replaying the whole conversation (which flashed the welcome
         // logo and re-rendered everything). The surviving messages are already
         // correct on screen — there is nothing to rebuild.
-        const users = [...messagesEl.querySelectorAll(".msg.user:not(.queued)")]
-          .filter((el) => el.dataset.steer !== "1");
-        const firstGone = users[msg.surviving];
-        if (firstGone) {
-          // Remove that message and every sibling after it — agent replies, tool
-          // groups, plan/permission cards, subagent rows all belong to the
-          // discarded turns.
-          while (messagesEl.lastElementChild && messagesEl.lastElementChild !== firstGone) {
-            messagesEl.removeChild(messagesEl.lastElementChild);
+        // A pending clearMessages is logically empty already; flush so
+        // lastElementChild is not a stale node we are about to drop.
+        flushPendingTranscriptClear();
+        const surviving = Math.max(0, Number(msg.surviving) || 0);
+        if (surviving < (state.historyPrefixUserCount || 0)) {
+          const trimmed = splitHistoryWindow(state.historyPrefix, (state.historyPrefixUserCount || 0) - surviving);
+          state.historyPrefix = trimmed.prefix;
+          state.historyPrefixUserCount = surviving;
+          state.historyPrefixPlans = (state.historyPrefixPlans || []).filter((p) =>
+            typeof p.afterUserMessage !== "number" || p.afterUserMessage <= surviving);
+          state.historyPrefixPermissions = (state.historyPrefixPermissions || []).filter((p) =>
+            typeof p.afterUserMessage !== "number" || p.afterUserMessage <= surviving);
+          for (const child of Array.from(messagesEl.children)) {
+            if (child.id === "welcome" || child.id === "history-head") continue;
+            child.remove();
           }
-          if (messagesEl.lastElementChild === firstGone) messagesEl.removeChild(firstGone);
+          syncHistoryHead();
+        } else {
+          const users = liveTranscriptQueryAll(".msg.user:not(.queued)")
+            .filter((el) => el.dataset.steer !== "1");
+          const firstGone = users.find((el) => Number(el.dataset.userBubbleIndex) === surviving) || users[surviving];
+          if (firstGone) {
+            // Remove that message and every sibling after it — agent replies, tool
+            // groups, plan/permission cards, subagent rows all belong to the
+            // discarded turns.
+            while (messagesEl.lastElementChild && messagesEl.lastElementChild !== firstGone) {
+              messagesEl.removeChild(messagesEl.lastElementChild);
+            }
+            if (messagesEl.lastElementChild === firstGone) messagesEl.removeChild(firstGone);
+          }
         }
         // Same surviving-user-turn count as the DOM filter above. Steer
         // interjections and hidden replayed user events do not consume a slot.
-        state.exportEvents = truncateExportEvents(state.exportEvents, msg.surviving);
+        state.exportEvents = truncateExportEvents(state.exportEvents, surviving);
         // Nothing streaming survives a truncation — drop the per-turn handles so
         // the next turn starts clean rather than appending into a removed node.
-        state.userMsgCount = msg.surviving;
+        state.userMsgCount = surviving;
         state.turnRating = 0;
         state.activeAgentEl = null;
         state.activeAgentRaw = "";
@@ -13829,13 +14396,13 @@
         // No completed-turn figure survives a rewind; when the whole transcript
         // is gone, neither does the session aggregate.
         state.lastTurnUsage = null;
-        if (msg.surviving === 0) state.sessionUsage = null;
+        if (surviving === 0) state.sessionUsage = null;
         if (!contextPopover.hidden) openContextPopover();
         hideGrokking();
         hideThinkingIndicator();
         // The newest surviving agent message ends a finished turn, so its
         // copy/timestamp footer belongs visible.
-        const agents = messagesEl.querySelectorAll(".msg.agent .msg-actions");
+        const agents = liveTranscriptQueryAll(".msg.agent .msg-actions");
         const lastFooter = agents[agents.length - 1];
         if (lastFooter) lastFooter.hidden = false;
         refreshUserRewindButtons();
@@ -13899,7 +14466,7 @@
         if (!msg.info.provider || msg.info.provider === "grok") state.cliVersion = msg.info.version || "";
         state.startingPhase = true;
         state.onboardingMode = null;
-        setWelcomeStatus("Starting", true);
+        if (!welcomeHoldActive()) setWelcomeStatus("Starting", true);
         const onb = $("welcome-onboarding");
         if (onb) onb.innerHTML = "";
         updateSendButton();
@@ -13909,7 +14476,7 @@
         // One-time hint while the silent `grok update` runs before the session
         // spawns; overwritten by Starting once grok connects, then Connected
         // once session startup finishes.
-        setWelcomeStatus("Updating Grok Build CLI", true);
+        if (!welcomeHoldActive()) setWelcomeStatus("Updating Grok Build CLI", true);
         break;
       }
       case "session": {
@@ -13933,7 +14500,8 @@
         break;
       }
       case "sessionName": {
-        state.sessionName = {
+        const prev = state.sessionName;
+        const next = {
           sessionId: msg.sessionId,
           name: String(msg.name || "New session"),
           cwd: String(msg.cwd || ""),
@@ -13942,6 +14510,12 @@
           // still has a fallback rather than depending on this.
           repoCwd: typeof msg.repoCwd === "string" ? msg.repoCwd : "",
         };
+        const sameId = !!(prev && prev.sessionId === next.sessionId);
+        const sameVisible = !!(sameId
+          && prev.name === next.name
+          && prev.cwd === next.cwd
+          && (prev.repoCwd || "") === (next.repoCwd || ""));
+        state.sessionName = next;
         // Host-confirmed identity only. Optimistic rail clicks never write here.
         state.activeSessionId = msg.sessionId;
         // May complete a resume (id match) or bind a new-session resolved id.
@@ -13949,8 +14523,20 @@
         // AFTER the note: a surviving transition means this frame was about a
         // different conversation. See noteHostIdentityKnown.
         noteHostIdentityKnown(msg.sessionId);
-        renderSessionName();
-        renderSessionHead();
+        // Same conversation coming back: do not rebuild the header. Different
+        // at all: paint immediately. A held resync that turns out to be a
+        // swap still lands the caret in the composer and pins like a fresh open.
+        if (!sameVisible) {
+          renderSessionName();
+          renderSessionHead();
+        }
+        pendingSessionChromeReset = false;
+        if (prev && !sameId) {
+          focusComposerIfAllowed();
+          setStickToBottom(true);
+          updateScrollBtn();
+          scrollToBottom();
+        }
         break;
       }
       case "modelChanged": {
@@ -14198,6 +14784,8 @@
             state.suppressReplayTurn = false; // fresh outer replay starts unsuppressed
             state.skipUserBubble = false;
             state.repoSwitchPending = true;
+            state.replayHold = true;
+            state.replayHeld = [];
             setConversationLoading(true);
             renderRepoChip();
           }
@@ -14205,10 +14793,16 @@
           state.replaying = true;
         } else {
           if (state.replayDepth === 0) break;
-          const inFlightSpeech = state.busy ? state.activeAgentRaw : "";
-          commitAgentTurn(); // finalize the last turn while still flagged as replay
           state.replayDepth -= 1;
           if (state.replayDepth > 0) break;
+          if (state.replayHold) {
+            state.replayHold = false;
+            const held = state.replayHeld;
+            state.replayHeld = [];
+            applyHistoryWindow(held);
+          }
+          const inFlightSpeech = state.busy ? state.activeAgentRaw : "";
+          commitAgentTurn(); // finalize the last turn while still flagged as replay
           state.replaying = false;
           state.repoSwitchPending = false;
           // historyReplay is never identity confirmation. If a rail click is
@@ -14216,6 +14810,11 @@
           // the highlight and the load indicator stay paired.
           if (!state.railTransition) setConversationLoading(false);
           else setConversationLoading(true);
+          // A RAF flush during the replay was skipped so the conversation
+          // stayed put. Empty replay: nothing replaced it, so the welcome
+          // belongs now. A replacement already dropped the pending flag.
+          if (pendingTranscriptClear) flushPendingTranscriptClear();
+          takeDesktopLaunchComposerFocus();
           renderRepoChip();
           // A remote snapshot can end while its latest turn is still running.
           // Seed the already-rendered prefix only in that case, so the eventual
@@ -14243,9 +14842,13 @@
           // Remote reconnect/cold-load delivers only a recent window. Label
           // the export so it cannot be read as the whole transcript.
           if (IS_REMOTE) state.exportWindowed = true;
-          // One layout after the whole transcript is in the DOM — not one per
-          // replayed row. Live streaming keeps using scrollToBottom per chunk.
-          forceScrollToBottom();
+          // Follow the pin. Do not re-pin: a reader (or a cache restore) who
+          // is not at the bottom must stay put. A pinned reader still lands
+          // at the bottom so new messages stay visible. Fresh open / empty
+          // flush pin in resetSessionChrome; a swap pins when sessionName
+          // names a different id. Skip while the wrapper is restoring
+          // identity — that class means a place is already owned.
+          if (!identityRestoring()) scrollToBottom();
           onFindTranscriptSettled();
         }
         break;
@@ -14489,7 +15092,7 @@
         // Replayed (on re-focus) right after the buffered permissionRequest, or
         // live right after the user answers — collapse the matching card if it's
         // still active. Idempotent: a live click already collapsed it.
-        const cards = [...messagesEl.querySelectorAll(".card.permission")];
+        const cards = liveTranscriptQueryAll(".card.permission");
         const el = cards.find((c) =>
           c.dataset.permReqId === String(msg.requestId) &&
           !c.classList.contains("perm-resolved") &&
@@ -14508,7 +15111,7 @@
         // Replayed (on re-focus) right after the buffered exitPlanRequest, or
         // live right after the user's verdict — collapse the matching card if
         // it's still actionable. Idempotent: a live click already collapsed it.
-        const cards = [...messagesEl.querySelectorAll(".card.plan")];
+        const cards = liveTranscriptQueryAll(".card.plan");
         const el = cards.find((c) => c.dataset.planReqId === String(msg.requestId) && !c.classList.contains("resolved"));
         if (el) resolvePlanCardEl(el, msg.verdict);
         break;
@@ -14793,7 +15396,7 @@
       case "feedbackAvailability":
         state.feedbackAvailable = msg.available === true;
         if (!state.feedbackAvailable) {
-          for (const actions of messagesEl.querySelectorAll(".msg.agent .msg-actions")) {
+          for (const actions of liveTranscriptQueryAll(".msg.agent .msg-actions")) {
             delete actions.dataset.feedbackPending;
           }
         }
@@ -14828,7 +15431,7 @@
           if (state.startingPhase) {
             state.startingPhase = false;
             const ver = state.cliVersion ? ` · v${state.cliVersion}` : "";
-            setWelcomeStatus(`Connected${ver}`, false); // settled — no spinner
+            if (!welcomeHoldActive()) setWelcomeStatus(`Connected${ver}`, false); // settled — no spinner
           }
         }
         // Refresh the gear popover's model/effort lock state if it's open.
@@ -14841,7 +15444,7 @@
         si.className = "session-context-banner";
         si.textContent = "Summarizing";
         si.insertAdjacentHTML("beforeend", BLINK_DOTS);
-        messagesEl.appendChild(si);
+        appendTranscriptChild(si);
         scrollToBottom();
         break;
       }
@@ -15196,7 +15799,7 @@
       ensureActivityIndicator();
       // Queued blocks live at the END of the conversation — re-pin them under
       // freshly streamed content.
-      if (state.sendQueue.length && state.queuedWrapEl) messagesEl.appendChild(state.queuedWrapEl);
+      if (state.sendQueue.length && state.queuedWrapEl) appendTranscriptChild(state.queuedWrapEl);
     }
     if (find.open && (
       TURN_PROGRESS_MSGS.has(msg.type) ||
@@ -15208,7 +15811,7 @@
       // finishFindSearch does not scroll, so the current match stays put.
       scheduleFindSearch();
     }
-    if (shouldRecordExportEvent(msg)) {
+    if (!state.historyHydrating && shouldRecordExportEvent(msg)) {
       state.exportEvents.push(msg);
     }
   }
@@ -15639,6 +16242,7 @@
       e.stopPropagation();
       if (msgRewindBtn.hidden) return;
       const msgEl = msgRewindBtn.closest(".msg.user");
+      if (isPendingClearNode(msgEl)) return;
       const idx = msgEl ? Number(msgEl.dataset.userBubbleIndex) : NaN;
       if (!Number.isInteger(idx) || idx < 0) return;
       // Send the text too: rewind discards this message, so the host hands it
@@ -15660,6 +16264,7 @@
       // host would only refuse. Say so here rather than round-trip for a warning.
       if (state.busy) return;
       const msgEl = msgEditBtn.closest(".msg.user");
+      if (isPendingClearNode(msgEl)) return;
       const idx = msgEl ? Number(msgEl.dataset.userBubbleIndex) : NaN;
       if (!Number.isInteger(idx) || idx < 0) return;
       // `_copyText` is the bubble's own words with the context envelope,
@@ -15945,15 +16550,20 @@
   // blinking in the box before the first click (matches Claude Code / Codex).
   // The webview is rebuilt on every re-show (no retainContextWhenHidden), so
   // the boot-time focus covers "reopened" too; the window-focus hook covers
-  // clicking back into a panel that stayed alive. Only claim focus when it
-  // landed on <body> (i.e. nowhere) — a click that focused a real control
-  // (history button, popover row) keeps it.
+  // clicking back into a panel that stayed alive.
+  // Desktop launch always claims the composer on the first focused-window
+  // event (Chromium otherwise lands on the first tabbable — rail search /
+  // history). Later window-focus only claims when it landed on <body> — a
+  // click that focused a real control keeps it, and a reconnect/resync must
+  // not steal. VS Code never takes this launch shot: focus belongs to the
+  // editor the user was already in.
   // applyChatZoom first: a stored desktop/remote scale must be on the body
   // before focus, or the first layout is at 1 and focus scrolls the overflow.
   // preventScroll: a taller-than-window first frame must not stick html.
   applyChatZoom();
   wireClientFontScaleShortcuts();
   window.addEventListener("focus", () => {
+    if (takeDesktopLaunchComposerFocus()) return;
     const el = document.activeElement;
     if (!el || el === document.body) input.focus({ preventScroll: true });
   });

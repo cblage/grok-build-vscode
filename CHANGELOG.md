@@ -1,10 +1,10 @@
 # Changelog
 
-## 3.13.2-sandbox.1 — 2026-08-20
+## 3.14.1-sandbox.1 — 2026-08-22
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.13.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.14.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,22 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 3.14.0 — 2026-08-21
+
+### Added
+
+- **Three more connectors, and connectors that take a key.** **GitHub**, **Calendly** and **Airtable** join Settings → Connectors. GitHub is the first that authorises with a personal access token you paste on the row itself (fine-grained recommended) rather than a browser round trip — the token goes to the platform secret store, never into `grok.mcpConnectors` and never into a settings file you might share. Connecting it in one editor now takes effect in the others instead of disconnecting them.
+- **A long conversation opens in a fifth of a second ([#102](https://github.com/phuryn/grok-build-vscode/issues/102)).** Opening a conversation with hundreds of turns took the better part of a minute and left the panel unusable while it worked. It now renders the most recent turns first and fills in the rest as you scroll back: 46 seconds became 191 milliseconds on the conversation that prompted the report, and resizing the panel went from a quarter of a second to ten milliseconds.
+
+### Fixed
+
+- **A reconnect feels like nothing happened.** Switching apps on a phone, locking the screen, or losing signal all drop the socket, and the reconnect used to be loud: the conversation was torn down before its replacement existed, the welcome screen flashed over a chat that was still coming back, the title blanked, the composer stole focus, and "Starting" appeared over a conversation that was merely being restored. The conversation now stays on screen throughout, and the panel says *Restoring conversation* rather than pretending to start a new one.
+- **Your place in the conversation survives a reconnect.** A reader scrolled up was yanked back to the bottom when the transcript was replayed — twice over, and from more than one direction. If you had scrolled up you stay where you were; if you were at the bottom you keep following, as before.
+- **A conversation name is a name, not the prompt that started it.** Whole first prompts were being stored as the conversation's automatic name — one had grown to 27,813 characters — which bloated the stored session index and slowed every read of it. Names are capped, and existing oversized ones are trimmed on load: the index on the machine that surfaced this went from 4.4 MB to 1.4 MB.
+- **File-panel row actions stop sticking.** After clicking a row, its actions stayed visible and highlighted once the pointer had moved away.
+- **The desktop app focuses the composer when it opens**, so you can type straight away.
+- **Plan and permission cards stay with their turn** when a long conversation fills in earlier history, instead of draining to the wrong place.
 
 ## 3.13.1 — 2026-08-20
 

@@ -140,7 +140,7 @@ The desktop has no Codex-path settings row. Its JSON config store still reads
 `grok.codexCliPath`, and VS Code keeps the contributed setting, so file/settings
 overrides continue to participate in discovery without renderer plumbing.
 
-Settings live in one shared surface ([media/settings.js](../media/settings.js)): a view over existing prefs and actions, plus the voice send-phrase / dictionary setters (`setVoiceSendPhrase` / `setVoiceKeyterms`, classified `propose` so a phone can edit them). Desktop and the remote browser open it as a full-window overlay from gear → **Settings**. The overlay traps Tab, marks covered siblings `inert`, and restores the opener on Escape or the top-left **← Back to app** link (above search; inside the trap). VS Code opens the same component in an editor-area webview tab (`grok.settings`, also a view/title gear on `grok.chat`) and has no Back link — the tab closes natively. Categories are General (purpose + chat display + telemetry), Voice, Notifications, Providers, Connectors, Account, Advanced, About — each nav row is icon + label. Connectors has three sections: On this computer is the host-owned Tier-1 list passed through ACP `session/new` `mcpServers` (connect/disconnect are desk-only because OAuth writes `~/.mcp-auth` on the machine); Grok.com connectors is the account-level grok inventory (`scopeName` is the team name; Open grok.com in the section header); Local Grok connectors are user-level config-file servers (header Open on the desk even when empty; a sentence on remote). Host-injected echoes are omitted from Local. Project-file servers are omitted at read time against the workspace that list was read from; the stored global-only view is rendered anywhere. Origin tags are gone. Live `_x.ai/mcp/*` notifications update health without polling. About is last and is the only place the non-affiliation disclaimer appears. Restore defaults only resets toggles/selects/sliders (`restoreChanges` — never free-text or list inputs such as the send phrase or dictionary), hides the button when nothing on the page would change, and expands an in-surface confirm that lists the rows and target values before acting. The tab snapshots on open and posts the same `set*` / `open*` messages, so a change cannot be lost or desync the sidebar. Host-local Advanced rows stay hidden on remote; Providers, Connectors, and Account render as read-only desk connection state plus a device-manager link. Connectors on a remote keeps the desk-owned catalog read-only, the live Grok inventory (page fields only — `transformHostMsgForRemote` strips launch recipes), a grok.com Open in the grok.com header, and a sentence that local config files are managed on the desk. Telemetry is a desktop toggle, a VS Code settings-opener, and a remote read-only row using the privacy.md claims.
+Settings live in one shared surface ([media/settings.js](../media/settings.js)): a view over existing prefs and actions, plus the voice send-phrase / dictionary setters (`setVoiceSendPhrase` / `setVoiceKeyterms`, classified `propose` so a phone can edit them). Desktop and the remote browser open it as a full-window overlay from gear → **Settings**. The overlay traps Tab, marks covered siblings `inert`, and restores the opener on Escape or the top-left **← Back to app** link (above search; inside the trap). VS Code opens the same component in an editor-area webview tab (`grok.settings`, also a view/title gear on `grok.chat`) and has no Back link — the tab closes natively. Categories are General (purpose + chat display + telemetry), Voice, Notifications, Providers, Connectors, Account, Advanced, About — each nav row is icon + label. Connectors has three sections: On this computer is the host-owned Tier-1 list passed through ACP `session/new` `mcpServers` (connect/disconnect are desk-only: OAuth writes `~/.mcp-auth` on the machine; GitHub pastes a PAT into `HostSecrets` and a remote cannot set, read, or clear it); Grok.com connectors is the account-level grok inventory (`scopeName` is the team name; Open grok.com in the section header); Local Grok connectors are user-level config-file servers (header Open on the desk even when empty; a sentence on remote). Host-injected echoes are omitted from Local. Project-file servers are omitted at read time against the workspace that list was read from; the stored global-only view is rendered anywhere. Origin tags are gone. Live `_x.ai/mcp/*` notifications update health without polling. About is last and is the only place the non-affiliation disclaimer appears. Restore defaults only resets toggles/selects/sliders (`restoreChanges` — never free-text or list inputs such as the send phrase or dictionary), hides the button when nothing on the page would change, and expands an in-surface confirm that lists the rows and target values before acting. The tab snapshots on open and posts the same `set*` / `open*` messages, so a change cannot be lost or desync the sidebar. Host-local Advanced rows stay hidden on remote; Providers, Connectors, and Account render as read-only desk connection state plus a device-manager link. Connectors on a remote keeps the desk-owned catalog read-only, the live Grok inventory (page fields only — `transformHostMsgForRemote` strips launch recipes), a grok.com Open in the grok.com header, and a sentence that local config files are managed on the desk. Telemetry is a desktop toggle, a VS Code settings-opener, and a remote read-only row using the privacy.md claims.
 
 The `postMessage` half (host↔webview) is a **typed contract**: [src/protocol.ts](../src/protocol.ts)
 is the single source of truth — `HostMsg` (host→webview) and `WebviewMsg` (webview→host)
@@ -232,6 +232,18 @@ every live `Session` (`pool`). The point is **lossless re-focus**: a backgrounde
 session keeps streaming into its own *view buffer* (every webview post that built
 its chat, in order), so re-focusing it is a `clearMessages` + replay of that
 buffer — no backend reload, no process kill, even mid-turn or mid-approval.
+The webview defers destroying those nodes until the first replacement append
+(`appendTranscriptChild`) or the next animation frame (`flushPendingTranscriptClear`).
+`body.identity-restoring` suspends that next-frame flush until the class lifts,
+and only then reveals the welcome if nothing replaced the nodes. The welcome
+stays hidden (`welcomeHoldActive`: a painted conversation, not a `clearMessages`
+mark; also `body.identity-restoring` on a cold restore of a remembered
+conversation, which must hide the welcome because it starts visible;
+`pendingWelcomeReveal`) and the title / composer
+focus / reader's pin (`pendingSessionChromeReset`) until that same moment. Desktop launch still
+takes composer focus once (`takeDesktopLaunchComposerFocus`) so a restored
+conversation is ready to type into; a later resync of an already-open surface
+does not, and VS Code never takes this shot.
 
 Switching focus (`focusSession`) never touches the backend: it swaps `this.focused`,
 replays the target's buffer to the webview, and re-pushes the mode/sessions UI.
@@ -590,6 +602,13 @@ different logical tab remains blocked. Ownerless live pool members and unreserve
 history remain deletable. This prevents an owner
 from retaining a rendered transcript after its backing process and disk session have
 been destroyed.
+
+Loading a conversation renders only its most recent turns and keeps the earlier
+prefix unrendered, so a long history opens immediately instead of building every
+turn up front; scrolling to the top hydrates the next chunk in place, with plan
+and permission cards partitioned to the chunk that owns their turn. Remote
+clients never reach that path - `bracketRemoteSnapshot` already caps a remote
+snapshot at the last ten user messages, so there is no prefix to page through.
 
 Relay IDs change after a network reconnect, so `media/chat.js` persists both the logical
 tab token and `{repoCwd, id, cwd}` in device-scoped `sessionStorage`. Its `ready` binds
