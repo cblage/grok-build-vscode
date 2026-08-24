@@ -179,6 +179,65 @@ describe("MCP remote inventory projection", () => {
     ]));
   });
 
+  it("clears a stale error when a later status reports no failure", () => {
+    // Nothing ever cleared `error`, so a server that failed once carried the
+    // text for the life of the session. Both renderers short-circuit on it, so
+    // a recovered server stayed red at the desk — and once the projection
+    // started translating a failure into `unavailable` for the phone, it
+    // stayed red there too. The error belongs to the event that reported it.
+    const failed = mergeMcpNotification(
+      [{ name: "linear", enabled: true }],
+      "_x.ai/mcp/init_progress",
+      { name: "linear", status: "unavailable", detail: "connection refused" },
+    );
+    expect(failed[0].error).toBe("connection refused");
+
+    const recovered = mergeMcpNotification(
+      failed,
+      "_x.ai/mcp/init_progress",
+      { name: "linear", status: "ready" },
+    );
+    expect(recovered[0].status).toBe("ready");
+    expect(recovered[0].error).toBeUndefined();
+    // And the phone sees the recovery rather than a frozen failure.
+    expect(projectMcpServerForRemote(recovered[0]).status).toBe("ready");
+  });
+
+  it("keeps a fresh failure, and does not let a status-only note erase it", () => {
+    const failed = mergeMcpNotification(
+      [{ name: "linear", enabled: true }],
+      "_x.ai/mcp/init_progress",
+      { name: "linear", status: "unavailable", detail: "connection refused" },
+    );
+    // A notification carrying neither status nor error changes neither.
+    const noise = mergeMcpNotification(failed, "_x.ai/mcp/init_progress", { name: "linear" });
+    expect(noise[0].error).toBe("connection refused");
+    expect(projectMcpServerForRemote(noise[0]).status).toBe("unavailable");
+  });
+
+  it("keeps a failure visible to a remote after the error text is stripped", () => {
+    // `status` and `error` arrive from the CLI as INDEPENDENT optionals, so a
+    // server can carry an error and no status at all. Dropping the error text
+    // (right — it can quote a launch recipe) then left the row with nothing
+    // negative on it, and the settings dot treats "enabled, no status, no
+    // error" as ready: green on the phone, red at the desk, for the same
+    // broken server. The fact of the failure has to survive; only the words
+    // are secret.
+    const remote = projectMcpServerForRemote({
+      name: "linear", enabled: true, source: "local", error: "spawn /usr/local/bin/linear-mcp --key sk-live-abc failed",
+    } as never);
+    expect(remote.status).toBe("unavailable");
+    expect(remote).not.toHaveProperty("error");
+    assertNoMcpLaunchLeak(remote);
+  });
+
+  it("lets a reported failure override a stale ready status", () => {
+    const remote = projectMcpServerForRemote({
+      name: "linear", enabled: true, status: "ready", error: "connection refused",
+    } as never);
+    expect(remote.status).toBe("unavailable");
+  });
+
   it("strips the reproduction leak and any extra key a future parser might add", () => {
     const [desk] = parseMcpListResponse({ servers: [leakyMcpWireServer()] });
     const before = JSON.stringify(desk);

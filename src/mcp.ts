@@ -172,6 +172,16 @@ export function projectMcpServerForRemote(server: McpServerView): McpServerRemot
     const value = server[key];
     if (value !== undefined) Object.assign(out, { [key]: value });
   }
+  // What must not cross is the error TEXT — it can quote a launch recipe. The
+  // FACT of the failure has to, or the remote reads better news than the desk:
+  // `status` and `error` arrive from the CLI as independent optionals, so a
+  // server can carry an error and no status at all, and dropping the error
+  // alone leaves the row with nothing negative left to render. It then paints
+  // green on the phone while the same server is red at the desk. Collapsing it
+  // to `unavailable` here reproduces exactly what the desk shows, and keeps
+  // the judgement in the projection — the one place desk truth becomes remote
+  // truth — rather than asking every renderer to remember this.
+  if (server.error) out.status = "unavailable";
   return { name: server.name, enabled: server.enabled, ...out };
 }
 
@@ -321,6 +331,16 @@ export function mergeMcpNotification(
     ...(typeof payload.enabled === "boolean" ? { enabled: payload.enabled } : {}),
     ...(Array.isArray(payload.tools) ? { tools: parseTools(payload.tools), toolCount: payload.tools.length } : {}),
   };
+  // An error belongs to the event that reported it. A later notification that
+  // states a status and reports no error supersedes it, so the old text must
+  // not survive into the new state — nothing else ever cleared it, and a
+  // server that failed once kept its error for the life of the session. Both
+  // renderers short-circuit on `error`, so a recovered server stayed red at
+  // the desk, and once a failure is projected to the phone as `unavailable`
+  // it stayed red there too. If the fresh status is itself a failure it still
+  // renders as one; it just does it on the current status rather than on a
+  // sentence about something that has already stopped being true.
+  if (status && !error) update.error = undefined;
   if (existing) return current.map((server) => server === existing ? { ...server, ...update } : server);
   return [...current, { name, enabled: true, ...update }].sort((a, b) => (a.displayName || a.name).localeCompare(b.displayName || b.name));
 }
