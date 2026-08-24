@@ -45,6 +45,20 @@ import {
   type ProviderModelInfo,
   type ProviderHistoryCursor,
 } from "./provider-ui";
+import {
+  ROUTINES_KEY,
+  routineWindow,
+  toRoutineView,
+  validateRoutine,
+  manualWindowKey,
+  routineSessionName,
+  type Routine,
+  type RoutineModelOption,
+  type RoutineProjectOption,
+  type RoutineRun,
+} from "./routines";
+import { RoutineRunStore } from "./routine-store";
+import { routinesMessageForRemote } from "./remote-policy";
 import { PersistedState } from "./persisted-state";
 import {
   Session,
@@ -784,6 +798,11 @@ export class GrokSidebar {
   private static readonly DEVICE_GLOBAL_REMOTE_TYPES = new Set<HostMsg["type"]>([
     "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "cliUpdating",
     "onboarding", "providerState", "mcpServers", "mcpConnectors", "expandCommandOutputs", "steerByDefault", "soundNotifications",
+    // Device-global, not session-scoped: a phone reading conversation B asked
+    // for the routines page and must get it, even though the desk is focused on
+    // conversation A. Without this, `post` routes the answer through the
+    // FOCUSED session and the requesting tab stays empty for ever.
+    "routines",
     "telemetryEnabled",
     "thumbsFeedback",
   ]);
@@ -820,6 +839,15 @@ export class GrokSidebar {
   private static readonly SETTINGS_PANEL_TYPES = new Set<WebviewMsg["type"]>([
     "openSettingsSurface",
     "closeSettingsSurface",
+    // The standalone VS Code Settings tab is a first-class surface for this
+    // page — it loads settings.js and nothing else. Without these five it
+    // posts `listRoutines`, gets "[settings] ignored", and shows an empty
+    // Routines page with no projects, no models and no way to create one.
+    "listRoutines",
+    "saveRoutine",
+    "deleteRoutine",
+    "setRoutinePaused",
+    "runRoutineNow",
     "setShowThinking",
     "setAppPurpose",
     "setExpandCommandOutputs",
@@ -921,6 +949,15 @@ export class GrokSidebar {
    *  still lands in `globalState`; see persisted-state.ts. */
   private readonly state: PersistedState;
 
+  /** Run records, and the exclusive-create claim that makes a due run happen
+   *  exactly once across every host sharing this `~/.grok`. */
+  private readonly routineRuns: RoutineRunStore;
+  private routineTimer?: ReturnType<typeof setInterval>;
+  /** Routines whose session is live right now, so a slow turn cannot be
+   *  overlapped by the next tick even though its window is still current. */
+  private readonly routinesInFlight = new Set<string>();
+  private routineError?: { id?: string; message: string };
+
   constructor(
     private context: HostContext,
     /** Effectful host surface — VS Code supplies createVsCodeHost; a desktop app injects its own. */
@@ -950,8 +987,302 @@ export class GrokSidebar {
     // default "auto" resolution and diverge from a configured `cmd` pref.
     this.applyTerminalShellPref();
     this.mcpConnectorKeysReady = this.loadMcpConnectorKeys();
+    this.routineRuns = new RoutineRunStore({
+      dir: `${path.join(resolveGrokHome(process.env), "client-state").replace(/\\/g, "/")}/routine-runs`,
+      fs,
+      log: (line) => this.host.appendLine(line),
+    });
     void this.sweepImageStaging();
     void this.sweepFileStaging();
+    this.startRoutineScheduler();
+  }
+
+  /* ------------------------------------------------------------ routines */
+
+  /**
+   * A record map keyed by id, NOT an array — twice over.
+   *
+   * `PersistedState.validValue` accepts a string or a record map and nothing
+   * else, so an array is rejected on load AND on the globalState shadow read:
+   * every routine would vanish on the next restart. And the write path is a
+   * three-way `mergeRecord` against the disk snapshot, which is what lets two
+   * hosts each add a routine without clobbering each other. An array would have
+   * broken that too, silently, and only for people running two editors.
+   */
+  private loadRoutines(): Routine[] {
+    const raw = this.state.get<Record<string, Routine>>(ROUTINES_KEY, {});
+    return Object.values(raw || {})
+      .filter((r) => r && typeof r.id === "string" && typeof r.cwd === "string")
+      .sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  private async saveRoutines(routines: readonly Routine[]): Promise<void> {
+    const map: Record<string, Routine> = {};
+    for (const routine of routines) map[routine.id] = routine;
+    await this.state.update(ROUTINES_KEY, map);
+  }
+
+  /**
+   * One tick for every routine.
+   *
+   * Deliberately NOT aligned to any particular boundary: the schedule lives in
+   * the window key, so the tick only has to be finer than the smallest cadence
+   * (15 minutes). A minute is comfortably that, and costs one `routineWindow`
+   * call plus at most one `EEXIST` per routine.
+   */
+  private startRoutineScheduler(): void {
+    // Sweep first: a record left `running` belonged to a host that died
+    // mid-run, and must not sit in the strip pretending to be live.
+    const now = Date.now();
+    for (const routine of this.loadRoutines()) this.routineRuns.sweepInterrupted(routine.id, now);
+
+    this.routineTimer = setInterval(() => void this.tickRoutines(), 60_000);
+    // `unref` so a pending tick never holds the process open — the desktop app
+    // quitting with all its windows is the normal end of a session, not
+    // something to delay by up to a minute.
+    this.routineTimer.unref?.();
+  }
+
+  private async tickRoutines(): Promise<void> {
+    const now = Date.now();
+    for (const routine of this.loadRoutines()) {
+      if (routine.paused) continue;
+      if (this.routinesInFlight.has(routine.id)) continue;
+      const { key } = routineWindow(routine, now);
+      if (!key) continue;
+      // The claim IS the mutual exclusion. Losing it is the normal outcome for
+      // every host that did not win, and for this host on every later tick
+      // inside the same window.
+      const claimed = this.routineRuns.claim(routine.id, key, {
+        routineId: routine.id,
+        windowKey: key,
+        startedAt: now,
+        outcome: "running",
+      });
+      if (!claimed) continue;
+      await this.runRoutine(routine, key, now);
+    }
+  }
+
+  /**
+   * Fire one routine: open a background session in its project and send its
+   * prompt. Never focuses — a routine that steals the desk while you are typing
+   * is worse than one that does not run.
+   */
+  private async runRoutine(routine: Routine, windowKey: string, startedAt: number): Promise<void> {
+    this.routinesInFlight.add(routine.id);
+    const finish = (outcome: RoutineRun["outcome"], extra: Partial<RoutineRun> = {}): void => {
+      this.routineRuns.finish({
+        routineId: routine.id,
+        windowKey,
+        startedAt,
+        endedAt: Date.now(),
+        outcome,
+        cwd: routine.cwd,
+        ...extra,
+      });
+      this.routineRuns.prune(routine.id);
+      this.routinesInFlight.delete(routine.id);
+      this.postRoutines();
+    };
+
+    // The model gate, and the reason a skip is a first-class outcome rather
+    // than a failure: "Claude was not connected at 06:00" is a fact about the
+    // machine, and the strip should say so plainly.
+    // Gate on the PROVIDER, never on an exact model.
+    //
+    // The model list is a picker concern and its contents move: a provider with
+    // an empty cache contributes one "<Provider> default" row carrying an empty
+    // modelId, and once discovery populates the cache it contributes concrete
+    // models instead. Matching a saved routine against that list meant a
+    // routine created on a fresh host ran ONCE — populating the cache as it went
+    // — and then skipped every later firing, reporting "was not connected" about
+    // a provider that was connected the whole time.
+    //
+    // What actually decides whether a run can happen is whether the provider is
+    // usable. The model is a preference, applied below and harmless if it no
+    // longer exists.
+    //
+    // A review asked for the exact gate back for CONCRETE models, so that a
+    // routine pinned to a retired model skips rather than running on the
+    // agent's default. Declined, deliberately, and this note exists so it is
+    // not re-litigated every round. The two failure modes are not symmetric:
+    // the exact gate skips FOREVER and blames a provider that is connected,
+    // triggered by an ordinary cache refresh; the provider gate produces one
+    // run on a slightly different model, triggered only when a vendor retires
+    // a model the user pinned. Interactive sessions fall back the same way when
+    // that happens, so this is the product behaving consistently rather than an
+    // exception. A routine that quietly stops for months is the failure a user
+    // actually notices, and only after it has cost them something.
+    if (!this.usableProviders().includes(routine.provider)) {
+      finish("skipped", { detail: `Skipped — ${providerDisplayName(routine.provider)} was not connected` });
+      return;
+    }
+    if (!this.resolveLocalRepoTarget(routine.cwd)) {
+      finish("skipped", { detail: "Skipped — the project is no longer available" });
+      return;
+    }
+
+    try {
+      const session = this.newLocalSession();
+      this.pool.add(session);
+      this.setSessionCwd(session, routine.cwd, this.workspaceRoot());
+      session.provider = routine.provider;
+      const client = await this.startSession(undefined, session);
+      if (!client) {
+        finish("failed", { detail: "Failed — the agent could not start" });
+        return;
+      }
+      // Empty means "this agent's default" — the session already has it, and
+      // asking to switch TO nothing is not a request the picker can serve.
+      if (routine.model) await this.switchModel(routine.model, session, undefined, routine.provider);
+      // Recorded BEFORE the turn: the session exists and is the run's result
+      // even if the prompt errors, and a link to a half-finished conversation
+      // beats a run with nothing to open.
+      const sessionId = session.client?.sessionId;
+      this.routineRuns.finish({
+        routineId: routine.id,
+        windowKey,
+        startedAt,
+        outcome: "running",
+        cwd: routine.cwd,
+        ...(sessionId ? { sessionId } : {}),
+      });
+      // Name it before the turn, not after. A run that errors or is interrupted
+      // still leaves a session in the rail, and an untitled one is the hardest
+      // to account for — "why is this here" is exactly the question the tag
+      // answers.
+      if (sessionId) {
+        const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+        await this.state.update(SESSION_META_KEY, {
+          ...overrides,
+          [sessionId]: {
+            ...(overrides[sessionId] ?? {}),
+            customName: routineSessionName(routine.title),
+          },
+        });
+        this.sessionCache.delete(sessionId);
+        this.postSessionName(session);
+      }
+      this.postRepoCatalog();
+      this.postSessionsList();
+      this.postRoutines();
+
+      await this.handleSend(routine.prompt, false, session, "local");
+      // `handleSend` CATCHES a failed turn — it renders the error and resolves
+      // normally — so awaiting it says nothing about whether the turn worked.
+      // Reporting every one of those as a success would put a green tick on the
+      // strip for a rate-limited run, which is precisely the lie this page
+      // exists to prevent.
+      const failed = session.status === "error";
+      // Re-read rather than reusing the id captured above: a session that had
+      // to restart mid-start carries a different id by now, and the run must
+      // link to the conversation that actually holds the answer.
+      finish(failed ? "failed" : "ran", {
+        cwd: routine.cwd,
+        ...(session.client?.sessionId ? { sessionId: session.client.sessionId } : {}),
+        ...(failed ? { detail: "Failed — the turn ended in an error" } : {}),
+      });
+    } catch (e) {
+      finish("failed", { detail: `Failed — ${(e as Error).message}` });
+    }
+  }
+
+  /** Connected models, in the shape the Routines form needs. */
+  private routineModelOptions(): RoutineModelOption[] {
+    // `usableProviders`, not merely connected: a provider that cannot answer
+    // must not be offerable, or a routine saves against a model that will skip
+    // every time it fires.
+    // Keep the `defaultImplied` rows, which carry an EMPTY modelId on purpose:
+    // a provider whose model list has not been fetched yet still contributes
+    // "<Provider> default", meaning "whatever that agent picks". Filtering on a
+    // non-empty modelId dropped every one of them, so a fresh desktop — where
+    // nothing has opened the model picker and the cache is empty — offered no
+    // models at all and read as "nothing is connected". An empty model is a
+    // valid routine: it means the same as not choosing one in the composer.
+    const cache = this.state.get<ProviderModelCache>(PROVIDER_MODEL_CACHE_KEY, {});
+    const providers = this.usableProviders();
+    const out: RoutineModelOption[] = [];
+    for (const provider of providers) {
+      // Offered ALWAYS, not only while the cache is empty. "Use this agent's
+      // default" is a real choice a routine can hold for months, so it has to
+      // survive model discovery — otherwise editing such a routine finds no
+      // matching option and silently re-points it at a concrete model.
+      out.push({ provider, model: "", label: `${providerDisplayName(provider)} default` });
+    }
+    for (const m of modelsForConnectedProviders(providers, cache)) {
+      if (!m.modelId) continue; // the sentinel, already emitted above
+      out.push({ provider: m.provider, model: m.modelId, label: m.name || m.modelId });
+    }
+    return out;
+  }
+
+  private routineProjectOptions(): RoutineProjectOption[] {
+    // Archived projects stay in this list on purpose. Archiving hides a project
+    // from the RAIL; a routine is not the rail, and one already scheduled
+    // against an archived project must keep running. `resolveLocalRepoTarget`
+    // does not filter on `archived` either, so the run path agrees.
+    return this.localRepoCatalogEntries().map((entry) => ({
+      cwd: entry.cwd,
+      label: entry.label,
+      defaultProvider: this.defaultProviderForProject(entry.cwd),
+      ...(entry.archived ? { archived: true } : {}),
+    }));
+  }
+
+  private buildRoutinesMessage(): Extract<HostMsg, { type: "routines" }> {
+    const now = Date.now();
+    const projects = this.routineProjectOptions();
+    const byCwd = new Map(projects.map((p) => [normalizeRepoPath(p.cwd), p]));
+    return {
+      type: "routines",
+      entries: this.loadRoutines().map((routine) =>
+        toRoutineView(
+          routine,
+          this.routineRuns.list(routine.id),
+          now,
+          byCwd.get(normalizeRepoPath(routine.cwd)),
+        ),
+      ),
+      projects,
+      models: this.routineModelOptions(),
+      ...(this.routineError
+        ? { error: this.routineError.message, ...(this.routineError.id ? { errorId: this.routineError.id } : {}) }
+        : {}),
+    };
+  }
+
+  /**
+   * Three audiences, two frames.
+   *
+   * The desk (chat webview + the standalone Settings tab) gets everything,
+   * archived projects included. Remotes get the same frame trimmed to what they
+   * may reach — filtered rather than merely checked, so one archived project
+   * cannot blank the whole page for a phone. See `routinesMessageForRemote`.
+   */
+  private postRoutines(): void {
+    const message = this.buildRoutinesMessage();
+    this.postLocal(message);
+    void this.settingsEditor?.webview.postMessage(message);
+    this.broadcastRemoteDevice(
+      routinesMessageForRemote(message, this.remoteAuthorizedSessionCwds(), pathsEqual),
+    );
+  }
+
+  /**
+   * May this connection point a routine at `cwd`?
+   *
+   * At the desk, any project in the catalog — archived included, because the
+   * rail hiding a project is a view decision and a routine is not the rail.
+   * From a remote, only the authorized set, which is the SAME set that decides
+   * whether that tab could open the project's conversations at all. Creating a
+   * routine is not the escalation; reaching a new project would be.
+   */
+  private mayTargetRoutineCwd(cwd: string, origin: MsgOrigin, clientId?: string): boolean {
+    if (!cwd) return false;
+    if (origin !== "remote") return !!this.resolveLocalRepoTarget(cwd);
+    void clientId;
+    return cwdIsAuthorized(cwd, this.remoteAuthorizedSessionCwds(), pathsEqual);
   }
 
   private providerConnections(): ProviderConnections {
@@ -6768,6 +7099,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   dispose(): void {
     void this.host.setContext("grok.composerFocus", false);
     if (this.reaper) { clearInterval(this.reaper); this.reaper = undefined; }
+    if (this.routineTimer) { clearInterval(this.routineTimer); this.routineTimer = undefined; }
     for (const timer of this.loginReprobeTimers.values()) clearTimeout(timer);
     this.loginReprobeTimers.clear();
     for (const timer of this.turnOrderTimers) clearTimeout(timer);
@@ -9104,6 +9436,84 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             : this.providerForRequestedModel(msg.modelId, session.provider),
         );
         break;
+      case "listRoutines":
+        this.routineError = undefined;
+        this.postRoutines();
+        break;
+      case "saveRoutine": {
+        const existing = this.loadRoutines();
+        const prior = msg.id ? existing.find((r) => r.id === msg.id) : undefined;
+        if (msg.id && !prior) {
+          this.routineError = { id: msg.id, message: "That routine is no longer there." };
+          this.postRoutines();
+          break;
+        }
+        // The cwd is checked against what this connection may reach, not
+        // against the whole catalog: a remote may create routines, and reach is
+        // the property that has to be bounded.
+        const cwd = typeof msg.draft.cwd === "string" ? msg.draft.cwd : "";
+        if (!this.mayTargetRoutineCwd(cwd, origin, clientId)) {
+          this.routineError = { id: msg.id, message: "Pick a project for this routine to run in." };
+          this.postRoutines();
+          break;
+        }
+        const result = validateRoutine(msg.draft, {
+          id: prior?.id ?? randomUUID(),
+          // Editing preserves createdAt, so the schedule anchor does not jump
+          // when someone fixes a typo in the prompt.
+          createdAt: prior?.createdAt ?? Date.now(),
+          models: this.routineModelOptions(),
+        });
+        if (!result.ok) {
+          this.routineError = { id: msg.id, message: result.error };
+          this.postRoutines();
+          break;
+        }
+        this.routineError = undefined;
+        const next = prior
+          ? existing.map((r) => (r.id === prior.id ? { ...result.routine, paused: r.paused } : r))
+          : [...existing, result.routine];
+        await this.saveRoutines(next);
+        this.postRoutines();
+        break;
+      }
+      case "deleteRoutine": {
+        const existing = this.loadRoutines();
+        const target = existing.find((r) => r.id === msg.id);
+        if (!target || !this.mayTargetRoutineCwd(target.cwd, origin, clientId)) break;
+        await this.saveRoutines(existing.filter((r) => r.id !== msg.id));
+        this.routineRuns.forget(msg.id);
+        this.routineError = undefined;
+        this.postRoutines();
+        break;
+      }
+      case "setRoutinePaused": {
+        const existing = this.loadRoutines();
+        const target = existing.find((r) => r.id === msg.id);
+        if (!target || !this.mayTargetRoutineCwd(target.cwd, origin, clientId)) break;
+        await this.saveRoutines(
+          existing.map((r) => (r.id === msg.id ? { ...r, paused: msg.paused === true } : r)),
+        );
+        this.postRoutines();
+        break;
+      }
+      case "runRoutineNow": {
+        const target = this.loadRoutines().find((r) => r.id === msg.id);
+        if (!target || !this.mayTargetRoutineCwd(target.cwd, origin, clientId)) break;
+        if (this.routinesInFlight.has(target.id)) break;
+        const now = Date.now();
+        // A manual key, so an explicit run never consumes the scheduled window
+        // — "Run now" at 07:59 must not cancel the 08:00 run.
+        const key = manualWindowKey(now);
+        this.routineRuns.claim(target.id, key, {
+          routineId: target.id,
+          windowKey: key,
+          startedAt: now,
+          outcome: "running",
+        });
+        await this.runRoutine(target, key, now);
+        break;
+      }
       case "installCodex":
         await this.installManagedCodexCli();
         break;

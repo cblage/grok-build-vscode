@@ -25,6 +25,7 @@ function loadSettings() {
     GROK_CONNECTORS_URL: string;
     ICON_SETTINGS: string;
     CONNECTOR_LOGO_IDS: Record<string, boolean>;
+    keyDocsLabel: (url: string) => string;
     sortConnectorsForDisplay: (connectors: Array<{ name?: string; connected?: boolean }>) => Array<{ name?: string; connected?: boolean }>;
     CONNECTOR_SECTION_HERE: string;
     CONNECTOR_SECTION_GROK: string;
@@ -131,7 +132,7 @@ describe("settings catalog", () => {
     });
     const local = api.visibleCategories(snapshot, api.defaultEnv(withMcpSettings()));
     expect(local.map((c) => c.id)).toEqual([
-      "general", "voice", "notifications", "providers", "connectors", "account", "advanced", "about",
+      "general", "voice", "notifications", "providers", "routines", "connectors", "account", "advanced", "about",
     ]);
     const remoteRows = api.visibleRows(snapshot, api.defaultEnv(withMcpSettings({ isRemote: true })));
     expect(remoteRows.some((row) => row.hostLocal)).toBe(false);
@@ -155,9 +156,12 @@ describe("settings catalog", () => {
     const snapshot = api.defaultSnapshot({ appPurpose: "coding" });
     const env = api.defaultEnv(fullEnv());
     expect(api.visibleCategories(snapshot, env).map((c) => c.id)).toEqual([
-      "general", "voice", "notifications", "providers", "account", "advanced", "about",
+      // Routines stays — it is not gated on mcpSettings, and a host without
+      // connectors still schedules perfectly well.
+      "general", "voice", "notifications", "providers", "routines", "account", "advanced", "about",
     ]);
     const rows = api.visibleRows(snapshot, env);
+    expect(rows.some((row) => row.id === "routinesList")).toBe(true);
     expect(rows.some((row) => row.id === "connectorsCatalog")).toBe(false);
     expect(rows.some((row) => row.id === "mcpCatalog")).toBe(false);
   });
@@ -167,7 +171,7 @@ describe("settings catalog", () => {
     const snapshot = api.defaultSnapshot({ appPurpose: "coding" });
     const env = api.defaultEnv(withMcpSettings());
     expect(api.visibleCategories(snapshot, env).map((c) => c.id)).toEqual([
-      "general", "voice", "notifications", "providers", "connectors", "account", "advanced", "about",
+      "general", "voice", "notifications", "providers", "routines", "connectors", "account", "advanced", "about",
     ]);
     expect(api.CATEGORIES.some((c: { id: string }) => c.id === "mcp")).toBe(false);
     expect(api.NAV_ICONS.mcp).toBeUndefined();
@@ -280,7 +284,7 @@ describe("settings overlay (chat.js)", () => {
     expect(overlay).toBeTruthy();
     const nav = settingsNav(h).map((el) => (el.textContent || "").trim());
     expect(nav).toEqual([
-      "General", "Voice", "Notifications", "Providers", "Remote control", "Advanced", "About",
+      "General", "Voice", "Notifications", "Providers", "Routines", "Remote control", "Advanced", "About",
     ]);
     expect(nav).not.toContain("Connectors");
     expect(nav).not.toContain("MCP servers");
@@ -325,7 +329,7 @@ describe("settings overlay (chat.js)", () => {
     openSettings(h);
     const nav = settingsNav(h).map((el) => (el.textContent || "").trim());
     expect(nav).toEqual([
-      "General", "Voice", "Notifications", "Providers", "Connectors", "Remote control", "Advanced", "About",
+      "General", "Voice", "Notifications", "Providers", "Routines", "Connectors", "Remote control", "Advanced", "About",
     ]);
     expect(nav.filter((label) => label === "Connectors")).toHaveLength(1);
     expect(nav).not.toContain("MCP servers");
@@ -426,6 +430,103 @@ describe("settings overlay (chat.js)", () => {
       "openGlobalConfig", "openProjectConfig", "showLogs",
       "openVsCodeSettings", "moveView",
     ]));
+  });
+
+  it("carries the routines frame through chat.js into the Routines page", () => {
+    // The whole point of going through chat.js: settings.js is a VIEW over a
+    // snapshot that chat.js builds, and `settingsSnapshot()` is a hand-written
+    // field list. A message can be handled, stored on `state`, and still never
+    // reach the page — which is exactly what happened. Mounting settings.js
+    // directly with a hand-built snapshot cannot see that gap, so this test
+    // takes the same route the product does.
+    const h = bootWebview();
+    seedChat(h);
+    openSettings(h);
+    clickSettingsNav(h, "Routines");
+    expect(h.posted).toContainEqual({ type: "listRoutines" });
+
+    dispatch(h.window, {
+      type: "routines",
+      entries: [],
+      projects: [{ cwd: "/w", label: "workspace" }],
+      models: [
+        { provider: "grok", model: "", label: "Grok default" },
+        { provider: "claude", model: "claude-opus-5", label: "Claude Opus 5" },
+      ],
+    });
+
+    const overlay = h.doc.getElementById("settings-overlay")!;
+    expect(overlay.textContent).toContain("No routines yet");
+    click(h.window, overlay.querySelector(".settings-routine-new")!);
+
+    const projects = [...overlay.querySelectorAll('[data-field="cwd"] option')].map((o) => o.textContent);
+    expect(projects).toEqual(["workspace"]);
+    const models = [...overlay.querySelectorAll('[data-field="model"] option')].map((o) => o.textContent);
+    expect(models).toEqual(["Grok default", "Claude Opus 5"]);
+    // A provider with no cached model list still offers its default, so an
+    // empty picker can only mean no provider at all — never "no model".
+    expect(overlay.textContent).not.toContain("No model is connected");
+  });
+
+  it("keeps the scroll position when a host frame repaints the page", () => {
+    // Every repaint rebuilds the whole surface. Clicking Connect makes the host
+    // answer with a fresh mcpConnectors frame, and without this the row the
+    // user just clicked jumps off the top of the screen.
+    const h = bootWebview();
+    seedChat(h, { capabilities: { mcpSettings: true } });
+    openSettings(h);
+    clickSettingsNav(h, "Connectors");
+    const body = h.doc.querySelector("#settings-overlay .settings-body") as HTMLElement;
+    expect(body).toBeTruthy();
+    Object.defineProperty(body, "scrollTop", { value: 420, writable: true, configurable: true });
+
+    dispatch(h.window, { type: "mcpConnectors", connectors: [] });
+    const after = h.doc.querySelector("#settings-overlay .settings-body") as HTMLElement;
+    expect(after.scrollTop).toBe(420);
+  });
+
+  it("shows a quota refusal on the Routines page, not only in the transcript", () => {
+    // A quota-refused save never reaches the host, so the host never answers.
+    // The relay bounces a plain `error`, which renders in the transcript —
+    // behind the settings overlay. At the paywall that made Create look like it
+    // did nothing, which is the worst possible moment to be silent.
+    const h = bootWebview();
+    seedChat(h);
+    openSettings(h);
+    clickSettingsNav(h, "Routines");
+    dispatch(h.window, { type: "routines", entries: [], projects: [{ cwd: "/w", label: "w" }], models: [{ provider: "grok", model: "", label: "Grok default" }] });
+
+    const overlay = h.doc.getElementById("settings-overlay")!;
+    click(h.window, overlay.querySelector(".settings-routine-new")!);
+    click(h.window, overlay.querySelector(".settings-routine-save")!);
+
+    dispatch(h.window, { type: "error", text: "Free plan limit reached (100 messages this week). Resets in 3d." });
+
+    expect(overlay.textContent).toContain("Free plan limit reached");
+    // And the form stays put, so the typed prompt is not lost.
+    expect(overlay.querySelector(".settings-routine.is-new")).toBeTruthy();
+  });
+
+  it("labels a key connector's docs link from its own URL", () => {
+    // This line was hardcoded to "github.com/settings/personal-access-tokens"
+    // under EVERY key connector, so Zapier told its users to go to GitHub.
+    const api = loadSettings();
+    expect(api.keyDocsLabel("https://mcp.zapier.com/")).toBe("mcp.zapier.com");
+    expect(api.keyDocsLabel("https://github.com/settings/personal-access-tokens"))
+      .toBe("github.com/settings/personal-access-tokens");
+    expect(api.keyDocsLabel("http://example.test/a/b/")).toBe("example.test/a/b");
+    expect(api.keyDocsLabel("")).toBe("");
+  });
+
+  it("says no PROVIDER is connected when the model list is empty", () => {
+    const h = bootWebview();
+    seedChat(h);
+    openSettings(h);
+    clickSettingsNav(h, "Routines");
+    dispatch(h.window, { type: "routines", entries: [], projects: [], models: [] });
+    const overlay = h.doc.getElementById("settings-overlay")!;
+    click(h.window, overlay.querySelector(".settings-routine-new")!);
+    expect(overlay.textContent).toContain("No provider connected");
   });
 
   it("loads a read-only Grok inventory on the Connectors page and marks managed servers", () => {

@@ -48,6 +48,43 @@ function assertNoSecretMaterial(value: unknown, planted = PLANTED_PAT) {
   expect(json).not.toMatch(/Bearer ghp_/);
 }
 
+describe("a broken npx install must name itself", () => {
+  // Verbatim from a real failure: `open@10.2.0` reached the npx cache without
+  // its `wsl-utils` dependency, so every OAuth connector died here. The user
+  // saw "Could not connect: Node.js v20.19.0" — the LAST line, and the only
+  // one carrying no information at all.
+  const CRASH = [
+    "node:internal/modules/esm/resolve:873",
+    "  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);",
+    "        ^",
+    "",
+    "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'wsl-utils' imported from /npm-cache/_npx/open/index.js",
+    "    at packageResolve (node:internal/modules/esm/resolve:873:9)",
+    "    at moduleResolve (node:internal/modules/esm/resolve:946:18)",
+    "  code: 'ERR_MODULE_NOT_FOUND'",
+    "}",
+    "",
+    "Node.js v20.19.0",
+  ].join("\n");
+
+  it("reports the module error, not Node's version footer", () => {
+    const summary = summarizeConnectOutput(CRASH);
+    expect(summary).toContain("ERR_MODULE_NOT_FOUND");
+    expect(summary).toContain("wsl-utils");
+    expect(summary).not.toContain("Node.js v20.19.0");
+  });
+
+  it("never falls back to the crash footer's furniture", () => {
+    for (const noise of ["Node.js v20.19.0", "^", "}", "code: 'ERR_MODULE_NOT_FOUND'"]) {
+      expect(summarizeConnectOutput(noise), noise).toBe("");
+    }
+  });
+
+  it("still reports a plain Error: line", () => {
+    expect(summarizeConnectOutput("TypeError: fetch failed")).toContain("fetch failed");
+  });
+});
+
 describe("Tier-1 connector catalog", () => {
   it("ships only vendor-documented HTTPS endpoints and unique ids", () => {
     const ids = TIER1_CONNECTORS.map((c) => c.id);
@@ -71,10 +108,20 @@ describe("Tier-1 connector catalog", () => {
     expect(TIER1_CONNECTORS.find((c) => c.id === "airtable")?.endpoint).toBe("https://mcp.airtable.com/mcp");
     expect(TIER1_CONNECTORS.find((c) => c.id === "github")?.endpoint).toBe(GITHUB_ENDPOINT);
     expect(TIER1_CONNECTORS.find((c) => c.id === "github")?.auth).toBe("key");
+    expect(TIER1_CONNECTORS.find((c) => c.id === "zapier")?.endpoint).toBe(
+      "https://mcp.zapier.com/api/v1/connect",
+    );
+    // OAuth via DCR, like every other Tier-1 row: the live endpoint answers a
+    // 401 Bearer challenge and its authorization server publishes a
+    // registration_endpoint, so there is nothing to paste and nothing to
+    // pre-register. Sources claiming a per-user token describe an older path.
+    expect(TIER1_CONNECTORS.find((c) => c.id === "zapier")?.auth).toBeUndefined();
+    expect(TIER1_CONNECTORS.find((c) => c.id === "zapier")?.keyHint).toBeUndefined();
+    expect(TIER1_CONNECTORS.find((c) => c.id === "zapier")?.oauthScope).toBeUndefined();
     expect(TIER1_CONNECTORS.filter((c) => c.oauthScope).map((c) => c.id)).toEqual(["stripe"]);
     expect(TIER1_CONNECTORS.filter((c) => c.auth === "key").map((c) => c.id)).toEqual(["github"]);
     // Append-only walk order: new ids go at the end, not alphabetically.
-    expect(TIER1_CONNECTORS.map((c) => c.id).slice(-3)).toEqual(["calendly", "airtable", "github"]);
+    expect(TIER1_CONNECTORS.map((c) => c.id).slice(-3)).toEqual(["airtable", "github", "zapier"]);
   });
 
   it("resolves calendly and airtable by id with no scope override", () => {

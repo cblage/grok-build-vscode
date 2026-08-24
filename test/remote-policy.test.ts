@@ -7,6 +7,7 @@ import {
   allowRemoteRepoTarget,
   bracketRemoteSnapshot,
   mayDeliverRemoteHostMsg,
+  routinesMessageForRemote,
   repoScopeFor,
   sessionForRequest,
   sessionCwdBelongsToRepo,
@@ -248,6 +249,176 @@ describe("mayDeliverRemoteHostMsg (outbound project authorization)", () => {
         same,
       ),
     ).toBe(true);
+  });
+
+  describe("the routines frame", () => {
+    // Same class of bug as the `message-cwd` one above, mirrored: `entries` was
+    // hardcoded to sessions/pinnedSessions and returned [] for anything else,
+    // so a newly-classified type would `.every()` over nothing and pass. That
+    // fails OPEN rather than closed, which is the worse direction.
+    const routine = (cwd: string) => ({
+      id: "r1", title: "Brief", prompt: "p", cwd,
+      provider: "grok" as const, model: "grok-4.6",
+      cadence: { every: 6, unit: "hours" as const },
+      createdAt: 0, cadenceLabel: "Every 6 hours", nextRunAt: 0,
+      runs: [], health: { ran: 0, skipped: 0, failed: 0, total: 0 },
+      projectLabel: "open",
+    });
+    const frame = (entries: ReturnType<typeof routine>[], projects: { cwd: string; label: string }[]) =>
+      ({ type: "routines", entries, projects, models: [] }) as never;
+
+    it("delivers routines for an authorized project", () => {
+      expect(
+        mayDeliverRemoteHostMsg(frame([routine(open[0])], [{ cwd: open[0], label: "open" }]), open, undefined, same),
+      ).toBe(true);
+    });
+
+    it("refuses a routine that names a project this tab may not reach", () => {
+      expect(
+        mayDeliverRemoteHostMsg(frame([routine(closed)], [{ cwd: open[0], label: "open" }]), open, undefined, same),
+      ).toBe(false);
+    });
+
+    it("refuses when only the PICKER names an unreachable project", () => {
+      // The rows are all fine here. Checking `entries` alone would pass this
+      // and hand the phone the name of every project on the machine through
+      // the dropdown — which is a leak with no row attached to it.
+      expect(
+        mayDeliverRemoteHostMsg(
+          frame([routine(open[0])], [{ cwd: open[0], label: "open" }, { cwd: closed, label: "secret" }]),
+          open,
+          undefined,
+          same,
+        ),
+      ).toBe(false);
+    });
+
+    it("refuses a routine carrying no cwd at all", () => {
+      // Unlike the session lists, an empty cwd is not a legitimate state here:
+      // every routine has a project by construction, so a blank one is
+      // malformed and must not be treated as "nothing to check".
+      expect(
+        mayDeliverRemoteHostMsg(frame([routine("")], []), open, undefined, same),
+      ).toBe(false);
+    });
+
+    it("delivers an empty page", () => {
+      expect(mayDeliverRemoteHostMsg(frame([], []), open, undefined, same)).toBe(true);
+    });
+
+    describe("routinesMessageForRemote", () => {
+      // The desk offers archived projects in the picker on purpose (archiving
+      // hides a project from the RAIL, and a routine is not the rail), while
+      // `remoteAuthorizedCwds` excludes them on purpose (archiving revokes
+      // remote access). Both rules are right; composed without a filter they
+      // meant one archived project anywhere blanked the whole page on a phone.
+      it("drops what a connection may not reach instead of dropping the page", () => {
+        const full = frame(
+          [routine(open[0]), routine(closed)],
+          [{ cwd: open[0], label: "open" }, { cwd: closed, label: "archived" }],
+        ) as Extract<HostMsg, { type: "routines" }>;
+
+        expect(mayDeliverRemoteHostMsg(full, open, undefined, same)).toBe(false);
+
+        const trimmed = routinesMessageForRemote(full, open, same);
+        expect(trimmed.entries.map((e) => e.cwd)).toEqual([open[0]]);
+        expect(trimmed.projects.map((p) => p.cwd)).toEqual([open[0]]);
+        // And what comes out always survives the gate, so the check stays a
+        // backstop rather than an outage.
+        expect(mayDeliverRemoteHostMsg(trimmed, open, undefined, same)).toBe(true);
+      });
+
+      it("leaves an already-authorized frame alone", () => {
+        const clean = frame([routine(open[0])], [{ cwd: open[0], label: "open" }]) as Extract<
+          HostMsg,
+          { type: "routines" }
+        >;
+        const trimmed = routinesMessageForRemote(clean, open, same);
+        expect(trimmed.entries).toHaveLength(1);
+        expect(trimmed.projects).toHaveLength(1);
+        expect(trimmed.models).toEqual(clean.models);
+      });
+
+      // Repoint a routine from A to B, then archive A. The entry now passes
+// under B while a RETAINED run still names A — so the routine's own cwd
+      // does not vouch for its history, and filtering only the top level sends
+      // a revoked project's path and session id across the wire.
+      const withRun = (routineCwd: string, runCwd: string) => {
+        const base = routine(routineCwd);
+        return {
+          ...base,
+          runs: [
+            {
+              routineId: "r1", windowKey: "i0", startedAt: 1, outcome: "ran" as const,
+              sessionId: "s-1", cwd: runCwd, detail: `wrote ${runCwd}/notes.md`,
+            },
+          ],
+        };
+      };
+
+      it("redacts a run whose own project is out of reach", () => {
+        const full = frame(
+          [withRun(open[0], closed)],
+          [{ cwd: open[0], label: "open" }],
+        ) as Extract<HostMsg, { type: "routines" }>;
+
+        // The top-level filter alone would pass this straight through.
+        expect(mayDeliverRemoteHostMsg(full, open, undefined, same)).toBe(false);
+
+        const trimmed = routinesMessageForRemote(full, open, same);
+        const [run] = trimmed.entries[0].runs;
+        // The run survives — it happened, and the health count beside it is
+        // computed host-side from the full list.
+        expect(trimmed.entries[0].runs).toHaveLength(1);
+        expect(run.outcome).toBe("ran");
+        expect(run.startedAt).toBe(1);
+        // Its identity does not. Path, session and the detail that could quote
+        // either are all gone, so the tick is simply unclickable.
+        expect(run.cwd).toBeUndefined();
+        expect(run.sessionId).toBeUndefined();
+        expect(run.detail).toBeUndefined();
+        expect(JSON.stringify(trimmed)).not.toContain(closed);
+
+        expect(mayDeliverRemoteHostMsg(trimmed, open, undefined, same)).toBe(true);
+      });
+
+      it("leaves a run in a reachable project completely alone", () => {
+        const full = frame(
+          [withRun(open[0], open[0])],
+          [{ cwd: open[0], label: "open" }],
+        ) as Extract<HostMsg, { type: "routines" }>;
+        const [run] = routinesMessageForRemote(full, open, same).entries[0].runs;
+        expect(run.cwd).toBe(open[0]);
+        expect(run.sessionId).toBe("s-1");
+        expect(run.detail).toBeTruthy();
+      });
+
+      it("passes a run recorded before runs carried a project", () => {
+        // No cwd means the session resolves against the routine's current
+        // project, which is already checked — so there is nothing to redact.
+        const legacy = routine(open[0]) as ReturnType<typeof routine> & { runs: unknown[] };
+        legacy.runs = [{ routineId: "r1", windowKey: "i0", startedAt: 1, outcome: "ran", sessionId: "s-1" }];
+        const full = frame([legacy], [{ cwd: open[0], label: "open" }]) as Extract<
+          HostMsg,
+          { type: "routines" }
+        >;
+        expect(mayDeliverRemoteHostMsg(full, open, undefined, same)).toBe(true);
+        expect(routinesMessageForRemote(full, open, same).entries[0].runs[0].sessionId).toBe("s-1");
+      });
+
+      it("yields an empty page rather than nothing when NOTHING is reachable", () => {
+        const none = frame([routine(closed)], [{ cwd: closed, label: "archived" }]) as Extract<
+          HostMsg,
+          { type: "routines" }
+        >;
+        const trimmed = routinesMessageForRemote(none, open, same);
+        expect(trimmed.entries).toEqual([]);
+        expect(trimmed.projects).toEqual([]);
+        // An empty page says "no routines here"; a dropped frame says nothing
+        // at all and leaves the phone on a spinner.
+        expect(mayDeliverRemoteHostMsg(trimmed, open, undefined, same)).toBe(true);
+      });
+    });
   });
 
   it("still refuses a file-browser answer for a project that has since closed", () => {

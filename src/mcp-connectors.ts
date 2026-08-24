@@ -41,6 +41,18 @@ export const MCP_CONNECTORS_KEY = "grok.mcpConnectors";
  * **Bumping is a deliberate release decision that costs every user one
  * re-authorisation per connector.** That is the point: it is chosen rather than
  * inflicted by an upstream publish.
+ *
+ * **The directory name does NOT track this spec.** Measured 2026-08-24:
+ * `mcp-remote@0.1.37` bundles the literal `"0.1.36"` as its own version, so
+ * `getConfigDir()` returns `~/.mcp-auth/mcp-remote-0.1.36` — an upstream build
+ * mismatch, not ours. The `mcp-remote-0.1.37` directory on that machine held
+ * seven unused tokens from an older build that reported itself correctly.
+ *
+ * Two consequences for whoever bumps this next. The re-auth cost cannot be
+ * predicted from the spec — read the bundled string before promising anything.
+ * And a version whose string is correct moves the directory even if the number
+ * looks adjacent, so 0.1.36 -> 0.1.38 could cost a re-auth that 0.1.36 -> 0.1.37
+ * did not.
  */
 export const MCP_REMOTE_PACKAGE = "mcp-remote@0.1.37";
 
@@ -82,7 +94,8 @@ export type ConnectorId =
   | "cloudflare"
   | "calendly"
   | "airtable"
-  | "github";
+  | "github"
+  | "zapier";
 
 export interface ConnectorDef {
   id: ConnectorId;
@@ -240,6 +253,25 @@ export const TIER1_CONNECTORS: readonly ConnectorDef[] = [
     auth: "key",
     keyHint: "Paste a GitHub personal access token. Fine-grained tokens are recommended; classic tokens also work.",
     keyDocsUrl: "https://github.com/settings/personal-access-tokens",
+  },
+  {
+    id: "zapier",
+    name: "Zapier",
+    endpoint: "https://mcp.zapier.com/api/v1/connect",
+    // Deliberately describes the shape rather than listing apps: what this
+    // reaches is whatever the user turned on in their own Zapier server, and a
+    // fixed list here would be wrong for everyone the day after it was written.
+    description: "Run the apps you have added to your own Zapier MCP server — Gmail, Calendar, Slack and thousands more.",
+    // OAuth, not a pasted token — measured, not inferred. The endpoint answers
+    // an unauthenticated initialize with
+    //   401 www-authenticate: Bearer resource_metadata="…"
+    // and its authorization server advertises a registration_endpoint, so
+    // mcp-remote registers itself dynamically like every other Tier-1 row.
+    // `scopes_supported` is exactly openid/profile/email — mcp-remote's own
+    // defaults — so there is no oauthScope override to make either.
+    //
+    // Sources that said "per-user Bearer token" describe an older path; this
+    // was checked against the live endpoint on 2026-08-24.
   },
 ];
 
@@ -929,7 +961,12 @@ export function connectOutputLooksSuccessful(output: string): boolean {
 
 const CONNECT_LOG_PREFIX =
   /^(?:Connection error|Error from remote server|Error from local client|Authorization error):\s+/i;
-const CONNECT_ERROR_TEXT = /(?:[A-Za-z_$][\w$]*Error|Error):\s+\S/;
+// Node's own crashes read `Error [ERR_MODULE_NOT_FOUND]: …` — a bracketed
+// code between the name and the colon, which the original pattern missed.
+// That is how a broken npx install surfaced as "Could not connect: Node.js
+// v20.19.0": the only informative line did not match, so the fallback took
+// the last line, which is Node's version footer.
+const CONNECT_ERROR_TEXT = /(?:[A-Za-z_$][\w$]*Error|Error)(?:\s+\[[^\]]+\])?:\s+\S/;
 
 function normalizeConnectLine(line: string): string {
   return line
@@ -941,6 +978,14 @@ function normalizeConnectLine(line: string): string {
 function isConnectStackNoise(line: string): boolean {
   if (!line) return true;
   if (/^npm\s+warn/i.test(line)) return true;
+  // The footer Node prints after an uncaught exception. Never a diagnosis, and
+  // being the LAST line it beat every real message to the fallback.
+  if (/^Node\.js\s+v?\d+\./i.test(line)) return true;
+  // The rest of that footer: the caret rule, the closing brace of the dumped
+  // error object, and its `code:` / `errno:` fields.
+  if (/^\^+$/.test(line)) return true;
+  if (/^[}\])]+,?$/.test(line)) return true;
+  if (/^(?:code|errno|syscall|requireStack):\s/.test(line)) return true;
   if (/^at\s+/.test(line)) return true;
   if (/^file:\/\//i.test(line)) return true;
   if (/file:\/\//i.test(line) && !CONNECT_ERROR_TEXT.test(line)) return true;

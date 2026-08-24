@@ -335,6 +335,20 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // and disconnect stay host-local. Mirroring the last fetch is not enough if
   // the desk never opened Settings, so a remote may ask when it opens the page.
   listMcpServers: "view",
+  // Reading the page is a view op. Everything that WRITES is "full": a routine
+  // schedules unattended agent runs, which is the same class as the other host
+  // state a remote may change (pins, archives), not turn control.
+  //
+  // Unlike connectors, these are NOT host-local. A phone is exactly where
+  // someone thinks "I should get a morning brief", and a remote can already
+  // send arbitrary prompts — a routine adds persistence, not reach. Reach is
+  // bounded separately, by `cwd` being checked against the authorized set at
+  // the point of the write.
+  listRoutines: "view",
+  saveRoutine: "full",
+  deleteRoutine: "full",
+  setRoutinePaused: "full",
+  runRoutineNow: "full",
   // OAuth opens a browser on the desk and writes ~/.mcp-auth there. Key-auth
   // pastes a secret into HostSecrets. A phone cannot complete either flow,
   // must never set/read/clear a key, and must not change which tools every
@@ -563,6 +577,9 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   // look, they cannot Connect/Disconnect (inbound host-local above).
   mcpServers: "allowlist",
   mcpConnectors: "mirror",
+  // Mirrored, but the project-auth pass above trims both cwd-bearing lists
+  // first, so a tab sees only routines and projects it may already reach.
+  routines: "mirror",
   codexInstallProgress: "host-local",
   // Placement is a property of the machine running the extension, and `moveView`
   // is host-local anyway — a remote could neither act on the hint nor need it.
@@ -709,6 +726,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   providerState: "none",
   mcpServers: "none",
   mcpConnectors: "none",
+  routines: "entries",
   codexInstallProgress: "none",
   expandCommandOutputs: "none",
   steerByDefault: "none",
@@ -858,6 +876,20 @@ export function mayDeliverRemoteHostMsg(
     case "none":
       return true;
     case "entries": {
+      // `routines` carries TWO cwd-bearing lists — the rows and the project
+      // picker feeding the form. Checking only `entries` would hand a remote
+      // the name of every project on the machine through the dropdown.
+      if (msg.type === "routines") {
+        return (
+          msg.entries.every(
+            (e) =>
+              cwdIsAuthorized(e.cwd, authorizedCwds, sameCwd) &&
+              // A retained run can name a project the routine no longer points
+              // at, so the entry's own cwd does not vouch for it.
+              e.runs.every((run) => !run.cwd || cwdIsAuthorized(run.cwd, authorizedCwds, sameCwd)),
+          ) && msg.projects.every((p) => cwdIsAuthorized(p.cwd, authorizedCwds, sameCwd))
+        );
+      }
       const entries =
         msg.type === "sessions" || msg.type === "pinnedSessions"
           ? msg.entries
@@ -1119,6 +1151,64 @@ export function transformHostMsgForRemote(msg: HostMsg, deps: MediaInlineDeps): 
     default:
       return null; // host-local
   }
+}
+
+/**
+ * Trim a `routines` frame to what one connection may reach.
+ *
+ * Both lists carry cwds and both must be filtered, but for different reasons.
+ * The ROWS are the routines themselves. The PROJECTS are the form's picker, and
+ * the desk deliberately offers archived projects there — archiving hides a
+ * project from the rail, and a routine is not the rail. Remotes are the other
+ * way round: `remoteAuthorizedCwds` excludes archived projects on purpose, so
+ * archiving revokes remote access to them.
+ *
+ * Those two correct rules compose into a bug if the frame is merely CHECKED:
+ * one archived project anywhere makes `mayDeliverRemoteHostMsg` refuse the
+ * whole page, and a phone then sees nothing at all — including routines in
+ * projects it may perfectly well reach. Filtering first is what keeps the
+ * authorization check a backstop rather than an outage.
+ */
+export function routinesMessageForRemote(
+  msg: Extract<HostMsg, { type: "routines" }>,
+  authorizedCwds: readonly string[],
+  sameCwd: (a: string, b: string) => boolean,
+): Extract<HostMsg, { type: "routines" }> {
+  return {
+    ...msg,
+    entries: msg.entries
+      .filter((e) => cwdIsAuthorized(e.cwd, authorizedCwds, sameCwd))
+      .map((e) => ({ ...e, runs: e.runs.map((run) => redactRun(run, authorizedCwds, sameCwd)) })),
+    projects: msg.projects.filter((p) => cwdIsAuthorized(p.cwd, authorizedCwds, sameCwd)),
+  };
+}
+
+/**
+ * A run whose own project is out of reach keeps only the fact that it happened.
+ *
+ * A routine's project can be edited, so its retained runs can name a DIFFERENT
+ * project from the one it points at now — and that older project may since have
+ * been archived, which is how a remote loses access to it. Filtering the
+ * routine's current cwd is then not enough: the entry passes under its new
+ * project while a retained run still carries the old path, its session id, and
+ * a `detail` string that may quote either.
+ *
+ * Redacted rather than dropped, because the run DID happen and the health count
+ * beside it is computed host-side from the full list. Removing the row would
+ * make the strip disagree with its own total; blanking its identity leaves the
+ * strip honest and the tick simply unclickable, which is what it should be when
+ * it points somewhere this connection may not go.
+ */
+function redactRun<T extends { cwd?: string; sessionId?: string; detail?: string }>(
+  run: T,
+  authorizedCwds: readonly string[],
+  sameCwd: (a: string, b: string) => boolean,
+): T {
+  // No cwd at all is a record written before runs carried one. Its session
+  // resolves against the routine's current project, which is already checked.
+  if (!run.cwd || cwdIsAuthorized(run.cwd, authorizedCwds, sameCwd)) return run;
+  const { cwd: _cwd, sessionId: _sessionId, detail: _detail, ...rest } = run;
+  return rest as T;
 }
 
 /** Fail closed: an `allowlist` type with no rewriter is dropped, not ferried. */
