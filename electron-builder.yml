@@ -15,6 +15,19 @@ directories:
 extraMetadata:
   main: out/desktop/main.js
   name: grok-build-desktop
+  # NOTE: `grokExtensionName` is deliberately NOT set here. It is the telemetry
+  # identity, and `name` above becomes the asar package name, so
+  # `${publisher}.${name}` is PawelHuryn.grok-build-desktop and never matches
+  # OFFICIAL_EXTENSION_ID — which means a build made from this file alone
+  # reports nothing. That is the wanted default for a local build and for any
+  # fork.
+  #
+  # The official value is injected by .github/workflows/desktop-release.yml, and
+  # only when the workflow is running in THIS repository. Nothing that ships in
+  # the source tree can distinguish our build from a fork's: a fork copies every
+  # file, and a desktop-only fork has no reason to change `publisher`, which is
+  # a VS Code Marketplace concept. The repository it builds from is the one
+  # signal it cannot inherit by copying.
   # rcedit stamps `description` as the .exe FileDescription, which is the label
   # Windows shows in Task Manager and the UAC prompt. package.json's is the
   # marketplace blurb — a 300-character paragraph in a column meant for a name.

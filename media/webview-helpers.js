@@ -1216,8 +1216,16 @@
 
   // The relay currently returns plain HostMsg-shaped errors without a request
   // id. Only these canonical texts are attributable to a refused browser send.
+  //
+  // The quota tail is deliberately loose. It used to require the whole
+  // sentence, which made the relay's exact wording a wire contract with this
+  // regex. The relay later shortened that sentence; this stopped matching, the
+  // refused send never became the editable "Not sent" block, and the user's
+  // text was lost on the next reload. Match the stable identifying prefix and
+  // let the tail vary \u2014 the anchors plus the message-count shape are what make
+  // the text attributable, not the wording that follows.
   function isRelaySendRejection(text) {
-    return /^(?:Slow down \u2014 at most \d+ messages per minute\.|Free plan limit reached \(\d+ messages this week\)\. Resets in .+ Upgrade to Remote Max for unlimited use\.)$/
+    return /^(?:Slow down \u2014 at most \d+ messages per minute\.|Free plan limit reached \(\d+ messages this week\)\. Resets in .+)$/
       .test(String(text || ""));
   }
 

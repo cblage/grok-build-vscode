@@ -2251,18 +2251,178 @@
 
   function previewFilename(opts) {
     if (opts.filename) return previewBasename(opts.filename);
-    if (opts.kind === "diff" && opts.path) {
+    if (opts.path) {
       const base = previewBasename(opts.path);
-      return /\.diff$/i.test(base) ? base : base + ".diff";
+      if (opts.kind === "diff") return /\.diff$/i.test(base) ? base : base + ".diff";
+      return base;
     }
     const ext = PREVIEW_EXT_BY_LANG[opts.language] || ".txt";
     return "Untitled" + ext;
   }
 
   function previewTitle(opts) {
-    if (opts.kind === "diff" && opts.path) return previewBasename(opts.path);
+    if (opts.path) return previewBasename(opts.path);
     if (opts.filename) return previewBasename(opts.filename);
     return opts.language ? `Untitled (${opts.language})` : "Untitled";
+  }
+
+  function previewLanguage(opts) {
+    if (opts.language) return opts.language;
+    const api = globalThis.GrokSyntaxHighlight;
+    if (opts.path && api && typeof api.languageForPath === "function") {
+      return api.languageForPath(opts.path) || "";
+    }
+    return "";
+  }
+
+  // Same `#Lstart-Lend` suffix parseFileRef accepts, kept local because the
+  // webview cannot import src/file-ref.ts. Anchored at the end so a `#` earlier
+  // in the path (C#/F# folders) stays in the path.
+  function previewFileRef(raw) {
+    const s = String(raw || "").trim();
+    if (!s) return { path: "", range: null };
+    const frag = s.match(/^(.*?)#L(\d+)(?:-L?(\d+))?$/i);
+    if (!frag) return { path: s, range: null };
+    const start = Number(frag[2]);
+    const end = frag[3] ? Number(frag[3]) : start;
+    return { path: frag[1], range: { start, end } };
+  }
+
+  // Workspace-relative path the file panel / readProjectFile will accept, or
+  // "" when the path is out of cwd scope (~/Downloads, another drive, …).
+  function workspaceRelPath(pathStr) {
+    const raw = String(pathStr || "").replace(/\\/g, "/").trim();
+    if (!raw || raw === "." || raw === "./") return "";
+    if (raw === "~" || raw.startsWith("~/")) return "";
+    const cwd = String(state.cwd || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    const isAbs = raw.startsWith("/") || /^[A-Za-z]:\//.test(raw);
+    if (!isAbs) return raw.replace(/^\.\//, "");
+    if (!cwd) return "";
+    const fold = /^[A-Za-z]:\//.test(cwd);
+    const a = fold ? raw.toLowerCase() : raw;
+    const c = fold ? cwd.toLowerCase() : cwd;
+    if (a === c) return "";
+    if (a.startsWith(c + "/")) return raw.slice(cwd.length).replace(/^\//, "");
+    return "";
+  }
+
+  // One formula for every `.tdl` gutter: 4ch through 999, then digits+1.
+  function tdlGutterCh(widest) {
+    return Math.max(4, String(widest).length + 1) + "ch";
+  }
+
+  function previewFilePanelController() {
+    if (!hostPreviewsInApp()) return null;
+    const desk = window.__grokDeskFilePanel;
+    if (desk && typeof desk.openPath === "function") return desk;
+    const remote = state.filesBrowse && state.filesBrowse.component;
+    if (remote && typeof remote.openPath === "function") return remote;
+    return null;
+  }
+
+  let previewFileSeq = 0;
+  let previewOverlayGen = 0;
+  const previewFilePending = new Map();
+
+  function fetchPreviewFile(relPath) {
+    const cwd = state.cwd || "";
+    if (!cwd || !relPath) return Promise.resolve({ ok: false, reason: "no path" });
+    return new Promise((resolve) => {
+      const requestId = "preview-" + (++previewFileSeq);
+      const timer = setTimeout(() => {
+        if (!previewFilePending.has(requestId)) return;
+        previewFilePending.delete(requestId);
+        resolve({ ok: false, reason: "timed out" });
+      }, 15000);
+      previewFilePending.set(requestId, { resolve, timer });
+      vscode.postMessage({ type: "readProjectFile", cwd, relPath, requestId });
+    });
+  }
+
+  function settlePreviewFileRequest(msg) {
+    if (!msg || typeof msg.requestId !== "string") return false;
+    const pending = previewFilePending.get(msg.requestId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    previewFilePending.delete(msg.requestId);
+    pending.resolve(msg);
+    return true;
+  }
+
+  // The host serves text files up to FILE_PREVIEW_MAX_BYTES (2 MiB), and a
+  // 2 MiB file of one-character lines is a million rows — four DOM nodes each,
+  // built synchronously on the UI thread. Rendering all of it would wedge the
+  // renderer for a file the host considers perfectly ordinary. So a window is
+  // rendered around the range the agent read, which is the only part anyone
+  // opened this to see; the count says what was left out, because a silently
+  // truncated file is the same lie as a silently substituted one.
+  const PREVIEW_MAX_LINES = 4000;
+  const PREVIEW_CONTEXT_LINES = 400;
+
+  function previewLineWindow(total, range) {
+    if (total <= PREVIEW_MAX_LINES) return { from: 1, to: total, clipped: false };
+    const start = Math.min(Math.max(1, (range && range.start) || 1), total);
+    const end = Math.min(Math.max(start, (range && range.end) || start), total);
+    const span = end - start + 1;
+
+    // The lines the agent READ are never trimmed to make room for context —
+    // context is the thing that gives way. An earlier version computed a budget
+    // that grew with the span and then clamped it straight back to the cap, so
+    // a 4000-line read starting at 5000 rendered 4600-8599 and silently
+    // dropped 400 lines the user had asked to see.
+    if (span >= PREVIEW_MAX_LINES) {
+      const to = Math.min(total, start + PREVIEW_MAX_LINES - 1);
+      return { from: start, to, clipped: start > 1 || to < total };
+    }
+
+    // Spend whatever is left on context, split either side, and give the unused
+    // half to the other when the range sits near a file boundary.
+    const slack = PREVIEW_MAX_LINES - span;
+    const before = Math.min(Math.floor(slack / 2), start - 1);
+    const from = Math.max(1, start - before);
+    const to = Math.min(total, from + PREVIEW_MAX_LINES - 1);
+    return { from, to, clipped: from > 1 || to < total };
+  }
+
+  function buildNumberedFilePreview(text, language, pathStr, range) {
+    const wrap = document.createElement("div");
+    wrap.className = "tool-diff-region preview-file-region";
+    const lines = String(text ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    const start = range && range.start;
+    const end = range && range.end;
+    const win = previewLineWindow(lines.length, range);
+    let firstRead = null;
+    for (let i = win.from - 1; i < win.to; i++) {
+      const n = i + 1;
+      const inRange = start != null && end != null && n >= start && n <= end;
+      const row = document.createElement("div");
+      row.className = "tdl" + (inRange ? " tdl-read" : "");
+      row.dataset.line = String(n);
+      const sign = document.createElement("span");
+      sign.className = "tdl-sign";
+      sign.textContent = "";
+      const num = document.createElement("span");
+      num.className = "tdl-num";
+      num.textContent = String(n);
+      const code = document.createElement("span");
+      code.className = "tdl-code";
+      const line = lines[i];
+      if (line === "") code.textContent = " ";
+      else code.innerHTML = highlightPreviewHtml(line, language, pathStr);
+      row.appendChild(sign);
+      row.appendChild(num);
+      row.appendChild(code);
+      if (inRange && !firstRead) {
+        row.id = "preview-read-start";
+        firstRead = row;
+      }
+      wrap.appendChild(row);
+    }
+    wrap.style.setProperty("--tdl-num-w", tdlGutterCh(win.to));
+    wrap._firstRead = firstRead;
+    wrap._window = win;
+    wrap._totalLines = lines.length;
+    return wrap;
   }
 
   function highlightPreviewHtml(text, language, pathStr) {
@@ -2295,14 +2455,57 @@
     const existing = document.getElementById("preview-overlay");
     if (!existing) return;
     if (existing._onKey) document.removeEventListener("keydown", existing._onKey, true);
+    existing._closed = true;
     existing.remove();
+  }
+
+  function insertPreviewPanelButton(actions, saveBtn, relPath) {
+    if (!hostPreviewsInApp() || !relPath) return null;
+    const controller = previewFilePanelController();
+    if (!controller) return null;
+    if (actions.querySelector(".preview-open-panel")) return actions.querySelector(".preview-open-panel");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "preview-action-btn preview-open-panel";
+    btn.textContent = "Open in file panel";
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      closePreviewOverlay();
+      controller.openPath(relPath);
+    };
+    actions.insertBefore(btn, saveBtn);
+    return btn;
+  }
+
+  function renderPreviewExcerpt(body, text, language, pathStr) {
+    const pre = document.createElement("pre");
+    pre.className = "preview-code";
+    const code = document.createElement("code");
+    code.innerHTML = highlightPreviewHtml(String(text ?? ""), language, pathStr);
+    pre.appendChild(code);
+    body.appendChild(pre);
+  }
+
+  function clearPreviewBody(body) {
+    while (body.firstChild) body.removeChild(body.firstChild);
+  }
+
+  function renderPreviewFallback(body, excerpt, language, pathStr, reason) {
+    clearPreviewBody(body);
+    const notice = document.createElement("div");
+    notice.className = "preview-notice";
+    notice.textContent = reason;
+    body.appendChild(notice);
+    renderPreviewExcerpt(body, excerpt, language, pathStr);
   }
 
   function openPreviewOverlay(opts) {
     closePreviewOverlay();
-    const copyText = opts.kind === "diff" ? unifiedDiffText(opts) : String(opts.content ?? "");
+    const payload = { text: opts.kind === "diff" ? unifiedDiffText(opts) : String(opts.content ?? "") };
     const filename = previewFilename(opts);
-    const language = opts.language || (opts.kind === "diff" ? "diff" : "");
+    const language = opts.kind === "diff" ? (opts.language || "diff") : previewLanguage(opts);
+    const excerpt = String(opts.content ?? "");
+    const relPath = workspaceRelPath(opts.path || "");
 
     const overlay = document.createElement("div");
     overlay.id = "preview-overlay";
@@ -2336,7 +2539,7 @@
     copyBtn.onclick = (e) => {
       e.stopPropagation();
       if (!navigator.clipboard || !navigator.clipboard.writeText) return;
-      navigator.clipboard.writeText(copyText).then(() => {
+      navigator.clipboard.writeText(payload.text).then(() => {
         copyBtn.textContent = "Copied";
         setTimeout(() => { if (copyBtn.isConnected) copyBtn.textContent = "Copy"; }, 1200);
       });
@@ -2347,7 +2550,7 @@
     saveBtn.textContent = "Save As";
     saveBtn.onclick = (e) => {
       e.stopPropagation();
-      const message = { type: "openText", content: copyText, filename };
+      const message = { type: "openText", content: payload.text, filename };
       if (language) message.language = language;
       vscode.postMessage(message);
     };
@@ -2374,13 +2577,83 @@
         result: computeLineDiff(site.oldText, site.newText),
       }));
       body.appendChild(buildInlineDiffRegion(hunks, { full: true }));
+      insertPreviewPanelButton(actions, saveBtn, relPath);
+    } else if (!opts.path) {
+      renderPreviewExcerpt(body, excerpt, language, opts.path);
+    } else if (!relPath) {
+      renderPreviewFallback(
+        body,
+        excerpt,
+        language,
+        opts.path,
+        "This file is outside the project, so only the excerpt the agent read is shown.",
+      );
     } else {
-      const pre = document.createElement("pre");
-      pre.className = "preview-code";
-      const code = document.createElement("code");
-      code.innerHTML = highlightPreviewHtml(String(opts.content ?? ""), language, opts.path);
-      pre.appendChild(code);
-      body.appendChild(pre);
+      const notice = document.createElement("div");
+      notice.className = "preview-notice";
+      notice.textContent = "Loading file…";
+      body.appendChild(notice);
+      const token = ++previewOverlayGen;
+      overlay._previewToken = token;
+      fetchPreviewFile(relPath).then((result) => {
+        if (overlay._closed || overlay._previewToken !== token) return;
+        // `readProjectFile` PRETTY-PRINTS JSON (file-tree.ts: JSON.stringify of
+        // the parsed value). That is right for the file panel, which edits and
+        // writes it back, and wrong here: the numbers in our gutter would count
+        // reformatted lines, and the highlighted range would mark the wrong
+        // ones. A one-line `{"n":1e3}` becomes three lines reading `"n": 1000`.
+        // The host tells us when it did this, so take the honest path instead
+        // of numbering a file the user does not have.
+        if (result && result.ok && result.reformatted) {
+          clearPreviewBody(body);
+          renderPreviewFallback(
+            body,
+            excerpt,
+            language,
+            opts.path,
+            "This JSON file is reformatted when loaded, so line numbers would not match the file on disk — showing the excerpt the agent read.",
+          );
+        } else if (result && result.ok && typeof result.text === "string") {
+          payload.text = result.text;
+          clearPreviewBody(body);
+          // The band marks the line numbers the agent asked for. That is a
+          // POSITIONAL reference, exactly what an editor host does when it
+          // opens the file at those lines, and it stays true whether or not the
+          // file has moved on since.
+          //
+          // A guard that tried to verify the content still matched was removed
+          // rather than tuned: the excerpt is the CLI's rendered transcript,
+          // not the file's bytes. A ranged read arrives decorated —
+          // `... 2219 lines not shown ...` and `  2220|  }` — so comparing it
+          // against raw file lines never matched, and the guard fired on every
+          // ordinary ranged read, stripped the markers, and announced a change
+          // that had not happened. Parsing those decorations would mean
+          // tracking a format that differs per CLI, to defend against a
+          // staleness the editor host has always had and nobody minds.
+          const region = buildNumberedFilePreview(result.text, language, opts.path, opts.range);
+          body.appendChild(region);
+          if (region._window && region._window.clipped) {
+            const clip = document.createElement("div");
+            clip.className = "preview-notice";
+            clip.textContent =
+              `Showing lines ${region._window.from}–${region._window.to} of ${region._totalLines} — the file is too long to render in full.`;
+            body.insertBefore(clip, region);
+          }
+          insertPreviewPanelButton(actions, saveBtn, relPath);
+          const startEl = region._firstRead;
+          if (startEl && typeof startEl.scrollIntoView === "function") {
+            startEl.scrollIntoView({ block: "center", inline: "nearest" });
+          }
+        } else {
+          renderPreviewFallback(
+            body,
+            excerpt,
+            language,
+            opts.path,
+            "Couldn't load the full file — showing the excerpt the agent read.",
+          );
+        }
+      });
     }
     panel.appendChild(body);
     overlay.appendChild(panel);
@@ -8586,7 +8859,11 @@
     if (start != null && limit != null && limit > 0) return { start, end: start + limit - 1 };
     if (start == null && limit != null && limit > 0) return { start: 1, end: limit };
     if (start != null && total != null && total >= start) return { start, end: total };
-    if (start == null && total != null && total > 0) return { start: 1, end: total };
+    // No offset, no limit, no end — the agent asked for the WHOLE file, and
+    // `total_lines` is then just how long the file happens to be. Rendering it
+    // as "lines 1-26" reads like a range the agent chose, which it did not, and
+    // costs the row space the path needs (owner, 2026-08-23). The row shows the
+    // path alone and the link opens the file with nothing selected.
     return null;
   }
   // `path#Lstart-Lend` — the syntax `parseFileRef` already accepts, so the host
@@ -8597,6 +8874,40 @@
     if (!p) return "";
     const range = readLineRange(call);
     return range ? `${p}#L${range.start}-L${range.end}` : p;
+  }
+  // The label text for a Read row's target: basename, plus the line range when
+  // one is on the wire. Shared by toolLabel and by the linked-label path, so the
+  // link's text can never drift from the row's own label.
+  function readTargetLabel(call) {
+    const filePath = toolFilePath(call);
+    if (!filePath) return "";
+    const range = readLineRange(call);
+    return range
+      ? `${prettyPath(filePath)} lines ${range.start}-${range.end}`
+      : prettyPath(filePath);
+  }
+  // #122: the path and range in a Read row's own label BECOME the link — no
+  // separate control, and no six-line excerpt of a 150-line read competing for
+  // space. The ROW LOOKS THE SAME on every host; only what the link does
+  // differs, because the hosts can do different things.
+  function readLinkRef(call) {
+    if (!isReadTool(call)) return "";
+    return readOpenFileRef(call);
+  }
+  // What that link can do here, decided by what the host proved it can do —
+  // never by a version:
+  //   "file"    an editor that opens the real file AT the line range. The whole
+  //             point: the surrounding context is why you clicked.
+  //   "overlay" the desktop app. Its openTextFile cannot honour a line
+  //             selection, so the click opens the in-app preview: the whole
+  //             file, numbered, with the agent's lines marked (falls back to
+  //             the excerpt when the file can't be fetched).
+  //   "inline"  a remote. `openFile` is host-local in remote-policy, so a phone
+  //             can only reveal the text already on the wire.
+  function readLinkMode() {
+    if (IS_REMOTE) return "inline";
+    if (hostPreviewsInApp()) return "overlay";
+    return "file";
   }
   function toolRenamePaths(call) {
     const r = call && (call.rawInput || call.input) || {};
@@ -8751,10 +9062,7 @@
       if (isList) {
         target = prettyDir(filePath);
       } else if (isRead) {
-        const range = readLineRange(call);
-        target = range
-          ? `${prettyPath(filePath)} lines ${range.start}-${range.end}`
-          : prettyPath(filePath);
+        target = readTargetLabel(call);
       } else {
         target = prettyPath(filePath);
       }
@@ -8781,8 +9089,60 @@
   // does not), so title has to be painted wherever textContent is set.
   function applyToolLabel(el, call) {
     if (!el) return;
-    el.textContent = toolLabel(call);
+    const full = toolLabel(call);
     el.title = toolLabel(call, { full: true });
+    // Assigning textContent first is what keeps this idempotent across the
+    // repaints that call it — it drops any link node an earlier pass appended.
+    el.textContent = full;
+    const ref = readLinkRef(call);
+    const target = ref ? readTargetLabel(call) : "";
+    // Split only when the rendered label really ends with the target: a row that
+    // fell back to grok's own title (nothing synthesized) stays plain text.
+    if (!target || !full.endsWith(target)) return;
+    // Off the editor the link acts on a CARRIER, and only a real tool row ever
+    // gets one — a subagent's row is painted by this same function (the row IS
+    // the label) and never does. Rendering a link there would give those hosts a
+    // control that looks clickable and does nothing. Decided by what the label
+    // IS, not where it sits: this runs BEFORE the label is appended to its row,
+    // so closest() would see nothing yet.
+    const carrierCapable = el.classList.contains("tool-item-label")
+      || el.classList.contains("tool-label");
+    if (readLinkMode() !== "file" && !carrierCapable) return;
+    el.textContent = full.slice(0, full.length - target.length);
+    const link = document.createElement("button");
+    link.type = "button";
+    link.className = "tool-label-ref";
+    link.textContent = target;
+    link.title = `Open ${ref.replace(/#L(\d+)-L(\d+)$/, " at lines $1-$2")}`;
+    link.onclick = (e) => {
+      e.stopPropagation(); // must not toggle the row or the group
+      const mode = readLinkMode();
+      if (mode === "file") {
+        vscode.postMessage({ type: "openFile", path: ref });
+        return;
+      }
+      // Both remaining hosts act on the carrier: the text the agent read, parked
+      // hidden in the row for exactly this (attachReadCarrier).
+      const row = el.closest && el.closest(".tool-item, .tool-flat");
+      const details = row && row.querySelector(".tool-item-details");
+      if (!details) return; // still reading — nothing to show yet
+      if (mode === "inline") {
+        details.hidden = !details.hidden;
+        link.classList.toggle("open", !details.hidden);
+        return;
+      }
+      const pre = details.querySelector(".tool-cmd-output");
+      const parsed = previewFileRef(ref);
+      if (pre) {
+        openPreviewOverlay({
+          kind: "text",
+          content: pre.textContent,
+          path: parsed.path,
+          range: parsed.range,
+        });
+      }
+    };
+    el.appendChild(link);
   }
 
   // Category icon for a tool row (lucide outline; sized + colored by CSS via
@@ -8838,10 +9198,14 @@
       // attaches.
       const detailsEl = el.querySelector(".tool-item-details");
       if (detailsEl) {
+        // A carrier keeps its silence through the flatten: no chevron, no row
+        // toggle. Wiring one here would hand the row back the affordance the
+        // label link replaced (#122).
+        const carrier = detailsEl.classList.contains("tool-read-carrier");
         const chev = el.querySelector(".tool-item .tool-chevron");
-        if (chev) flat.appendChild(chev);
+        if (chev && !carrier) flat.appendChild(chev);
         flat.appendChild(detailsEl);
-        wireCommandToggle(flat, detailsEl);
+        if (!carrier) wireCommandToggle(flat, detailsEl);
       }
       el.replaceWith(flat);
       const fail = calls[0].toolCallId && state.toolFailuresById.get(calls[0].toolCallId);
@@ -8919,7 +9283,11 @@
     if (cmd) attachCommandDetails(item, cmd, call.toolCallId);
     else if (isReadTool(call) && !item.querySelector(".cmd-block")) {
       const path = String(toolFilePath(call) || "");
-      if (path || extractToolResultOutput(call)) attachCommandDetails(item, path, call.toolCallId);
+      const ref = readLinkRef(call);
+      if (ref && readLinkMode() !== "file") attachReadCarrier(item, path, call.toolCallId);
+      else if (!ref && (path || extractToolResultOutput(call))) {
+        attachCommandDetails(item, path, call.toolCallId);
+      }
     }
 
     hdr.innerHTML =
@@ -8937,7 +9305,8 @@
     // full command mid-run.
     el.classList.toggle(
       "cmd-single",
-      el._calls.length === 1 && !!(commandDetailText(call) || isReadTool(call)),
+      el._calls.length === 1
+        && !!(commandDetailText(call) || (isReadTool(call) && !readLinkRef(call))),
     );
     hdr.onclick = () => {
       const expanded = !body.hidden;
@@ -8957,6 +9326,12 @@
         }
       }
     };
+    // Settle the group NOW, not only at closeToolGroup. Every row carries its
+    // detail (a command's IN block) or its link (a Read row's path) from the
+    // moment it appears, so deferring this is what made "expand tool details"
+    // look like it only fired once the command had finished (#122). An explicit
+    // toggle on this group still wins.
+    if (!el._userToggled) setGroupExpanded(el, groupShouldExpand(el));
     scrollToBottom();
   }
 
@@ -8978,7 +9353,11 @@
   // `detailShouldExpand` is group-agnostic.
   function groupShouldExpand(el) {
     if (state.toolExpandOverride !== null) return state.toolExpandOverride;
-    return effectiveExpandCommandOutputs() && !!(el && el.querySelector(".has-details"));
+    // `.tool-label-ref` counts the same as a detail: a linked Read row carries
+    // its payload in the row itself (#122), so a read-only batch is worth
+    // opening even though it holds no detail box.
+    return effectiveExpandCommandOutputs()
+      && !!(el && el.querySelector(".has-details, .tool-label-ref"));
   }
   function detailShouldExpand() {
     if (state.toolExpandOverride !== null) return state.toolExpandOverride;
@@ -9112,10 +9491,9 @@
         viewAll.onclick = (e) => {
           e.stopPropagation();
           // A Read row's "View all" means the file, not a copy of the lines the
-          // agent happened to request (#122) — otherwise the surrounding context
-          // is exactly what you can't see. Editor hosts only: the desktop app's
-          // openTextFile cannot honour a line selection and falls back to the OS
-          // default app, which is worse than its own in-app preview.
+          // agent happened to request (#122). Editor hosts post openFile with
+          // the range; desktop's openTextFile cannot honour a line selection,
+          // so the in-app preview fetches the file and marks those lines.
           if (openRef && !hostPreviewsInApp()) {
             vscode.postMessage({ type: "openFile", path: openRef });
             return;
@@ -9123,10 +9501,13 @@
           const openLanguage = language
             || (className === "tool-cmd" ? state.commandLanguage : "");
           if (hostPreviewsInApp()) {
+            const parsed = previewFileRef(openRef);
             openPreviewOverlay({
               kind: "text",
               content: fullText,
               language: openLanguage,
+              path: parsed.path || undefined,
+              range: parsed.range,
             });
             return;
           }
@@ -9172,6 +9553,23 @@
     requestAnimationFrame(syncOverflowAffordance);
   }
 
+  // A linked Read row's detail is a CARRIER, not an affordance: no chevron, no
+  // row toggle, hidden regardless of the expand setting. It exists only so the
+  // text the agent read is in the DOM for the label's link to act on — revealed
+  // in place on a remote, handed to the preview window on the desktop. The row's
+  // own path IS the control, which is the whole of #122.
+  function attachReadCarrier(item, path, toolCallId) {
+    const details = document.createElement("div");
+    details.className = "tool-item-details tool-read-carrier";
+    details.hidden = true;
+    const block = document.createElement("div");
+    block.className = "cmd-block";
+    details.appendChild(block);
+    item.appendChild(details);
+    // Same registration shape as attachCommandDetails, so the completed update
+    // fills it through the identical path.
+    state.pendingCommandDetails.push({ command: path, details, done: false, toolCallId });
+  }
   function attachCommandDetails(item, command, toolCallId) {
     // Chevron at the END of the (possibly ellipsized) command line: › when
     // collapsed, rotated to v while expanded.
@@ -9276,10 +9674,17 @@
     if (cmd && !item.querySelector(".cmd-block")) attachCommandDetails(item, cmd, id);
     else if (isReadTool(merged) && !item.querySelector(".cmd-block")) {
       const path = String(toolFilePath(merged) || "");
-      if (path || extractToolResultOutput(merged)) attachCommandDetails(item, path, id);
+      const ref = readLinkRef(merged);
+      if (ref && readLinkMode() !== "file") attachReadCarrier(item, path, id);
+      else if (!ref && (path || extractToolResultOutput(merged))) {
+        attachCommandDetails(item, path, id);
+      }
     }
     if (groupCalls && groupCalls.classList.contains("in-progress") && groupCalls._calls && groupCalls._calls.length === 1) {
-      groupCalls.classList.toggle("cmd-single", !!(cmd || isReadTool(merged)));
+      groupCalls.classList.toggle(
+        "cmd-single",
+        !!(cmd || (isReadTool(merged) && !readLinkRef(merged))),
+      );
     }
   }
 
@@ -9380,6 +9785,10 @@
     // path on the first tool_call and the result on a later one, so the update
     // that carries the text usually has no rawInput to read a path from.
     const rowCall = (state.toolItemsByToolCallId.get(id) || {})._call || call;
+    // On an editor host a linked Read row has no detail at all — its path and
+    // range ARE the affordance (#122). Elsewhere the carrier still gets filled,
+    // because the link needs that text to reveal or to hand to the preview.
+    if (readLinkRef(rowCall) && readLinkMode() === "file") return true;
     attachCommandOutput(
       entry.details,
       isReadTool(rowCall) ? { ...res, agentSawCut: false, openFileRef: readOpenFileRef(rowCall) } : res,
@@ -9493,7 +9902,7 @@
     // number never butts against the code column. Floored at 4ch, which is exactly
     // today's look for everything up to 999; only a 1000+ line file grows it. A
     // fixed track would instead overflow — 5 digits would collide with the +/- glyph.
-    wrap.style.setProperty("--tdl-num-w", Math.max(4, String(widest).length + 1) + "ch");
+    wrap.style.setProperty("--tdl-num-w", tdlGutterCh(widest));
     const remaining = total - rendered;
     if (remaining > 0) {
       const more = document.createElement("div");
@@ -16119,6 +16528,7 @@
   }
 
   function handleProjectFileContent(msg) {
+    if (settlePreviewFileRequest(msg)) return;
     settleRemoteFileRequest("read", msg);
   }
 
