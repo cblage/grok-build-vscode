@@ -447,6 +447,24 @@ describe("the three surfaces this page has to reach", () => {
     expect(block("private static readonly DEVICE_GLOBAL_REMOTE_TYPES")).toContain('"routines"');
   });
 
+  it("the standalone Settings tab LISTENS for the routines frame", () => {
+    // Fifth hand-written registry the same message type has to be named in, and
+    // TypeScript enforces none of them. The tab renders settings.js with its own
+    // inline listener; a type missing there is received and silently dropped, so
+    // the page sat on "Loading routines…" for ever. Pre-existing — before the
+    // loading state it defaulted to [] and merely lied about having none.
+    const start = sidebarSrc.indexOf('window.addEventListener("message"');
+    expect(start).toBeGreaterThan(-1);
+    const listener = sidebarSrc.slice(start, sidebarSrc.indexOf("settingsCategory", start) + 40);
+    // The EXACT conditional, not just the string: a dead branch such as
+    // `false && msg.type === "routines"` still contains the substring.
+    expect(listener).toContain('if (msg.type === "routines") {');
+    expect(listener).toContain("routineProjects");
+    expect(listener).toContain("routineModels");
+    // And the relay's quota bounce, which is the only answer a refused save gets.
+    expect(listener).toContain('if (msg.type === "error") {');
+  });
+
   it("accepts every routine message from the standalone Settings tab", () => {
     // That tab loads settings.js and nothing else. Anything missing here is
     // answered with "[settings] ignored <type>" and the page cannot function.
@@ -589,6 +607,68 @@ describe("the model picker", () => {
     const groups = [...root.querySelectorAll('[data-field="model"] optgroup')];
     expect(groups.map((g) => g.getAttribute("label"))).toEqual(["Grok", "Claude"]);
     expect(groups[0].querySelectorAll("option")).toHaveLength(2);
+  });
+
+  it("shows one group per provider, not one per run of options", () => {
+    // The host sends "<X> default" then that provider's models, per provider.
+    // Sending all the defaults first put every provider in the list twice, and
+    // the picker grouped by consecutive provider — six headings for three
+    // agents, which is what the owner saw.
+    const { root } = boot({
+      routines: [],
+      routineModels: [
+        { provider: "grok", model: "", label: "Grok default" },
+        { provider: "grok", model: "grok-4.6", label: "Grok 4.6" },
+        { provider: "claude", model: "", label: "Claude default" },
+        { provider: "claude", model: "claude-opus-5", label: "Claude Opus 5" },
+      ],
+    });
+    click(root.querySelector(".settings-routine-new"));
+    const labels = [...root.querySelectorAll('[data-field="model"] optgroup')]
+      .map((g) => g.getAttribute("label"));
+    expect(labels).toEqual(["Grok", "Claude"]);
+  });
+
+  it("hides the empty-model row beside real models, as the composer does", () => {
+    const { root } = boot({
+      routines: [],
+      routineModels: [
+        { provider: "grok", model: "", label: "Grok default" },
+        { provider: "grok", model: "grok-4.6", label: "Grok 4.6" },
+      ],
+    });
+    click(root.querySelector(".settings-routine-new"));
+    const options = [...root.querySelectorAll('[data-field="model"] option')].map((o) => o.textContent);
+    expect(options).toEqual(["Grok 4.6"]);
+  });
+
+  it("keeps the empty-model row when it is the only thing a provider offers", () => {
+    // A fresh host, before anything has opened the model picker.
+    const { root } = boot({
+      routines: [],
+      routineModels: [{ provider: "grok", model: "", label: "Grok default" }],
+    });
+    click(root.querySelector(".settings-routine-new"));
+    const options = [...root.querySelectorAll('[data-field="model"] option')].map((o) => o.textContent);
+    expect(options).toEqual(["Grok default"]);
+  });
+
+  it("keeps the empty-model row for a routine already saved on it", () => {
+    // Otherwise opening such a routine finds no matching option and the select
+    // silently re-points it at a concrete model the user never chose.
+    const saved = routine({ provider: "grok", model: "" });
+    const { root } = boot({
+      routines: [saved],
+      routineModels: [
+        { provider: "grok", model: "", label: "Grok default" },
+        { provider: "grok", model: "grok-4.6", label: "Grok 4.6" },
+      ],
+    });
+    click(root.querySelector(".settings-routine-toggle"));
+    const select = root.querySelector('[data-field="model"]') as HTMLSelectElement;
+    expect([...select.querySelectorAll("option")].map((o) => o.textContent))
+      .toEqual(["Grok default", "Grok 4.6"]);
+    expect(select.value).toBe("grok ");
   });
 
   it("starts on the project's default provider, like the composer", () => {
