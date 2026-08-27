@@ -17,7 +17,7 @@ export const REMOTE_PROTO_VERSION = 1;
 /** Optional richer-device fields on hello / link/start. */
 export type RelayClientMeta = {
   clientLabel?: string;
-  platform?: "win" | "mac" | "linux";
+  platform?: "win" | "mac" | "linux" | "cloud";
   osLabel?: string;
 };
 
@@ -27,7 +27,23 @@ export type RelayClientSource = {
   release: string;
   appName: string;
   isDesktop: boolean;
+  /** This host IS an AFK Pilot cloud environment. Set from
+   *  {@link CLOUD_ENVIRONMENT_ENV}; see {@link relayClientMeta}. */
+  isCloud?: boolean;
 };
+
+/**
+ * Marks a host as a hosted cloud environment rather than someone's machine.
+ *
+ * The host reports this about ITSELF rather than the relay inferring it, for
+ * the same reason every other client field works that way: the relay stores
+ * what it is told and never invents a label. When the relay grows a real
+ * environments table it will know independently, and this stays true anyway.
+ */
+export const CLOUD_ENVIRONMENT_ENV = "GROK_CLOUD_ENVIRONMENT";
+
+/** The parenthetical a cloud environment shows in the device picker. */
+export const CLOUD_CLIENT_LABEL = "by afkpilot.com";
 
 /** extension -> relay */
 export type UplinkFrame =
@@ -610,6 +626,17 @@ export type LinkStartBody = {
 
 /** Same mapped `clientLabel` / `platform` / `osLabel` as link/start — omit empty. */
 export function relayClientMeta(input: RelayClientSource): RelayClientMeta {
+  // A cloud environment says what it IS and nothing about the box underneath.
+  //
+  // It genuinely runs the desktop host on Linux, and reporting either fact is
+  // worse than useless to the person reading the picker: they cannot act on the
+  // operating system of a machine they do not administer, and "desktop app" is
+  // actively wrong — nobody installed anything. What they need to know is who
+  // runs it, so the whole parenthetical is "by afkpilot.com" and the OS half is
+  // omitted rather than blanked.
+  if (input.isCloud) {
+    return { clientLabel: CLOUD_CLIENT_LABEL, platform: "cloud" };
+  }
   const clientLabel = sanitizeRelayDeviceField(deviceClientLabel(input.appName, input.isDesktop));
   const platform = devicePlatformCode(input.platform);
   const osLabel = sanitizeRelayDeviceField(deviceOsLabel(input.platform, input.release));
@@ -629,6 +656,7 @@ export function buildLinkStartBody(input: {
   installId: string;
   appName: string;
   isDesktop: boolean;
+  isCloud?: boolean;
 }): LinkStartBody {
   return {
     name: deviceDisplayName(input.hostname, input.platform, input.release),
@@ -643,4 +671,15 @@ export const MAX_BACKOFF_MS = 30_000;
 /** Reconnect backoff: double up to the cap. */
 export function nextBackoffMs(prev: number): number {
   return Math.min(Math.max(prev, INITIAL_BACKOFF_MS) * 2, MAX_BACKOFF_MS);
+}
+
+/**
+ * Is this host an AFK Pilot cloud environment?
+ *
+ * One env var, read in one place, so "am I hosted" is never re-derived from
+ * something adjacent like the platform or the relay URL. Both of those have
+ * other reasons to be true.
+ */
+export function isCloudEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[CLOUD_ENVIRONMENT_ENV] === "1";
 }

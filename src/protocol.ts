@@ -97,6 +97,18 @@ export const HOST_CAPABILITIES = {
   // Edit+save existing project files from a remote. Separate from browse so a
   // host can offer list/read without a write path. OPT-IN field presence.
   editProjectFiles: true,
+  // Whether this host can run an agent's headless sign-in for a remote and
+  // report back the URL and code.
+  //
+  // OPT-IN, and load-bearing rather than tidy. The relay serves the web client,
+  // so the client is always as new as the deploy while the extension is
+  // whatever the user installed. Every host built before this shipped
+  // classifies `runGrokLogin` as `host-local` and DROPS it — no error, no
+  // reply, nothing. A client that offered Connect unconditionally would give
+  // every 3.18.0 user a button that does nothing at all, which is worse than
+  // the dead end it replaced, because a dead end at least tells you where to
+  // go. Field presence, never a version check.
+  remoteAgentSignIn: true,
 } as const;
 
 /** Machine-readable `error.code` for a send abandoned after its userMessage echo. */
@@ -120,6 +132,13 @@ export type HostUiCapabilities = {
    * No create/delete/rename in this pass.
    */
   editProjectFiles?: boolean;
+  /**
+   * Whether this host can run an agent's headless sign-in on a remote's behalf.
+   * OPT-IN: absent/false = the remote empty state falls back to "connect it at
+   * your computer" instead of offering a control an older host would silently
+   * drop. See HOST_CAPABILITIES for why silence is the failure mode.
+   */
+  remoteAgentSignIn?: boolean;
   /**
    * Settings → Connectors. OPT-IN: absent/false = hide the nav row and keep
    * the page unreachable. Desktop and VS Code set true; remotes inherit the
@@ -546,7 +565,42 @@ export type HostMsg =
   // `launched` says the HOST already opened the login terminal, so the panel can
   // show it as done. Without it an automatically opened terminal leaves the
   // button looking untouched, which reads as "press it again".
-  | { type: "onboarding"; state: "connect-agent" | "missing-cli" | "auth-required" | "missing-codex" | "codex-login" | "missing-claude" | "claude-login" | "provider-connected" | "no-project"; platform?: string; reason?: string; provider?: "grok" | "codex" | "claude"; launched?: boolean }
+  // `device` is the headless sign-in, and it is additive on purpose: a remote
+  // gets the same `onboarding` panel it always got, plus a URL and a code when
+  // the host is running a device-code flow for it. A client that predates the
+  // field ignores it and shows the panel exactly as before, which is the right
+  // fallback — it still says which agent needs connecting.
+  //
+  // Only the REMOTE path ever carries it. At a desk the CLI opens the browser
+  // itself and a terminal is the better affordance, so nothing changes there.
+  | {
+      type: "onboarding";
+      state: "connect-agent" | "missing-cli" | "auth-required" | "missing-codex" | "codex-login" | "missing-claude" | "claude-login" | "provider-connected" | "no-project";
+      platform?: string;
+      reason?: string;
+      provider?: "grok" | "codex" | "claude";
+      launched?: boolean;
+      device?: {
+        /** starting: spawned, nothing printed yet. waiting: URL and code are on
+         *  screen and the CLI is polling. done/failed: terminal. unavailable:
+         *  this provider has no flow that works without a terminal. */
+        status: "starting" | "waiting" | "done" | "failed" | "unavailable";
+        url?: string;
+        code?: string;
+        /** Said to the person, not logged — a failure or an explanation. */
+        message?: string;
+        /**
+         * Shown BEFORE the sign-in starts, when it is likely to fail for a
+         * reason the person can fix in seconds. Codex device-code login is off
+         * by default on every account; telling somebody that after a wait and a
+         * failure is telling them too late.
+         *
+         * Cloud environments only — at a desk the browser flow works and this
+         * setting never comes up.
+         */
+        preflight?: { reason: string; steps: string[]; url?: string };
+      };
+    }
   // resumeFailed is additive: a remote resume refusal names the requested id so
   // the browser outbox can fail closed. Older clients ignore the extra field.
   // code is additive too — a harness must not match user-facing `text`.
@@ -855,6 +909,9 @@ export type WebviewMsg =
   | { type: "cancelCodexInstall" }
   | { type: "runInstallCmd" }
   | { type: "runGrokLogin"; provider?: "grok" | "codex" | "claude" }
+  // Stop a headless sign-in the host is running. Only reachable while one is in
+  // flight, and it kills a child process this same user started moments ago.
+  | { type: "cancelDeviceLogin"; provider?: "grok" | "codex" | "claude" }
   | { type: "logout"; provider?: "grok" | "codex" | "claude" }
   | { type: "checkGrokUpdate" }
   | { type: "updateGrok" }
@@ -1052,6 +1109,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, setVoiceSendPhrase: true, setVoiceKeyterms: true, setTelemetryEnabled: true, setThumbsFeedback: true, summarizeSpeech: true, requestImageFull: true, composerFocus: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
   questionCancel: true, setModel: true, installCodex: true, cancelCodexInstall: true, runInstallCmd: true, runGrokLogin: true,
+  cancelDeviceLogin: true,
   logout: true, checkGrokUpdate: true, updateGrok: true, recheckConnection: true, refreshProviders: true, retryProviderSession: true,
   listSessions: true, listRepoSessions: true, selectRepo: true, toggleRepoPin: true, toggleSessionPin: true,
   setRepoArchived: true, setRepoColor: true,

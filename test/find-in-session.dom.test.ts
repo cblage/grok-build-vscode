@@ -30,10 +30,39 @@ interface FindApi {
   hasHighlightApi: () => boolean;
 }
 
-async function flushPaint(window: Window) {
-  await new Promise<void>((resolve) => {
-    window.requestAnimationFrame(() => resolve());
-  });
+/**
+ * Wait until the transcript has stopped growing.
+ *
+ * Three earlier versions of this were counted waits — one animation frame, then
+ * two frames with a macrotask between — and both lose the same race for the same
+ * reason: chat.js appends across an unknown number of turns of the event loop,
+ * and no fixed count outruns an arbitrarily loaded machine. The symptom was a
+ * file that passed in isolation and failed a DIFFERENT test in it on each full
+ * run, which reads as flakiness in the feature and is really a race in the
+ * harness.
+ *
+ * So this waits for a CONDITION instead: the node count stable across two
+ * consecutive frames. That is bounded by how fast the machine actually is rather
+ * than by a number somebody guessed, and it returns immediately on an idle one.
+ *
+ * The deadline exists so a genuine hang fails as a timeout rather than spinning
+ * for the whole suite.
+ */
+async function flushPaint(window: Window, timeoutMs = 5_000) {
+  const doc = window.document;
+  const frame = () => new Promise<void>((resolve) => { window.requestAnimationFrame(() => resolve()); });
+  const count = () => doc.querySelectorAll(".msg, .tool-item, .thought").length;
+  const deadline = Date.now() + timeoutMs;
+  let previous = -1;
+  for (;;) {
+    await frame();
+    const now = count();
+    // Two consecutive equal readings: nothing arrived during a whole frame.
+    if (now === previous) return;
+    previous = now;
+    if (Date.now() > deadline) return; // a hang is the test's problem to report
+    await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+  }
 }
 
 async function playTurn(window: Window, user: string, agent: string, thought?: string) {

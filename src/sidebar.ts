@@ -46,6 +46,7 @@ import {
   type ProviderHistoryCursor,
 } from "./provider-ui";
 import {
+  nextWakeAt,
   ROUTINES_KEY,
   routineWindow,
   toRoutineView,
@@ -100,6 +101,13 @@ import {
   withShownTip,
 } from "./welcome-tips";
 import { commandOnPath, runGitClone } from "./git-clone";
+import {
+  deviceLoginFailureText,
+  deviceLoginPlan,
+  deviceLoginPreflight,
+  deviceLoginUnavailable,
+} from "./device-login";
+import { runDeviceLogin, type DeviceLoginHandle } from "./device-login-run";
 import {
   GITHUB_CLI_DOWNLOAD,
   classifyCloneFailure,
@@ -261,7 +269,9 @@ import {
   resolveRemoteFileRoot,
   writeRemoteProjectFile,
 } from "./remote-files";
-import { buildLinkStartBody, deviceDisplayName, httpBaseFromRelayUrl, parseRelayFrame, RELAY_DEVICE_TOKEN_SECRET, resolveRelayUrl } from "./remote-frames";
+import {
+  isCloudEnvironment,
+  CLOUD_ENVIRONMENT_ENV, buildLinkStartBody, deviceDisplayName, httpBaseFromRelayUrl, parseRelayFrame, RELAY_DEVICE_TOKEN_SECRET, resolveRelayUrl } from "./remote-frames";
 import { KeepAwake, shouldKeepAwake } from "./keep-awake";
 import { thumbnailImage, thumbnailMime } from "./image-thumbnail";
 import { historyImagePreviews } from "./image-history";
@@ -914,6 +924,14 @@ export class GrokSidebar {
     "unlinkRemoteDevice",
   ]);
   private readonly loginReprobeTimers = new Map<AcpProvider, ReturnType<typeof setTimeout>>();
+  /** Headless sign-ins in flight, one per provider, with the remote client that
+   *  asked. Keyed by provider rather than by client because the CREDENTIAL is
+   *  per-provider: two phones both connecting Grok want one flow and one code,
+   *  not two codes racing to write the same file. */
+  private readonly deviceLogins = new Map<
+    AcpProvider,
+    { handle: DeviceLoginHandle; clientId?: string }
+  >();
   /** A Settings → Providers refresh in flight. Reported on `providerState` so
    *  the button can say it is working, and guards re-entry: a second click (or
    *  the page's own open-refresh landing on top of a click) must not start a
@@ -987,6 +1005,9 @@ export class GrokSidebar {
    *  exactly once across every host sharing this `~/.grok`. */
   private readonly routineRuns: RoutineRunStore;
   private routineTimer?: ReturnType<typeof setInterval>;
+  /** Last wake time the relay accepted. `undefined` = never published, which is
+   *  distinct from `null` = published "nothing scheduled". */
+  private publishedWakeAt: number | null | undefined;
   /** Routines whose session is live right now, so a slow turn cannot be
    *  overlapped by the next tick even though its window is still current. */
   private readonly routinesInFlight = new Set<string>();
@@ -1305,6 +1326,51 @@ export class GrokSidebar {
     // observe for itself, and it just changed. Posted from here rather than
     // from each of the seven call sites above, so the two can never disagree.
     this.postWelcomeTips();
+    // Same reasoning, one layer out: this is the single choke point where the
+    // schedule can change, so it is the only honest place to tell the relay
+    // when this machine next needs to be awake.
+    void this.publishWakeAt();
+  }
+
+  /**
+   * Tell the relay when this environment next needs to be awake.
+   *
+   * ONLY a cloud environment does this, and only ever a timestamp. A laptop
+   * needs no such thing — it fires its own routines because somebody opened it
+   * — and sending one from a desk machine would put a schedule in a database
+   * that deliberately holds no payloads, for no benefit at all.
+   *
+   * `null` is a real and necessary value: a user who pauses or deletes their
+   * last routine must clear the standing wake, or the machine keeps starting up
+   * nightly for something that no longer exists.
+   *
+   * Best-effort by design. A relay that is unreachable, older than this
+   * endpoint, or serving no environments answers 404 or nothing, and the
+   * correct response is silence: routines still run when the machine is up, and
+   * catch-up is arithmetic. A failure here delays a routine; it never loses
+   * one, and it must never interrupt anybody.
+   */
+  private async publishWakeAt(): Promise<void> {
+    if (!isCloudEnvironment()) return;
+    // Through relayUrl(), like every other consumer: half the app on staging
+    // and half on production fails in a way that looks like a relay bug.
+    const base = httpBaseFromRelayUrl(this.relayUrl());
+    const token = await this.readDeviceToken().catch(() => undefined);
+    if (!base || !token) return;
+    const wakeAt = nextWakeAt(this.loadRoutines(), Date.now());
+    if (wakeAt === this.publishedWakeAt) return;
+    try {
+      const res = await fetch(`${base}/api/environment/wake-at`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ wakeAt }),
+      });
+      // Remembered only on success, so a transient failure is retried by the
+      // next schedule change rather than being assumed delivered.
+      if (res.ok) this.publishedWakeAt = wakeAt;
+    } catch {
+      /* the relay is unreachable; routines still run when this host is up */
+    }
   }
 
   /**
@@ -1621,6 +1687,103 @@ export class GrokSidebar {
       if (probeId) this.removeSessionFromDisk(probeId, scratch);
       try { fs.rmSync(scratch, { recursive: true, force: true }); } catch { /* leftover temp dir is harmless */ }
     }
+  }
+
+  /**
+   * The remote half of connecting an agent: run the CLI's headless sign-in and
+   * report the URL and code it prints.
+   *
+   * Sends only to the client that asked. A code is for the person holding that
+   * device, and broadcasting it to a desk webview nobody is sitting at would be
+   * both useless and, for something that is briefly a bearer credential, worse
+   * than useless.
+   *
+   * The panel is posted BEFORE the flow starts. `starting` is a real state with
+   * a real duration — a cold CLI takes a second or two to say anything — and
+   * without it a phone shows nothing at all between the tap and the code, which
+   * reads as a button that did not work.
+   */
+  private async startDeviceLogin(
+    provider: AcpProvider,
+    cliPath: string,
+    clientId?: string,
+  ): Promise<void> {
+    const displayName = providerDisplayName(provider);
+    const send = (device: Extract<HostMsg, { type: "onboarding" }>["device"]) => {
+      const message: HostMsg = {
+        type: "onboarding",
+        state: providerLoginState(provider),
+        platform: process.platform,
+        provider,
+        launched: true,
+        device,
+      };
+      if (clientId) this.sendRemoteClient(clientId, message);
+      else this.post(message);
+    };
+
+    const isCloud = isCloudEnvironment();
+    const unavailable = deviceLoginUnavailable(provider, { isCloud });
+    const plan = deviceLoginPlan(provider);
+    // Before anything is spawned. A person who reads this fixes a setting in
+    // fifteen seconds; a person who reads the failure afterwards has already
+    // waited for it.
+    const preflight = deviceLoginPreflight(provider, { isCloud });
+    if (preflight) {
+      send({ status: "unavailable", message: preflight.reason, preflight: { ...preflight, steps: [...preflight.steps] } });
+      return;
+    }
+    if (unavailable || !plan) {
+      // Not an error, and it must not read as one: the agent can still be
+      // connected, just not from here. Saying which is the difference between
+      // a dead end and a next step.
+      send({
+        status: "unavailable",
+        message: unavailable
+          ?? `${displayName} has no sign-in that works without a terminal. Connect it at your computer.`,
+      });
+      return;
+    }
+
+    // One flow per provider. A second tap while the first is polling would
+    // spawn a second child racing the first to write the same credential file,
+    // and would replace a code the user may already be typing.
+    const running = this.deviceLogins.get(provider);
+    if (running) {
+      running.clientId = clientId;
+      return;
+    }
+
+    send({ status: "starting" });
+    const handle = runDeviceLogin(cliPath, plan.args, {
+      onPrompt: (prompt) => {
+        send({ status: "waiting", url: prompt.url, code: prompt.code });
+      },
+      onDone: (result) => {
+        this.deviceLogins.delete(provider);
+        if (!result.ok && "cancelled" in result) return;
+        if (result.ok) {
+          send({ status: "done" });
+          // Same reprobe the desk path uses. The CLI exiting 0 says the vendor
+          // approved it; only a credential probe says this host can now use it.
+          this.watchProviderLogin(provider);
+          return;
+        }
+        this.host.appendLine(`[${provider}] device login failed: ${result.output.slice(-2000)}`);
+        send({
+          status: "failed",
+          message: deviceLoginFailureText(provider, result.failure, displayName),
+        });
+      },
+    });
+    this.deviceLogins.set(provider, { handle, clientId });
+  }
+
+  /** Stop every headless sign-in. Called on dispose so a child polling a device
+   *  endpoint does not outlive the window that started it. */
+  private cancelAllDeviceLogins(): void {
+    for (const { handle } of this.deviceLogins.values()) handle.cancel();
+    this.deviceLogins.clear();
   }
 
   /** Observe an interactive terminal login without requiring a reload. Terminal
@@ -7344,6 +7507,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (this.reaper) { clearInterval(this.reaper); this.reaper = undefined; }
     if (this.routineTimer) { clearInterval(this.routineTimer); this.routineTimer = undefined; }
     for (const timer of this.loginReprobeTimers.values()) clearTimeout(timer);
+    this.cancelAllDeviceLogins();
     this.loginReprobeTimers.clear();
     for (const timer of this.turnOrderTimers) clearTimeout(timer);
     this.turnOrderTimers.clear();
@@ -10007,6 +10171,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           });
           break;
         }
+        // A remote has no terminal to look at and no keyboard attached to the
+        // host, so the desk path is not merely worse there — it does nothing
+        // visible at all. Run the CLI's headless flow instead and put the URL
+        // and code in the transcript. Everything below this branch is the desk
+        // path and is deliberately unchanged.
+        if (origin === "remote") {
+          await this.startDeviceLogin(provider, cliPath, clientId);
+          break;
+        }
         // Official CLI owns login. For Claude this is `claude auth login`
         // without --claudeai — we never implement or proxy Claude.ai OAuth.
         const loginArgs = provider === "claude" ? ["auth", "login"] : ["login"];
@@ -10032,7 +10205,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // nowhere to start a session. Connecting still works — it only opens a
         // terminal — and the panel below still shows; the fresh session simply
         // waits until there is a project to put it in.
-        if (session.hasHistory && origin !== "remote" && this.workspaceRoot()) {
+        //
+        // The `origin !== "remote"` this used to carry is gone because the
+        // remote branch above returns before here — TypeScript pointed out the
+        // comparison could no longer be false, which is the check that the two
+        // paths really are separate rather than merely intended to be.
+        if (session.hasHistory && this.workspaceRoot()) {
           await this.newFocusedSession(origin);
         }
         // ALWAYS show this provider's login panel, and say the terminal was
@@ -10054,6 +10232,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           provider,
           launched: true,
         });
+        break;
+      }
+      case "cancelDeviceLogin": {
+        const provider: AcpProvider = isAcpProvider(msg.provider) ? msg.provider : "grok";
+        const running = this.deviceLogins.get(provider);
+        if (!running) break;
+        this.deviceLogins.delete(provider);
+        running.handle.cancel();
+        // Back to the plain sign-in panel, with no code and no failure. The
+        // person cancelled; telling them it failed would be a small lie.
+        const message: HostMsg = {
+          type: "onboarding",
+          state: providerLoginState(provider),
+          platform: process.platform,
+          provider,
+        };
+        if (clientId) this.sendRemoteClient(clientId, message);
+        else this.post(message);
         break;
       }
       case "recheckConnection": {
@@ -14314,7 +14510,18 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // DevTools is discoverable without the auto-hidden application menu.
         toggleDevTools: this.host.canToggleDevTools,
         // OPT-IN: absent/false hides Settings → Connectors.
-        ...(this.host.canShowMcpSettings ? { mcpSettings: true } : {}),
+        //
+        // A cloud environment withholds it. Connecting an MCP connector is a
+        // browser OAuth flow at the VENDOR, and there is no browser in a hosted
+        // machine — nor, unlike a desk, any computer to walk over to. Every
+        // other host-local capability re-homes to the remote client, which knows
+        // how to present a file or open a URL itself; this one genuinely cannot,
+        // until a connector offers a device-code flow.
+        //
+        // Withheld rather than shown-and-disabled: a control that explains why
+        // it will not work is still a control that does not work, and the page
+        // behind it would list servers nobody can connect.
+        ...(this.host.canShowMcpSettings && !isCloudEnvironment() ? { mcpSettings: true } : {}),
         // Absent/true = host opens files in an editor tab; false = no editor
         // (desktop → in-app lightbox for generated images). See Host.canOpenInEditor.
         openInEditor: this.host.canOpenInEditor,
@@ -17262,6 +17469,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         release: os.release(),
         appName: this.host.appName,
         isDesktop: this.host.remoteInstallIdSuffix === ":desktop",
+        isCloud: isCloudEnvironment(),
       },
       snapshot: (clientId) => this.buildRemoteSnapshot(clientId),
       // Socket-level project gate — also covers the catch-up snapshot path,
@@ -17405,6 +17613,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         installId,
         appName: this.host.appName,
         isDesktop: this.host.remoteInstallIdSuffix === ":desktop",
+        isCloud: isCloudEnvironment(),
       });
       const startRes = await fetch(`${base}/api/link/start`, {
         method: "POST",
