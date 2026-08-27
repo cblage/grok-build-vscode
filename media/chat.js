@@ -762,6 +762,11 @@
     arrowUp: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg>`,
     arrowDown: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>`,
     brain: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4"/><path d="M9 13a4.5 4.5 0 0 0 3-4"/></svg>`,
+    // The empty state's advice mark. Lucide `lightbulb`, on this map's own
+    // conventions — 24 viewBox, stroke 2, currentColor — so it sits in the
+    // same drawn language as every other glyph in the product rather than
+    // being the one filled outlier.
+    idea: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>`,
     orbit: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.341 6.484A10 10 0 0 1 10.266 21.85"/><path d="M3.659 17.516A10 10 0 0 1 13.74 2.152"/><circle cx="12" cy="12" r="3"/><circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/></svg>`,
     square: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>`,
     spinner: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>`,
@@ -7689,7 +7694,7 @@
     // exist. `role`/`tabindex`/keydown put back the semantics the anchor was
     // providing.
     tip.innerHTML =
-      "\u{1F4A1} <b>To move Grok to the right</b>" +
+      `<span class="welcome-tip-bulb">${ICON.idea}</span> <b>To move Grok to the right</b>` +
       "<br>After moving, click <b>Toggle Agents Side Bar</b> to show it." +
       '<br><span id="welcome-tip-link" class="muted-link" role="button" tabindex="0">Click here</span>' +
       " and select <b>New Secondary Side Bar Entry</b>.";
@@ -7725,6 +7730,12 @@
    * alternate agent IS connected, so the one tip a multi-agent user would find
    * silly cannot flash on screen during startup.
    */
+  /** Whatever tip is on screen right now, or "". */
+  function currentWelcomeTipId() {
+    const el = document.getElementById("welcome-tip");
+    return (el && el.dataset && el.dataset.tip) || "";
+  }
+
   function welcomeTipFacts() {
     const host = state.welcomeTips || {};
     const providers = state.providers || [];
@@ -7734,6 +7745,10 @@
     return {
       appPurpose: state.appPurpose === "coding" ? "coding" : "knowledge",
       isRemote: IS_REMOTE,
+      // Mirrors continueChatDestinations(), so the tip is never offered where
+      // the action it links to would be refused.
+      worktreeSupported: state.worktreeSupported !== false,
+      inWorktree: !!state.isWorktree,
       altAgentConnected: !state.providersKnown || altConnected,
       routineCount: host.routineCount,
       connectorCount: host.connectorCount,
@@ -7741,20 +7756,67 @@
       readRepliesAloud: IS_REMOTE ? !!state.remoteTts : !!state.readRepliesAloud,
       voiceConfigured: !!state.voiceConfigured,
       remoteLinked: state.remoteLinked,
-      dismissed: Array.isArray(host.dismissed) ? host.dismissed : [],
+      // Host list plus anything retired here. The union, so the control works
+      // before the first frame and keeps working if the host never answers.
+      dismissed: (Array.isArray(host.dismissed) ? host.dismissed : [])
+        .concat(Array.from(welcomeTipsRetiredHere)),
+      shownToday: (Array.isArray(host.shownToday) ? host.shownToday : [])
+        .concat(Array.from(welcomeTipsClosedHere)),
+      // The tip on screen is exempt from the once-a-day filter — it joined that
+      // list when it rendered, and a repaint must not blank it mid-read. Closing
+      // it with the X is exactly the act of releasing that pin.
+      keepId: welcomeTipsClosedHere.has(currentWelcomeTipId())
+        ? ""
+        : currentWelcomeTipId(),
     };
   }
 
-  /** Where a tip's action goes. Every destination is real - a tip whose target
-   *  cannot be opened from an empty screen carries no link at all (worktrees). */
+  /**
+   * Record that a tip has had its turn today, once per client.
+   *
+   * Deliberately NOT conditional on the host frame having arrived — that is the
+   * same mistake the dismiss control made, where an effect that depended on a
+   * frame landing silently did nothing when it had not.
+   */
+  function noteWelcomeTipShown(id, force) {
+    if (!force && welcomeTipsNoted.has(id)) return;
+    welcomeTipsNoted.add(id);
+    const host = state.welcomeTips;
+    if (host && Array.isArray(host.shownToday) && host.shownToday.indexOf(id) < 0) {
+      host.shownToday = host.shownToday.concat([id]);
+    }
+    vscode.postMessage({ type: "welcomeTipShown", id });
+  }
+
+  /** The X: done with this one for today. */
+  function closeWelcomeTipForToday(id) {
+    welcomeTipsClosedHere.add(id);
+    // `force`, because the render already noted this id and the once-guard
+    // would otherwise swallow the message. That guard exists to stop repaints
+    // rewriting the file all afternoon; a deliberate close is not a repaint,
+    // and if the render's note never reached the host then without this one
+    // tomorrow would look exactly like today. The host is idempotent per day,
+    // so the extra message costs nothing when the first one did arrive.
+    noteWelcomeTipShown(id, true);
+  }
+
+  /**
+   * Where a tip's action goes. Every destination is real and reachable from an
+   * empty screen — that is the bar a tip has to clear to earn a link at all,
+   * and the reason the Plan tip was removed rather than given one: it pointed
+   * at a mode menu, which is a control, not work.
+   */
   function runWelcomeTipTarget(target) {
     if (typeof target !== "string") return;
     if (target.indexOf("settings:") === 0) {
       openSettingsCategory(target.slice("settings:".length));
       return;
     }
-    if (target === "mode") {
-      openModePopover();
+    if (target === "worktree") {
+      // No confirm step: the host refuses a non-git folder and a nested
+      // worktree with a message of its own, and on an empty screen the only
+      // other destination ("use this checkout") is what the screen already is.
+      vscode.postMessage({ type: "newWorktreeSession" });
       return;
     }
     if (target === "mention") {
@@ -7776,12 +7838,39 @@
     }
   }
 
-  /** Retire a tip on this machine - the same message for "took it" and "not
-   *  interested", because both mean the reader is done with it. */
+  /**
+   * Tips retired in THIS client, whatever the host has said.
+   *
+   * The dismiss control used to write only into `state.welcomeTips.dismissed`,
+   * which meant it did nothing at all whenever that frame had not arrived: no
+   * local record, so the next render recomputed the same pool and put the same
+   * tip straight back. On a host too old to answer, the X stayed inert for
+   * ever. A control whose effect depends on a frame having landed is a control
+   * that silently does nothing, so this set is consulted unconditionally and
+   * merged with whatever the host reports.
+   */
+  const welcomeTipsRetiredHere = new Set();
+
+  /**
+   * Tips the reader has closed with the X — NOT TODAY, not for ever.
+   *
+   * Every tip is already recorded as shown for the day the moment it renders,
+   * so closing one does not need to record anything new: it only has to release
+   * the pin that keeps the tip currently on screen exempt from that day filter.
+   * Tomorrow it comes round again.
+   */
+  const welcomeTipsClosedHere = new Set();
+
+  /** Ids this client has already reported as shown, so a repaint cannot post
+   *  the same note over and over. */
+  const welcomeTipsNoted = new Set();
+
+  /** Retire a tip - the same message for "took it" and "not interested",
+   *  because both mean the reader is done with it. */
   function retireWelcomeTip(id) {
+    // First, and never conditionally: this is what makes the click work.
+    welcomeTipsRetiredHere.add(id);
     const host = state.welcomeTips;
-    // Optimistic local retirement so the slot changes on this click rather than
-    // on the host's answering frame. The host echoes a fresh list either way.
     if (host && Array.isArray(host.dismissed) && host.dismissed.indexOf(id) < 0) {
       host.dismissed = host.dismissed.concat([id]);
     }
@@ -7823,6 +7912,13 @@
     if (!helpers || typeof helpers.welcomeTipsFor !== "function") return drop();
     const status = $("welcome-version");
     if (status && status.classList.contains("welcome-status-busy")) return drop();
+    // BOTH the mode and the node. The node alone is a proxy that is briefly
+    // wrong: showOnboarding sets the mode, reveals the welcome — which stamps
+    // the status line, which re-renders this slot — and only then writes the
+    // card's HTML. In that gap the node is still empty, so a tip rendered over
+    // an empty state that was about to have a call to action in it, and burned
+    // its own once-a-day turn doing so.
+    if (state.onboardingMode) return drop();
     const onb = $("welcome-onboarding");
     if (onb && onb.childNodes.length) return drop();
 
@@ -7844,7 +7940,7 @@
 
     const bulb = document.createElement("span");
     bulb.className = "welcome-tip-bulb";
-    bulb.textContent = "\u{1F4A1}";
+    bulb.innerHTML = ICON.idea;
     bulb.setAttribute("aria-hidden", "true");
     el.appendChild(bulb);
 
@@ -7864,6 +7960,12 @@
         action.setAttribute("tabindex", "0");
         const go = (e) => {
           if (e) e.preventDefault();
+          // The click must NOT reach the document. Several handlers there close
+          // every popover on any outside click, and this one runs first — so a
+          // target that opens a popover had it built and then hidden again in
+          // the same tick, which is precisely how the Plan link looked broken
+          // while doing exactly what it was told.
+          if (e && typeof e.stopPropagation === "function") e.stopPropagation();
           runWelcomeTipTarget(tip.target);
           // Acting on advice retires the advice - the principle the move-view
           // hint established. Retire AFTER opening, so a target that refuses to
@@ -7882,18 +7984,20 @@
     const close = document.createElement("button");
     close.type = "button";
     close.className = "welcome-tip-dismiss";
-    close.title = "Not interested";
-    close.setAttribute("aria-label", "Dismiss this tip");
+    close.title = "Not today";
+    close.setAttribute("aria-label", "Hide this tip until tomorrow");
     close.textContent = "\u00d7";
     close.onclick = (e) => {
       e.preventDefault();
       e.stopPropagation();
-      retireWelcomeTip(tip.id);
+      closeWelcomeTipForToday(tip.id);
       renderWelcomeTip();
     };
     el.appendChild(close);
 
     welcome.appendChild(el);
+    // After the append, so a tip that failed to build is not marked as seen.
+    noteWelcomeTipShown(tip.id);
   }
 
   /**
@@ -15032,6 +15136,9 @@
           routineCount: msg.routineCount,
           connectorCount: msg.connectorCount,
           dismissed: Array.isArray(msg.dismissed) ? msg.dismissed : [],
+          // Absent on an older host: no field, no once-a-day filter, and the
+          // pool behaves exactly as it did before this existed.
+          shownToday: Array.isArray(msg.shownToday) ? msg.shownToday : [],
         };
         renderWelcomeTip();
         break;

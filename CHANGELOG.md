@@ -1,10 +1,10 @@
 # Changelog
 
-## 3.17.3-sandbox.1 — 2026-08-25
+## 3.18.1-sandbox.1 — 2026-08-26
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.17.2.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.18.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,25 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 3.18.0 — 2026-08-26
+
+### Added
+
+- **Add project can make one, not just find one.** It used to be a single control that opened your operating system's folder picker — right for a folder that already exists, and wrong for everything else. There are three ways in now. **New project** takes a name and creates `~/Grok Build/<name>`: one folder, no `git init`, and nothing to choose in a file dialog. **Import a folder** is the picker, unchanged. **Clone from GitHub** takes a repository URL and checks it out beside the others; it appears in Coding mode, because that is where it belongs. A host that offers only one of the three shows no menu at all.
+- **Naming a project and cloning one work from your phone.** They send a name or a URL and let the computer running the extension decide where it goes, which is why they can travel when the folder picker never could — a native dialog is not something a browser can show or answer. Importing stays at the desk for that reason.
+- **Cloning uses the Git credentials you already have.** No token to paste, nothing stored, and public repositories need nothing at all — on most machines the GitHub CLI is never needed at all. When a private repository does fail, the form says so and offers the next step rather than printing what Git said. **Sign in to GitHub** runs `gh auth login` *and* `gh auth setup-git`, because login alone asks whether to configure Git and lets you say no — which would leave the clone failing exactly as before. If the CLI is not installed, the button offers to install it and names the exact command first; if there is no package manager to install it with either — a Mac without Homebrew, Windows without winget — it points at cli.github.com rather than offering a button that would run a command which is also missing.
+- **A tip on the empty screen.** Once an agent is connected the welcome screen had nothing to say; it now carries one quiet line naming something you have not set up yet — another agent, a routine, connectors, read aloud, `@` file mentions, a worktree. Each links to the exact place it names. You are never shown advice about something you have already done, no tip appears twice in a day, and **✕** means *not today* rather than never. When it all applies to you, the line is simply gone. See [Tips on the empty screen](https://github.com/phuryn/grok-build-vscode/blob/main/docs/empty-state-tips.md).
+
+### Fixed
+
+- **The Settings link on a tip opens the right page.** Every tip that points at Settings now lands on its own category rather than the top of the page.
+
+### Documentation
+
+- [Projects](https://github.com/phuryn/grok-build-vscode/blob/main/docs/projects.md) — the three ways to add one, where new folders go, name rules, and what happens when a clone needs credentials.
+- [Signing agents in](https://github.com/phuryn/grok-build-vscode/blob/main/docs/provider-login.md) — how Grok, Codex and Claude authenticate, including the headless paths for a machine you only ever reach remotely.
+- [Tips on the empty screen](https://github.com/phuryn/grok-build-vscode/blob/main/docs/empty-state-tips.md) — what can be suggested, the rules it follows, and where the state lives.
 
 ## 3.17.2 — 2026-08-25
 

@@ -92,17 +92,24 @@ import { modeToRemember, startsInYolo } from "./mode-prefs";
 import { beginAuthRecovery, oauthShadowsXaiApiKey } from "./auth-recovery";
 import {
   WELCOME_TIPS_KEY,
+  WELCOME_TIPS_SHOWN_KEY,
+  localDayKey,
   parseDismissedTips,
+  shownOn,
   withDismissedTip,
+  withShownTip,
 } from "./welcome-tips";
 import { commandOnPath, runGitClone } from "./git-clone";
 import {
+  GITHUB_CLI_DOWNLOAD,
   classifyCloneFailure,
   cloneDestination,
+  cloneFailureText,
   cloneUrlError,
   displayPath,
-  cloneFailureText,
   githubCliInstallCommand,
+  githubFixFor,
+  githubSignInCommand,
   offersGithubSetup,
   projectDestination,
   projectNameError,
@@ -1310,13 +1317,18 @@ export class GrokSidebar {
    * lists here would put routine prompts on the wire for a client that never
    * asked for them.
    */
-  private postWelcomeTips(): void {
-    this.post({
+  private welcomeTipsMessage(): Extract<HostMsg, { type: "welcomeTips" }> {
+    return {
       type: "welcomeTips",
       routineCount: this.loadRoutines().length,
       connectorCount: Object.keys(this.connectedConnectorStore()).length,
       dismissed: parseDismissedTips(this.state.get(WELCOME_TIPS_KEY, {})),
-    });
+      shownToday: shownOn(this.state.get(WELCOME_TIPS_SHOWN_KEY, {}), localDayKey(new Date())),
+    };
+  }
+
+  private postWelcomeTips(): void {
+    this.post(this.welcomeTipsMessage());
   }
 
   /**
@@ -5922,14 +5934,20 @@ Only continue if you trust this code.`,
    * only to show where the folder will be, and a remote has no business
    * learning the desk's home directory.
    */
-  private postProjectSetup(
+  private projectSetupMessage(
     extra: Omit<Extract<HostMsg, { type: "projectSetup" }>, "type" | "root"> = {},
-  ): void {
-    this.post({
+  ): Extract<HostMsg, { type: "projectSetup" }> {
+    return {
       type: "projectSetup",
       root: displayPath(this.projectRootPath(), this.projectHomeDir()),
       ...extra,
-    });
+    };
+  }
+
+  private postProjectSetup(
+    extra: Omit<Extract<HostMsg, { type: "projectSetup" }>, "type" | "root"> = {},
+  ): void {
+    this.post(this.projectSetupMessage(extra));
   }
 
   /**
@@ -6019,18 +6037,20 @@ Only continue if you trust this code.`,
         /* leave it — reporting the clone failure matters more */
       }
       const kind = classifyCloneFailure(failure);
-      const offer = offersGithubSetup(trimmed, kind);
-      const install = githubCliInstallCommand(process.platform);
-      this.postProjectSetup({
-        error: cloneFailureText(kind, failure),
-        ...(offer
-          ? commandOnPath("gh")
-            ? { fix: "auth-gh" as const }
-            : install
-              ? { fix: "install-gh" as const, fixCommand: install.display }
-              : {}
-          : {}),
-      });
+      let error = cloneFailureText(kind, failure);
+      let fix: { fix?: "auth-gh" | "install-gh"; fixCommand?: string } = {};
+      if (offersGithubSetup(trimmed, kind)) {
+        const offer = githubFixFor(process.platform, commandOnPath);
+        if (offer.kind === "auth") fix = { fix: "auth-gh" };
+        else if (offer.kind === "install") fix = { fix: "install-gh", fixCommand: offer.command };
+        else {
+          // No gh, and no package manager we could drive either — a Mac with no
+          // Homebrew, or Windows without winget. A button that runs a command
+          // which is not installed either is worse than saying where to get it.
+          error += ` Install the GitHub CLI from ${offer.where} first.`;
+        }
+      }
+      this.postProjectSetup({ error, ...fix });
       return;
     }
     await this.addProjectFolder(dest);
@@ -6046,26 +6066,28 @@ Only continue if you trust this code.`,
    * could neither see the questions nor answer them.
    */
   async setupGithubCli(action: "install" | "auth"): Promise<void> {
+    // `sendText`, not `shellPath`/`shellArgs`: both of these are command LINES
+    // rather than one binary with arguments. Signing in has to run two commands
+    // in order — see githubSignInCommand for why the second is not optional —
+    // and this is the seam that already exists for exactly that (the desktop
+    // host routes it through planRunCommandInTerminal, which keeps the window
+    // open so the outcome stays readable).
     if (action === "auth") {
-      const term = this.host.createTerminal({
-        name: "GitHub sign-in",
-        shellPath: "gh",
-        shellArgs: ["auth", "login"],
-      });
+      const term = this.host.createTerminal({ name: "GitHub sign-in" });
       term.show();
+      term.sendText(githubSignInCommand(process.platform));
       return;
     }
     const install = githubCliInstallCommand(process.platform);
     if (!install) {
-      this.postProjectSetup({ error: "Install the GitHub CLI from cli.github.com, then try again." });
+      this.postProjectSetup({
+        error: `Install the GitHub CLI from ${GITHUB_CLI_DOWNLOAD}, then try again.`,
+      });
       return;
     }
-    const term = this.host.createTerminal({
-      name: "Install GitHub CLI",
-      shellPath: install.file,
-      shellArgs: install.args,
-    });
+    const term = this.host.createTerminal({ name: "Install GitHub CLI" });
     term.show();
+    term.sendText(install.display);
   }
 
   /**
@@ -9811,6 +9833,21 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // host-local by policy, so `origin` is always local here.
         await this.setupGithubCli(msg.action === "install" ? "install" : "auth");
         break;
+      case "welcomeTipShown": {
+        // Idempotent per day: `withShownTip` answers null when this tip is
+        // already recorded for today, which means no write and no frame — the
+        // client posts at most once per tip per day, and this is the second
+        // gate so a client that forgets cannot rewrite the file all afternoon.
+        const seen = withShownTip(
+          this.state.get(WELCOME_TIPS_SHOWN_KEY, {}),
+          msg.id,
+          localDayKey(new Date()),
+        );
+        if (!seen) break;
+        await this.state.update(WELCOME_TIPS_SHOWN_KEY, seen);
+        this.postWelcomeTips();
+        break;
+      }
       case "dismissWelcomeTip": {
         // Id-shaped only, capped, and idempotent — `withDismissedTip` answers
         // null for anything already retired or out of bounds, and a null means
@@ -17478,6 +17515,18 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     snap.push(this.providerStateMessage());
     snap.push(this.mcpConnectorsMessage());
     snap.push(this.mcpServersMessage());
+    // SIXTH hand-written registry, and it is not the same one as
+    // DEVICE_GLOBAL_REMOTE_TYPES. That set decides how a frame is ROUTED once
+    // something posts it; this list decides whether a newly-connected browser
+    // ever receives it at all. Both are needed and TypeScript enforces neither.
+    //
+    // Without these two, a phone came up with no tip facts and no project root:
+    // every count read as unknown, the dismissed list read as empty, so a tip
+    // the user had retired weeks ago came back on every empty screen and the
+    // once-a-day rule never applied — the host was recording faithfully and
+    // nobody was listening.
+    snap.push(this.welcomeTipsMessage());
+    snap.push(this.projectSetupMessage());
     snap.push({ type: "clearMessages" });
     // Conversation buffer only when the bound session still lives under an
     // authorized cwd (revoke disposes doomed sessions; this is the belt).

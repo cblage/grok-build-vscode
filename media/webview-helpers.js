@@ -40,7 +40,7 @@
     "ready", "remotePreferences", "send", "newSession", "cancel", "pickModel", "setMode", "setSandbox", "removeChip",
     "toggleChip", "openFile", "showInFolder", "openUrl", "openText", "openDiff", "exportExpr", "setEffort",
     "addProjectFolder", "removeProjectFolder", "createProject", "cloneProject", "setupGithubCli",
-    "openGlobalConfig", "openProjectConfig", "listMcpServers", "connectMcpConnector", "disconnectMcpConnector", "showLogs", "toggleDevTools", "openSettings", "openSettingsSurface", "closeSettingsSurface", "dismissWelcomeTip", "moveView",
+    "openGlobalConfig", "openProjectConfig", "listMcpServers", "connectMcpConnector", "disconnectMcpConnector", "showLogs", "toggleDevTools", "openSettings", "openSettingsSurface", "closeSettingsSurface", "dismissWelcomeTip", "welcomeTipShown", "moveView",
     "listRoutines", "saveRoutine", "deleteRoutine", "setRoutinePaused", "runRoutineNow",
     "setShowThinking", "setAppPurpose", "setExpandCommandOutputs",
     "dropFile", "permissionAnswer", "exitPlanAnswer", "questionAnswer", "questionCancel",
@@ -1964,28 +1964,29 @@
       eligible: (f) => !f.voiceConfigured,
     },
     {
-      id: "plan",
-      copy: "Want the approach before the work? Pick {Plan} in the mode menu.",
-      target: "mode",
-      deskOnly: false,
-      eligible: () => true,
-    },
-    {
       id: "mentions",
-      copy: "Point at a file with {@}, or drop one onto the composer.",
+      // The actionable phrase, not the character: "@" alone is about six pixels
+      // wide, and no amount of padding turns that into a finger-sized target
+      // without visibly shoving the sentence around it.
+      copy: "{Mention a file with @}, or drop one onto the composer.",
       target: "mention",
       deskOnly: false,
       eligible: () => true,
     },
     {
       id: "worktrees",
-      // No target: starting a worktree needs a conversation to continue FROM,
-      // and this tip is only ever shown on an empty screen. Emphasis without a
-      // link is honest; a link that opens nothing is not.
-      copy: "Keep your checkout clean — let the agent work in {its own worktree}.",
-      target: null,
+      // It DOES have an action, which the first version of this tip missed:
+      // `newWorktreeSession` takes no source conversation — it cuts from the
+      // current project — so it works perfectly well from an empty screen. The
+      // copy names what the click does rather than describing a menu path
+      // nobody remembers ("… > Continue in a new chat > Use a new worktree").
+      copy: "Trying something risky? {Start it in a worktree} — your checkout stays untouched.",
+      target: "worktree",
       deskOnly: true,
-      eligible: (f) => f.appPurpose === "coding",
+      // Every condition the destination list itself applies, so the link can
+      // never fire something the host would refuse: coding mode, a CLI that
+      // supports worktrees, and not already inside one (they do not nest).
+      eligible: (f) => f.appPurpose === "coding" && f.worktreeSupported && !f.inWorktree,
     },
   ];
 
@@ -2008,6 +2009,14 @@
     const dismissed = Array.isArray(f.dismissed)
       ? new Set(f.dismissed)
       : new Set(Object.keys(f.dismissed || {}));
+    // Seen already today. The pool is small, so without this the same two or
+    // three lines come round again every time a conversation ends — which is
+    // how advice turns into wallpaper.
+    const shownToday = new Set(Array.isArray(f.shownToday) ? f.shownToday : []);
+    // …except whatever is on screen RIGHT NOW. It was added to that set the
+    // moment it rendered, and a repaint must not make the line the reader is
+    // in the middle of vanish from under them.
+    if (f.keepId) shownToday.delete(f.keepId);
     const known = {
       appPurpose: f.appPurpose === "coding" ? "coding" : "knowledge",
       isRemote: !!f.isRemote,
@@ -2016,10 +2025,16 @@
       connectorCount: typeof f.connectorCount === "number" ? f.connectorCount : -1,
       readRepliesAloud: !!f.readRepliesAloud,
       voiceConfigured: !!f.voiceConfigured,
+      // Opt-OUT, matching the client's own default: a CLI is assumed to support
+      // worktrees until a create says otherwise, and reading absence as "no"
+      // here would have hidden the tip on every host that never mentions it.
+      worktreeSupported: f.worktreeSupported !== false,
+      inWorktree: !!f.inWorktree,
       remoteLinked: f.remoteLinked === true ? true : f.remoteLinked === false ? false : null,
     };
     return WELCOME_TIPS.filter((tip) => {
       if (dismissed.has(tip.id)) return false;
+      if (shownToday.has(tip.id)) return false;
       if (known.isRemote && tip.deskOnly) return false;
       // -1 is "the host never told us" — see the doc comment.
       if (tip.id === "routines" && known.routineCount < 0) return false;
