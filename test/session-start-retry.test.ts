@@ -129,7 +129,7 @@ function makeSidebar(cwd: string): any {
   // on whoever's laptop runs it.
   sidebar.resolveSpawnSandbox = vi.fn(() => undefined);
   sidebar.readSavedSandboxProfile = vi.fn(() => ({ status: "legacy" }));
-  sidebar.terminalManager = { create: vi.fn(), disposeAll: vi.fn() };
+  sidebar.terminalManager = { create: vi.fn(), disposeAll: vi.fn(), ownedBy: vi.fn(() => ({ create: vi.fn() })), releaseOwnedBy: vi.fn(() => 0) };
   sidebar.workspaceRoot = vi.fn(() => cwd);
   sidebar.sessionCwd = vi.fn((session: Session) => session.cwd || cwd);
   sidebar.locateProvider = vi.fn(() => "grok");

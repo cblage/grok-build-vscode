@@ -332,9 +332,10 @@ fail-closed:
 - Normal client disposal waits for its execution backend to be disposed.
 
 On shutdown, the host sends a broker `dispose` sentinel. The child releases all
-terminals, sends `SIGTERM` to each POSIX process group, and escalates to
-`SIGKILL` after 500 ms. The broker remains alive long enough for that escalation
-and the host has an additional termination fallback if cooperative shutdown
+terminals and sends `SIGTERM` to each POSIX process group while its wrapper is
+still known to be alive. Once the wrapper exits, the group identifier may be
+recycled, so teardown deliberately does not signal that ambiguous identifier
+again. The host retains a termination fallback if cooperative broker shutdown
 does not complete.
 
 Because each sandboxed live conversation owns its own broker and process tree,

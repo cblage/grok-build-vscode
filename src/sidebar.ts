@@ -121,7 +121,11 @@ import {
   offersGithubSetup,
   projectDestination,
   projectNameError,
+  PROJECT_ROOT_CHOICE_KEY,
+  legacyProjectRootPath,
   projectRoot,
+  rememberedRootFor,
+  shouldUseLegacyRoot,
 } from "./project-create";
 import {
   GROK_VIEW_ID,
@@ -273,6 +277,37 @@ import {
   isCloudEnvironment,
   CLOUD_ENVIRONMENT_ENV, buildLinkStartBody, deviceDisplayName, httpBaseFromRelayUrl, parseRelayFrame, RELAY_DEVICE_TOKEN_SECRET, resolveRelayUrl } from "./remote-frames";
 import { KeepAwake, shouldKeepAwake } from "./keep-awake";
+
+/**
+ * How long an unanswered card keeps a cloud machine awake.
+ *
+ * A backstop, not the main signal: a command that is still RUNNING keeps the
+ * machine awake for as long as it runs, however long that is. This covers the
+ * rest — an agent that has genuinely stopped and is waiting on a person. Long
+ * enough not to punish somebody who steps away mid-thought, short enough that a
+ * card nobody comes back to tonight stops costing money. Local wake locks are
+ * unaffected; this is only about a machine somebody else is paying for.
+ */
+const NEEDS_YOU_KEEP_AWAKE_MS = 20 * 60 * 1000;
+
+/**
+ * Is this session actually holding work open?
+ *
+ * The status alone is not enough, and the gap is a real one: worktree teardown
+ * detaches and disposes a session's client while leaving its row in the pool
+ * with `working` still on it. That ghost then keeps the OS wake lock — and, on
+ * a rented machine, the keep-awake heartbeat — running for the rest of the
+ * session, long after everything it described was killed.
+ *
+ * Checking the CLIENT rather than patching that one caller is deliberate: a
+ * session with no client has no agent, so it cannot be working whatever its
+ * status says, and any other path that disposes a client without updating a
+ * status is covered by the same line.
+ */
+function hasLiveWork(s: { status: string; client?: unknown }): boolean {
+  if (!s.client) return false;
+  return s.status === "working" || s.status === "needs-you";
+}
 import { thumbnailImage, thumbnailMime } from "./image-thumbnail";
 import { historyImagePreviews } from "./image-history";
 import {
@@ -2101,7 +2136,15 @@ export class GrokSidebar {
     // Periodic idle-TTL sweep over the live-session pool (the LRU cap is enforced
     // eagerly on each new start; this catches sessions that simply went stale).
     if (!this.reaper) {
-      this.reaper = setInterval(() => this.reapPool(), GrokSidebar.REAP_INTERVAL_MS);
+      this.reaper = setInterval(() => {
+        this.reapPool();
+        // The only thing that re-evaluates keep-awake on the CLOCK rather than
+        // on an event. `needs-you` holds a cloud machine awake for a bounded
+        // window, and nothing else would ever notice that window closing —
+        // the heartbeat would run until the next status change, which on an
+        // abandoned permission card is never.
+        this.refreshKeepAwake();
+      }, GrokSidebar.REAP_INTERVAL_MS);
     }
     // Re-tell the webview whether voice is set up when the relevant settings
     // change, so the mic button's "needs setup" hint updates without a reload.
@@ -3164,7 +3207,9 @@ Only continue if you trust this code.`,
     function commitVerdict(): void {
       session.pendingExitPlans.delete(requestId);
       sidebar.persistPlanVerdict(session, verdict, planText);
-      sidebar.setStatus(session, "working");
+      // Same rule as answering a permission or a question: a plan verdict is
+      // activity, but it only resumes the turn if nothing else is outstanding.
+      sidebar.noteAnswered(session);
       if (verdict === "approved" && session.autoApprove) {
         sidebar.autoApprovePendingPermissions(session);
       }
@@ -3587,8 +3632,9 @@ Only continue if you trust this code.`,
       this.closeDiffForRequest(session, requestId);
       resolved += 1;
     }
-    // A leftover plan-review (or a card with no allow option) still needs the user.
-    if (resolved > 0 && session.pendingPermissions.size === 0) this.setStatus(session, "working");
+    // A leftover plan-review, question, or a card with no allow option still
+    // needs the user — `noteAnswered` is the one place that knows all three.
+    if (resolved > 0) this.noteAnswered(session);
   }
 
   /**
@@ -3868,6 +3914,32 @@ Only continue if you trust this code.`,
    * turn and no earlier one; a cold `session/load` never sets this.
    */
   private noteLiveTurnEnded(session: Session): void {
+    // The turn is over, so nothing it asked is outstanding any more — whether
+    // it ended by finishing or by being cancelled. Without this, a question
+    // card left on screen after Stop still passes the "is it outstanding" check
+    // when somebody answers it, and `noteAnswered` drags a settled session back
+    // to `working` with no turn left that could ever end it. On a rented
+    // machine that holds it awake and billing for good.
+    // NOTHING the ended turn asked is outstanding any more — whichever kind of
+    // card it was. Clearing only one kind is worse than clearing none: with a
+    // question and a permission both on screen after Stop, emptying the
+    // question set alone means answering the leftover permission finds every
+    // map empty and marks the settled session `working`, with no turn left that
+    // could ever end it. Both other paths already refuse a card they cannot
+    // find, so clearing here is what makes a stale card inert rather than
+    // merely mis-scored.
+    //
+    // ONLY when no newer turn has started, though. This runs from a completion
+    // path that can resume after an await — /compact yields while it refreshes
+    // context — and by then another tab or a remote send may have begun a turn
+    // of its own. Clearing then would delete a LIVE turn's cards, and the host
+    // would refuse to answer the card still on the reader's screen, leaving
+    // that agent blocked with no way back short of restarting the session.
+    if (!turnIsInFlight(session)) {
+      session.pendingQuestions.clear();
+      session.pendingPermissions.clear();
+      session.pendingExitPlans.clear();
+    }
     if (session.replaying || session.suppressContent) return;
     session.liveFeedbackEligible = true;
     session.turnRating = 0;
@@ -4954,7 +5026,8 @@ Only continue if you trust this code.`,
     // Minimal handlers so the handshake doesn't hang on server requests.
     client.fsRead = async (p) => fs.readFileSync(p, "utf8");
     client.fsWrite = async () => { /* create-only client */ };
-    client.terminal = this.terminalManager;
+    // Owned by this client, so tearing it down takes its commands with it.
+    client.terminal = this.terminalManager.ownedBy(client);
     await client.start();
     await client.newSession();
     return { client, disposeAfter: true };
@@ -6087,7 +6160,36 @@ Only continue if you trust this code.`,
 
   /** The one directory new and cloned projects land in. */
   private projectRootPath(): string {
-    return projectRoot(this.projectHomeDir());
+    const home = this.projectHomeDir();
+    // Decided ONCE, then written down. Inferring it from the disk every time
+    // cannot distinguish "an old install that also has a folder by the new
+    // name" from "a new install committed to it", and guessing wrong sends an
+    // upgrading user's next project into a second root, away from all their
+    // work. A plain FILE named `~/Grok Build` is not a root either.
+    const remembered = this.context.globalState.get<"legacy" | "current">(
+      PROJECT_ROOT_CHOICE_KEY,
+    );
+    let legacyIsDirectory = false;
+    if (!remembered) {
+      try {
+        const legacy = legacyProjectRootPath(home);
+        legacyIsDirectory = fs.existsSync(legacy) && fs.statSync(legacy).isDirectory();
+      } catch {
+        /* unreadable home — fall through to the current name */
+      }
+    }
+    const useLegacyRoot = shouldUseLegacyRoot({ remembered, legacyIsDirectory });
+    if (!remembered) {
+      // Fire and forget: a failed write costs one more disk look next launch,
+      // and the answer it would record is the same one.
+      void Promise.resolve(
+        this.context.globalState.update(
+          PROJECT_ROOT_CHOICE_KEY,
+          rememberedRootFor(useLegacyRoot),
+        ),
+      ).catch(() => {});
+    }
+    return projectRoot(home, { useLegacyRoot });
   }
 
   /**
@@ -8231,6 +8333,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // process has actually exited.
     const disposeAt = clock.now();
     if (replacedClient) {
+      // Its commands go with it, exactly as in detachClient — this path does
+      // not go through that function but tears a client down all the same.
+      // A cancel the CLI ignored replaces the client mid-turn, and without
+      // this its terminals stay in the manager with no agent that could ever
+      // release them: a running command with no owner, holding a rented
+      // machine awake for the rest of the session.
+      try {
+        const n = this.terminalManager.releaseOwnedBy(replacedClient);
+        if (n > 0) this.host.appendLine(`[terminal] released ${n} command(s) with the replaced client`);
+      } catch { /* teardown is not worth failing over */ }
       await replacedClient.dispose();
       if (gen !== session.gen) return undefined;
     }
@@ -8268,6 +8380,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session.sawCompactNotification = false;
     session.lastPlanText = "";
     session.pendingExitPlans.clear();
+    session.pendingQuestions.clear();
     session.inFlightPlanComments.clear();
     if (session.planModeRecovery?.warningTimer) clearTimeout(session.planModeRecovery.warningTimer);
     session.planModeRecovery = undefined;
@@ -8471,11 +8584,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       client.terminal = broker;
       client.executionBackend = broker;
     } else {
-      // Unsandboxed/off sessions keep the normal host filesystem path. Terminals
-      // share one sidebar-wide manager; each is tracked by its own terminalId, so
-      // a restart/reap still only ever kills/releases that session's own — never
-      // reaches for another conversation's — and disposeAll() is reserved for
-      // full sidebar teardown.
+      // Unsandboxed/off sessions keep the normal host filesystem path.
       client.fsRead = async (p: string) => {
         try {
           // Agent paths are genuine workspace disk paths on the extension host.
@@ -8494,7 +8603,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           fs.writeFileSync(p, content, "utf8");
         }
       };
-      client.terminal = this.terminalManager;
+      // Owned by this client, so tearing it down takes its commands with it.
+      client.terminal = this.terminalManager.ownedBy(client);
     }
 
     client.on("initialized", (init) => {
@@ -8947,6 +9057,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (gen !== session.gen) return;
       // Questions are read-only and need a human — surface them in every mode
       // (plan/YOLO included); there's no sensible auto-answer.
+      session.pendingQuestions.add(req.id);
       this.emit(session, { type: "questionRequest", req });
       this.setStatus(session, "needs-you");
     });
@@ -9817,20 +9928,37 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             this.persistPermissionAnswer(session, msg.requestId, msg.optionId);
           }
           this.closeDiffForRequest(session, msg.requestId); // tidy up the auto-opened diff (#21)
-          this.setStatus(session, "working"); // turn resumes after the answer
+          // Only once EVERY card is answered. Two tools can ask at the same
+          // time, and answering one leaves the agent blocked on the other — so
+          // saying "working" here was a lie that the auto-approval path (which
+          // checks the same thing) never told. On a cloud machine the lie also
+          // costs money: `working` is what holds the machine awake, so a
+          // half-answered pair would hold it open indefinitely while nothing
+          // ran.
+          this.noteAnswered(session);
           break;
         }
       case "exitPlanAnswer":
         this.handleExitPlan(msg.requestId, msg.verdict, msg.comment, session);
         break;
       case "questionAnswer":
+        // A card that is no longer outstanding is a STALE card: a second tab
+        // still showing it, or one replayed from the session buffer after the
+        // turn ended. Answering it again would write a duplicate JSON-RPC
+        // response and drag a settled session back to `working` — with no turn
+        // left to ever end it, which on a rented machine bills for ever.
+        if (!session.pendingQuestions.delete(msg.requestId)) break;
         if (session.client?.respondQuestion(msg.requestId, msg.answers ?? {}, msg.annotations ?? {})) {
-          this.setStatus(session, "working");
+          // Answering a QUESTION is not answering a permission card that is
+          // also outstanding — the agent stays blocked on it, so `working`
+          // would be wrong and would hold a rented machine awake indefinitely.
+          this.noteAnswered(session);
         }
         break;
       case "questionCancel":
+        if (!session.pendingQuestions.delete(msg.requestId)) break;
         if (session.client?.respondQuestionCancelled(msg.requestId)) {
-          this.setStatus(session, "working");
+          this.noteAnswered(session);
         }
         break;
       case "setModel":
@@ -14245,9 +14373,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           if (gen !== session.gen) return;
         }
       }
-      this.emit(session, { type: "agentEnd", meta });
+      // Nor does it get to say the turn ENDED. Browsers treat agentEnd as
+      // authoritative and clear busy on it, so a stale compact handler
+      // resuming after a newer turn started would leave every remote tab
+      // showing that turn as idle, with no Stop control — and a refresh does
+      // not repair it, because the snapshot replays the same order. The newer
+      // turn emits its own end when it really ends. (The other agentEnd site
+      // needs no guard: nothing awaits between its endTurn check and its
+      // emit.)
+      if (!turnIsInFlight(session)) this.emit(session, { type: "agentEnd", meta });
       this.noteLiveTurnEnded(session);
-      this.setStatus(session, "done");
+      // "done" only if this is still the LAST word. /compact releases its turn
+      // token before awaiting the context refresh, so a send from another tab
+      // can start a turn while this handler is suspended — and marking the
+      // session done then tells every view the agent is idle while it is not.
+      // On a cloud machine it also stops the heartbeat, which reads the status:
+      // a quiet long-running tool in the newer turn is then frozen ninety
+      // seconds later.
+      if (!turnIsInFlight(session)) this.setStatus(session, "done");
       // Again at the end: by now the transcript really has moved, so this is
       // the push that makes the row's position true rather than asserted.
       this.noteSessionActivity(session);
@@ -15892,6 +16035,23 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session.gen++;
     session.client = undefined;
     session.turnToken = undefined;
+    // ITS COMMANDS GO WITH IT.
+    //
+    // A terminal is a child of the extension, not of the agent, so it outlives
+    // the client that asked for it — and once the client is gone nothing can
+    // ever send it `terminal/release`. That leaves a command running that
+    // nobody owns, and since a running command is what keeps a cloud machine
+    // awake, it holds one running and billing until the extension itself exits.
+    //
+    // Done HERE rather than in disposeSession because every teardown path goes
+    // through this one function: worktree removal, a crashed ACP process, pool
+    // disposal, and the session being deleted outright.
+    if (client) {
+      try {
+        const n = this.terminalManager.releaseOwnedBy(client);
+        if (n > 0) this.host.appendLine(`[terminal] released ${n} command(s) with their session`);
+      } catch { /* teardown is not worth failing over */ }
+    }
     return client;
   }
 
@@ -15909,6 +16069,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.pool.delete(session);
     this.remoteClients.deleteActiveValue(session);
     if (id) this.post({ type: "sessionDot", id, dot: this.dotForId(id) });
+    // A session can leave the pool while it is still WORKING — deleting the
+    // conversation you are watching is allowed, and reaping and worktree
+    // teardown end here too. Every one of those can take the last turn away, so
+    // the wake lock and the cloud heartbeat are re-asserted HERE rather than at
+    // each caller: setStatus covers a turn that finishes, and this covers a
+    // turn that is taken away. Without it the heartbeat outlives the work and
+    // holds a machine we rent awake until something else happens to stop it.
+    this.refreshKeepAwake();
     return exited ?? Promise.resolve();
   }
 
@@ -16010,9 +16178,70 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private turnOrderTimers = new Set<ReturnType<typeof setTimeout>>();
 
   /** True when any live pool member is mid-turn or waiting on the user. */
+  /**
+   * The agent was waiting on a person and now it is not.
+   *
+   * Answering is ACTIVITY whether or not it unblocks the whole turn: the tool
+   * that was approved starts running immediately. Setting `working` is separate,
+   * and conditional — with another card still outstanding the turn is not
+   * resumed and saying so would be a lie — but the clock has to be re-armed
+   * either way, or a machine can freeze on work that has only just begun.
+   */
+  noteAnswered(session: Session): void {
+    // EVERY kind of card, not just permissions. Parallel tool calls can raise a
+    // question and a plan review together, and answering one of them resumed
+    // nothing — while `working` is what holds a rented machine awake, so the
+    // claim cost money as well as being untrue.
+    if (session.pendingPermissions.size === 0
+      && session.pendingExitPlans.size === 0
+      && session.pendingQuestions.size === 0) {
+      this.setStatus(session, "working"); // setStatus touches and re-asserts
+      return;
+    }
+    this.touch(session);
+    this.refreshKeepAwake();
+  }
+
   private anyTurnInFlight(): boolean {
     for (const s of this.pool) {
-      if (s.status === "working" || s.status === "needs-you") return true;
+      if (hasLiveWork(s)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Does a machine we rent still need to be awake?
+   *
+   * `working` always counts. The hard case is `needs-you`, and it has been
+   * wrong in both directions:
+   *
+   * - Counting it for ever holds a machine running and billing while an
+   *   unanswered permission card sits there and nobody is coming back tonight.
+   * - Not counting it at all is worse, because `needs-you` does not mean the
+   *   machine is idle. Terminal work is deliberately asynchronous, so an agent
+   *   can start a long test run and THEN ask a question — and freezing the
+   *   machine underneath that kills exactly the work somebody walked away from.
+   *
+   * So a card holds the machine for a while and then stops. Anything a
+   * background process was going to finish, it finishes; an abandoned card
+   * stops costing money. Nothing is lost either way — opening the page wakes
+   * the machine and the card is still there.
+   */
+  private anyTurnWorking(): boolean {
+    // A command that is still running is the one answer that does not depend on
+    // reading a status. An agent can start a twenty-five-minute build and THEN
+    // ask a question — the session then says it is waiting for a person while
+    // the build carries on, and any window we pick is a guess about how long
+    // that build takes. This is not a guess.
+    if (this.terminalManager.anyRunning()) return true;
+    const now = Date.now();
+    for (const s of this.pool) {
+      if (!hasLiveWork(s)) continue;
+      if (s.status === "working") return true;
+      // `lastActiveAt` is stamped when a session becomes working or needs-you,
+      // so this is "how long ago the agent last did something", not "how long
+      // the card has been on screen".
+      if (now - s.lastActiveAt < NEEDS_YOU_KEEP_AWAKE_MS) return true;
     }
     return false;
   }
@@ -16317,6 +16546,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (await this.refreshContextFromSessionInfo(session, gen, { force: true })) return;
     if (gen !== session.gen || !session.sessionInfoUnsupported) return;
     if (!client.availableCommands.some((command) => command?.name === "session-info")) return;
+    // NOT while somebody else's turn is running.
+    //
+    // This is a real `session/prompt`, and a second prompt ends the active one.
+    // The compact path released its turn token before the RPC above, so another
+    // tab can have started a genuine turn during that await — and sending this
+    // would cancel it mid-work, silently, to refresh a context number. The
+    // guards further down run only after this returns and cannot undo it.
+    //
+    // Skipping costs a stale context reading until the next turn refreshes it.
+    // That is the cheaper of the two by a wide margin.
+    if (turnIsInFlight(session)) return;
     session.suppressContent = true;
     session.captureAgentText = "";
     try {
@@ -17451,6 +17691,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return resolveRelayUrl({
       isProduction: this.context.isProduction,
       env: process.env,
+      cloudBuild: this.context.isCloudBuild,
     });
   }
 
@@ -17579,17 +17820,29 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private refreshKeepAwake(): void {
     try {
       const enabled = this.host.getConfiguration("grok").get<boolean>("remote.keepAwake", true);
+      const turnInFlight = this.anyTurnInFlight();
+      // The remote twin of the OS wake lock below, and the one that matters in
+      // the cloud: an OS wake lock cannot stop a hypervisor suspending the whole
+      // machine, and a suspended machine takes the turn down with it. Not gated
+      // on the opt-out — that setting is about a laptop's battery, and this
+      // costs a few bytes a minute on a socket that is already open.
+      try { this.uplink?.setWorking(this.anyTurnWorking()); } catch { /* never worth failing over */ }
       if (shouldKeepAwake({
         enabled,
         linked: !!this.uplink,
-        turnInFlight: this.anyTurnInFlight(),
+        turnInFlight,
       })) {
         this.keepAwake.start();
       } else {
         this.keepAwake.stop();
       }
     } catch (e) {
-      this.host.appendLine(`[keep-awake] skipped: ${(e as Error)?.message ?? e}`);
+      // Keeping a machine awake is never worth failing a caller over, and this
+      // now runs from every path that answers a card — so the handler itself
+      // must not throw either.
+      try {
+        this.host.appendLine?.(`[keep-awake] skipped: ${(e as Error)?.message ?? e}`);
+      } catch { /* nothing left to say it with */ }
     }
   }
 
@@ -18145,7 +18398,7 @@ ${fileShellOpen}
   <main id="messages" class="messages">
     <div class="welcome" id="welcome">
       <span class="welcome-mark" role="img" aria-label="Grok" style="--welcome-mark:url('${resourceUri("grok-icon.svg")}')"></span>
-      <h2>Grok Build (Community)</h2>
+      <h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok Build (Community)"}</h2>
       <p class="welcome-byline muted">by Paweł Huryn (<a href="https://www.productcompass.pm/" class="muted-link">The Product Compass</a>)</p>
       <p id="welcome-version" class="muted welcome-status-busy"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg><span>Starting</span></p>
       <div id="welcome-onboarding"></div>

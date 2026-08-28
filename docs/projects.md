@@ -11,9 +11,13 @@ rail — offers up to three:
 
 | | You give it | It makes |
 |---|---|---|
-| **New project** | A name | `~/Grok Build/<Name>` |
+| **New project** | A name | `~/AFK Pilot/<Name>` |
 | **Import a folder** | A folder | Nothing — it records the one you picked |
-| **Clone from GitHub** | A repository URL | `~/Grok Build/<repo>` |
+| **Clone from GitHub** | A repository URL | `~/AFK Pilot/<repo>` |
+
+Machines set up before this changed keep using `~/Grok Build` as that folder,
+and nothing moves — splitting your projects across two places to improve a
+folder name would be a poor trade.
 
 Which ones appear depends on two things. **Cloning is offered in Coding mode**
 (Settings → General → Use this app for) because that is where it belongs;
@@ -30,7 +34,7 @@ that one thing.
 Type a name. The destination appears underneath as you type, and the folder is
 created when you press Create.
 
-`~/Grok Build` is where it goes — the same folder the desktop app uses for its
+`~/AFK Pilot` is where it goes — the same folder the desktop app uses for its
 first-run project. It sits directly in your home directory on purpose: on macOS
 that location is not privacy-protected the way Desktop, Documents and Downloads
 are, so creating it raises no consent dialog, and it stays easy to find in Finder
@@ -65,7 +69,7 @@ What happens next differs by app, and deliberately:
 ## Clone from GitHub
 
 Paste any `https://` or `git@` repository URL. The folder name comes from the
-URL — `https://github.com/you/project` becomes `~/Grok Build/project` — and is
+URL — `https://github.com/you/project` becomes `~/AFK Pilot/project` — and is
 shown before you commit to it.
 
 **Credentials are git's own.** Whatever you already have set up — a credential

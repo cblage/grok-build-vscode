@@ -17,6 +17,16 @@ export interface TerminalOutputResult {
 }
 
 interface TerminalEntry {
+  /**
+   * Who asked for this command.
+   *
+   * A terminal outlives the ACP client that started it — the process is a child
+   * of the extension, not of the agent — so without an owner a deleted
+   * conversation leaves a command running that nothing can reach, and
+   * {@link TerminalManager.anyRunning} goes on reporting the machine as busy
+   * for ever.
+   */
+  owner?: object;
   proc: ChildProcess;
   buf: string;
   byteLen: number;
@@ -27,7 +37,6 @@ interface TerminalEntry {
   // Buffers incomplete multi-byte UTF-8 sequences across chunk boundaries so a
   // character split by streaming (or by truncation) never becomes a U+FFFD.
   decoder: StringDecoder;
-  killTimer?: ReturnType<typeof setTimeout>;
 }
 
 const DEFAULT_BYTE_LIMIT = 40_000;
@@ -48,7 +57,9 @@ export function resolveExitCode(code: number | null, signal: NodeJS.Signals | nu
 }
 
 export type KillPlan =
-  | { kind: "signal"; signal: NodeJS.Signals; target: number }
+  | { kind: "signal"; signal: NodeJS.Signals }
+  /** Signal the whole process group — `process.kill(-pid, signal)` on POSIX. */
+  | { kind: "group"; signal: NodeJS.Signals; pid: number }
   | { kind: "taskkill"; file: string; args: string[] };
 
 /**
@@ -63,7 +74,13 @@ export function buildKillPlan(pid: number, platform: NodeJS.Platform = process.p
   if (platform === "win32") {
     return { kind: "taskkill", file: "taskkill", args: ["/pid", String(pid), "/T", "/F"] };
   }
-  return { kind: "signal", signal: "SIGTERM", target: -pid };
+  // The whole GROUP, not the shell. `sh -c 'node build.js & wait'` is one
+  // wrapper and one long-lived child; signalling the wrapper alone leaves the
+  // child running with nothing tracking it — and since a running command is
+  // what keeps a cloud machine awake, we would stop paying for a machine that
+  // is still working, then freeze it. Spawned detached so the negative pid
+  // names the group.
+  return { kind: "group", signal: "SIGTERM", pid };
 }
 
 /**
@@ -217,6 +234,8 @@ function terminalShell(): string | true {
 export interface TerminalManagerDeps {
   execFileImpl?: typeof execFile;
   platform?: NodeJS.Platform;
+  /** Injected so a test can assert the GROUP is signalled, not just the shell. */
+  killImpl?: (pid: number, signal: NodeJS.Signals | 0) => void;
 }
 
 export class TerminalManager {
@@ -225,20 +244,56 @@ export class TerminalManager {
 
   constructor(private deps: TerminalManagerDeps = {}) {}
 
-  create(params: TerminalCreateParams): { terminalId: string } {
+  /**
+   * A view of this manager whose commands belong to `owner`.
+   *
+   * Handed to each ACP client instead of the manager itself, so tearing that
+   * client down can take its commands with it. Same interface — the agent side
+   * cannot tell the difference.
+   */
+  ownedBy(owner: object): {
+    create(params: TerminalCreateParams): { terminalId: string };
+    output(terminalId: string): TerminalOutputResult;
+    waitForExit(terminalId: string): Promise<{ exitCode: number }>;
+    kill(terminalId: string): void;
+    release(terminalId: string): void;
+  } {
+    return {
+      create: (params) => this.create(params, owner),
+      output: (id) => this.output(id),
+      waitForExit: (id) => this.waitForExit(id),
+      kill: (id) => this.kill(id),
+      release: (id) => this.release(id),
+    };
+  }
+
+  /** Kill and forget everything `owner` started. Returns how many. */
+  releaseOwnedBy(owner: object): number {
+    let n = 0;
+    for (const [id, t] of Array.from(this.terminals)) {
+      if (t.owner !== owner) continue;
+      this.release(id);
+      n += 1;
+    }
+    return n;
+  }
+
+  create(params: TerminalCreateParams, owner?: object): { terminalId: string } {
     const env = this.envFromParams(params.env);
     const cwd = params.cwd || process.cwd();
     const byteLimit = params.outputByteLimit ?? DEFAULT_BYTE_LIMIT;
-    const proc = spawn(params.command, {
-      cwd,
-      env,
-      shell: terminalShell(),
-      // Stop/restart must be able to terminate the entire POSIX command tree,
-      // not only the shell wrapper that Node returns.
-      detached: process.platform !== "win32",
-    });
+    // `detached` on POSIX so the shell leads its own PROCESS GROUP, which is
+    // what makes killing the whole tree possible — see buildKillPlan. Without
+    // it a SIGTERM reaches the wrapper and every descendant it started keeps
+    // running: on a machine we rent that is an orphan burning CPU that nothing
+    // can reach, and on a laptop it is the battery. Not on Windows, where
+    // `taskkill /T` already walks the tree and `detached` would open a console
+    // window.
+    const detached = (this.deps.platform ?? process.platform) !== "win32";
+    const proc = spawn(params.command, { cwd, env, shell: terminalShell(), detached });
 
     const entry: TerminalEntry = {
+      owner,
       proc,
       buf: "",
       byteLen: 0,
@@ -310,9 +365,11 @@ export class TerminalManager {
     try {
       const platform = this.deps.platform ?? process.platform;
       const plan: KillPlan =
-        pid != null
-          ? buildKillPlan(pid, platform)
-          : { kind: "signal", signal: "SIGTERM", target: 0 };
+        pid != null ? buildKillPlan(pid, platform) : { kind: "signal", signal: "SIGTERM" };
+      // Windows has no cheap way to ask whether a pid's tree still exists, and
+      // `taskkill /T` on a recycled pid would kill somebody else's tree. The
+      // exit code is the best answer available there.
+      if (plan.kind === "taskkill" && t.exitCode != null) return;
       if (plan.kind === "taskkill") {
         const exec = this.deps.execFileImpl ?? execFile;
         exec(plan.file, plan.args, (err) => {
@@ -330,17 +387,36 @@ export class TerminalManager {
             }
           }
         });
-      } else {
-        if (plan.target !== 0) process.kill(plan.target, plan.signal);
-        else t.proc.kill(plan.signal);
-        // Give cooperative descendants a moment to clean up, then guarantee
-        // that a signal-ignoring member of the process group cannot survive.
-        if (pid != null && platform !== "win32" && !t.killTimer) {
-          t.killTimer = setTimeout(() => {
-            try { process.kill(-pid, "SIGKILL"); } catch { /* group already gone */ }
-          }, 500);
-          t.killTimer.unref?.();
+      } else if (plan.kind === "group") {
+        // ONLY WHILE THE WRAPPER IS ALIVE.
+        //
+        // Two previous versions each got half of this. Signalling whenever we
+        // are asked can reach a pid the OS has recycled and kill somebody
+        // else's work. Probing first with signal 0 does not help: it proves
+        // that *a* group holds that id, not that it is OURS — an empty group
+        // releases its id and the next one to get it answers the probe just as
+        // happily.
+        //
+        // The wrapper's own liveness is the one thing that settles it. While it
+        // is running, its group exists and is unambiguously ours, so the signal
+        // is safe. Once it has exited we cannot tell our surviving descendants
+        // from a stranger's group, and killing a stranger is the worse mistake.
+        //
+        // The cost is a command deliberately detached from its shell —
+        // `nohup job &`, `disown` — which outlives the wrapper and is neither
+        // tracked nor killed. That is what detaching MEANS, and it is a leak we
+        // can see rather than a signal we cannot aim.
+        if (t.exitCode != null) return;
+        const killImpl = this.deps.killImpl ?? ((p: number, sig: NodeJS.Signals | 0) => process.kill(p, sig));
+        try {
+          killImpl(-plan.pid, plan.signal);
+        } catch {
+          // Never became a group leader — a stub in a test, or a platform that
+          // refused `detached`. The child self-guards against being exited.
+          try { t.proc.kill(plan.signal); } catch { /* already gone */ }
         }
+      } else {
+        t.proc.kill(plan.signal);
       }
     } catch {
       /* ignore */
@@ -354,6 +430,23 @@ export class TerminalManager {
 
   disposeAll(): void {
     for (const id of Array.from(this.terminals.keys())) this.release(id);
+  }
+
+  /**
+   * Is any command still running?
+   *
+   * Asked by the keep-awake rules, and it is the only HONEST answer to "is this
+   * machine still doing something". Session status cannot answer it: the agent
+   * can start a twenty-five-minute build and then ask a question, at which
+   * point the session says it is waiting for a person while the build carries
+   * on. On a cloud machine, believing the status there freezes the build.
+   *
+   * `exitCode === null` is precisely "has not exited". A released terminal has
+   * already left the map.
+   */
+  anyRunning(): boolean {
+    for (const t of this.terminals.values()) if (t.exitCode === null) return true;
+    return false;
   }
 
   private required(terminalId: string): TerminalEntry {

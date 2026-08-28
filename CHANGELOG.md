@@ -1,10 +1,10 @@
 # Changelog
 
-## 3.19.1-sandbox.1 — 2026-08-27
+## 3.19.4-sandbox.1 — 2026-08-28
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.19.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.19.3.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,30 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 3.19.3 — 2026-08-28
+
+### Fixed
+
+- **The desktop app writes its log again.** 3.19.2 added a log file so anyone chasing a problem would have something to send, and the code that started it could not run — the app threw on every launch before writing a line, so the release whose whole purpose was to produce logs produced none. It writes from the first line now, and rotation measures what it actually wrote rather than guessing at startup, so a long session no longer grows one file without end. Still under **Settings → Advanced → Show logs**.
+- **A long turn survives you putting your phone down.** On a cloud environment the machine is suspended when nothing has touched it for about a minute, and suspended means frozen — so a turn that spent four minutes running tests or an install was stopped in the middle of the work you had walked away from. That is the one thing remote control exists to prevent. The machine now says it is still working while the agent is working and for as long as any command it started is still running, however long that takes; if it stops to ask you something and you do not come back, it goes to sleep after twenty minutes and wakes when you open the page, with the question still there. **Nothing changes on your own computer**, where the wake lock already covered this.
+
+### Changed
+
+- **A new install no longer files your work under the name of the tool.** New projects went into `~/Grok Build`, and on the desktop app that folder was also your first project — the product's name on a folder that is yours. New installs now get an **AFK Pilot** folder holding a first project called **My First Project**, so the container and the project are no longer the same thing. If you already have a `~/Grok Build` folder it keeps being used and nothing moves; that decision is made once and remembered, so an upgrade never scatters your projects across two roots. In a cloud environment the welcome screen now reads **AFK Pilot (Cloud)**, which is the product you are actually in.
+
+## 3.19.2 — 2026-08-27
+
+### Fixed
+
+- **You can get the logs off the desktop app.** *Settings → Advanced → Show logs* did nothing: it was wired to an empty function, DevTools is disabled in packaged builds, and the log went to stdout — which is discarded when the app starts from an icon rather than a terminal. Anyone asked for a log went looking and correctly found none. The app now writes a log file under its own data folder, keeps one previous copy, and **Show logs** opens the folder with it selected. Lines are written as they happen, so the ones just before a freeze survive. Reported while chasing #131 and #133 by @RudyParengal, who was right that the button did nothing.
+- **A proposed-change diff you closed stays closed.** Returning to a conversation reopened the `Grok proposed:` tab and pushed the files you were working in off the screen. Auto-open now happens once when the change is proposed, not every time the conversation is redrawn — a new edit still opens, and **open diff** reopens it whenever you want. Thanks to @tarekmaalouf (#132) for pinning down exactly what was happening.
+
+## 3.19.1 — 2026-08-27
+
+### Fixed
+
+- **Cloud environments can start.** The Linux build published in 3.19.0 could install itself on a hosted machine and then never come up: a packaged build refuses to take its relay or its device token from the environment, which is right for an app on your desk and impossible for a machine with no keyboard. That one build is now marked as a cloud build at package time and accepts an identity only when the machine also declares itself a cloud environment. **Nothing changes for the Mac and Windows apps** — they still refuse the environment exactly as before, and the Linux AppImage remains a cloud-only artifact rather than a desktop download.
 
 ## 3.19.0 — 2026-08-27
 

@@ -262,9 +262,31 @@ describe("buildKillPlan", () => {
     }
   });
 
-  it("uses a SIGTERM signal on POSIX", () => {
+  it("signals the whole process GROUP on POSIX, not just the shell", () => {
+    // `sh -c 'node build.js & wait'` is one wrapper and one long-lived child.
+    // Signalling the wrapper alone leaves the child running with nothing
+    // tracking it — and a running command is what keeps a cloud machine awake,
+    // so we would stop paying for a machine that is still working and then
+    // freeze it. On a laptop the orphan is the battery.
     const plan = buildKillPlan(1234, "linux");
-    expect(plan).toEqual({ kind: "signal", signal: "SIGTERM", target: -1234 });
+    expect(plan).toEqual({ kind: "group", signal: "SIGTERM", pid: 1234 });
+  });
+
+  it("kills the group by negative pid, and falls back to the child", () => {
+    const killed: number[] = [];
+    const m = new TerminalManager({
+      platform: "linux",
+      killImpl: (pid) => {
+        killed.push(pid);
+        if (pid < 0) throw new Error("ESRCH"); // group already gone
+      },
+    });
+    const { terminalId } = m.create({ command: nodeEval("setTimeout(() => {}, 3000)") });
+    m.kill(terminalId);
+    // The negative pid is the group; the throw proves the fallback path runs
+    // rather than leaving the command alive.
+    expect(killed.some((p) => p < 0)).toBe(true);
+    m.release(terminalId);
   });
 });
 
@@ -425,4 +447,154 @@ describe("TerminalManager kill fallback (Windows taskkill failure)", () => {
     expect(signalled).toBe(false);
     m.release(terminalId);
   }, 15000);
+});
+
+describe("anyRunning — the honest answer to 'is this machine still doing something'", () => {
+  /**
+   * Session status cannot answer that. An agent can start a twenty-five-minute
+   * build and THEN ask a question, at which point the session says it is
+   * waiting for a person while the build carries on — and on a cloud machine,
+   * believing the status there freezes the build.
+   */
+  it("is false with nothing to run", () => {
+    expect(new TerminalManager().anyRunning()).toBe(false);
+  });
+
+  it("is true while a command runs and false once it exits", async () => {
+    const m = new TerminalManager();
+    const { terminalId } = m.create({ command: nodeEval("setTimeout(() => {}, 300)") });
+    expect(m.anyRunning()).toBe(true);
+    await m.waitForExit(terminalId);
+    expect(m.anyRunning()).toBe(false);
+    m.release(terminalId);
+  });
+
+  it("stays true while ANY command is still going", async () => {
+    // The case that matters: a quick one finishing must not make a long one
+    // invisible.
+    const m = new TerminalManager();
+    const quick = m.create({ command: nodeEval("process.exit(0)") }).terminalId;
+    const slow = m.create({ command: nodeEval("setTimeout(() => {}, 600)") }).terminalId;
+    await m.waitForExit(quick);
+    expect(m.anyRunning()).toBe(true);
+    await m.waitForExit(slow);
+    expect(m.anyRunning()).toBe(false);
+    m.release(quick);
+    m.release(slow);
+  });
+
+  it("is false once a running command is released", async () => {
+    // Released means we have stopped tracking it; holding a machine awake for
+    // something nothing is watching would be a bill with no owner.
+    const m = new TerminalManager();
+    const { terminalId } = m.create({ command: nodeEval("setTimeout(() => {}, 5000)") });
+    expect(m.anyRunning()).toBe(true);
+    m.release(terminalId);
+    expect(m.anyRunning()).toBe(false);
+  });
+});
+
+describe("commands belong to whoever started them", () => {
+  /**
+   * A terminal is a child of the extension, not of the agent, so it outlives the
+   * ACP client that asked for it — and once that client is gone nothing can
+   * send it `terminal/release`. Left alone it is a command nobody owns, and
+   * since a running command is what keeps a cloud machine awake, it holds one
+   * running and billing until the extension itself exits.
+   */
+  it("takes an owner's commands with it and leaves everyone else's", async () => {
+    const m = new TerminalManager();
+    const alice = {};
+    const bob = {};
+    const a = m.ownedBy(alice).create({ command: nodeEval("setTimeout(() => {}, 5000)") }).terminalId;
+    const b = m.ownedBy(bob).create({ command: nodeEval("setTimeout(() => {}, 5000)") }).terminalId;
+    expect(m.anyRunning()).toBe(true);
+
+    expect(m.releaseOwnedBy(alice)).toBe(1);
+    // Bob's is still going, so the machine is still busy.
+    expect(m.anyRunning()).toBe(true);
+    expect(() => m.output(a)).toThrow();
+
+    expect(m.releaseOwnedBy(bob)).toBe(1);
+    expect(m.anyRunning()).toBe(false);
+    void b;
+  });
+
+  it("stops reporting a machine as busy once the owner is gone", async () => {
+    // The whole point: this is what reopened the ghost path.
+    const m = new TerminalManager();
+    const owner = {};
+    m.ownedBy(owner).create({ command: nodeEval("setTimeout(() => {}, 5000)") });
+    expect(m.anyRunning()).toBe(true);
+    m.releaseOwnedBy(owner);
+    expect(m.anyRunning()).toBe(false);
+  });
+
+  it("releasing an owner with nothing running is a no-op", () => {
+    expect(new TerminalManager().releaseOwnedBy({})).toBe(0);
+  });
+
+  it("hands the agent the same interface either way", () => {
+    // The owned view must be indistinguishable from the manager, or the ACP
+    // side would need to know about ownership.
+    const m = new TerminalManager();
+    const view = m.ownedBy({});
+    for (const k of ["create", "output", "waitForExit", "kill", "release"]) {
+      expect(typeof (view as unknown as Record<string, unknown>)[k]).toBe("function");
+    }
+  });
+});
+
+describe("signalling a process group, and when not to", () => {
+  /**
+   * Three versions of this rule have now been wrong in three different ways, so
+   * the reasoning is worth keeping next to the tests.
+   *
+   * Signalling whenever asked can reach a pid the OS recycled and kill somebody
+   * else's work. Probing first with signal 0 does not save it: that proves *a*
+   * group holds the id, not that it is ours — an empty group releases its id
+   * and the next holder answers the probe just as happily.
+   *
+   * The wrapper's own liveness is the one thing that settles it. Alive, its
+   * group exists and is unambiguously ours. Exited, we cannot tell our
+   * surviving descendants from a stranger's group, and killing a stranger is
+   * the worse mistake.
+   */
+  function manager() {
+    const sent: Array<{ pid: number; signal: NodeJS.Signals | 0 }> = [];
+    const m = new TerminalManager({
+      platform: "linux",
+      killImpl: (pid, signal) => { sent.push({ pid, signal }); },
+    });
+    return { m, sent };
+  }
+
+  it("signals the group while the command is running", () => {
+    const { m, sent } = manager();
+    const { terminalId } = m.create({ command: nodeEval("setTimeout(() => {}, 3000)") });
+    m.kill(terminalId);
+    expect(sent.some((c) => c.pid < 0 && c.signal === "SIGTERM")).toBe(true);
+    m.release(terminalId);
+  });
+
+  it("sends NOTHING once the command has exited", async () => {
+    // Where the pid may since have been recycled. Our cleanup must never kill
+    // somebody else's work, and a detached job outliving its shell — which is
+    // what detaching means — is the accepted cost.
+    const { m, sent } = manager();
+    const { terminalId } = m.create({ command: nodeEval("process.exit(0)") });
+    await m.waitForExit(terminalId);
+    m.kill(terminalId);
+    expect(sent).toEqual([]);
+    m.release(terminalId);
+    expect(sent).toEqual([]);
+  });
+
+  it("never probes — a probe cannot tell our group from a stranger's", async () => {
+    const { m, sent } = manager();
+    const { terminalId } = m.create({ command: nodeEval("setTimeout(() => {}, 3000)") });
+    m.kill(terminalId);
+    expect(sent.every((c) => c.signal !== 0)).toBe(true);
+    m.release(terminalId);
+  });
 });

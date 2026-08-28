@@ -27,6 +27,12 @@ import {
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+  createLogFileSink,
+  desktopLogPath,
+  formatLogLine,
+  prepareLogFile,
+} from "./log-file";
 import { GrokSidebar } from "../sidebar";
 import { Uri } from "../host";
 import type { HostContext, HostDisposable } from "../host";
@@ -47,7 +53,7 @@ import {
   DESKTOP_PUBLIC_REPO_URL,
 } from "./host-dialogs";
 import { createFileMemento } from "./memento";
-import { extensionIdFromPackageMeta } from "./package-meta";
+import { extensionIdFromPackageMeta, isCloudBuildFromPackageMeta } from "./package-meta";
 import {
   desktopUserHomeDir,
   provisionDefaultProjectDir,
@@ -106,6 +112,51 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
+/**
+ * Set once the user-data directory is known — see `log`.
+ *
+ * A `let` because `log()` is called before that point (argument parsing,
+ * profile resolution) and those lines must not be lost or crash the app for
+ * want of a directory that does not exist yet. Early lines go to stdout only.
+ *
+ * DECLARED ABOVE THE STARTUP BLOCK THAT CALLS `startFileLogging`, and that is
+ * load-bearing rather than tidy. `function` declarations hoist; `let` bindings
+ * do not — they sit in the temporal dead zone until this line is evaluated. So
+ * calling `startFileLogging` from the profile-resolution block further down the
+ * file, while these still sat BELOW it, threw
+ * `ReferenceError: Cannot access 'desktopLogFile' before initialization` on the
+ * assignment. That block has its own `catch`, which swallowed it. The app
+ * launched, no sink was ever installed, and Show logs stayed the no-op it was
+ * supposed to stop being — shipped in 3.19.2, and invisible because the tests
+ * covered the helper module rather than this file's initialization order.
+ */
+let logToFile: ((text: string) => void) | undefined;
+let desktopLogFile: string | undefined;
+
+function log(line: string): void {
+  const stamp = new Date().toISOString();
+  const text = formatLogLine(stamp, line);
+  process.stdout.write(text);
+  // Synchronous, deliberately. The lines that matter are the last few before a
+  // freeze, which is exactly what a buffered writer loses.
+  logToFile?.(text);
+}
+
+/**
+ * Start writing the log to a file the user can actually retrieve.
+ *
+ * Called as soon as the user-data directory is resolved. Failure is survivable
+ * and silent-ish: the app runs, stdout still works, and the only cost is that
+ * this session has no retrievable log.
+ */
+function startFileLogging(userDataDir: string): void {
+  const target = desktopLogPath(userDataDir);
+  if (!prepareLogFile(target, fs)) return;
+  desktopLogFile = target;
+  logToFile = createLogFileSink(target);
+  log(`logging to ${target}`);
+}
+
 function parseArgs(argv: string[]): {
   workspace?: string;
   userDataDir?: string;
@@ -151,32 +202,38 @@ try {
     override: earlyArgs.userDataDir,
   });
   app.setPath("userData", ud);
+  // As early as the directory is known. Everything logged before this line is
+  // stdout-only, so the window is deliberately small: the interesting failures
+  // (a session that will not load, a window that stops painting) all happen
+  // long after startup.
+  startFileLogging(ud);
   if (migratedFrom) {
-    process.stdout.write(
-      `[desktop] migrated profile from ${migratedFrom} → ${ud}\n`,
-    );
+    log(`migrated profile from ${migratedFrom} → ${ud}`);
   }
 } catch {
   /* best-effort; createApp still resolves via resolveUserDataDir */
 }
 
-function readPackageMeta(extensionRoot: string): { version: string; id: string } {
+function readPackageMeta(
+  extensionRoot: string,
+): { version: string; id: string; cloudBuild: boolean } {
   try {
     const pkg = JSON.parse(
       fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8"),
-    ) as { version?: string; publisher?: string; name?: string; grokExtensionName?: string };
+    ) as {
+      version?: string; publisher?: string; name?: string;
+      grokExtensionName?: string; grokCloudBuild?: unknown;
+    };
     return {
       version: pkg.version ?? "0.0.0",
       id: extensionIdFromPackageMeta(pkg),
+      cloudBuild: isCloudBuildFromPackageMeta(pkg),
     };
   } catch {
-    return { version: "0.0.0", id: "PawelHuryn.grok-vscode-phuryn" };
+    // Unreadable metadata must not promote a build to one that trusts its
+    // environment. The safe answer to "is this a cloud build" is no.
+    return { version: "0.0.0", id: "PawelHuryn.grok-vscode-phuryn", cloudBuild: false };
   }
-}
-
-function log(line: string): void {
-  const stamp = new Date().toISOString();
-  process.stdout.write(`[desktop ${stamp}] ${line}\n`);
 }
 
 /**
@@ -360,11 +417,14 @@ async function createApp(): Promise<void> {
   const injectedToken = consumeInjectedDeviceToken({
     isProduction: app.isPackaged,
     env: process.env,
+    cloudBuild: pkg.cloudBuild,
   });
   if (envTokenPresent && !injectedToken) {
     log("ignoring GROK_RELAY_DEVICE_TOKEN (production build or relay URL not overridden)");
   } else if (injectedToken) {
-    log("using injected development device token (relay URL override active)");
+    log(pkg.cloudBuild
+      ? "using the device token this cloud environment was handed"
+      : "using injected development device token (relay URL override active)");
   }
   const hostContext: HostContext = {
     secrets: {
@@ -381,6 +441,7 @@ async function createApp(): Promise<void> {
     extensionId: pkg.id,
     extensionVersion: pkg.version,
     isProduction: app.isPackaged,
+    isCloudBuild: pkg.cloudBuild,
     globalState: createFileMemento(path.join(userData, "globalState.json")),
     subscriptions: {
       push(...items: HostDisposable[]) {
@@ -436,6 +497,7 @@ async function createApp(): Promise<void> {
   const host = createElectronHost({
     config,
     getWindow: () => mainWindow,
+    getLogFile: () => desktopLogFile,
     log,
     remoteActions,
     getAuthContext: () => authContext.get?.(),
