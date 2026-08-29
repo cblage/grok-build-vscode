@@ -1,10 +1,10 @@
 # Changelog
 
-## 3.19.4-sandbox.1 — 2026-08-28
+## 3.19.5-sandbox.1 — 2026-08-29
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.19.3.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.19.4.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,16 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 3.19.4 — 2026-08-28
+
+### Added
+
+- **The file panel can be told to look again.** It read each folder once and kept that listing for as long as the project stayed open, so anything changing files behind its back — the agent writing them, a build, a branch switch, another editor — left it quietly wrong with no way to ask for a fresh look. There is now a **Refresh** control in the panel header, **Refresh this folder** on a folder's right-click menu, and the same button inside an empty folder, which is where it is easiest to conclude the panel is simply broken. Refreshing keeps your place: folders you had open stay open, and your filter text, scroll position and open file tabs all survive. Thanks to @leriksen71LJR (#134).
+
+### Fixed
+
+- **A folder too big to list in full appeared to be empty.** Past the listing cap, the "Folder truncated" note replaced the very entries it was meant to sit under, so a large folder showed the warning and none of its files. The note now sits below them.
 
 ## 3.19.3 — 2026-08-28
 
