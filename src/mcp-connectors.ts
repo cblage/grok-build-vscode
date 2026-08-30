@@ -56,6 +56,24 @@ export const MCP_CONNECTORS_KEY = "grok.mcpConnectors";
  */
 export const MCP_REMOTE_PACKAGE = "mcp-remote@0.1.37";
 
+/**
+ * The version segment `mcp-remote@0.1.37` actually writes under `~/.mcp-auth`.
+ *
+ * MEASURED, not derived — that is the whole point. 0.1.37 bundles the literal
+ * string `"0.1.36"` as its own version, so `getConfigDir()` returns
+ * `mcp-remote-0.1.36` and the spec above does not name the directory. Measured
+ * 2026-08-24 and again 2026-08-30, when every live token on the dev box was
+ * found there.
+ *
+ * **Re-measure this whenever MCP_REMOTE_PACKAGE moves.** Read the bundled
+ * string; do not assume it follows the spec, because it demonstrably does not.
+ * Anything that reads the token store must use THIS directory and no other: the
+ * proxy reads exactly one, derived from its own embedded version, and never
+ * looks at siblings. A token in any other version directory is unreachable to
+ * it, so it proves nothing about whether a connector can be used.
+ */
+export const MCP_REMOTE_STORE_VERSION = "0.1.36";
+
 /** The package name without a version, for recognising an existing invocation. */
 export const MCP_REMOTE_NAME = "mcp-remote";
 
@@ -73,6 +91,16 @@ export const MCP_REMOTE_AUTH_HEADER_TEMPLATE = `Authorization:\${${MCP_REMOTE_AU
 
 /** GitHub MCP read-only header. Constant, not a secret — argv is fine. */
 export const MCP_REMOTE_READONLY_HEADER = "X-MCP-Readonly:true";
+
+/**
+ * What a connector says when we are deliberately holding it back.
+ *
+ * Not an error the user caused, and not a failure of the last thing they did —
+ * so it explains the trade rather than apologising: the prompt is gone, and
+ * reconnecting is how it comes back.
+ */
+export const CONNECTOR_REAUTH_MESSAGE =
+  "Sign-in expired, so this is paused. Reconnect when you want it back — nothing will open a browser until you do.";
 
 export const MCP_CONNECTOR_SECRET_KEY_PREFIX = "grok.mcpConnector.";
 
@@ -521,6 +549,11 @@ export function hostMcpServers(
   reserved: ReservedMcpIdentity = { names: [], urls: [] },
   oauthClientMetadataPaths: Readonly<Partial<Record<string, string>>> = {},
   keyAuthById: Readonly<Partial<Record<string, string>>> = {},
+  /**
+   * OAuth connectors whose token store is empty, which we must NOT hand to the
+   * CLI. See the skip below; an empty set (the default) keeps the old behaviour.
+   */
+  lapsed: ReadonlySet<string> = new Set(),
 ): AcpMcpStdioServer[] {
   const out: AcpMcpStdioServer[] = [];
   const seen = new Set<string>();
@@ -541,6 +574,19 @@ export function hostMcpServers(
       }));
       continue;
     }
+    // An OAuth connector with NO token cannot refresh, so mcp-remote starts a
+    // full authorization and OPENS A BROWSER — on session start, unprompted, and
+    // again on every session after it, because nothing about the failure is
+    // recorded. One connector in that state reads to the user as the app
+    // demanding sign-ins at random (owner, 2026-08-30). Withholding it is the
+    // quiet outcome: the row says why, and the browser opens only when the
+    // person clicks Connect.
+    //
+    // Deliberately NOT keyed on expiry. These tokens live 1-24 hours and carry a
+    // refresh_token that mcp-remote uses silently; treating an expired ACCESS
+    // token as failure would disconnect connectors that work perfectly. Only a
+    // missing token file means there is nothing left to refresh.
+    if (lapsed.has(connector.id)) continue;
     seen.add(name);
     const metadataPath = connector.oauthScope?.trim()
       ? oauthClientMetadataPaths[connector.id]
@@ -557,6 +603,8 @@ export function connectorViews(
     errorId?: string;
     error?: string;
     keySet?: ReadonlySet<string>;
+    /** OAuth connectors being withheld from `mcpServers` — see hostMcpServers. */
+    lapsed?: ReadonlySet<string>;
   } = {},
 ): ConnectorView[] {
   return TIER1_CONNECTORS.map((connector) => {
@@ -565,15 +613,22 @@ export function connectorViews(
     const connected = !!store[connector.id];
     const connecting = opts.connectingId === connector.id;
     const failed = opts.errorId === connector.id && !!opts.error;
+    // A withheld connector reports as NOT connected, with the reason where its
+    // description goes. That is the row the settings page already knows how to
+    // draw — no green dot, an explanation, and a Connect button that runs
+    // exactly the flow we stopped running on the user's behalf. The store record
+    // is untouched, so reconnecting keeps any endpoint override.
+    const lapsed = auth === "oauth" && connected && !connecting && !failed
+      && !!opts.lapsed?.has(connector.id);
     return {
       id: connector.id,
       name: connector.name,
       description: connector.description,
       endpoint: store[connector.id]?.endpoint || connector.endpoint,
-      connected,
-      status: connecting ? "connecting" : failed ? "error" : "idle",
+      connected: lapsed ? false : connected,
+      status: connecting ? "connecting" : (failed || lapsed) ? "error" : "idle",
       auth,
-      ...(failed ? { error: opts.error } : {}),
+      ...(failed ? { error: opts.error } : lapsed ? { error: CONNECTOR_REAUTH_MESSAGE } : {}),
       ...(auth === "key" ? {
         keySet,
         ...(connector.keyHint ? { keyHint: connector.keyHint } : {}),

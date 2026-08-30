@@ -105,6 +105,7 @@ import {
   deviceLoginFailureText,
   deviceLoginPlan,
   deviceLoginPreflight,
+  noRemoteSignInMessage,
   deviceLoginUnavailable,
 } from "./device-login";
 import { runDeviceLogin, type DeviceLoginHandle } from "./device-login-run";
@@ -464,6 +465,7 @@ import {
 } from "./mcp-connectors";
 import {
   authorizeMcpRemote,
+  connectorsLackingOAuthToken,
   npxSpawnPlan,
   persistConnectorOAuthClientMetadata,
   writeOAuthClientMetadataFile,
@@ -775,6 +777,17 @@ export class GrokSidebar {
   // delay is what keeps it from being routine. Costs nothing in return: an orphan
   // is stamped when its window opened, so by the next activation it is already old.
   private static readonly SWEEP_MIN_AGE_MS = 30 * 60 * 1000;
+  /** How often the sweep may actually walk, per repo. Well under
+   *  SWEEP_MIN_AGE_MS, so a shell waits at most SWEEP_MIN_AGE_MS + this before
+   *  it is collected — while the walk stops being something a click pays for. */
+  private static readonly SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+  /** Last real sweep per repo, for SWEEP_INTERVAL_MS. */
+  private readonly lastSweepAt = new Map<string, number>();
+  /** A whole-list refresh is already queued for this tick. See postSessionsList. */
+  private sessionsListScheduled = false;
+  /** Providers whose device-login preflight advice has been shown this
+   *  activation. Advice, not a gate - see startDeviceLogin. */
+  private readonly deviceLoginPreflightShown = new Set<AcpProvider>();
   private reaper?: ReturnType<typeof setInterval>;
   private oauthShadowWarningShown = false;
   private get chips(): FileChip[] { return this.focused.chips; }
@@ -1763,8 +1776,21 @@ export class GrokSidebar {
     // Before anything is spawned. A person who reads this fixes a setting in
     // fifteen seconds; a person who reads the failure afterwards has already
     // waited for it.
+    // ONCE, then get out of the way.
+    //
+    // This used to return unconditionally, which made the flow impossible to
+    // finish: the panel's own "I've turned it on - connect" button posts
+    // `runGrokLogin` again, landed here again, and re-rendered the identical
+    // card. The button could never do anything, and to the person clicking it
+    // nothing happened at all (owner, on a cloud environment).
+    //
+    // The advice is still worth showing before the first attempt - it saves a
+    // wait for a failure almost everyone gets. It is advice, though, not a gate,
+    // so the second attempt runs. If the setting is still off, the real failure
+    // is classified and says so (classifyDeviceLoginFailure).
     const preflight = deviceLoginPreflight(provider, { isCloud });
-    if (preflight) {
+    if (preflight && !this.deviceLoginPreflightShown.has(provider)) {
+      this.deviceLoginPreflightShown.add(provider);
       send({ status: "unavailable", message: preflight.reason, preflight: { ...preflight, steps: [...preflight.steps] } });
       return;
     }
@@ -1774,8 +1800,7 @@ export class GrokSidebar {
       // a dead end and a next step.
       send({
         status: "unavailable",
-        message: unavailable
-          ?? `${displayName} has no sign-in that works without a terminal. Connect it at your computer.`,
+        message: unavailable ?? noRemoteSignInMessage(displayName, { isCloud }),
       });
       return;
     }
@@ -5973,6 +5998,13 @@ Only continue if you trust this code.`,
     options: { warnOnRefusal?: boolean } = {},
   ): Promise<void> {
     const prevRoot = this.workspaceRoot();
+    // What the LIST depends on: which folder is active, and which project the
+    // rail has selected. Following a session into the project you are already in
+    // moves neither, and rebuilding for that walked the whole session catalog to
+    // produce the list already on screen. Captured before either can move.
+    const prevSelected = this.selectedRepoCwd;
+    const listMayHaveChanged = () =>
+      !pathsEqual(target, prevRoot) || !pathsEqual(prevSelected ?? "", this.selectedRepoCwd ?? "");
     if (!pathsEqual(target, prevRoot)) {
       // A rejected host call must abort — never treat setActive as advisory
       // and then open history / spawn an agent against the refused path.
@@ -5996,7 +6028,7 @@ Only continue if you trust this code.`,
 
     // Already focused on this folder's live conversation — just refresh chrome.
     if (pathsEqual(this.sessionCwd(this.focused), target) && this.focused.client) {
-      this.postSessionsList();
+      if (listMayHaveChanged()) this.postSessionsList();
       return;
     }
 
@@ -6016,7 +6048,7 @@ Only continue if you trust this code.`,
     // (see desktopAuthRoots), so a conversation in another project keeps
     // reaching its own files and only its own.
     this.postRepoCatalog();
-    this.postSessionsList();
+    if (listMayHaveChanged()) this.postSessionsList();
   }
 
   /**
@@ -7301,36 +7333,61 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * CLI owns auth, so we shell out to it, tear down the live session, and drop
    * the webview back to the auth-required onboarding state. Resolves issue #13.
    */
-  async logout(provider: AcpProvider = "grok"): Promise<void> {
+  async logout(
+    provider: AcpProvider = "grok",
+    opts: { fromRemote?: boolean; report?: (text: string) => void } = {},
+  ): Promise<void> {
+    // Every failure below goes through here. A cloud environment has nobody at
+    // its desk: a modal blocks on an answer that never comes, and an error
+    // dialog is simply never seen — so the remote closed Settings believing it
+    // had signed out while the account stayed connected. Caught in review, after
+    // only the CONFIRMATION modal was made remote-aware.
+    const fail = (text: string) => {
+      this.host.appendLine(`[providers] ${text}`);
+      if (opts.report) opts.report(text);
+      else void this.host.showErrorMessage(text);
+    };
     if (isAdapterProvider(provider)) {
       const cliPath = this.locateProvider(provider);
       const name = providerDisplayName(provider);
       if (!cliPath) {
-        await this.host.showErrorMessage(`${name} sign-out could not run because the ${name} CLI was not found. The account remains connected.`);
+        fail(`${name} sign-out could not run because the ${name} CLI was not found. The account remains connected.`);
         return;
       }
-      const choice = await this.host.showWarningMessage(
-        `Sign out of ${name}? This clears the ${name} CLI's cached credentials.`,
-        { modal: true },
-        "Sign Out",
-      );
-      if (choice !== "Sign Out") return;
+      // The modal is the DESK's confirmation step. A cloud environment has
+      // nobody at its desk, so showing one there asks a question no one can
+      // answer and the sign-out simply never happens. The remote already
+      // clicked Sign out on the only surface that host has.
+      if (!opts.fromRemote) {
+        const choice = await this.host.showWarningMessage(
+          `Sign out of ${name}? This clears the ${name} CLI's cached credentials.`,
+          { modal: true },
+          "Sign Out",
+        );
+        if (choice !== "Sign Out") return;
+      }
       const logoutArgs = provider === "claude" ? ["auth", "logout"] : ["logout"];
       try {
         await execGrokCli(cliPath, logoutArgs, { timeout: 30_000, windowsHide: true });
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         if (code === "ENOENT" || code === "EACCES" || code === "EPERM") {
-          this.host.createTerminal({ name: `${name} Logout`, shellPath: cliPath, shellArgs: logoutArgs }).show();
-          await this.host.showErrorMessage(
-            `${name} sign-out could not be observed, so it was opened in a terminal. The account remains connected until sign-out is confirmed.`,
-          );
+          // The terminal fallback is a DESK affordance: it works because someone
+          // is there to read it. On a cloud box it opens a window nobody sees and
+          // reports success that never happened, so that path is desk-only.
+          if (!opts.fromRemote) {
+            this.host.createTerminal({ name: `${name} Logout`, shellPath: cliPath, shellArgs: logoutArgs }).show();
+            fail(`${name} sign-out could not be observed, so it was opened in a terminal. The account remains connected until sign-out is confirmed.`);
+          } else {
+            fail(`${name} sign-out could not run here: ${errorDetail(error)}. The account remains connected.`);
+          }
         } else {
-          await this.host.showErrorMessage(`${name} sign-out failed: ${errorDetail(error)}. The account remains connected.`);
+          fail(`${name} sign-out failed: ${errorDetail(error)}. The account remains connected.`);
         }
+        this.postProviderState();
         return;
       }
-      await this.finishProviderLogout(provider);
+      await this.finishProviderLogout(provider, opts.report);
       return;
     }
     const cliPath = this.locateProvider("grok");
@@ -7338,19 +7395,37 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.post({ type: "onboarding", state: "missing-cli", platform: process.platform, provider: "grok" });
       return;
     }
-    const choice = await this.host.showWarningMessage(
-      "Sign out of Grok? This clears the CLI's cached credentials.",
-      { modal: true },
-      "Sign Out",
-    );
-    if (choice !== "Sign Out") return;
-    // shellPath/shellArgs, not sendText — a quoted path typed into PowerShell
-    // is parsed as a string literal rather than an invocation.
-    this.host.createTerminal({ name: "Grok Logout", shellPath: cliPath, shellArgs: ["logout"] });
-    await this.finishProviderLogout("grok");
+    if (!opts.fromRemote) {
+      const choice = await this.host.showWarningMessage(
+        "Sign out of Grok? This clears the CLI's cached credentials.",
+        { modal: true },
+        "Sign Out",
+      );
+      if (choice !== "Sign Out") return;
+      // shellPath/shellArgs, not sendText — a quoted path typed into PowerShell
+      // is parsed as a string literal rather than an invocation.
+      this.host.createTerminal({ name: "Grok Logout", shellPath: cliPath, shellArgs: ["logout"] });
+      await this.finishProviderLogout("grok", opts.report);
+      return;
+    }
+    // A terminal nobody can see is not evidence. Run it and WAIT, so the
+    // disconnected state is recorded only if the CLI actually cleared the
+    // credential — the desk path can be optimistic because a person is watching
+    // the terminal it opened.
+    try {
+      await execGrokCli(cliPath, ["logout"], { timeout: 30_000, windowsHide: true });
+    } catch (error) {
+      fail(`Grok sign-out failed: ${errorDetail(error)}. The account remains connected.`);
+      this.postProviderState();
+      return;
+    }
+    await this.finishProviderLogout("grok", opts.report);
   }
 
-  private async finishProviderLogout(provider: AcpProvider): Promise<void> {
+  private async finishProviderLogout(
+    provider: AcpProvider,
+    report?: (text: string) => void,
+  ): Promise<void> {
     this.setProviderConnectedInMemory(provider, false);
     const reset = this.resetProviderSessionsAfterLogout(provider);
     try {
@@ -7359,9 +7434,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       const providerName = providerDisplayName(provider);
       const detail = errorDetail(error);
       this.host.appendLine(`[providers] ${providerName} signed out, but saving connection state failed: ${detail}`);
-      await this.host.showErrorMessage(
-        `${providerName} signed out and its conversations were reset, but the disconnected state could not be saved: ${detail}`,
-      );
+      const text = `${providerName} signed out and its conversations were reset, but the disconnected state could not be saved: ${detail}`;
+      // Same reason as the failures above: on a cloud box a dialog is nobody's.
+      if (report) report(text);
+      else await this.host.showErrorMessage(text);
     }
     await reset;
     this.postSessionsList();
@@ -10544,7 +10620,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "logout":
-        await this.logout(isAcpProvider(msg.provider) ? msg.provider : "grok");
+        // `fromRemote` is not a permission — the gate above already decided
+        // that, and it only lets this through on a cloud environment. It says
+        // there is NOBODY AT THE MACHINE to answer a modal.
+        await this.logout(
+          isAcpProvider(msg.provider) ? msg.provider : "grok",
+          {
+            fromRemote: origin === "remote",
+            // `requester`, NOT clientId. Host dialogs are invisible on a cloud
+            // box, so the asking client is the only surface that can be told —
+            // and a clientId is ephemeral: a same-tab reconnect replaces it, and
+            // sign-out can sit for 30 seconds, so one phone network blip is
+            // enough to address the failure to a dead connection while the
+            // credential stays on the machine. `reportRequester` is the
+            // reconnect-stable path and already falls back to a host dialog at a
+            // desk, which is what the first version of this reinvented badly.
+            report: (text) => this.reportRequester(requester, "error", text),
+          },
+        );
         break;
       case "refreshProviders":
         await this.refreshProviderStates();
@@ -10941,13 +11034,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private mcpConnectorsMessage(): Extract<HostMsg, { type: "mcpConnectors" }> {
+    const store = this.connectedConnectorStore();
     return {
       type: "mcpConnectors",
-      connectors: connectorViews(this.connectedConnectorStore(), {
+      connectors: connectorViews(store, {
         connectingId: this.mcpConnectingId,
         errorId: this.mcpConnectError?.id,
         error: this.mcpConnectError?.message,
         keySet: new Set((this.mcpConnectorKeys ?? new Map()).keys()),
+        lapsed: this.lapsedOAuthConnectors(store),
       }),
     };
   }
@@ -11041,7 +11136,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.reservedMcpIdentityFor(session),
       persistConnectorOAuthClientMetadata(store),
       keyAuth,
+      this.lapsedOAuthConnectors(store),
     );
+  }
+
+  /**
+   * Connectors we withhold from `session/new` because their token is gone.
+   *
+   * Read fresh rather than cached: a person can finish a sign-in in the browser
+   * between two sessions, and a cached "lapsed" would keep the connector off
+   * until the window was reloaded. It is one readdir and a few existsSync calls.
+   */
+  private lapsedOAuthConnectors(store = this.connectedConnectorStore()): ReadonlySet<string> {
+    return connectorsLackingOAuthToken({ store });
   }
 
   private async loadMcpConnectorKeys(): Promise<void> {
@@ -11383,7 +11490,38 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   /** Refresh local history plus each connected remote tab. */
+  /**
+   * Rebuild and fan out the conversation list — COALESCED.
+   *
+   * Twenty-odd sites call this, because every catalog mutation funnels here on
+   * purpose. That is the right shape, and it meant one click ran the rebuild
+   * about twice, each time walking every session directory to sort by mtime:
+   * ~380ms per walk at 3000 conversations, synchronously, on the thread that
+   * paints the window (#133/#131).
+   *
+   * Every call posts a COMPLETE snapshot, so collapsing the ones that land in a
+   * single tick loses nothing — the earlier frames were superseded before
+   * anyone saw them. What the rail shows is unchanged; it is painted once
+   * instead of twice, a tick later.
+   *
+   * A paged request is NOT coalesced. `opts` means the webview asked for a
+   * specific slice and is waiting for it: merging that into a later
+   * whole-list refresh would answer a scroll with the wrong page, or not at all.
+   */
   private postSessionsList(opts?: SessionsListOptions): void {
+    if (opts) {
+      this.postSessionsListNow(opts);
+      return;
+    }
+    if (this.sessionsListScheduled) return;
+    this.sessionsListScheduled = true;
+    setImmediate(() => {
+      this.sessionsListScheduled = false;
+      this.postSessionsListNow();
+    });
+  }
+
+  private postSessionsListNow(opts?: SessionsListOptions): void {
     const localCwd = this.historyCwdFor("local");
     const local = this.buildSessionsList(localCwd, opts, undefined, "local");
     this.postLocal(local);
@@ -14731,6 +14869,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // it will not work is still a control that does not work, and the page
         // behind it would list servers nobody can connect.
         ...(this.host.canShowMcpSettings && !isCloudEnvironment() ? { mcpSettings: true } : {}),
+        // Sign OUT from a remote, cloud only. See HostUiCapabilities and the
+        // CLOUD_DISPOSITION override in remote-policy.ts, which is the half that
+        // actually admits the message — this flag only decides whether the page
+        // offers the control.
+        ...(isCloudEnvironment() ? { remoteAgentSignOut: true } : {}),
         // Absent/true = host opens files in an editor tab; false = no editor
         // (desktop → in-app lightbox for generated images). See Host.canOpenInEditor.
         openInEditor: this.host.canOpenInEditor,
@@ -15580,7 +15723,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       },
       remoteClientLeft: (clientId) => this.releaseRemoteClient(clientId),
       remoteClientRoster: (clientIds) => this.retainRemoteClients(clientIds),
-      sweepEmptySessions: (cwd) => this.sweepEmptySessions(cwd),
+      // Asking for the sweep by name means now — see the `force` note there.
+      sweepEmptySessions: (cwd) => this.sweepEmptySessions(cwd, { force: true }),
       workspaceRoot: () => this.workspaceRoot(),
     };
   }
@@ -15815,7 +15959,22 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     this.postMode();
     this.postRepoCatalog();
-    this.postSessionsList();
+    // The IDENTITY frame, sent directly rather than as a side effect.
+    //
+    // Both clients hold their rail transition open until they learn which
+    // conversation is now active — from `sessionName`, or from a sessions list's
+    // `activeId` (chat.js `noteRailTransitionSessionName`, projects-rail.js
+    // `case "sessionName"`). That frame used to ride inside postSessionsList,
+    // which is a whole catalog walk to deliver one id, and dropping the walk
+    // dropped the id with it: switching to an already-live conversation hung the
+    // transition for its full timeout and then snapped the highlight back to the
+    // previous one while the host was focused on the new one. Caught in review,
+    // after a commit message asserted this path already sent it.
+    //
+    // Sending it here is the point of the change rather than an exception to it:
+    // the small frame the client actually needs, instead of rebuilding a list
+    // that has not changed.
+    this.postSessionName(session);
   }
 
   /**
@@ -15856,6 +16015,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.disposeSession(cur);
     if (isAdapterProvider(provider)) void this.discardAdapterEmptySession(provider, id, cwd);
     else this.removeSessionFromDisk(id, cwd);
+    // This one KEEPS its rebuild, unlike focusSession above: a row genuinely
+    // disappeared. Abandoning an empty session deletes its directory, so the
+    // list on screen is now wrong and no other frame says so.
     this.postSessionsList();
   }
 
@@ -15966,8 +16128,41 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  right now, one younger than {@link SWEEP_MIN_AGE_MS}, a renamed or pinned
    *  one, a worktree session, or a subagent's transcript. Best-effort
    *  throughout: a locked directory is logged and skipped. */
-  private sweepEmptySessions(cwd: string = this.workspaceRoot()): void {
+  private sweepEmptySessions(
+    cwd: string = this.workspaceRoot(),
+    opts: { force?: boolean } = {},
+  ): void {
     if (!cwd) return;
+    const repoKey = normalizeRepoPath(cwd);
+    // THROTTLED, because the per-open frequency was buying nothing.
+    //
+    // Every call walks the whole catalog to sort it by mtime — `readdirSync`
+    // plus up to three `statSync` per session directory — and then reads
+    // `summary.json` and `chat_history.jsonl` for each surviving candidate. At
+    // 3000 conversations that measured 200-380ms of walking plus the reads, on
+    // the Electron MAIN thread, which is the thread that paints the window.
+    // Callers put it on the open path, so it ran on every click (#133/#131).
+    //
+    // And it could not have found anything: SWEEP_MIN_AGE_MS is THIRTY MINUTES,
+    // so a session that was not sweepable half an hour ago is not sweepable now.
+    // Running it dozens of times an hour deletes exactly what running it once
+    // would have.
+    //
+    // This is not the "tidy up the conversation I just abandoned" path — that is
+    // `discardRestartedEmptySession` / `removeSessionFromDisk`, which delete one
+    // known id immediately and are untouched here. This is the periodic sweep of
+    // shells left by earlier runs, and periodic is what it now is.
+    //
+    // `force` is for a caller that NAMES the sweep, which means now. The
+    // throttle is about the incidental callers on the open path; applying it to
+    // a deliberate request makes an explicit call silently do nothing, which is
+    // the shape of a bug nobody can find later. The integration gate caught
+    // exactly that: it calls the sweep to assert what it deletes, an earlier
+    // incidental sweep had already stamped the repo, and it deleted nothing.
+    const startedAt = Date.now();
+    const lastSweep = this.lastSweepAt.get(repoKey) ?? 0;
+    if (!opts.force && startedAt - lastSweep < GrokSidebar.SWEEP_INTERVAL_MS) return;
+    this.lastSweepAt.set(repoKey, startedAt);
     const grokHome = resolveGrokHome(process.env);
     const log = (m: string) => this.host.appendLine(m);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
@@ -15987,7 +16182,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     for (const id of this.sessionLoadReservations.keys()) liveIds.add(id);
 
-    const repoKey = normalizeRepoPath(cwd);
     let proven = this.provenNonEmpty.get(repoKey);
     if (!proven) {
       proven = new Set<string>();
@@ -17606,7 +17800,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         return;
       }
-      if (!allowFromRemote(m.type, GrokSidebar.REMOTE_TIER)) {
+      if (!allowFromRemote(m.type, GrokSidebar.REMOTE_TIER, { isCloud: isCloudEnvironment() })) {
         this.host.appendLine(`[remote] dropped ${m.type} (not allowed from a remote client)`);
         return;
       }

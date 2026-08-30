@@ -2,7 +2,7 @@
   "name": "grok-vscode-phuryn",
   "displayName": "Grok Build for VS Code (Community)",
   "description": "GUI for Grok Build CLI (incl. Grok 4.6). Remote Control from your phone, voice control, multiple sessions, images and videos, Mermaid diagrams, and LaTeX. Works with SuperGrok, X Premium+, and xAI API key. Fair Source (FSL-1.1-MIT). Not affiliated with or endorsed by SpaceXAI (formerly xAI).",
-  "version": "3.19.7-sandbox.1",
+  "version": "3.19.8-sandbox.1",
   "publisher": "PawelHuryn",
   "author": {
     "name": "Paweł Huryn",
@@ -487,6 +487,7 @@
     "test:desktop": "npm run compile && vitest run --config vitest.desktop.config.ts",
     "e2e:screens": "npm run compile && node scripts/desk-screens-check.mjs",
     "e2e:open-timing": "npm run compile && node scripts/open-timing-check.mjs",
+    "e2e:hc-colour": "node scripts/hc-colour-screens.mjs",
     "e2e:welcome-tip": "node scripts/ide-welcome-tip-screens.mjs",
     "e2e:gh-unauth": "npm run compile && node scripts/gh-unauth-check.mjs",
     "marketplace:login": "node scripts/marketplace-session.mjs",

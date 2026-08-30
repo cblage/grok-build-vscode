@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
+  mcpRemoteStoreDir,
   authorizeMcpRemote,
+  connectorsLackingOAuthToken,
+  mcpServerUrlHash,
   npxSpawnPlan,
   persistConnectorOAuthClientMetadata,
   quoteSpawnArgs,
@@ -629,5 +632,130 @@ describe("mcp-remote version pin", () => {
   it("still finds the package when rebuilding args with a callback port", () => {
     const rebuilt = withMcpRemoteCallbackPort(mcpRemoteArgs("https://mcp.linear.app/mcp"), 22227);
     expect(rebuilt).toEqual(["-y", MCP_REMOTE_PACKAGE, "https://mcp.linear.app/mcp", "22227"]);
+  });
+});
+
+describe("connectorsLackingOAuthToken — never re-prompt a connector we cannot refresh (#owner 2026-08-30)", () => {
+  const LINEAR = "https://mcp.linear.app/mcp";
+  const NOTION = "https://mcp.notion.com/mcp";
+  const store = { linear: { endpoint: LINEAR }, notion: { endpoint: NOTION } } as never;
+
+  function fakeFs(dirs: { name: string; mtimeMs: number }[], files: string[]) {
+    const set = new Set(files);
+    return { versionDirs: () => dirs, hasFile: (p: string) => set.has(p) };
+  }
+
+  it("names the one directory the proxy reads, and nothing else", () => {
+    // Never by mtime: a token REFRESH rewrites the file without touching the
+    // parent's mtime, so an abandoned directory can stay "newest" for ever.
+    expect(mcpRemoteStoreDir([
+      { name: "mcp-remote-0.2.5" },
+      { name: "mcp-remote-0.1.36" },
+      { name: "not-ours" },
+    ])).toBe("mcp-remote-0.1.36");
+    // Absent -> undefined, which the caller must treat as "cannot tell".
+    expect(mcpRemoteStoreDir([{ name: "mcp-remote-0.2.5" }])).toBeUndefined();
+    expect(mcpRemoteStoreDir([])).toBeUndefined();
+  });
+
+  it("does not let an abandoned directory's token prove anything", () => {
+    // The proxy reads ONE directory, derived from its own embedded version, and
+    // never looks at siblings. A token in 0.2.9 is unreachable to a proxy
+    // reading 0.1.36 — so accepting it would pass the connector through and let
+    // it open a browser anyway, which is the thing this exists to prevent.
+    const root = join("/home/dev", ".mcp-auth");
+    const lapsed = connectorsLackingOAuthToken({
+      store,
+      home: "/home/dev",
+      env: {},
+      fs: fakeFs(
+        [{ name: "mcp-remote-0.1.36", mtimeMs: 10 }, { name: "mcp-remote-0.2.9", mtimeMs: 9000 }],
+        [
+          join(root, "mcp-remote-0.2.9", `${mcpServerUrlHash(LINEAR)}_tokens.json`),
+          join(root, "mcp-remote-0.1.36", `${mcpServerUrlHash(NOTION)}_tokens.json`),
+        ],
+      ),
+    });
+    expect([...lapsed]).toEqual(["linear"]);
+  });
+
+  it("fails open when the directory the proxy reads is not there at all", () => {
+    // A changed pin, an unfamiliar layout: withholding everything would break
+    // every connector on a machine we simply do not recognise.
+    const root = join("/home/dev", ".mcp-auth");
+    expect([...connectorsLackingOAuthToken({
+      store,
+      home: "/home/dev",
+      env: {},
+      fs: fakeFs([{ name: "mcp-remote-9.9.9", mtimeMs: 1 }],
+        [join(root, "mcp-remote-9.9.9", `${mcpServerUrlHash(LINEAR)}_tokens.json`)]),
+    })]).toEqual([]);
+  });
+
+  it("hashes an endpoint the way the real store does", () => {
+    // Measured: this is the directory name mcp-remote actually used for Linear.
+    expect(mcpServerUrlHash(LINEAR)).toBe("fcc436b0d1e0a1ed9a2b15bbd638eb13");
+  });
+
+  it("names only the connector whose token file is gone", () => {
+    const root = join("/home/dev", ".mcp-auth", "mcp-remote-0.1.36");
+    const lapsed = connectorsLackingOAuthToken({
+      store,
+      home: "/home/dev",
+      env: {},
+      fs: fakeFs(
+        [{ name: "mcp-remote-0.1.36", mtimeMs: 1 }],
+        [join(root, `${mcpServerUrlHash(NOTION)}_tokens.json`)],
+      ),
+    });
+    // Withheld only because there is no token for it in ANY version directory.
+    expect([...lapsed]).toEqual(["linear"]);
+  });
+
+  it("does not care that a token has EXPIRED — only that it is absent", () => {
+    // These live 1-24 hours and carry a refresh_token mcp-remote uses silently.
+    // Treating expiry as failure would disconnect connectors that work.
+    const root = join("/home/dev", ".mcp-auth", "mcp-remote-0.1.36");
+    const lapsed = connectorsLackingOAuthToken({
+      store,
+      home: "/home/dev",
+      env: {},
+      fs: fakeFs(
+        [{ name: "mcp-remote-0.1.36", mtimeMs: 1 }],
+        [
+          join(root, `${mcpServerUrlHash(LINEAR)}_tokens.json`),
+          join(root, `${mcpServerUrlHash(NOTION)}_tokens.json`),
+        ],
+      ),
+    });
+    expect([...lapsed]).toEqual([]);
+  });
+
+  it("fails OPEN when it cannot tell", () => {
+    // No store directory at all: withholding everything would break every
+    // connector on a machine whose layout we simply do not recognise.
+    expect([...connectorsLackingOAuthToken({
+      store, home: "/home/dev", env: {}, fs: fakeFs([], []),
+    })]).toEqual([]);
+    expect([...connectorsLackingOAuthToken({
+      store,
+      home: "/home/dev",
+      env: {},
+      fs: { versionDirs: () => { throw new Error("EACCES"); }, hasFile: () => false },
+    })]).toEqual([]);
+  });
+
+  it("honours MCP_REMOTE_CONFIG_DIR as the BASE, with the version segment still appended", () => {
+    const base = "/custom/store";
+    const root = join(base, "mcp-remote-0.1.36");
+    expect([...connectorsLackingOAuthToken({
+      store,
+      home: "/home/dev",
+      env: { MCP_REMOTE_CONFIG_DIR: base },
+      fs: fakeFs(
+        [{ name: "mcp-remote-0.1.36", mtimeMs: 1 }],
+        [join(root, `${mcpServerUrlHash(LINEAR)}_tokens.json`)],
+      ),
+    })]).toEqual(["notion"]);
   });
 });
