@@ -1,10 +1,10 @@
 # Changelog
 
-## 3.19.6-sandbox.1 — 2026-08-30
+## 3.19.7-sandbox.1 — 2026-08-30
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.19.5.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.19.6.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,12 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 3.19.6 — 2026-08-30
+
+### Fixed
+
+- **Agent commands really do run in your own shell now.** 3.19.5 switched the shell on macOS and Linux and that was not enough: Grok sends every command already wrapped as `/bin/bash -lc …`, so running it under zsh just meant zsh handed it straight back to bash — the same bash 3.2 from 2007, sourcing the same profile, printing the same sdkman error. Verified against the real CLI: **every** command it issues arrives inside that wrapper. The wrapper is now unwrapped and the command is given to your shell as an explicit argument, so it cannot bounce back into bash — when that shell can stand in for bash (zsh, bash). On `/bin/sh`, dash or ksh the wrapper is deliberately left alone, because Grok wrote the script for bash and a smaller shell would fail on syntax it is entitled to use. A command the model itself wrote as `bash -lc …` is left alone. Found, diagnosed and fixed by **@russwyte** in #141 — including the part 3.19.5 missed. A `$SHELL` we cannot drive (fish, nushell) or that is not a runnable file still falls back to `/bin/sh`. **If a project's `.env` sets `SHELL`,** the agent reads that while your commands still run under the shell VS Code itself was started with — so bash-only syntax could now fail where it previously worked. Rare, and on the list to fix. **One behaviour change worth knowing:** that wrapper was also making every command run through a *login* shell, so your profile was being sourced. It no longer is. If a tool is on a `PATH` that only `~/.zprofile` or `~/.bash_profile` sets, the agent may stop finding it — tell us if that happens to you, it is the kind of trade-off worth revisiting with real cases.
 
 ## 3.19.5 — 2026-08-30
 

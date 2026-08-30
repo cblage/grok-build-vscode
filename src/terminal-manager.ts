@@ -16,6 +16,11 @@ export interface TerminalOutputResult {
   truncated: boolean;
 }
 
+/** How long `waitForExit` lets stdout finish after the process has gone.
+ *  Long enough for a pipe already holding bytes, short enough that a command
+ *  which leaves a daemon on the other end still returns promptly. */
+const DRAIN_GRACE_MS = 2000;
+
 interface TerminalEntry {
   /**
    * Who asked for this command.
@@ -32,6 +37,11 @@ interface TerminalEntry {
   byteLen: number;
   truncated: boolean;
   exitCode: number | null;
+  /** The code `exit` reported, held while the pipes finish draining. */
+  pendingExitCode?: number;
+  /** Set once listeners have been told; `exit` and `close` race to be first. */
+  settled?: boolean;
+  drainTimer?: ReturnType<typeof setTimeout>;
   exitListeners: Array<(code: number) => void>;
   byteLimit: number;
   // Buffers incomplete multi-byte UTF-8 sequences across chunk boundaries so a
@@ -110,112 +120,254 @@ function whichOnPath(name: string): string | undefined {
   }
 }
 
-/** How to pick the Windows host shell — `grok.terminalShell` (#46). */
+/** How to pick the host shell — `grok.terminalShell` (#46). */
 export type ShellPreference = "auto" | "cmd";
+
+/**
+ * `$SHELL` when it is an absolute path (the login shell the standalone TUI
+ * inherits). `/bin/sh` and `/usr/bin/sh` stay `true` so Node's default and
+ * `GROK_SHELL` unset remain the same no-op. Pure.
+ */
+/**
+ * Shells whose grammar is close enough to `/bin/sh` that a command the agent
+ * wrote for a POSIX host runs unchanged. An ALLOWLIST, not a denylist: `$SHELL`
+ * can be fish, nushell, csh or even pwsh, and `posixSpawnArgv` hands the script
+ * to it as an explicit `-c` argument — so an unrecognised grammar breaks
+ * commands that work today rather than merely running them somewhere else.
+ */
+const POSIX_SHELL_NAMES = new Set(["sh", "bash", "zsh", "ksh", "ksh93", "mksh", "dash", "ash"]);
+
+export function posixShellFromEnv(shell: string | undefined): string | true {
+  if (typeof shell !== "string") return true;
+  const trimmed = shell.trim();
+  if (!trimmed.startsWith("/")) return true;
+  if (trimmed === "/bin/sh" || trimmed === "/usr/bin/sh") return true;
+  const name = trimmed.slice(trimmed.lastIndexOf("/") + 1).toLowerCase();
+  if (!POSIX_SHELL_NAMES.has(name)) return true;
+  return trimmed;
+}
+
+/**
+ * Peel a single POSIX quoted word. Used only when grok wrapped the entire
+ * inner script in one pair of quotes (`bash -lc 'script'`). A remainder that
+ * is not one quoted word is returned as-is by the caller.
+ */
+/** Space, tab and newline — the only blanks a POSIX shell separates tokens on.
+ *  `trimStart()` and `\s` also match NBSP and other Unicode spaces, which a
+ *  shell does not: a command starting with NBSP fails today as an invalid
+ *  pathname, and trimming it would make us recognise and RUN it instead. */
+function stripPosixBlanks(v: string): string {
+  let i = 0;
+  while (i < v.length && (v[i] === " " || v[i] === "\t" || v[i] === "\n")) i++;
+  return v.slice(i);
+}
+
+/**
+ * Decode ONE shell word from the front of `s`.
+ *
+ * This is what grok actually emits. It builds the wrapper with Rust's
+ * `shlex::try_quote`, which does not pick one quoting style for the whole
+ * script — it CONCATENATES segments whenever a single strategy cannot encode
+ * the string. `echo '$HOME'` comes out as `"echo '"'$HOME'"'"`: a
+ * double-quoted chunk, a single-quoted chunk and another double-quoted chunk,
+ * joined with no whitespace, forming one word.
+ *
+ * Handling that with special cases is what produced three separate defects
+ * here — a dropped `-n` flag, mangled `\$`, and `rm -rf target` being made
+ * destructive. One parser removes the whole class: single quotes are literal,
+ * double quotes honour the backslash only before `$`, a backtick, a quote, a
+ * backslash or a newline, and an unquoted backslash escapes the next
+ * character. Unquoted whitespace ends the word.
+ *
+ * Returns the decoded word and whatever follows it, or `undefined` if the
+ * quoting is unterminated — in which case the caller must not rewrite anything.
+ */
+export function parseOneShellWord(s: string): { word: string; rest: string } | undefined {
+  let word = "";
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === " " || ch === "\t" || ch === "\n") break;
+    if (ch === "'") {
+      const close = s.indexOf("'", i + 1);
+      if (close === -1) return undefined; // unterminated
+      word += s.slice(i + 1, close);
+      i = close + 1;
+      continue;
+    }
+    if (ch === '"') {
+      i++;
+      let closed = false;
+      while (i < s.length) {
+        if (s[i] === '"') { closed = true; i++; break; }
+        if (s[i] === "\\" && i + 1 < s.length) {
+          // A backslash-newline is a LINE CONTINUATION: POSIX removes both
+          // characters, it does not yield a newline. Decoding it as one made
+          // `printf '<%s>' foo\<newline>bar` print `<foo>` and then try to run
+          // `bar`, where the original prints `<foobar>`.
+          if (s[i + 1] === "\n") { i += 2; continue; }
+          if ('$`"\\'.includes(s[i + 1])) {
+            word += s[i + 1];
+            i += 2;
+            continue;
+          }
+        }
+        word += s[i];
+        i++;
+      }
+      if (!closed) return undefined; // unterminated
+      continue;
+    }
+    if (ch === "\\") {
+      if (i + 1 >= s.length) return undefined; // trailing backslash
+      if (s[i + 1] === "\n") { i += 2; continue; } // line continuation
+      word += s[i + 1];
+      i += 2;
+      continue;
+    }
+    word += ch;
+    i++;
+  }
+  return { word, rest: s.slice(i) };
+}
+
+/**
+ * If `command` is grok's POSIX login-bash wrapper, return the inner script.
+ * Otherwise `undefined` (caller keeps `command`).
+ *
+ * Grok 1.0.x still sends `terminal/create` as `/bin/bash -lc <script>` even
+ * when `GROK_SHELL=zsh`. Node `spawn(cmd, { shell: zsh })` is then
+ * `zsh -c '/bin/bash -lc …'`; zsh execs bash, and macOS bash 3.2 sources
+ * `~/.bash_profile` (sdkman `${var^^}`).
+ *
+ * Matches `bash` / `/bin/bash` / `/usr/bin/env bash` plus login+command flags
+ * (`-lc`, `-cl`, `-l -c`, `--login -c`). One layer only: a script that itself
+ * starts with `bash -lc` is the model's command, not grok's wrapper.
+ * Pure.
+ */
+export function unwrapGrokBashLoginWrapper(command: string): string | undefined {
+  let s = stripPosixBlanks(command);
+  const envPrefix = /^\/usr\/bin\/env\s+/;
+  const envMatch = s.match(envPrefix);
+  if (envMatch) s = s.slice(envMatch[0].length);
+  const exeMatch = s.match(/^(\S+)(\s+|$)/);
+  if (!exeMatch) return undefined;
+  const base = exeMatch[1].split("/").pop() ?? "";
+  if (base !== "bash") return undefined;
+  s = stripPosixBlanks(s.slice(exeMatch[0].length));
+
+  // ONLY `-l` and `-c`, in any spelling. Every other flag is a refusal, not
+  // something to skip: bash flags CHANGE WHAT THE SCRIPT DOES, and dropping one
+  // while running the script anyway is worse than not unwrapping at all.
+  // `bash -n -l -c 'rm target'` asks bash to syntax-check WITHOUT executing;
+  // discarding `-n` turns that into a real `rm`. Same for `-e`, `-u`,
+  // `--posix`, `--restricted`. We recognise only the wrapper grok actually
+  // sends; anything else keeps its original command untouched.
+  let sawLogin = false;
+  let sawCommand = false;
+  while (s.startsWith("-")) {
+    const tokMatch = s.match(/^(--[a-zA-Z0-9-]+|-[a-zA-Z]+)(?:\s+|$)/);
+    if (!tokMatch) return undefined;
+    const tok = tokMatch[1];
+    if (tok === "--login") {
+      sawLogin = true;
+    } else if (/^-[a-zA-Z]+$/.test(tok)) {
+      for (const ch of tok.slice(1)) {
+        if (ch === "l") sawLogin = true;
+        else if (ch === "c") sawCommand = true;
+        else return undefined; // a flag we do not model — do not rewrite it away
+      }
+    } else {
+      return undefined;
+    }
+    s = stripPosixBlanks(s.slice(tokMatch[0].length));
+    if (sawCommand) break;
+  }
+  if (!sawLogin || !sawCommand || s === "") return undefined;
+  // QUOTED, or we leave it alone. `shlex::try_quote` quotes anything with a
+  // shell character in it, and every payload captured from a real grok starts
+  // with a quote. Unquoted text is where the two readings diverge: our old path
+  // let the outer shell expand `$VAR` before bash saw it, while unwrapping makes
+  // it the script the host expands. Refusing keeps that difference impossible.
+  if (s[0] !== "'" && s[0] !== '"') return undefined;
+  const parsed = parseOneShellWord(s);
+  if (!parsed) return undefined; // unterminated quoting — do not rewrite it
+  // Exactly one word, or nothing to unwrap. POSIX hands `-c` only the FIRST
+  // word as the script and makes the rest `$0`, `$1`, so a remainder means
+  // rewriting would change what the command does — `bash -lc rm -rf target`
+  // really does run `rm` with no operands.
+  if (stripPosixBlanks(parsed.rest) === "") return parsed.word;
+  return undefined;
+}
+
+export interface PosixSpawnArgv {
+  file: string;
+  args: [string, string];
+}
+
+/**
+ * POSIX argv for `terminal/create`. Always `shell: false`: an explicit
+ * `[file, '-c', script]` so the host shell cannot exec grok's `bash -lc`
+ * wrapper. `hostShell === true` is `/bin/sh` (Node's old default / `cmd` pref).
+ * Pure.
+ */
+/** Hosts whose grammar covers what grok's bash wrapper could run: `[[ ]]`,
+ *  arrays, process substitution. Unwrapping into anything else would take a
+ *  script grok deliberately sent to BASH and hand it to a smaller shell. */
+const BASH_CAPABLE_HOSTS = new Set(["bash", "zsh"]);
+
+export function posixSpawnArgv(command: string, hostShell: string | true): PosixSpawnArgv {
+  const file = hostShell === true ? "/bin/sh" : hostShell;
+  const base = file.slice(file.lastIndexOf("/") + 1).toLowerCase();
+  // Only peel the wrapper when the host can stand in for bash. On `/bin/sh`,
+  // dash or ksh — the fallback, the `cmd` preference, a dash `$SHELL` — grok's
+  // wrapper stays, so the script still reaches the bash it was written for.
+  // That is exactly what v3.19.5 did, and it is right for those hosts.
+  const script = BASH_CAPABLE_HOSTS.has(base)
+    ? unwrapGrokBashLoginWrapper(command) ?? command
+    : command;
+  return { file, args: ["-c", script] };
+}
 
 /**
  * Choose the shell for the agent's `terminal/*` commands (spawn's `shell`
  * option). On Windows, mirror the standalone grok CLI by running under
  * PowerShell — PowerShell 7 (`pwsh.exe`) when installed, else Windows
  * PowerShell 5.1 (`powershell.exe`), else cmd.exe (Node's `shell: true`
- * default). See issue #46.
- *
- * On POSIX the same principle: the user's `$SHELL` when it is POSIX-compatible,
- * else `/bin/sh` (Node's `shell: true`). Matching the login shell is what makes
- * a profile behave as it does in the standalone CLI — `/bin/sh` is bash 3.2 on
- * macOS, which takes different profile branches and made sdkman print a
- * bash-4-only parse error onto the front of every captured output (#140).
+ * default). On POSIX, use `$SHELL` when it is an absolute path (typically
+ * `/bin/zsh` on macOS), else `/bin/sh` (Node's `shell: true`). See issue #46.
  *
  * The extension is the one running commands — grok delegates every one over ACP
  * `terminal/create` — so the host shell is *our* choice, not a CLI flag. Under
  * cmd.exe the agent couldn't reach the user's PowerShell profile functions or
  * run pipelines, so it had to re-wrap each command; matching PowerShell (as the
- * standalone CLI already does) removes that friction.
+ * standalone CLI already does) removes that friction. The POSIX half is the same
+ * idea: a GUI-launched VS Code host otherwise always gets `/bin/sh` (macOS:
+ * bash 3.2), which is not the zsh login shell the TUI runs under.
  *
- * Node runs a string shell as `<shell> -c "<command>"`, and both pwsh and
- * Windows PowerShell accept `-c` as the `-Command` alias, so the agent's
- * command string runs with PowerShell semantics. We deliberately don't force
- * `-NoProfile`: profile-defined functions/modules are exactly what users expect
- * commands to reach (and what standalone grok reaches).
+ * POSIX actually spawns `[host, '-c', script]` (`posixSpawnArgv`); Node's
+ * `shell:` option is Windows-only here. Node runs a string shell as
+ * `<shell> -c "<command>"`, and both pwsh and Windows PowerShell accept `-c`
+ * as the `-Command` alias, so the agent's command string runs with PowerShell
+ * semantics. We deliberately don't force `-NoProfile`: profile-defined
+ * functions/modules are exactly what users expect commands to reach (and what
+ * standalone grok reaches).
  *
  * `pref = "cmd"` is the escape hatch (`grok.terminalShell`): force cmd.exe on
- * Windows for anyone the PowerShell default bites — e.g. the `powershell.exe`
- * 5.1 fallback rejects `&&` chains and collapses non-zero native exits to 1
- * (pwsh 7 does neither). It is no longer a no-op on POSIX: it forces `/bin/sh`
- * back, for anyone whose profile is slow or noisy under the login shell.
- * Pure given `resolve`, `env` and `exists`.
+ * Windows, `/bin/sh` on POSIX, for anyone the default host bites — e.g. the
+ * `powershell.exe` 5.1 fallback rejects `&&` chains and collapses non-zero
+ * native exits to 1 (pwsh 7 does neither).
+ * Pure given `resolve` and `posixShell`.
  */
 export function resolveTerminalShell(
   platform: NodeJS.Platform,
   resolve: (name: string) => string | undefined,
   pref: ShellPreference = "auto",
-  env: NodeJS.ProcessEnv = process.env,
-  exists: (p: string) => boolean = isRegularFile,
+  posixShell?: string,
 ): string | true {
   if (pref === "cmd") return true; // cmd.exe on Windows / /bin/sh on POSIX
-  if (platform !== "win32") return posixUserShell(env, exists) ?? true;
+  if (platform !== "win32") return posixShellFromEnv(posixShell);
   return resolve("pwsh") ?? resolve("powershell") ?? true;
-}
-
-/**
- * A regular file, not merely a path that resolves.
- *
- * `existsSync` says yes to a DIRECTORY named `zsh`, and to a non-executable
- * file — either of which we would then hand to `spawn` as the shell, failing
- * every agent command with `EISDIR` or `EACCES`. Before #140 POSIX always used
- * Node's own `/bin/sh` and could not get this wrong.
- */
-function isRegularFile(p: string): boolean {
-  try {
-    if (!statSync(p).isFile()) return false;
-    // And actually runnable. A regular file we cannot execute fails `spawn`
-    // with EACCES on every command instead of falling back — the comment above
-    // promised this and the check did not deliver it.
-    accessSync(p, fsConstants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Shells whose grammar is close enough to `/bin/sh` that a command the agent
- * wrote for a POSIX host runs unchanged. An ALLOWLIST, not a denylist: `$SHELL`
- * can be fish, nushell, csh or even pwsh, and handing any of those a POSIX
- * command breaks things that work today. Anything unrecognized falls back.
- */
-const POSIX_SHELL_NAMES = new Set(["sh", "bash", "zsh", "ksh", "ksh93", "mksh", "dash", "ash"]);
-
-/**
- * The shell `$SHELL` names, when we can safely run the agent's commands in it.
- *
- * NOT a login shell, despite what `$SHELL` suggests: Node invokes it as
- * `<shell> -c`, so `~/.zshrc` and `~/.bash_profile` are not sourced and a PATH
- * set up there is not inherited. (`~/.zshenv` and `$BASH_ENV` still are — a
- * non-interactive shell is not a shell with no configuration at all.) What changes is WHICH shell interprets the
- * command — which is the whole of #140, because sdkman branches on it.
- *
- * Node's `shell: true` is `/bin/sh`, which on macOS is bash 3.2 — so a command
- * run by us takes a different profile branch than the same command in the
- * standalone CLI, which uses the login shell. sdkman is the reported case
- * (#140): its helper uses the bash 4 `${x^^}`, sees `$BASH_VERSION` under
- * bash 3.2, and prints a parse error onto the front of every captured output.
- * Windows already matches the user's shell for exactly this reason (#46).
- *
- * Absolute path required — `$SHELL` is a path by definition, and resolving a
- * bare name against PATH would be a different (and guessier) feature.
- */
-function posixUserShell(
-  env: NodeJS.ProcessEnv,
-  exists: (p: string) => boolean,
-): string | undefined {
-  const shell = (env.SHELL ?? "").trim();
-  if (!shell.startsWith("/")) return undefined;
-  const name = shell.slice(shell.lastIndexOf("/") + 1).toLowerCase();
-  if (!POSIX_SHELL_NAMES.has(name)) return undefined;
-  // A `$SHELL` naming a binary that is not there would break every command;
-  // `/bin/sh` is the safer answer than a spawn failure per command.
-  return exists(shell) ? shell : undefined;
 }
 
 /**
@@ -227,32 +379,21 @@ function posixUserShell(
  * PowerShell syntax when we fall back to cmd) — setting `GROK_SHELL` in grok's
  * spawn env realigns the model's dialect hints with our shell (§2.9;
  * research/oss-surfaces-probe.cjs confirms it drives the first-message `Shell:`).
- * Pure. On POSIX the answer depends on whether we ran the shell `$SHELL` names:
- * if we did, grok's own detection names the same shell and needs no override;
- * if we fell back to `/bin/sh` (a fish or nushell `$SHELL`), it would describe
- * a shell we are not running, so `bash` is set to realign it. Windows maps the
- * resolved shell to grok's accepted override values (`pwsh`/`powershell`/`cmd`).
+ * Pure. POSIX maps a resolved `$SHELL` path (`zsh`, `bash`, …) and leaves
+ * `undefined` for the `/bin/sh` fallback so grok keeps detecting. Windows maps
+ * the resolved shell to grok's accepted override values (`pwsh` / `powershell` /
+ * `cmd`).
  */
 export function grokShellEnvValue(
   resolved: string | true,
   platform: NodeJS.Platform = process.platform,
-  env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
   if (platform !== "win32") {
-    // NOTHING, deliberately, and this is the third thing three review rounds
-    // kept flagging — correctly, but the fix is not a better value.
-    //
-    // Upstream builds the model-facing `Shell:` from `$SHELL` on Unix
-    // (`resolve_shell_display`: `std::env::var("SHELL")`), and treats
-    // `GROK_SHELL` there as a PATH to a shell binary, which it validates with
-    // an executable check — so the bare string `bash` never applied in the
-    // first place. It steers the dialect on Windows only.
-    //
-    // Which means running the shell `$SHELL` names IS the alignment: grok
-    // describes `$SHELL`, we run `$SHELL`, and no override can improve on two
-    // things that already agree. The residual is the fallback — a fish `$SHELL`
-    // has grok describing fish while we run `/bin/sh` — and no value of this
-    // variable closes it on Unix.
+    // NOTHING on POSIX — a correction to this PR rather than a disagreement
+    // with it. Upstream builds the model-facing `Shell:` from `$SHELL` on Unix
+    // (`resolve_shell_display`) and reads `GROK_SHELL` there as a PATH to a
+    // shell binary, validated with an executable check, so a bare `zsh` never
+    // reached the model. Running the shell `$SHELL` names IS the alignment.
     return undefined;
   }
   if (resolved === true) return "cmd"; // cmd.exe: forced pref, or no PowerShell found
@@ -306,9 +447,33 @@ export function setTerminalShellPreference(pref: ShellPreference): void {
   }
 }
 
+/**
+ * A regular file we can actually execute.
+ *
+ * `existsSync` says yes to a DIRECTORY named `zsh`, and to a file with no
+ * execute bit — either of which `spawn` then fails on for every command
+ * (`EISDIR`, `EACCES`) instead of falling back to `/bin/sh`.
+ */
+function isRegularExecutable(p: string): boolean {
+  try {
+    if (!statSync(p).isFile()) return false;
+    accessSync(p, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function terminalShell(): string | true {
   if (cachedTerminalShell === undefined) {
-    cachedTerminalShell = resolveTerminalShell(process.platform, whichOnPath, shellPreference);
+    const resolved = resolveTerminalShell(
+      process.platform,
+      whichOnPath,
+      shellPreference,
+      process.env.SHELL,
+    );
+    cachedTerminalShell =
+      typeof resolved === "string" && !isRegularExecutable(resolved) ? true : resolved;
   }
   return cachedTerminalShell;
 }
@@ -316,8 +481,9 @@ function terminalShell(): string | true {
 /**
  * Manages background processes spawned on behalf of the agent's `terminal/*`
  * ACP requests. Each terminal is a headless shell child process (PowerShell on
- * Windows, /bin/sh elsewhere — see `resolveTerminalShell`) whose stdout+stderr
- * is captured into a single rolling buffer respecting `outputByteLimit`.
+ * Windows, `$SHELL` / `/bin/sh` elsewhere — see `resolveTerminalShell`) whose
+ * stdout+stderr is captured into a single rolling buffer respecting
+ * `outputByteLimit`.
  */
 /** Injectable seams for tests — production callers pass nothing. */
 export interface TerminalManagerDeps {
@@ -379,7 +545,17 @@ export class TerminalManager {
     // `taskkill /T` already walks the tree and `detached` would open a console
     // window.
     const detached = (this.deps.platform ?? process.platform) !== "win32";
-    const proc = spawn(params.command, { cwd, env, shell: terminalShell(), detached });
+    // Windows still uses Node `shell:` (pwsh/powershell/cmd). POSIX uses an
+    // explicit argv so `$SHELL -c` cannot exec grok's `/bin/bash -lc` wrapper.
+    // `process.platform` (not `deps.platform`): kill-plan tests inject win32
+    // on a POSIX box and still have to spawn a real local command.
+    let proc: ChildProcess;
+    if (process.platform === "win32") {
+      proc = spawn(params.command, { cwd, env, shell: terminalShell(), detached });
+    } else {
+      const { file, args } = posixSpawnArgv(params.command, terminalShell());
+      proc = spawn(file, args, { cwd, env, detached });
+    }
 
     const entry: TerminalEntry = {
       owner,
@@ -409,20 +585,53 @@ export class TerminalManager {
     proc.stdout?.on("data", onChunk);
     proc.stderr?.on("data", onChunk);
     proc.on("error", (err) => {
+      entry.settled = true;
       entry.buf += `\n[spawn error] ${err.message}`;
       entry.exitCode = -1;
       for (const l of entry.exitListeners) l(-1);
       entry.exitListeners = [];
     });
+    // FINISHING is two events, not one. Node's `exit` fires when the process
+    // ends, which can be BEFORE its stdout has been delivered to us; `close`
+    // fires once the pipes are drained. Resolving on `exit` alone means an
+    // agent can ask for the output of a command that ran fine and receive
+    // nothing — three CI runs on ubuntu-latest showed exactly that, with
+    // `printf HIT` exiting 0 and no output, while 65 spawns across macOS and a
+    // real Ubuntu never reproduced it.
+    //
+    // Waiting for `close` ALONE would be worse: a command that starts a
+    // background daemon leaves stdout open, and `waitForExit` would then block
+    // until the daemon died instead of returning promptly. So: take the exit
+    // code from `exit`, and give the pipes a bounded moment to finish.
+    const settle = (code: number) => {
+      if (entry.settled) return;
+      entry.settled = true;
+      if (entry.drainTimer) {
+        clearTimeout(entry.drainTimer);
+        entry.drainTimer = undefined;
+      }
+      if (!entry.truncated) entry.buf += entry.decoder.end();
+      entry.exitCode = code;
+      for (const l of entry.exitListeners) l(code);
+      entry.exitListeners = [];
+    };
+    proc.on("close", () => {
+      if (entry.exitCode != null && entry.settled) return;
+      if (entry.pendingExitCode != null) settle(entry.pendingExitCode);
+    });
     proc.on("exit", (code, signal) => {
       if (entry.exitCode != null) return; // spawn error already set it; don't clobber
-      // Flush any trailing complete bytes for a clean run. Skip when truncated:
-      // the decoder may hold a partial of a *dropped* char, and end() would turn
-      // that into a U+FFFD.
-      if (!entry.truncated) entry.buf += entry.decoder.end();
-      entry.exitCode = resolveExitCode(code, signal);
-      for (const l of entry.exitListeners) l(entry.exitCode!);
-      entry.exitListeners = [];
+      const resolved = resolveExitCode(code, signal);
+      entry.pendingExitCode = resolved;
+      // Already drained (`close` first, or no pipes to wait on): finish now.
+      const open = [proc.stdout, proc.stderr].filter((st) => st && !st.readableEnded);
+      if (open.length === 0) {
+        settle(resolved);
+        return;
+      }
+      // Otherwise let the reads finish, but never wait on them indefinitely.
+      entry.drainTimer = setTimeout(() => settle(resolved), DRAIN_GRACE_MS);
+      entry.drainTimer.unref?.();
     });
 
     const terminalId = `t-${this.nextId++}`;
