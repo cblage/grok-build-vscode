@@ -1,5 +1,5 @@
 import { ChildProcess, execFile, execFileSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, statSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import * as os from "node:os";
 
@@ -118,7 +118,13 @@ export type ShellPreference = "auto" | "cmd";
  * option). On Windows, mirror the standalone grok CLI by running under
  * PowerShell — PowerShell 7 (`pwsh.exe`) when installed, else Windows
  * PowerShell 5.1 (`powershell.exe`), else cmd.exe (Node's `shell: true`
- * default). On POSIX, `/bin/sh` (Node's `shell: true`). See issue #46.
+ * default). See issue #46.
+ *
+ * On POSIX the same principle: the user's `$SHELL` when it is POSIX-compatible,
+ * else `/bin/sh` (Node's `shell: true`). Matching the login shell is what makes
+ * a profile behave as it does in the standalone CLI — `/bin/sh` is bash 3.2 on
+ * macOS, which takes different profile branches and made sdkman print a
+ * bash-4-only parse error onto the front of every captured output (#140).
  *
  * The extension is the one running commands — grok delegates every one over ACP
  * `terminal/create` — so the host shell is *our* choice, not a CLI flag. Under
@@ -133,19 +139,83 @@ export type ShellPreference = "auto" | "cmd";
  * commands to reach (and what standalone grok reaches).
  *
  * `pref = "cmd"` is the escape hatch (`grok.terminalShell`): force cmd.exe on
- * Windows (a no-op on POSIX, where it's `/bin/sh` either way) for anyone the
- * PowerShell default bites — e.g. the `powershell.exe` 5.1 fallback rejects
- * `&&` chains and collapses non-zero native exits to 1 (pwsh 7 does neither).
- * Pure given `resolve`.
+ * Windows for anyone the PowerShell default bites — e.g. the `powershell.exe`
+ * 5.1 fallback rejects `&&` chains and collapses non-zero native exits to 1
+ * (pwsh 7 does neither). It is no longer a no-op on POSIX: it forces `/bin/sh`
+ * back, for anyone whose profile is slow or noisy under the login shell.
+ * Pure given `resolve`, `env` and `exists`.
  */
 export function resolveTerminalShell(
   platform: NodeJS.Platform,
   resolve: (name: string) => string | undefined,
   pref: ShellPreference = "auto",
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (p: string) => boolean = isRegularFile,
 ): string | true {
   if (pref === "cmd") return true; // cmd.exe on Windows / /bin/sh on POSIX
-  if (platform !== "win32") return true;
+  if (platform !== "win32") return posixUserShell(env, exists) ?? true;
   return resolve("pwsh") ?? resolve("powershell") ?? true;
+}
+
+/**
+ * A regular file, not merely a path that resolves.
+ *
+ * `existsSync` says yes to a DIRECTORY named `zsh`, and to a non-executable
+ * file — either of which we would then hand to `spawn` as the shell, failing
+ * every agent command with `EISDIR` or `EACCES`. Before #140 POSIX always used
+ * Node's own `/bin/sh` and could not get this wrong.
+ */
+function isRegularFile(p: string): boolean {
+  try {
+    if (!statSync(p).isFile()) return false;
+    // And actually runnable. A regular file we cannot execute fails `spawn`
+    // with EACCES on every command instead of falling back — the comment above
+    // promised this and the check did not deliver it.
+    accessSync(p, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Shells whose grammar is close enough to `/bin/sh` that a command the agent
+ * wrote for a POSIX host runs unchanged. An ALLOWLIST, not a denylist: `$SHELL`
+ * can be fish, nushell, csh or even pwsh, and handing any of those a POSIX
+ * command breaks things that work today. Anything unrecognized falls back.
+ */
+const POSIX_SHELL_NAMES = new Set(["sh", "bash", "zsh", "ksh", "ksh93", "mksh", "dash", "ash"]);
+
+/**
+ * The shell `$SHELL` names, when we can safely run the agent's commands in it.
+ *
+ * NOT a login shell, despite what `$SHELL` suggests: Node invokes it as
+ * `<shell> -c`, so `~/.zshrc` and `~/.bash_profile` are not sourced and a PATH
+ * set up there is not inherited. (`~/.zshenv` and `$BASH_ENV` still are — a
+ * non-interactive shell is not a shell with no configuration at all.) What changes is WHICH shell interprets the
+ * command — which is the whole of #140, because sdkman branches on it.
+ *
+ * Node's `shell: true` is `/bin/sh`, which on macOS is bash 3.2 — so a command
+ * run by us takes a different profile branch than the same command in the
+ * standalone CLI, which uses the login shell. sdkman is the reported case
+ * (#140): its helper uses the bash 4 `${x^^}`, sees `$BASH_VERSION` under
+ * bash 3.2, and prints a parse error onto the front of every captured output.
+ * Windows already matches the user's shell for exactly this reason (#46).
+ *
+ * Absolute path required — `$SHELL` is a path by definition, and resolving a
+ * bare name against PATH would be a different (and guessier) feature.
+ */
+function posixUserShell(
+  env: NodeJS.ProcessEnv,
+  exists: (p: string) => boolean,
+): string | undefined {
+  const shell = (env.SHELL ?? "").trim();
+  if (!shell.startsWith("/")) return undefined;
+  const name = shell.slice(shell.lastIndexOf("/") + 1).toLowerCase();
+  if (!POSIX_SHELL_NAMES.has(name)) return undefined;
+  // A `$SHELL` naming a binary that is not there would break every command;
+  // `/bin/sh` is the safer answer than a spawn failure per command.
+  return exists(shell) ? shell : undefined;
 }
 
 /**
@@ -157,15 +227,34 @@ export function resolveTerminalShell(
  * PowerShell syntax when we fall back to cmd) — setting `GROK_SHELL` in grok's
  * spawn env realigns the model's dialect hints with our shell (§2.9;
  * research/oss-surfaces-probe.cjs confirms it drives the first-message `Shell:`).
- * Pure. POSIX returns `undefined` — grok's own host detection is correct there,
- * so we don't override it. Windows maps the resolved shell to grok's accepted
- * override values (`pwsh` / `powershell` / `cmd`).
+ * Pure. On POSIX the answer depends on whether we ran the shell `$SHELL` names:
+ * if we did, grok's own detection names the same shell and needs no override;
+ * if we fell back to `/bin/sh` (a fish or nushell `$SHELL`), it would describe
+ * a shell we are not running, so `bash` is set to realign it. Windows maps the
+ * resolved shell to grok's accepted override values (`pwsh`/`powershell`/`cmd`).
  */
 export function grokShellEnvValue(
   resolved: string | true,
   platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
-  if (platform !== "win32") return undefined;
+  if (platform !== "win32") {
+    // NOTHING, deliberately, and this is the third thing three review rounds
+    // kept flagging — correctly, but the fix is not a better value.
+    //
+    // Upstream builds the model-facing `Shell:` from `$SHELL` on Unix
+    // (`resolve_shell_display`: `std::env::var("SHELL")`), and treats
+    // `GROK_SHELL` there as a PATH to a shell binary, which it validates with
+    // an executable check — so the bare string `bash` never applied in the
+    // first place. It steers the dialect on Windows only.
+    //
+    // Which means running the shell `$SHELL` names IS the alignment: grok
+    // describes `$SHELL`, we run `$SHELL`, and no override can improve on two
+    // things that already agree. The residual is the fallback — a fish `$SHELL`
+    // has grok describing fish while we run `/bin/sh` — and no value of this
+    // variable closes it on Unix.
+    return undefined;
+  }
   if (resolved === true) return "cmd"; // cmd.exe: forced pref, or no PowerShell found
   const base = resolved.toLowerCase();
   if (base.includes("pwsh")) return "pwsh";

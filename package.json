@@ -2,7 +2,7 @@
   "name": "grok-vscode-phuryn",
   "displayName": "Grok Build for VS Code (Community)",
   "description": "GUI for Grok Build CLI (incl. Grok 4.6). Remote Control from your phone, voice control, multiple sessions, images and videos, Mermaid diagrams, and LaTeX. Works with SuperGrok, X Premium+, and xAI API key. Fair Source (FSL-1.1-MIT). Not affiliated with or endorsed by SpaceXAI (formerly xAI).",
-  "version": "3.19.5-sandbox.1",
+  "version": "3.19.6-sandbox.1",
   "publisher": "PawelHuryn",
   "author": {
     "name": "Paweł Huryn",
@@ -368,11 +368,11 @@
             "cmd"
           ],
           "enumDescriptions": [
-            "PowerShell on Windows (pwsh, then Windows PowerShell 5.1) — matches the standalone Grok CLI",
-            "Force cmd.exe on Windows (legacy)"
+            "PowerShell on Windows (pwsh, then Windows PowerShell 5.1); the shell $SHELL names on macOS and Linux — matches the standalone Grok CLI",
+            "Force cmd.exe on Windows, /bin/sh on macOS and Linux"
           ],
           "default": "auto",
-          "markdownDescription": "Which shell runs the agent's commands **on Windows**. `auto` (default) uses PowerShell — `pwsh.exe` if installed, else Windows PowerShell 5.1 — so your PowerShell profile functions and pipelines work like they do in the standalone Grok CLI (#46). `cmd` forces `cmd.exe` (the pre-1.5.13 behavior) if the PowerShell host causes trouble. **Tip: install PowerShell 7 (`pwsh`)** — the 5.1 fallback rejects `&&` chains and reports every failing command's exit code as 1. No effect on macOS/Linux (always `/bin/sh`)."
+          "markdownDescription": "Which shell runs the agent's commands. `auto` (default) matches the standalone Grok CLI: PowerShell on Windows — `pwsh.exe` if installed, else Windows PowerShell 5.1 (#46) — and the shell `$SHELL` names on macOS and Linux, so shell-specific setup takes the same branch it does in the CLI (#140) — note this selects the shell, it does not run it as a login shell, so `~/.zshrc` and `~/.bash_profile` are still not read. A `$SHELL` that isn't POSIX-compatible (fish, nushell) falls back to `/bin/sh`, because the agent writes POSIX commands. `cmd` forces `cmd.exe` on Windows and `/bin/sh` on macOS/Linux, if matching your shell causes trouble — a profile that prints on startup, or is slow to load. On Windows, changing this switches the shell straight away but the agent is told which dialect to write when a conversation starts, so **start a new conversation** for the change to apply to both halves. On macOS and Linux the agent reads `$SHELL` itself, so forcing `/bin/sh` here changes what runs your commands without changing what it writes for. **Tip: install PowerShell 7 (`pwsh`)** — the 5.1 fallback rejects `&&` chains and reports every failing command's exit code as 1."
         },
         "grok.showThinking": {
           "type": "boolean",
@@ -486,6 +486,7 @@
     "desktop-dev": "npm run compile && node scripts/run-desktop.cjs --relay-dev --open-devtools --remote-debugging-port=9333",
     "test:desktop": "npm run compile && vitest run --config vitest.desktop.config.ts",
     "e2e:screens": "npm run compile && node scripts/desk-screens-check.mjs",
+    "e2e:open-timing": "npm run compile && node scripts/open-timing-check.mjs",
     "e2e:welcome-tip": "node scripts/ide-welcome-tip-screens.mjs",
     "e2e:gh-unauth": "npm run compile && node scripts/gh-unauth-check.mjs",
     "marketplace:login": "node scripts/marketplace-session.mjs",

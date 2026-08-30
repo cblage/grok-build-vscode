@@ -1,10 +1,10 @@
 # Changelog
 
-## 3.19.5-sandbox.1 — 2026-08-29
+## 3.19.6-sandbox.1 — 2026-08-30
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.19.4.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.19.5.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,14 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 3.19.5 — 2026-08-30
+
+### Fixed
+
+- **Agent commands run in your own shell on macOS and Linux.** Every command the agent ran went through `/bin/sh`, which on macOS is bash 3.2 from 2007 — not the shell you actually use. Anything that branches on which shell is running took the wrong branch: sdkman printed a `bad substitution` error at the top of every command's output, because seeing bash 3.2 sends it down a path that needs bash 4. Commands now run under the shell `$SHELL` names, when it is one the agent can drive (sh, bash, zsh, ksh, dash, ash), and fall back to `/bin/sh` otherwise. That also lines the two halves up: the agent decides which dialect to write from `$SHELL`, so running the shell `$SHELL` names means the shell it describes and the shell it gets are the same one. **This changes which shell runs your command, not what your profile sets up:** as before, commands are not run through a login shell, so `~/.zshrc` and `~/.bash_profile` are still not read and a tool that only exists on a `PATH` set there is still not found. Setting **Terminal shell** to `cmd` forces `/bin/sh` exactly as before, and Windows is unchanged. Thanks to @russwyte (#140), whose report named the cause precisely.
+
+- **A slow conversation open now says where the time went.** The `session open:` line in the log listed phases that could add up to a small fraction of the time the open really took, with nothing admitting the gap — one report showed 5.2 seconds against 379ms of named work, and every phase on it looked fast. The line now accounts for its whole total: whatever the named phases do not claim is printed as `other`, and the clock starts when you click rather than partway through, so finding the conversation and reading its stored details are on the line too. That last part is not small — on a machine with a lot of history it was the largest single piece of the open, and it was invisible. Starting a new conversation is now timed too — in one reporter's log that step took between 2.2 and 4.8 seconds every single time, and nothing on the line said so. Chasing #131, #133 and #138; if you have been hit by one of those, a fresh log now says considerably more.
 
 ## 3.19.4 — 2026-08-28
 
