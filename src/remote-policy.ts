@@ -917,6 +917,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   // Conversation names are already exposed in the remote history list, so
   // the focused-name update has the same display-only sensitivity.
   sessionName: "mirror",
+  sessionRemoved: "mirror",
   modelChanged: "mirror",
   modeChanged: "mirror",
   modePolicy: "mirror",
@@ -1087,6 +1088,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   pinnedSessions: "entries",
   repoSessions: "message-cwd",
   sessionName: "message-cwd",
+  sessionRemoved: "message-cwd",
   // Session-scoped live + restore payload — requires authorized session/repo cwd.
   session: "scope",
   sessionDot: "scope",
@@ -1251,7 +1253,7 @@ export function mayDeliverRemoteHostMsg(
           (e) => !e.cwd || cwdIsAuthorized(e.cwd, authorizedCwds, sameCwd),
         );
       }
-      if (msg.type === "sessionName") {
+      if (msg.type === "sessionName" || msg.type === "sessionRemoved") {
         return cwdIsAuthorized(msg.cwd, authorizedCwds, sameCwd);
       }
       // The file-browser answers. They were classified `message-cwd` above but
