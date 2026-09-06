@@ -319,3 +319,76 @@ describe("multi-provider review regressions", () => {
       .toContain("providerForRequestedModel");
   });
 });
+
+describe("deleting a conversation on a machine nobody sits at", () => {
+  // The owner, on a Cloud machine, could not delete a conversation he had
+  // just navigated away from: "This conversation is open in another tab or
+  // the VS Code view." There is no other tab and no VS Code view there. Five
+  // identical refusals in one evening.
+
+  it("does not let the host's own focus claim a session on a cloud machine", () => {
+    // `this.focused` is a real second surface at a desk and a phantom on a
+    // cloud VM: the host keeps one, nobody is ever looking at it, and it does
+    // not move when the only real user switches conversations. So whatever it
+    // adopted stayed owned for good.
+    const body = methodBody("private sessionHasLiveOwner(");
+    expect(body).toContain("!isCloudEnvironment()");
+    // Remote ownership is untouched — a second phone or tab still protects a
+    // conversation, on cloud exactly as anywhere else.
+    expect(body).toContain("this.remoteClients.isActiveValueVisible(session)");
+  });
+
+  it("removes the row even when the provider refuses the delete", () => {
+    // Codex deletes with one `threadArchive(threadId)` and Claude removes a
+    // session file; BOTH throw when the thread was never written, which is
+    // every conversation nobody has used yet. The error was the visible half.
+    // The damaging half was the `return` after it: the host abandoned its own
+    // cleanup, so a failed delete left a row that could never be sent to.
+    const body = methodBody("async deleteSession(");
+    const call = body.indexOf("client.deleteSession(id)");
+    const cleanup = body.indexOf("if (live) this.disposeSession(live);");
+    expect(call).toBeGreaterThan(-1);
+    expect(cleanup).toBeGreaterThan(call);
+    // No early exit between the provider call and our cleanup.
+    expect(body.slice(call, cleanup)).not.toContain("return;");
+  });
+
+  it("does not tell the person their own system failed", () => {
+    // The overwhelmingly common cause is a thread that was never there, so
+    // the refusal is not news — it is the delete succeeding by another name.
+    // A genuine provider failure returns the row on the next listing refresh,
+    // which is visible and recoverable; neither outcome loses written work.
+    const body = methodBody("async deleteSession(");
+    const at = body.indexOf("could not delete");
+    expect(at).toBeGreaterThan(-1);
+    const adapterHalf = body.slice(0, body.indexOf("deleteSessionDir("));
+    expect(adapterHalf).not.toContain("refused to delete this conversation");
+    expect(adapterHalf).not.toContain("showErrorMessage");
+  });
+
+  it("stopped predicting whether the provider has a thread", () => {
+    // Three attempts guessed and each was wrong in a different direction:
+    // `hasHistory` (a suppressed Summarize & Restart turn writes a thread the
+    // row calls empty), a flag set at the prompt call site (a prompt that
+    // THREW still looked written), and one set from provider output (the user
+    // turn persists before any agent output arrives). Guessing wrong one way
+    // orphans a real thread; the other way is the original bug. The host
+    // cannot see the moment a provider persists, so it no longer tries.
+    expect(sidebar).not.toContain("providerWrote");
+    expect(sidebar).not.toContain("providerPrompted");
+  });
+
+  it("says WHY it refused, in the line it writes", () => {
+    // The bare version said "owned elsewhere" and could not say by whom. The
+    // answer was one field away and it cost an evening of guessing.
+    const src = sidebar;
+    const at = src.indexOf("refused delete of live session");
+    expect(at).toBeGreaterThan(-1);
+    const line = src.slice(at, at + 400);
+    expect(line).toContain("localFocused=");
+    expect(line).toContain("cloud=");
+    expect(line).toContain("remoteOwners=");
+    expect(line).toContain("requesterWatches=");
+  });
+
+});
