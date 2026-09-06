@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.1.7-sandbox.1 — 2026-09-04
+## 4.1.8-sandbox.1 — 2026-09-05
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.6.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.7.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,20 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.1.7 — 2026-09-05
+
+**A new cloud machine offers to connect an agent straight away, and the composer's menus close each other.** Two visible papercuts, and two quieter fixes: the buttons of a sign-in started from Settings did nothing, and approving an Edit or a Rewind long after asking for it could discard work done in the meantime.
+
+### Fixed
+
+- **One menu at a time in the composer** ([#148](https://github.com/phuryn/grok-build-vscode/issues/148)). Opening Settings left the context-usage popover on screen underneath it, and the same held for every pair among the add, settings, context-usage and mode menus. Each now closes the others, and still closes on its own button. Reported by @HubKing.
+
+- **A brand-new cloud machine shows "Connect an agent" without a refresh.** On the first look at a machine that had just been created, the panel offering the three agents was painted and then hidden again a moment later, leaving an empty page with the model picker locked until you reloaded. An account that is configured but signed out no longer counts as one that has answered the offer.
+
+- **"Re-check connection" and "Cancel" do something in Settings.** Both buttons of an agent sign-in started from the settings page were dead, and said nothing when pressed. GitHub's Re-check happened to work, which made the difference impossible to spot.
+
+- **Approving an Edit or a Rewind late no longer reverts newer work.** With the confirmation waiting on one device, you could start and finish another turn somewhere else; approving afterwards rewound that newer turn's files too. An approval is now refused if the conversation moved on while it waited.
 
 ## 4.1.6 — 2026-09-04
 

@@ -989,6 +989,14 @@ export class GrokSidebar {
     "githubLoginWithToken",
     "runGrokLogin",
     "refreshProviders",
+    // Both halves of a terminal sign-in started FROM this page. Without them
+    // the buttons were dead and said nothing: `recheckConnection` is what an
+    // agent row's "Re-check connection" sends, and `cancelDeviceLogin` is what
+    // either row's Cancel sends. GitHub's Re-check happened to work only
+    // because it asks for `refreshProviders`, which was already listed — two
+    // identical-looking buttons, one alive, and no way to tell from the page.
+    "recheckConnection",
+    "cancelDeviceLogin",
     "checkGrokUpdate",
     "updateGrok",
     "openRemotePortal",
@@ -4591,8 +4599,9 @@ Only continue if you trust this code.`,
           : "Wait for the current turn to finish (or Stop it) before editing your last message.",
       );
     }
+    const { client, gen, activeSessionId, userMessageCount } = session;
     try {
-      const points = await session.client.listRewindPoints();
+      const points = await client.listRewindPoints();
       if (points === "unsupported") {
         return void this.reportRequester(
           requester,
@@ -4640,7 +4649,20 @@ Only continue if you trust this code.`,
         if (!ok) return;
       }
 
-      const result = await session.client.executeRewind({
+      // Another view can start a turn or replace the client while we await
+      // the points or confirmation. The count catches even a finished turn;
+      // the old target must not reach that work.
+      if (
+        session.client !== client || session.gen !== gen || session.activeSessionId !== activeSessionId ||
+        session.userMessageCount !== userMessageCount ||
+        ["working", "needs-you"].includes(session.status)
+      ) {
+        return void this.reportRequester(
+          requester, "warning",
+          "Edit cancelled because the conversation changed or another turn started. Nothing was rewound. Try Edit again when the conversation is idle.",
+        );
+      }
+      const result = await client.executeRewind({
         targetPromptIndex: target.promptIndex,
         mode: "all",
       });
@@ -4765,8 +4787,9 @@ Only continue if you trust this code.`,
     if (!session.hasHistory) {
       return void this.reportRequester(requester, "info", "Nothing to rewind yet — this session has no conversation.");
     }
+    const { client, gen, activeSessionId, userMessageCount } = session;
     try {
-      const points = await session.client.listRewindPoints();
+      const points = await client.listRewindPoints();
       if (points === "unsupported") {
         return void this.reportRequester(
           requester,
@@ -4859,7 +4882,17 @@ Only continue if you trust this code.`,
         if (!ok) return;
       }
 
-      const result = await session.client.executeRewind({
+      if (
+        session.client !== client || session.gen !== gen || session.activeSessionId !== activeSessionId ||
+        session.userMessageCount !== userMessageCount ||
+        ["working", "needs-you"].includes(session.status)
+      ) {
+        return void this.reportRequester(
+          requester, "warning",
+          "Rewind cancelled because the conversation changed or another turn started. Nothing was rewound. Try Rewind again when the conversation is idle.",
+        );
+      }
+      const result = await client.executeRewind({
         targetPromptIndex: target.promptIndex,
         mode: "all",
       });

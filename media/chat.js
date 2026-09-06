@@ -3681,6 +3681,9 @@
       closePopovers();
       if (showingThis) return;
     }
+    // One popover at a time (#148): the donut, mode and add menus stayed up
+    // under the gear because only their own openers dismissed the others.
+    closePopovers();
     state.gearSurface = surface;
     renderGearMain();
     positionGearPopover(fromBtn || activeGearButton());
@@ -4072,6 +4075,7 @@
 
   function openModePopover() {
     if (!modePopover.hidden) { closePopovers(); return; }
+    closePopovers();
     modePopover.innerHTML = "";
     // modeMeta() rather than upstream's MODE_META constant — see modeButtonTitle.
     const metas = modeMeta();
@@ -16296,9 +16300,15 @@
             || (CONNECT_ONBOARDING_MODES[state.onboardingMode]
               ? (state.onboardingInfo && state.onboardingInfo.provider) || ""
               : "");
-          const anyConnected = state.providers.some((provider) => provider.connected);
+          // "Connected" is the configured account; one the host says still
+          // needs a sign-in has not answered a card that asks for one. A fresh
+          // cloud machine posts connect-agent and then broadcasts providerState
+          // with grok connected + needsLogin behind it, and this dismissal
+          // blanked the first attach until a reload (owner, 2026-09-05).
+          const usable = (provider) => !!provider.connected && provider.needsLogin !== true;
+          const anyConnected = state.providers.some(usable);
           const askedForConnected = onboardingProvider && state.providers.some((provider) =>
-            provider.id === onboardingProvider && provider.connected);
+            provider.id === onboardingProvider && usable(provider));
           // `connect-agent` names no provider: it is the "pick any of the
           // three" card, so any connected account answers it.
           const chooserAnswered = state.onboardingMode === "connect-agent" && anyConnected;
