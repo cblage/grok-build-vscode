@@ -1,10 +1,10 @@
 # Changelog
 
-## 3.19.9-sandbox.1 — 2026-08-31
+## 4.0.1-sandbox.1 — 2026-08-31
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v3.19.8.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.0.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,42 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.0.0 — 2026-08-31
+
+**Cloud machines.** A hosted environment you reach from a browser, with Grok Build and the agents already on it — no laptop to leave running, nothing to install. This release is the one that makes connecting an agent there work end to end, because a cloud machine has no desk: there is no second screen to answer a dialog, no terminal to read, and no one sitting at it. Every fix below came out of using one for real.
+
+### Connecting an agent
+
+- **One dialog, not two implementations.** The sign-in used to report into the transcript's welcome card, which refuses to draw over a conversation — so on a machine with any history the code, the progress and the failure were invisible, and Settings had grown a second copy of the whole flow to work around it. There is now one renderer, in a dialog, and both places open it. Closing it puts you back exactly where you were.
+
+- **A sign-in finishes the job.** Connecting an account proved the credential and then stopped: the model picker stayed empty and the card still offered to connect the agent you had just connected, until you reloaded the page. Signing in now does what the Providers "Check again" button has always done — start the conversation that was waiting for an agent, fill the picker, and put the card away.
+
+- **The agents are named as products.** Grok Build by SpaceXAI, Codex by OpenAI, Claude Code by Anthropic — in Settings, in the sign-in dialog, and on the buttons, with each vendor's mark beside it. The heading used to say "Connect Grok" while the button under it said "Connect Grok Build", because there were two lists of names.
+
+- **Step one of the Codex sign-in is a link again**, and the security warning OpenAI is about to show you is named in bold before you meet it. Signing out puts the next sign-in back at step one, instead of dropping you at the code with the setting still off.
+
+- **Disconnecting says it is disconnecting.** A sign-out from a browser crosses the network, wakes a machine that may have gone to sleep, and runs the vendor's own CLI — ten to fifteen seconds during which the button said "Sign out" and nothing happened, so people clicked it again. It now reads "Disconnecting…" and refuses the second click.
+
+### Cloud machines
+
+- **The projects rail is there from the first frame.** It used to wait for the machine to answer before drawing, which on a machine that was asleep meant the pre-rail layout — no rail, no file explorer — was the whole screen until it woke. Measured at four seconds of waiting; now a third of a second. A linked laptop still waits, because its Grok Build may be older than the answer.
+
+- **A machine that is asleep is not a machine that is broken.** Sleeping is what a cloud machine does when you stop typing, and it wakes on your next message — so the page no longer announces it as a fault while you are reading. If a message is waiting to send, it says so, calmly, and sends it when the machine comes back.
+
+- **The empty conversation calls itself AFK Pilot Cloud** there, rather than naming an extension nobody installed.
+
+### Fixed
+
+- **"Could not restore this tab's previous conversation."** An empty conversation was remembered as worth restoring whenever anything at all had been drawn in the transcript — including the notice saying an account had signed out. The machine then cleared that empty conversation away, so the next refresh asked for something that no longer existed, drew the error, and armed itself to do it again. Refreshing made it worse; only "New session" escaped. A conversation now counts as empty when it has no turns in it, and a refused restore forgets what it was refused.
+
+- **"Sessions need a newer Grok Build"** was not a version check at all — it was an eight-second timeout, latched for as long as the page stayed open. A machine that was waking, or busy signing an account out, got labelled as an old install and never asked again. Reconnecting now asks again.
+
+- **Signing out cleans up after itself.** Each sign-out replaced its conversations and left the empty ones behind, so a few connect/disconnect cycles put untitled sessions in the rail that nobody could account for.
+
+- **The slash menu starts where your text starts.** In a browser it was drawn against the outside edge of the composer rather than the centred text inside it, so it hung further to the left the wider the window — which made it look like it depended on zoom.
+
+- **The code and the buttons in the sign-in dialog are centred** by construction rather than by arithmetic that happened to work at one font size.
 
 ## 3.19.8 — 2026-08-31
 

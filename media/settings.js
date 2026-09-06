@@ -209,63 +209,6 @@
     return flow && flow.status ? flow : undefined;
   }
 
-  /** Steps the host wants read BEFORE the code is used (Codex's account
-   *  setting). Rendered as real nodes, never innerHTML — `**bold**` becomes a
-   *  <strong>, everything else stays text. */
-  function deviceFlowSteps(flow) {
-    const steps = flow && flow.preflight && flow.preflight.steps;
-    return Array.isArray(steps) ? steps : [];
-  }
-
-  /** The step heading, when the host gave one ("Step 1 of 2 — …"). */
-  function deviceFlowTitle(flow) {
-    if (!flow) return "";
-    if (flow.status === "unavailable" && flow.preflight && flow.preflight.title) return flow.preflight.title;
-    // Only a flow that HAD a first step gets a second one's number. Grok's
-    // sign-in is a single step and numbering it invents a step that never
-    // happened (seen in the state matrix, 2026-08-31).
-    if (flow.status === "waiting" && flow.preflight) return "Step 2 of 2 — confirm the code";
-    return "";
-  }
-
-  function deviceFlowHint(flow) {
-    return (flow && flow.preflight && flow.preflight.reason) || "";
-  }
-
-  function deviceFlowDescription(flow) {
-    if (!flow) return "";
-    if (flow.status === "unavailable" && flow.preflight) return flow.preflight.reason || "";
-    if (flow.status === "starting") return "Asking the CLI for a sign-in code…";
-    if (flow.status === "waiting") {
-      return "Open the sign-in page and confirm the code. It finishes on its own — keep this page open.";
-    }
-    if (flow.status === "verifying") return "Signed in — confirming the credential on this machine…";
-    if (flow.status === "done") return "Connected. The agent's models are on their way.";
-    if (flow.status === "failed") return flow.message || "The sign-in did not finish. Try connecting again.";
-    if (flow.status === "unavailable") return flow.message || "";
-    return "";
-  }
-
-  /** Whether the provider's DEDICATED flow row renders. One row per provider
-   *  at a time — the owner's retest read the flow row + the ordinary row as a
-   *  duplicate. Live flows own the space; a done flow keeps it only until the
-   *  snapshot confirms the account; failed/unavailable fold back into the
-   *  ordinary row's description instead. */
-  function deviceFlowRowVisible(s, env, id) {
-    const flow = deviceLoginFlow(env, id);
-    if (!flow) return false;
-    // Step 1 of 2 lives in this row too, or a Connect clicked here would send
-    // the reader to a card they cannot see (the transcript's onboarding panel
-    // refuses to paint over a conversation).
-    if (flow.status === "unavailable" && flow.preflight) return true;
-    if (flow.status === "starting" || flow.status === "waiting" || flow.status === "verifying") return true;
-    if (flow.status === "done") {
-      const provider = providerOf(s, id);
-      return !(provider && provider.connected);
-    }
-    return false;
-  }
-
   /** The ordinary row's description, with a settled flow's outcome folded in. */
   function providerRemoteDescribe(s, env, id) {
     const flow = deviceLoginFlow(env, id);
@@ -280,6 +223,12 @@
       return "Recommended. " + base;
     }
     return base;
+  }
+
+  /** The same test `message` uses to choose between logout and sign-in. */
+  function providerConnectedNow(snapshot, id) {
+    const provider = providerOf(snapshot, id);
+    return !!(provider && provider.connected && provider.needsLogin !== true);
   }
 
   function remoteProviderActionable(snapshot, env, id) {
@@ -614,7 +563,9 @@
       id: "providerGrok",
       category: "providers",
       logo: "grok",
-      title: "Grok",
+      provider: "grok",
+      title: "Grok Build",
+      vendor: "SpaceXAI",
       description: "",
       kind: "action",
       visible: (s, env) => !!(env && !env.isRemote && env.providersKnown),
@@ -631,7 +582,9 @@
       id: "providerCodex",
       category: "providers",
       logo: "codex",
+      provider: "codex",
       title: "Codex",
+      vendor: "OpenAI",
       description: "",
       kind: "action",
       visible: (s, env) => !!(env && !env.isRemote && env.providersKnown),
@@ -648,7 +601,9 @@
       id: "providerClaude",
       category: "providers",
       logo: "claude",
-      title: "Claude",
+      provider: "claude",
+      title: "Claude Code",
+      vendor: "Anthropic",
       description: "",
       kind: "action",
       visible: (s, env) => !!(env && !env.isRemote && env.providersKnown),
@@ -661,47 +616,6 @@
           : { type: "runGrokLogin", provider: "claude" };
       },
     },
-    // A device-code sign-in IN FLIGHT, rendered where the click happened.
-    // The transcript's connect card refuses to render over a painted
-    // conversation (revealWelcome holds), so without these rows a Connect
-    // click from this page had no visible effect at all — the first real
-    // cloud test's "clicking Connect does nothing" (owner, 2026-08-31).
-    {
-      id: "providerGrokFlow",
-      category: "providers",
-      logo: "grok",
-      title: "Grok",
-      description: "",
-      kind: "deviceflow",
-      providerId: "grok",
-      flow: (s, env) => deviceLoginFlow(env, "grok"),
-      visible: (s, env) => !!(env && env.isRemote && deviceFlowRowVisible(s, env, "grok")),
-      describe: (s, env) => deviceFlowDescription(deviceLoginFlow(env, "grok")),
-    },
-    {
-      id: "providerCodexFlow",
-      category: "providers",
-      logo: "codex",
-      title: "Codex",
-      description: "",
-      kind: "deviceflow",
-      providerId: "codex",
-      flow: (s, env) => deviceLoginFlow(env, "codex"),
-      visible: (s, env) => !!(env && env.isRemote && deviceFlowRowVisible(s, env, "codex")),
-      describe: (s, env) => deviceFlowDescription(deviceLoginFlow(env, "codex")),
-    },
-    {
-      id: "providerClaudeFlow",
-      category: "providers",
-      logo: "claude",
-      title: "Claude",
-      description: "",
-      kind: "deviceflow",
-      providerId: "claude",
-      flow: (s, env) => deviceLoginFlow(env, "claude"),
-      visible: (s, env) => !!(env && env.isRemote && deviceFlowRowVisible(s, env, "claude")),
-      describe: (s, env) => deviceFlowDescription(deviceLoginFlow(env, "claude")),
-    },
     // Remote provider rows come in a PAIR, and which one shows is the point.
     // This page rendered status-only for a remote from 3.9.0, when a remote
     // genuinely could not sign a provider in. `0fa6661` gave it the device-code
@@ -712,29 +626,37 @@
       id: "providerGrokStatus",
       category: "providers",
       logo: "grok",
-      title: "Grok",
+      provider: "grok",
+      title: "Grok Build",
+      vendor: "SpaceXAI",
       description: "",
       kind: "status",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
-        && !remoteProviderActionable(s, env, "grok")
-        && !deviceFlowRowVisible(s, env, "grok")),
+        && !remoteProviderActionable(s, env, "grok")),
       describe: (s, env) => providerRemoteDescribe(s, env, "grok"),
     },
     {
       id: "providerGrokRemote",
       category: "providers",
       logo: "grok",
-      title: "Grok",
+      provider: "grok",
+      title: "Grok Build",
+      vendor: "SpaceXAI",
       description: "",
       kind: "action",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
-        && remoteProviderActionable(s, env, "grok")
-        && !deviceFlowRowVisible(s, env, "grok")),
-      // The flow this click starts reports RIGHT HERE (the deviceflow row),
-      // so the overlay must survive the click — closing it was how "Connect
-      // does nothing" happened: the transcript card cannot render over a
-      // painted conversation, and the overlay had already left the screen.
+        && remoteProviderActionable(s, env, "grok")),
+      // The flow opens in the connect wizard — one renderer, in a dialog,
+      // which is not subject to the welcome card's refusal to paint over a
+      // conversation. This page stays put behind it, so closing the wizard
+      // returns the reader exactly where they were.
       keepOpen: (s, env) => !!(env && env.isRemote),
+      // Only for the sign-IN message. This row sends `logout` when the
+      // account is connected, and opening a Connect wizard on a Sign out
+      // click is the opposite of what was asked (review, 2026-08-31).
+      local: (s, env) => (env && env.isRemote && !providerConnectedNow(s, "grok")
+        ? "connectWizard:grok"
+        : ""),
       describe: (s, env) => providerRemoteDescribe(s, env, "grok"),
       actionLabel: (s) => providerAction(providerOf(s, "grok")),
       // Same two messages the desk row sends, reached through the same test.
@@ -751,29 +673,37 @@
       id: "providerCodexStatus",
       category: "providers",
       logo: "codex",
+      provider: "codex",
       title: "Codex",
+      vendor: "OpenAI",
       description: "",
       kind: "status",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
-        && !remoteProviderActionable(s, env, "codex")
-        && !deviceFlowRowVisible(s, env, "codex")),
+        && !remoteProviderActionable(s, env, "codex")),
       describe: (s, env) => providerRemoteDescribe(s, env, "codex"),
     },
     {
       id: "providerCodexRemote",
       category: "providers",
       logo: "codex",
+      provider: "codex",
       title: "Codex",
+      vendor: "OpenAI",
       description: "",
       kind: "action",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
-        && remoteProviderActionable(s, env, "codex")
-        && !deviceFlowRowVisible(s, env, "codex")),
-      // The flow this click starts reports RIGHT HERE (the deviceflow row),
-      // so the overlay must survive the click — closing it was how "Connect
-      // does nothing" happened: the transcript card cannot render over a
-      // painted conversation, and the overlay had already left the screen.
+        && remoteProviderActionable(s, env, "codex")),
+      // The flow opens in the connect wizard — one renderer, in a dialog,
+      // which is not subject to the welcome card's refusal to paint over a
+      // conversation. This page stays put behind it, so closing the wizard
+      // returns the reader exactly where they were.
       keepOpen: (s, env) => !!(env && env.isRemote),
+      // Only for the sign-IN message. This row sends `logout` when the
+      // account is connected, and opening a Connect wizard on a Sign out
+      // click is the opposite of what was asked (review, 2026-08-31).
+      local: (s, env) => (env && env.isRemote && !providerConnectedNow(s, "codex")
+        ? "connectWizard:codex"
+        : ""),
       describe: (s, env) => providerRemoteDescribe(s, env, "codex"),
       actionLabel: (s) => providerAction(providerOf(s, "codex")),
       // Same two messages the desk row sends, reached through the same test.
@@ -790,13 +720,14 @@
       id: "providerClaudeStatus",
       category: "providers",
       logo: "claude",
-      title: "Claude",
+      provider: "claude",
+      title: "Claude Code",
+      vendor: "Anthropic",
       description: "",
       kind: "status",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
         && !hostIsCloud(env)
-        && !remoteProviderActionable(s, env, "claude")
-        && !deviceFlowRowVisible(s, env, "claude")),
+        && !remoteProviderActionable(s, env, "claude")),
       describe: (s, env) => providerRemoteDescribe(s, env, "claude"),
     },
     // On a cloud machine, Claude gets the answer BEFORE the click: a Connect
@@ -806,7 +737,9 @@
       id: "providerClaudeCloud",
       category: "providers",
       logo: "claude",
-      title: "Claude",
+      provider: "claude",
+      title: "Claude Code",
+      vendor: "Anthropic",
       description: "Claude Code isn't available on cloud machines yet — we're working on adding it. Grok and Codex both sign in right here.",
       kind: "status",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown && hostIsCloud(env)
@@ -816,19 +749,31 @@
       id: "providerClaudeRemote",
       category: "providers",
       logo: "claude",
-      title: "Claude",
+      provider: "claude",
+      title: "Claude Code",
+      vendor: "Anthropic",
       description: "",
       kind: "action",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
         && !hostIsCloud(env)
-        && remoteProviderActionable(s, env, "claude")
-        && !deviceFlowRowVisible(s, env, "claude")),
-      // The flow this click starts reports RIGHT HERE (the deviceflow row),
-      // so the overlay must survive the click — closing it was how "Connect
-      // does nothing" happened: the transcript card cannot render over a
-      // painted conversation, and the overlay had already left the screen.
+        && remoteProviderActionable(s, env, "claude")),
+      // The flow opens in the connect wizard — one renderer, in a dialog,
+      // which is not subject to the welcome card's refusal to paint over a
+      // conversation. This page stays put behind it, so closing the wizard
+      // returns the reader exactly where they were.
       keepOpen: (s, env) => !!(env && env.isRemote),
-      describe: (s, env) => providerRemoteDescribe(s, env, "claude"),
+      // Only for the sign-IN message. This row sends `logout` when the
+      // account is connected, and opening a Connect wizard on a Sign out
+      // click is the opposite of what was asked (review, 2026-08-31).
+      local: (s, env) => (env && env.isRemote && !providerConnectedNow(s, "claude")
+        ? "connectWizard:claude"
+        : ""),
+      describe: (s, env) => (hostIsCloud(env) && providerConnectedNow(s, "claude")
+        // Signing out here is one-way: Claude's sign-in needs a terminal and a
+        // cloud machine has none, while the cloud override permits logout for
+        // every provider (found while documenting the matrices, 2026-08-31).
+        ? "Connected. Signing out here cannot be undone from this page — Claude Code needs a terminal to sign in again."
+        : providerRemoteDescribe(s, env, "claude")),
       actionLabel: (s) => providerAction(providerOf(s, "claude")),
       // Same two messages the desk row sends, reached through the same test.
       // Which one is offered is decided by visibility above, so this cannot
@@ -1986,6 +1931,31 @@
   // snapshot arriving mid-edit (another window saved something) re-renders the
   // list without throwing away what is half-typed here.
   const ROUTINE_UI = { open: "", draft: null, confirmRemove: "", pendingSave: false };
+
+  /** The provider row waiting on the host, if any. One at a time: it exists to
+   *  stop the second click, so a second pending row would be a contradiction. */
+  const PROVIDER_PENDING = { id: "", label: "", wanted: false, at: 0 };
+  /** Longer than the host's own 30s CLI timeout plus a relay round trip, so in
+   *  every case this covers, the real answer arrives first. */
+  const PROVIDER_PENDING_MS = 45000;
+
+  function clearProviderPending() {
+    PROVIDER_PENDING.id = "";
+    PROVIDER_PENDING.label = "";
+  }
+
+  /** Drop the pending label once the host has answered — or given up. */
+  function reconcileProviderPending(snapshot) {
+    if (!PROVIDER_PENDING.id) return;
+    if (Date.now() - PROVIDER_PENDING.at > PROVIDER_PENDING_MS) { clearProviderPending(); return; }
+    if (providerConnectedNow(snapshot, PROVIDER_PENDING.id) === PROVIDER_PENDING.wanted) {
+      clearProviderPending();
+    }
+  }
+
+  function providerPendingLabel(row) {
+    return row && row.provider && PROVIDER_PENDING.id === row.provider ? PROVIDER_PENDING.label : "";
+  }
   const NEW_ROUTINE = "__new__";
 
   const PROVIDER_LABELS = { grok: "Grok", codex: "Codex", claude: "Claude" };
@@ -2556,6 +2526,14 @@
     } else {
       name.textContent = rowTitle(row, snapshot, env);
     }
+    // Whose product this is, beside its name — provenance, not identity, so it
+    // does not take the title's weight.
+    if (row.vendor) {
+      const vendor = document.createElement("span");
+      vendor.className = "settings-row-vendor";
+      vendor.textContent = " by " + row.vendor;
+      name.appendChild(vendor);
+    }
     const desc = document.createElement("div");
     desc.className = "settings-row-desc";
     desc.textContent = rowDescription(row, snapshot, env);
@@ -2636,118 +2614,14 @@
       span.className = "settings-value";
       span.textContent = String(value ?? "—");
       control.appendChild(span);
-    } else if (row.kind === "deviceflow") {
-      const flow = (row.flow ? row.flow(snapshot, env) : undefined) || {};
-      el.classList.add("settings-deviceflow");
-      const preflightStep = flow.status === "unavailable" && !!flow.preflight;
-      const live = preflightStep || flow.status === "starting" || flow.status === "waiting" || flow.status === "verifying";
-      const stepTitle = deviceFlowTitle(flow);
-      if (stepTitle) {
-        const heading = document.createElement("div");
-        heading.className = "settings-row-desc settings-deviceflow-step";
-        heading.textContent = stepTitle;
-        // Above the description, not after it: the row builds copy as
-        // name → desc, and appending here put the heading under its own body.
-        title.insertBefore(heading, desc);
-      }
-      // Step 1 shows the reason as the row description already; step 2 keeps
-      // the setting visible beside the code it gates.
-      const hint = preflightStep ? "" : (live ? deviceFlowHint(flow) : "");
-      const steps = live ? deviceFlowSteps(flow) : [];
-      if (hint) {
-        const note = document.createElement("div");
-        note.className = "settings-row-desc settings-deviceflow-hint";
-        note.textContent = hint;
-        title.appendChild(note);
-      }
-      if (flow.note) {
-        const note = document.createElement("div");
-        note.className = "settings-row-desc settings-deviceflow-note";
-        note.textContent = flow.note;
-        title.appendChild(note);
-      }
-      if (steps.length) {
-        const list = document.createElement("ol");
-        list.className = "settings-deviceflow-steps";
-        for (const step of steps) {
-          const li = document.createElement("li");
-          // `**bold**` → <strong>, as DOM nodes. The setting people cannot find
-          // sits at the bottom of a long page, and the emphasis is the point.
-          const parts = String(step).split(/\*\*([^*\n]+)\*\*/);
-          parts.forEach((part, index) => {
-            if (!part) return;
-            if (index % 2 === 1) {
-              const strong = document.createElement("strong");
-              strong.textContent = part;
-              li.appendChild(strong);
-            } else {
-              li.appendChild(document.createTextNode(part));
-            }
-          });
-          list.appendChild(li);
-        }
-        title.appendChild(list);
-      }
-      if (preflightStep) {
-        if (flow.preflight.url) {
-          const open = document.createElement("button");
-          open.type = "button";
-          open.className = "settings-action settings-action-quiet";
-          open.dataset.deviceOpen = flow.preflight.url;
-          open.textContent = "Open settings";
-          control.appendChild(open);
-        }
-        const go = document.createElement("button");
-        go.type = "button";
-        go.className = "settings-action";
-        go.dataset.deviceContinue = row.providerId || "";
-        go.textContent = flow.preflight.continueLabel || "Done — continue";
-        control.appendChild(go);
-      }
-      if (flow.status === "waiting") {
-        if (flow.code) {
-          // The person is about to type this somewhere else. Selectable as a
-          // unit, big enough to read across the room — and copyable in one
-          // tap, because a code you can see but not copy is busywork.
-          const code = document.createElement("code");
-          code.className = "settings-devicecode";
-          code.textContent = flow.code;
-          control.appendChild(code);
-          const copy = document.createElement("button");
-          copy.type = "button";
-          copy.className = "settings-action settings-action-quiet";
-          copy.dataset.deviceCopy = flow.code;
-          copy.textContent = "Copy";
-          control.appendChild(copy);
-        }
-        if (flow.url) {
-          const open = document.createElement("button");
-          open.type = "button";
-          open.className = "settings-action";
-          open.dataset.deviceOpen = flow.url;
-          open.textContent = "Open sign-in page";
-          control.appendChild(open);
-        }
-      } else if (flow.status === "done") {
-        const mark = document.createElement("span");
-        mark.className = "settings-value";
-        mark.textContent = "Connected";
-        control.appendChild(mark);
-      }
-      if (flow.status === "starting" || flow.status === "waiting" || flow.status === "verifying") {
-        const cancelBtn = document.createElement("button");
-        cancelBtn.type = "button";
-        cancelBtn.className = "settings-action settings-action-quiet";
-        cancelBtn.dataset.deviceCancel = row.providerId || "";
-        cancelBtn.textContent = "Cancel";
-        control.appendChild(cancelBtn);
-      }
     } else if (row.kind === "action") {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "settings-action";
-      btn.textContent = rowActionLabel(row, snapshot, env);
-      if (!enabled) btn.disabled = true;
+      const pending = providerPendingLabel(row);
+      btn.textContent = pending || rowActionLabel(row, snapshot, env);
+      if (!enabled || pending) btn.disabled = true;
+      if (pending) btn.setAttribute("aria-busy", "true");
       control.appendChild(btn);
     }
 
@@ -2908,17 +2782,40 @@
     }
 
     function runAction(row) {
-      if (row.local) {
+      // `local` may be a plain name (a purely client-side action) or a
+      // function of the current state, and it no longer swallows the row's
+      // message: Settings → Providers → Connect must BOTH post `runGrokLogin`
+      // and open the wizard that shows what happens next. Returning here sent
+      // the message nowhere and left a dialog with nothing to report.
+      const local = typeof row.local === "function" ? row.local(snapshot, env) : row.local;
+      if (local && !row.message) {
         if (onClose && !opts.standalone) onClose();
-        if (onLocal) onLocal(row.local);
+        if (onLocal) onLocal(local);
         return;
       }
+      if (local && onLocal) onLocal(local);
       if (row.href) {
         openExternalHref(row.href);
         return;
       }
       const message = rowMessage(row, undefined, snapshot);
+      // Sign-out is the one with nothing else to show for it: a sign-in opens
+      // the wizard, and this page sits behind that.
+      let marked = false;
+      if (message && message.type === "logout" && message.provider && env.isRemote) {
+        PROVIDER_PENDING.id = message.provider;
+        PROVIDER_PENDING.label = "Disconnecting…";
+        PROVIDER_PENDING.wanted = false;
+        PROVIDER_PENDING.at = Date.now();
+        marked = true;
+        // The backstop paint. Every normal path clears this from the host's
+        // answer; this is the one where no answer ever comes.
+        setTimeout(() => { reconcileProviderPending(snapshot); paint(); }, PROVIDER_PENDING_MS + 500);
+      }
       if (message) post(message);
+      // Nothing else repaints until the host answers — which is the whole
+      // point: the label has to change on the click, not on the reply.
+      if (marked) paint();
       const keep = typeof row.keepOpen === "function" ? row.keepOpen(snapshot, env) : !!row.keepOpen;
       if (opts.closeOnAction && !keep && onClose) onClose();
     }
@@ -2942,12 +2839,16 @@
         // selected option. Deliberately not title/prompt: those change per
         // keystroke, and repainting would rebuild the input under the caret.
         routineDraft: ROUTINE_UI.draft
-          ? [ROUTINE_UI.draft.unit, ROUTINE_UI.draft.cwd, ROUTINE_UI.draft.provider, ROUTINE_UI.draft.model].join(" ")
+          ? [ROUTINE_UI.draft.unit, ROUTINE_UI.draft.cwd, ROUTINE_UI.draft.provider, ROUTINE_UI.draft.model].join(" ")
           : "",
+        // Which row is waiting on the host: local state that changes a label
+        // and a disabled attribute, so the key has to carry it.
+        providerPending: PROVIDER_PENDING.id + ":" + PROVIDER_PENDING.label,
       });
     }
 
     function paint() {
+      reconcileProviderPending(snapshot);
       const chrome = describeChrome(container);
       ensureCategory();
       maybeCheckAbout();
@@ -3276,36 +3177,6 @@
           const btn = el.querySelector(".settings-action");
           if (!btn) return;
           btn.onclick = (e) => { e.stopPropagation(); runAction(row); };
-        } else if (row.kind === "deviceflow") {
-          const open = el.querySelector("[data-device-open]");
-          if (open) {
-            open.onclick = (e) => { e.stopPropagation(); openExternalHref(open.dataset.deviceOpen); };
-          }
-          const copy = el.querySelector("[data-device-copy]");
-          if (copy) {
-            copy.onclick = (e) => {
-              e.stopPropagation();
-              try {
-                navigator.clipboard.writeText(copy.dataset.deviceCopy);
-                copy.textContent = "Copied";
-                setTimeout(() => { copy.textContent = "Copy"; }, 1500);
-              } catch { /* clipboard denied — the code is still selectable */ }
-            };
-          }
-          const go = el.querySelector("[data-device-continue]");
-          if (go) {
-            go.onclick = (e) => {
-              e.stopPropagation();
-              post({ type: "runGrokLogin", provider: go.dataset.deviceContinue });
-            };
-          }
-          const cancelBtn = el.querySelector("[data-device-cancel]");
-          if (cancelBtn) {
-            cancelBtn.onclick = (e) => {
-              e.stopPropagation();
-              post({ type: "cancelDeviceLogin", provider: cancelBtn.dataset.deviceCancel });
-            };
-          }
         }
       });
       function closeKeyForm() {
@@ -3570,6 +3441,11 @@
     }
 
     function onKey(e) {
+      // A dialog stacked above this page owns the keyboard. Both handlers are
+      // on document in capture and this one was registered first, so without
+      // standing down, Escape closed the page underneath the dialog and Tab
+      // pulled focus out of it (review, 2026-08-31).
+      if (document.body && document.body.dataset.modalAbove) return;
       if (e.key === "Escape") {
         e.stopPropagation();
         e.preventDefault();
@@ -3631,6 +3507,10 @@
       update(nextSnapshot, nextEnv) {
         if (nextSnapshot) snapshot = defaultSnapshot({ ...snapshot, ...nextSnapshot });
         if (nextEnv) Object.assign(env, nextEnv);
+        // Before the key: the answer this was waiting for is usually IN this
+        // snapshot, and a stale "Disconnecting…" left in the key would make
+        // the repaint that clears it look like a no-op.
+        reconcileProviderPending(snapshot);
         if (container.firstChild && paintKey() === lastPaintedKey) return;
         if (describeChrome(container).navMenuOpen) {
           paintDeferred = true;

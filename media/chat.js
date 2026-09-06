@@ -27,6 +27,10 @@
       : "default"
   );
   const REMOTE_SESSION_KEY = "grok.remote.tabSession:" + REMOTE_STORAGE_SUFFIX;
+  // Set by the relay's page before this file loads. Only ever says "the host on
+  // the other end is one the relay installed", which is why it can skip a
+  // compatibility wait rather than change any behaviour.
+  const IS_CLOUD_HOST = typeof window !== "undefined" && window.grokCloudHost === true;
   const REMOTE_TAB_TOKEN_KEY = "grok.remote.tabToken:" + REMOTE_STORAGE_SUFFIX;
   const REMOTE_TAB_OWNER_KEY = "grok.remote.tabOwner:" + REMOTE_STORAGE_SUFFIX;
   const REMOTE_TAB_CHANNEL = "grok.remote.tabClaim:" + REMOTE_STORAGE_SUFFIX;
@@ -2896,6 +2900,11 @@
       onLocal: (name) => {
         if (name === "explainRemote") showRemoteExplainer();
         if (name === "openDeviceManager") window.open("/", "_blank", "noopener");
+        // Settings → Providers → Connect. The overlay stays open behind the
+        // wizard so closing it returns the reader where they were.
+        if (typeof name === "string" && name.indexOf("connectWizard:") === 0) {
+          openConnectWizard(name.slice("connectWizard:".length));
+        }
       },
       closeOnAction: true,
       onClose: closeSettingsOverlay,
@@ -4885,12 +4894,31 @@
     return document.body.classList.contains("desk") && !!railMount();
   }
 
+  /** A cloud machine, as the page that served this client was told by the
+   *  relay that provisioned it. */
+  function cloudHostLayout() {
+    return IS_CLOUD_HOST && !!railMount();
+  }
+
+  /**
+   * May this surface paint the rail chrome BEFORE the catalog arrives?
+   *
+   * Only where there is no host version skew to protect against. Desktop
+   * qualifies because renderer and host ship together; a cloud machine
+   * qualifies because the relay installed that host itself. Everything else
+   * waits for a `repos` frame, since an extension older than v2.0.5 never
+   * sends one and an empty sidebar is worse than a plain column.
+   */
+  function railChromeBeforeCatalog() {
+    return desktopLargeLayout() || cloudHostLayout();
+  }
+
   /**
    * Rail is live when the mount exists AND (desktop first-frame chrome, or the
    * host has proven it feeds a multi-repo catalog). Never gated on IS_REMOTE.
    */
   function railAvailable() {
-    return !!railMount() && (desktopLargeLayout() || state.reposKnown);
+    return !!railMount() && (railChromeBeforeCatalog() || state.reposKnown);
   }
 
   /** The list body. The browser page wraps the rail in fixed chrome (brand,
@@ -5909,6 +5937,8 @@
     railProbeTimer = setTimeout(() => {
       railProbeTimer = null;
       if (state.repoPreviewsSupported) return;
+      // A verdict, not a fact: nothing answered in time. Said out loud so the
+      // rail has something to show, and dropped on the next reconnect.
       state.repoPreviewsUnsupported = true;
       renderRail();
     }, ms);
@@ -5919,6 +5949,23 @@
    *  but that is a correction owed when the conversation ARRIVES, not a reason to
    *  refuse the fold forever. Keyed on the repo changing, so re-collapsing the
    *  project you are working in sticks until you go somewhere else. */
+  /**
+   * Forget an unanswered capability probe.
+   *
+   * `repoPreviewsUnsupported` is inferred from silence, so it is only ever as
+   * good as the moment it was measured. A reconnect may be a different host —
+   * or the same one, no longer busy — and without this the page carried
+   * "Sessions need a newer Grok Build" about a current host for as long as it
+   * stayed open (owner, on a cloud machine that had just run a CLI sign-out,
+   * 2026-08-31).
+   */
+  function forgetRailProbeVerdict() {
+    if (state.repoPreviewsSupported) return;
+    if (railProbeTimer) { clearTimeout(railProbeTimer); railProbeTimer = null; }
+    state.repoPreviewsUnsupported = false;
+    state.repoPreviewsAsked = {};
+  }
+
   function railFollowLiveRepo() {
     // Via the display target (confirmed or pending), not the host-confirmed
     // active cwd alone: a worktree conversation reports the WORKTREE as its
@@ -5949,7 +5996,7 @@
     // user most needs the rail, because it is where the only useful control
     // lives. Hiding it made the empty-state action unreachable and left the
     // File menu — which the desktop hides — as the sole route in.
-    const on = desktopLargeLayout() ||
+    const on = railChromeBeforeCatalog() ||
       (railAvailable() && (state.repos.length > 0 || canAddProjectFolder()));
     const panel = railPanel();
     if (panel) panel.hidden = !on;
@@ -6090,7 +6137,7 @@
     }
 
     if (!shownAnything) {
-      if (!state.reposKnown && desktopLargeLayout()) {
+      if (!state.reposKnown && railChromeBeforeCatalog()) {
         root.appendChild(railNote("Loading…"));
       } else if (!q && canAddProjectFolder()) {
         // An empty rail that only says "No projects yet" is a dead end on the
@@ -8759,11 +8806,25 @@
    * with a sentence saying so. That way a CLI that grows the flow starts working
    * without a client change, and one that loses it stops lying.
    */
+  /** Host-supplied panel text: escaped, then `**bold**` and `[label](https://…)`
+   *  re-admitted. Never the other way round — see the note on the steps below. */
+  function onbRich(text) {
+    return escapeHtml(String(text == null ? "" : text))
+      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+      .replace(
+        /\[([^\]\n]+)\]\((https:\/\/[^\s)]+)\)/g,
+        (_m, label, url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`,
+      );
+  }
+
   function remoteConnectPanel(mode, info, ver) {
     const device = info.device;
     const provider = info.provider
       || (mode === "codex-login" ? "codex" : mode === "claude-login" ? "claude" : mode === "auth-required" ? "grok" : "");
-    const NAMES = { grok: "Grok", codex: "Codex", claude: "Claude" };
+    // The products' own names, everywhere this panel speaks. Not "Grok": that
+    // is the model, the extension is Grok Build, and a heading that disagrees
+    // with the button beneath it reads as two different things to connect.
+    const NAMES = { grok: "Grok Build", codex: "Codex", claude: "Claude Code" };
     const name = NAMES[provider] || "an agent";
     const status = (text) => { if (ver) setWelcomeStatus(text, false); };
 
@@ -8786,12 +8847,12 @@
     if (device && device.status === "waiting" && device.url) {
       status("Confirm the code");
       return `<div class="onb">` +
-        `<p class="onb-heading">Step 2 of 2 &mdash; confirm the code</p>` +
+        `<p class="onb-heading">${device.preflight ? "Step 2 of 2 &mdash; confirm the code" : `Finish signing in to ${escapeHtml(name)}`}</p>` +
         // The vendor's own page warns that device codes are used in phishing
         // and to continue only if the CLI started the sign-in. Saying that
         // BEFORE they meet it turns an alarming page into an expected one
         // (owner, with the screenshot, 2026-08-31).
-        (device.note ? `<p class="onb-desc onb-note">${escapeHtml(device.note)}</p>` : "") +
+        (device.note ? `<p class="onb-desc onb-note">${onbRich(device.note)}</p>` : "") +
         (device.code
           ? `<p class="onb-desc">Open the link, then confirm this code:</p>` +
             // Same markup as every other copyable value in this panel, so it
@@ -8805,9 +8866,9 @@
         // The setting to check, beside the code it gates — not on a screen
         // before it that cost an extra click to get past.
         (device.preflight && Array.isArray(device.preflight.steps) && device.preflight.steps.length
-          ? `<p class="onb-desc">${escapeHtml(device.preflight.reason || "")}</p>` +
+          ? `<p class="onb-desc">${onbRich(device.preflight.reason || "")}</p>` +
             `<ol class="onb-steps">${device.preflight.steps
-              .map((s) => `<li>${escapeHtml(String(s)).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")}</li>`)
+              .map((s) => `<li>${onbRich(s)}</li>`)
               .join("")}</ol>`
           : "") +
         cancel +
@@ -8849,17 +8910,18 @@
     if (device && device.preflight) {
       status("One setting first");
       const pf = device.preflight;
-      // Escape FIRST, then allow `**bold**` — never the other way round. The
-      // step strings come from the host, and the point of the escape is that
-      // nothing in them can become markup; re-admitting one tag afterwards, on
-      // text that is already inert, keeps that true. One step needs it: the
-      // setting people cannot find sits at the bottom of a long page.
+      // Escape FIRST, then allow `**bold**` and one link — never the other way
+      // round. The step strings come from the host, and the point of the escape
+      // is that nothing in them can become markup; re-admitting two shapes
+      // afterwards, on text that is already inert, keeps that true. Both are
+      // needed here: the setting people cannot find sits at the bottom of a
+      // long page, and the page it sits on should be one tap away.
       const steps = (pf.steps || [])
-        .map((s) => `<li>${escapeHtml(String(s)).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")}</li>`)
+        .map((s) => `<li>${onbRich(s)}</li>`)
         .join("");
       return `<div class="onb">` +
         `<p class="onb-heading">${escapeHtml(pf.title || `Turn on device sign-in for ${name}`)}</p>` +
-        `<p class="onb-desc">${escapeHtml(pf.reason || "")}</p>` +
+        `<p class="onb-desc">${onbRich(pf.reason || "")}</p>` +
         (steps ? `<ol class="onb-steps">${steps}</ol>` : "") +
         (pf.url
           ? `<a class="onb-action" href="${escapeHtml(pf.url)}" target="_blank" rel="noopener noreferrer">Open ${escapeHtml(name)} settings</a>`
@@ -8901,18 +8963,20 @@
     // one, and Claude cannot be connected there yet — a button that always
     // ends in "not available" is a dead end wearing an affordance.
     const cloudHost = !!(state.hostCaps && state.hostCaps.remoteAgentSignOut);
-    // On a cloud machine the agents are named as products and ranked: Grok
-    // Build is the one this environment is built around, and Claude Code is
-    // not connectable here yet, so it is stated rather than offered.
-    const CLOUD_NAMES = { grok: "Grok Build", codex: "Codex", claude: "Claude Code" };
+    // Ranking is the cloud-only part: Grok Build is the agent this environment
+    // is built around, and Claude Code cannot be connected here yet, so it is
+    // stated rather than offered. The NAMES above are the same everywhere.
     const buttons = offer
       .map((id) => {
         if (cloudHost && id === "claude") {
           return `<p class="onb-desc onb-agent-note">Claude Code — we're working on adding it, not available yet.</p>`;
         }
-        const label = cloudHost ? CLOUD_NAMES[id] : NAMES[id];
         const rec = cloudHost && id === "grok" ? " (recommended)" : "";
-        return `<button class="onb-action" type="button" data-act="connectRemote" data-provider="${id}">Connect ${label}${rec}</button>`;
+        // The mark the reader already knows from the model picker and the
+        // provider rows. currentColor, so it takes the button's foreground.
+        return `<button class="onb-action" type="button" data-act="connectRemote" data-provider="${id}">`
+          + providerLogoMarkup(id)
+          + `<span>Connect ${NAMES[id]}${rec}</span></button>`;
       })
       .join("");
     return `<div class="onb">` +
@@ -8924,6 +8988,180 @@
 
   /** `beforeRender` runs after the mode is set and before markup is built, so a
    *  host-launched terminal can be recorded against the panel it belongs to. */
+  /**
+   * Connecting an agent, in ONE place.
+   *
+   * There used to be two renderers for this flow: the transcript's onboarding
+   * card, and a set of rows inside Settings → Providers. The second existed
+   * only because the first cannot paint over a conversation
+   * (`revealWelcome` holds while `.msg` nodes exist), so a Connect clicked in
+   * Settings had nowhere to report. Two implementations of one auth flow is
+   * one too many to keep true (owner, 2026-08-31).
+   *
+   * A dialog is subject to no such hold, so the flow lives here and both
+   * surfaces become entry points. The markup is the SAME builder the welcome
+   * card uses, and the document-level `.onb-action` delegation already wires
+   * every button inside it, so there is nothing to duplicate and nothing to
+   * keep in step.
+   */
+  let connectWizard = null;
+
+  function connectWizardProvider() {
+    return connectWizard ? connectWizard.provider : "";
+  }
+
+  function closeConnectWizard() {
+    if (!connectWizard) return;
+    document.removeEventListener("keydown", connectWizard.onKey, true);
+    delete document.body.dataset.modalAbove;
+    connectWizard.overlay.remove();
+    const opener = connectWizard.opener;
+    connectWizard = null;
+    if (opener && typeof opener.focus === "function" && document.contains(opener)) {
+      try { opener.focus(); } catch { /* the opener may have gone with a repaint */ }
+    }
+  }
+
+  function openConnectWizard(provider, opener) {
+    if (connectWizard && connectWizard.provider === provider) {
+      renderConnectWizard();
+      return;
+    }
+    closeConnectWizard();
+    const overlay = document.createElement("div");
+    overlay.className = "confirm-overlay connect-wizard-overlay";
+    const panel = document.createElement("div");
+    panel.className = "confirm-panel connect-wizard-panel";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-label", `Connect ${provider}`);
+    const body = document.createElement("div");
+    body.className = "connect-wizard-body";
+    panel.appendChild(body);
+    const actions = document.createElement("div");
+    actions.className = "confirm-actions";
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "confirm-btn";
+    closeBtn.textContent = "Close";
+    // Closing the window never cancels the sign-in: the flow lives on the host
+    // and finishes on its own, which is exactly what the card promises.
+    // Cancelling is a separate, explicit button inside the panel.
+    closeBtn.onclick = (e) => { e.stopPropagation(); closeConnectWizard(); };
+    actions.appendChild(closeBtn);
+    panel.appendChild(actions);
+    overlay.appendChild(panel);
+    overlay.onclick = (e) => { if (e.target === overlay) { e.stopPropagation(); closeConnectWizard(); } };
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); closeConnectWizard(); } };
+    document.addEventListener("keydown", onKey, true);
+    // Tells any page underneath (the settings overlay has its own Escape and
+    // Tab trap) that a modal owns the keyboard while this is up.
+    document.body.dataset.modalAbove = "connect-wizard";
+    document.body.appendChild(overlay);
+    connectWizard = { provider, overlay, panel, body, onKey, opener: opener || document.activeElement };
+    // Nothing has come back from the host yet — and on a cloud machine the
+    // first frame is seconds away. Open on "starting" rather than repainting
+    // the offer that was just clicked, which read as a click that did nothing
+    // (owner, 2026-08-31). A real frame replaces this on arrival.
+    if (!state.deviceLoginByProvider[provider]) connectWizard.lastDevice = { status: "starting" };
+    renderConnectWizard();
+    const focusTarget = body.querySelector(".onb-action") || closeBtn;
+    try { focusTarget.focus(); } catch { /* focus is a courtesy, never a failure */ }
+  }
+
+  /** Paint the wizard from the flow state the host last sent. */
+  function renderConnectWizard() {
+    if (!connectWizard) return;
+    const provider = connectWizard.provider;
+    // The mirror is the live source, but a confirmed account retires its
+    // mirror, so a settled panel keeps its own copy of the last thing it was
+    // told rather than falling back to the empty-state offer.
+    const device = state.deviceLoginByProvider[provider] || connectWizard.lastDevice;
+    // `ver` is null on purpose: the welcome status line belongs to the welcome
+    // card, and a modal must not rewrite it.
+    connectWizard.body.innerHTML = remoteConnectPanel(
+      "auth-required",
+      { provider, device, platform: state.onboardingInfo && state.onboardingInfo.platform },
+      null,
+    );
+  }
+
+  /**
+   * Keep the wizard in step with the host, and open it when a flow begins
+   * wherever the click came from — the card, Settings, or another tab.
+   */
+  function syncConnectWizard(provider, device) {
+    if (!IS_REMOTE || !provider) return;
+    // Only a RUNNING flow opens a wizard. A settled outcome renders wherever
+    // the reader already is: in this dialog when one is open (which it is
+    // whenever they got here by clicking Connect), and in the card otherwise.
+    // Opening one for `failed` meant the card and the dialog both painted the
+    // same retry button — the relay's sign-in check found it as a strict-mode
+    // locator violation, which is a person seeing the same panel twice.
+    const live = !!device && (device.status === "starting" || device.status === "waiting"
+      || device.status === "verifying" || !!device.preflight);
+    if (live) {
+      openConnectWizard(provider);
+      if (connectWizard) connectWizard.lastDevice = device;
+      return;
+    }
+    if (!connectWizard || connectWizard.provider !== provider) return;
+    if (device && device.status === "done") {
+      // Show the confirmation, then get out of the way. The account is
+      // connected; keeping a dialog up over it is make-work.
+      connectWizard.lastDevice = device;
+      connectWizard.settled = true;
+      renderConnectWizard();
+      setTimeout(() => {
+        if (connectWizard && connectWizard.provider === provider) closeConnectWizard();
+      }, 1600);
+      return;
+    }
+    // Nothing repaints a finished panel. Between "connected" and the close
+    // there is a window where the mirror is already gone, and repainting in
+    // it turned a success into an offer to start over.
+    if (connectWizard.settled) return;
+    // No flow left to show — a cancel, or a bare frame after one ends. The
+    // wizard exists to RUN a flow, so with nothing to run it gets out of the
+    // way rather than repainting itself as an invitation to start another;
+    // the card underneath is the entry point and is already offering one.
+    if (!device) {
+      closeConnectWizard();
+      return;
+    }
+    renderConnectWizard();
+  }
+
+  /** The onboarding modes that are asking for an account to be connected. */
+  const CONNECT_ONBOARDING_MODES = {
+    "connect-agent": true,
+    "codex-login": true,
+    "claude-login": true,
+    "auth-required": true,
+  };
+
+  /**
+   * Nothing in this transcript is a conversation.
+   *
+   * The second signal for "this session is empty, do not remember it". It used
+   * to be `welcomeVisible`, which an error bubble turns off — including the
+   * host's own sign-out notice, so an empty session was remembered, reaped, and
+   * then failed to restore on every refresh (owner, 2026-08-31). Errors and
+   * notices are momentary UI; a turn is the thing that makes a conversation
+   * worth restoring. Pending authored text still counts, because `numMessages`
+   * lags during the first send.
+   */
+  function transcriptHasNoTurns() {
+    const messages = $("messages");
+    if (!messages) return true;
+    // `.msg.error` is a notice and `.msg.thinking` is scaffolding; anything
+    // else in the transcript is somebody's conversation.
+    if (messages.querySelector(".msg:not(.error):not(.thinking)")) return false;
+    const input = $("input");
+    const typed = input && typeof input.value === "string" ? input.value.trim() : "";
+    return !typed;
+  }
+
   function showOnboarding(mode, info, beforeRender) {
     info = info || {};
     state.onboardingMode = mode;
@@ -8943,7 +9181,25 @@
     const ver = $("welcome-version");
     if (!onb) return;
     if (IS_REMOTE && (mode === "connect-agent" || mode === "codex-login" || mode === "claude-login" || mode === "auth-required")) {
-      onb.innerHTML = remoteConnectPanel(mode, info, ver);
+      // The card is an ENTRY POINT, not a second renderer: a live flow belongs
+      // to the wizard, so the card keeps showing the offer underneath it.
+      // The card NEVER renders a live flow. Stripping it only while the wizard
+      // was already open left a window -- this function runs before
+      // syncConnectWizard on the very frame that starts a flow -- where both
+      // painted it, so the code and its Cancel existed twice on the page. The
+      // relay's own sign-in check caught that as a strict-mode locator
+      // violation; a person would have seen it by closing the dialog.
+      //
+      // A SETTLED outcome still lands here when no wizard is open, so nothing
+      // is lost if the reader closed it.
+      const device = info && info.device;
+      const liveFlow = !!device && (device.status === "starting" || device.status === "waiting"
+        || device.status === "verifying" || !!device.preflight);
+      const wizardOwnsIt = !!connectWizard && info && info.provider === connectWizard.provider;
+      const forCard = device && (liveFlow || wizardOwnsIt)
+        ? Object.assign({}, info, { device: undefined })
+        : info;
+      onb.innerHTML = remoteConnectPanel(mode, forCard, ver);
       return;
     }
     if (mode === "no-project") {
@@ -15321,6 +15577,10 @@
         // Field presence: an older host never sends this, and command View all
         // then omits language rather than inventing a dialect.
         state.commandLanguage = typeof msg.commandLanguage === "string" ? msg.commandLanguage : "";
+        // Every remote snapshot carries an initialState, so this is where a
+        // reconnect lands. Whatever the rail concluded from silence belongs to
+        // the host that was quiet, not to this one.
+        forgetRailProbeVerdict();
         restoreRememberedRemoteSession();
         // Capability field presence — never a version check. Local hosts ignore.
         ensureRemoteFilesBrowser();
@@ -15415,11 +15675,23 @@
         // borrows the welcome overlay; dismiss it when the provider it was
         // waiting for is now connected, without clearing or replaying messages.
         {
-          const pendingProvider = $("welcome-onboarding")?.querySelector(
+          // What the card is ASKING FOR, not which button it happens to draw.
+          // Keying on the recovery button meant a device-code card — the only
+          // way to connect from a phone or a cloud machine — was never
+          // dismissed by its own success (owner, 2026-08-31).
+          const onboardingProvider = $("welcome-onboarding")?.querySelector(
             '[data-act="recheckProvider"][data-provider], [data-act="recheck"][data-provider]',
-          )?.dataset?.provider;
-          if (pendingProvider && state.providers.some((provider) =>
-            provider.id === pendingProvider && provider.connected)) {
+          )?.dataset?.provider
+            || (CONNECT_ONBOARDING_MODES[state.onboardingMode]
+              ? (state.onboardingInfo && state.onboardingInfo.provider) || ""
+              : "");
+          const anyConnected = state.providers.some((provider) => provider.connected);
+          const askedForConnected = onboardingProvider && state.providers.some((provider) =>
+            provider.id === onboardingProvider && provider.connected);
+          // `connect-agent` names no provider: it is the "pick any of the
+          // three" card, so any connected account answers it.
+          const chooserAnswered = state.onboardingMode === "connect-agent" && anyConnected;
+          if ($("welcome-onboarding")?.childElementCount && (askedForConnected || chooserAnswered)) {
             clearWelcome();
           }
         }
@@ -16730,9 +17002,21 @@
               delete state.deviceLoginByProvider[msg.provider];
             }
             refreshSettingsOverlay();
+            // AFTER the mirror: renderConnectWizard reads it, and syncing
+            // first painted the previous state every time (caught by driving
+            // the states in a browser, 2026-08-31).
+            syncConnectWizard(msg.provider, msg.device);
           }
         break;
       case "error":
+        // The host refused to restore a specific conversation, and named it.
+        // Keeping that id meant the next reload asked for the same dead
+        // session, drew the same error, and re-armed itself — the owner could
+        // only escape by clicking New session (2026-08-31).
+        if (msg.resumeFailed && typeof msg.resumeFailed.id === "string"
+          && rememberedRemoteSession && rememberedRemoteSession.id === msg.resumeFailed.id) {
+          saveRememberedRemoteSession(null);
+        }
         // The relay bounces a quota-refused frame as a plain error, which
         // renders in the transcript — behind the settings overlay the reader is
         // looking at. At the paywall that made Create appear to do nothing, at
@@ -16871,7 +17155,7 @@
             // mean no restore attempt. Both signals have to agree — the host's
             // message count AND a blank view — so a refresh mid-first-turn,
             // where the count still lags at 0, keeps remembering.
-            if (activeEntry?.numMessages === 0 && state.welcomeVisible) {
+            if (activeEntry?.numMessages === 0 && transcriptHasNoTurns()) {
               saveRememberedRemoteSession(null);
             } else saveRememberedRemoteSession({
               id: state.activeSessionId,
@@ -17109,9 +17393,12 @@
   }
   newBtn.onclick = () => beginNewSession();
   fillSessionHeadActions();
-  // Desktop ships the rail mount in the first HTML frame. Paint the skeleton
-  // before catalog frames arrive so the window never starts panel-less.
-  if (desktopLargeLayout()) renderRail();
+  // Desktop and cloud ship the rail mount in the first HTML frame. Paint the
+  // skeleton before catalog frames arrive so the window never starts
+  // panel-less — on a cloud machine that gap is however long the host takes to
+  // wake, and what showed instead was the layout this product had before it
+  // had a rail (owner, 2026-08-31).
+  if (railChromeBeforeCatalog()) renderRail();
   modeBtn.onclick = (e) => { e.stopPropagation(); if (state.busyLocked) return; openModePopover(); };
   if (sandboxBtn) {
     sandboxBtn.onclick = (e) => {
@@ -17469,7 +17756,14 @@
       // remote request means the headless flow — so there is one capability
       // here, not two, and nothing new for the policy table to gate.
       else if (act === "connectRemote") vscode.postMessage({ type: "runGrokLogin", provider: onbAction.dataset.provider });
-      else if (act === "cancelDeviceLogin") vscode.postMessage({ type: "cancelDeviceLogin", provider: onbAction.dataset.provider });
+      else if (act === "cancelDeviceLogin") {
+        vscode.postMessage({ type: "cancelDeviceLogin", provider: onbAction.dataset.provider });
+        // Close on the click, not on the host's answer. The person has said
+        // they are done; leaving the dialog up until a frame comes back makes
+        // Cancel feel ignored, and if the answer never comes it stays up over
+        // a flow that is already gone.
+        if (connectWizardProvider() === onbAction.dataset.provider) closeConnectWizard();
+      }
       else if (act === "addProjectFolder") openAddProjectMenu(onbAction);
       return;
     }

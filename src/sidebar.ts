@@ -982,6 +982,10 @@ export class GrokSidebar {
     {
       handle: DeviceLoginHandle;
       clientId?: string;
+      /** The TAB that started this, which outlives the socket that did: a phone
+       *  reconnects on every trip to the vendor's code page, and `identify`
+       *  re-points this token at the new client. */
+      tabToken?: string;
       /** What the flow last told its client, so a re-tap — usually a client
        *  that RECONNECTED while visiting the vendor's code page — can be
        *  shown the same code instead of silence. */
@@ -1774,6 +1778,7 @@ export class GrokSidebar {
     const entry: {
       handle?: DeviceLoginHandle;
       clientId?: string;
+      tabToken?: string;
       last?: Extract<HostMsg, { type: "onboarding" }>["device"];
       preflight?: Extract<HostMsg, { type: "onboarding" }>["device"] extends infer D
         ? D extends { preflight?: infer P } ? P : never
@@ -1782,6 +1787,7 @@ export class GrokSidebar {
       send: (device: Extract<HostMsg, { type: "onboarding" }>["device"]) => void;
     } = {
       clientId,
+      tabToken: clientId ? this.remoteClients.tabToken(clientId) : undefined,
       send: (device) => {
         // The setting-to-check travels with every card of this flow, so it is
         // still on screen when the code is.
@@ -1871,6 +1877,7 @@ export class GrokSidebar {
     const running = this.deviceLogins.get(provider);
     if (running) {
       running.clientId = clientId;
+      if (clientId) running.tabToken = this.remoteClients.tabToken(clientId) ?? running.tabToken;
       if (running.last) running.send(running.last);
       this.host.appendLine(`[${provider}] device login already in flight; repeated its state to the new tap`);
       return;
@@ -1918,7 +1925,8 @@ export class GrokSidebar {
           // The page must change when the vendor approves — "nothing happened"
           // during a silent 30s probe was the owner's very first retest note.
           send({ status: "verifying" });
-          void this.confirmDeviceLogin(provider, send, displayName, workId);
+          void this.confirmDeviceLogin(provider, send, displayName, workId,
+            () => ({ clientId: entry.clientId, tabToken: entry.tabToken }));
           return;
         }
         this.host.appendLine(`[${provider}] device login failed (${result.failure}) after ${elapsed}s: ${result.output.slice(-2000)}`);
@@ -1943,14 +1951,31 @@ export class GrokSidebar {
    * Runs detached from the flow entry — by the time this fails, offering the
    * user a fresh attempt must not be blocked by the old one.
    */
+  /**
+   * The tab that started a device login, wherever its socket is now.
+   *
+   * Resolved through the tab token, because a phone reconnects on every trip to
+   * the vendor's code page and the starting client id is usually gone by the
+   * time this is asked. Falls back to the focused session rather than throwing:
+   * `remoteClients.cwd()` refuses an unknown client, and a sign-in that has
+   * already succeeded must not end in an exception.
+   */
+  private deviceLoginSession(clientId?: string, tabToken?: string): Session {
+    const live = tabToken ? this.remoteClients.clientForTabToken(tabToken) : undefined;
+    const id = live ?? clientId;
+    if (!id || this.remoteClients.cwdIfPresent(id) === undefined) return this.focused;
+    return this.remoteSessionFor(id);
+  }
+
   private async confirmDeviceLogin(
     provider: AcpProvider,
     send: (device: Extract<HostMsg, { type: "onboarding" }>["device"]) => void,
     displayName: string,
     workId: number,
+    currentClient: () => { clientId?: string; tabToken?: string },
   ): Promise<void> {
     try {
-      await this.confirmDeviceLoginInner(provider, send, displayName);
+      await this.confirmDeviceLoginInner(provider, send, displayName, currentClient);
     } finally {
       // One door out, whatever happened above — and only this operation's.
       this.endDeviceLoginWork(workId);
@@ -1961,6 +1986,7 @@ export class GrokSidebar {
     provider: AcpProvider,
     send: (device: Extract<HostMsg, { type: "onboarding" }>["device"]) => void,
     displayName: string,
+    currentClient: () => { clientId?: string; tabToken?: string } = () => ({}),
   ): Promise<void> {
     const delays = [0, 2_000, 5_000, 10_000, 20_000];
     for (const delay of delays) {
@@ -1973,6 +1999,24 @@ export class GrokSidebar {
         // Sign out for an account that is plainly signed in (owner, 2026-08-31).
         await this.setProviderConnected(provider, true);
         send({ status: "done" });
+        // The same follow-through Settings' "Check again" runs. Promoting the
+        // account is not the job — putting an agent on the screen that just
+        // signed in is, and until this call the tab kept an empty model picker
+        // and a card still offering to connect until it was reloaded (owner, on
+        // a fresh cloud machine, 2026-08-31).
+        try {
+          const flow = currentClient();
+          await this.adoptSessionsForConnectedProvider(
+            provider,
+            this.deviceLoginSession(flow.clientId, flow.tabToken),
+          );
+        } catch (error) {
+          // The sign-in itself SUCCEEDED and has already been announced. A
+          // failure to start the session afterwards is a worse screen, not a
+          // worse account — and this runs under `void` on a machine with
+          // nobody at it, where an unhandled rejection is the only trace.
+          this.host.appendLine(`[${provider}] connected, but starting the session failed: ${errorDetail(error)}`);
+        }
         return;
       }
     }
@@ -7632,6 +7676,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     report?: (text: string) => void,
   ): Promise<void> {
     this.setProviderConnectedInMemory(provider, false);
+    // Next sign-in starts at step 1 again. The latch stops the advice from
+    // repeating inside one flow; a sign-out ends the flow, and the account
+    // setting it names is the first thing to check before the next one.
+    this.deviceLoginPreflightShown.delete(provider);
     const reset = this.resetProviderSessionsAfterLogout(provider);
     try {
       await this.persistProviderConnections();
@@ -7725,10 +7773,29 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
     }
 
+    // A signed-out session with nothing in it is a shell, and a sign-out is
+    // the moment it stops having any owner at all. Left on disk each one is an
+    // "Untitled" row in the rail that nobody can account for — the owner
+    // counted three after a few connect/disconnect cycles (2026-08-31) — and
+    // the periodic sweep is age-gated at thirty minutes, so it collects them
+    // long after they have been read as a bug. Drafts were persisted to meta
+    // above, so "empty" here is genuinely empty. Read BEFORE dispose, which
+    // clears the ids this needs.
+    const shells = [...affectedSessions]
+      .filter((s) => !s.hasHistory && !s.worktree && s.chips.length === 0 && !s.priming
+        && !s.strandedDraft && s.queuedSends.length === 0 && !!s.activeSessionId)
+      .map((s) => ({ id: s.activeSessionId, cwd: this.sessionCwd(s), provider: s.provider }));
     // Atomic boundary: detach every signed-out-provider client before any
     // replacement startup can await. Membership is provider identity only;
     // another provider's crashed/clientless session remains resumable.
     for (const session of affectedSessions) this.disposeSession(session);
+    for (const shell of shells) {
+      if (isAdapterProvider(shell.provider)) {
+        void this.discardAdapterEmptySession(shell.provider, shell.id, shell.cwd);
+      } else {
+        this.removeSessionFromDisk(shell.id, shell.cwd);
+      }
+    }
 
     let localReplacement: Session | undefined;
     if (replacingFocused) {
@@ -7845,6 +7912,88 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * every remote tab, and the detached replacements sitting in the pool waiting
    * for their tab to come back.
    */
+  /**
+   * A provider just became usable — put every view that was waiting for one to
+   * work.
+   *
+   * Both ways in end here: Settings' "Check again" (`recheckConnection`) and
+   * the device-code sign-in a phone or a cloud machine uses. The second one did
+   * none of this until 2026-08-31: it promoted the account and stopped, so the
+   * tab that had just signed in kept an empty model picker and a card still
+   * offering to connect, and only a page reload — which starts a session for
+   * its own reasons — put the agent on screen.
+   */
+  private async adoptSessionsForConnectedProvider(
+    provider: AcpProvider,
+    session: Session,
+  ): Promise<void> {
+      // Every view stranded by a last-provider sign-out, not just this one.
+      const adopted = await this.retargetNeedsProviderSessions(provider);
+      // An empty conversation bound to a provider that cannot answer has
+      // nothing worth preserving, so hand it to the one just connected. This
+      // used to require `firstConnection`, computed from CONNECTED providers,
+      // so a lapsed Codex made connecting Grok look like a second account and
+      // the empty session stayed on Codex — asking for a codex login while
+      // the picker read Grok 4.6. What matters is whether the session's own
+      // provider can answer, not how many others are linked.
+      // Both halves matter: the session is stranded on something that cannot
+      // answer, AND the provider just re-checked can. A FAILED re-check leaves
+      // it unusable, and handing the empty session to it there would start a
+      // session against an agent that just refused to authenticate.
+      const nowUsable = this.usableProviders();
+      const strandedOnUnusable = !session.hasHistory
+        && !nowUsable.includes(session.provider)
+        && nowUsable.includes(provider);
+      // Say it worked. An empty session looks exactly like a re-check that did
+      // nothing, and this is the moment someone most wants confirmation. Only
+      // on a conversation with no history — a real transcript is its own
+      // evidence, and the panel would cover it.
+      // Announced once, after whichever branch ran, and only when the re-check
+      // actually succeeded. It was previously wired into two of the four
+      // outcomes and missed the most ordinary one — the session is already on
+      // this provider and simply starts — so the confirmation the owner asked
+      // for did not appear in the case he was testing.
+      const confirmConnected = () => {
+        if (session.hasHistory || !this.usableProviders().includes(provider)) return;
+        // No folder to start in — "You can start grokking!" would be a lie.
+        // startSession already painted no-project.
+        if (this.host.canSwitchWorkspaceFolder && !this.openWorkspaceFolders().length) return;
+        this.emit(session, {
+          type: "onboarding",
+          state: "provider-connected",
+          platform: process.platform,
+          provider,
+        });
+      };
+      if (adopted.has(session)) {
+        this.postSessionsList();
+      } else if (strandedOnUnusable) {
+        session.provider = provider;
+        await this.rememberProjectProvider(this.sessionCwd(session), provider);
+        await this.startSession(undefined, session);
+      } else if (session.provider === provider && !session.client) {
+        // Retry a provider whose first real session exposed a credential error.
+        await this.startSession(session.hasHistory ? session.activeSessionId : undefined, session);
+      } else {
+        // Adding a second account must not restart or change a conversation
+        // with history on screen. But an EMPTY one has nothing to protect,
+        // and leaving its picker stale meant the newly connected agent's
+        // models only appeared after clicking New session — for a session
+        // that already was new. Re-post the catalog so the picker picks it up
+        // in place.
+        if (isAdapterProvider(provider)) this.scheduleAdapterHistoryRefresh(provider, this.sessionCwd(session));
+        if (!session.hasHistory) this.postSessionModels(session);
+        this.postSessionsList();
+      }
+      // Re-post after the branches, not just after setProviderConnected: the
+      // credential re-probe and any retarget above change what a provider row
+      // should say, and Settings → Providers reads this. Without it a freshly
+      // connected agent still showed its old state there until something else
+      // happened to refresh the panel.
+      this.postProviderState();
+      confirmConnected();
+  }
+
   private async retargetNeedsProviderSessions(provider: AcpProvider): Promise<Set<Session>> {
     const targets = new Set<Session>();
     const consider = (session: Session | undefined) => {
@@ -10743,73 +10892,18 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const pendingLoginProbe = this.loginReprobeTimers.get(provider);
         if (pendingLoginProbe) clearTimeout(pendingLoginProbe);
         this.loginReprobeTimers.delete(provider);
-        await this.setProviderConnected(provider, true);
-        await this.reprobeProviderCredentials(provider);
-        // Every view stranded by a last-provider sign-out, not just this one.
-        const adopted = await this.retargetNeedsProviderSessions(provider);
-        // An empty conversation bound to a provider that cannot answer has
-        // nothing worth preserving, so hand it to the one just connected. This
-        // used to require `firstConnection`, computed from CONNECTED providers,
-        // so a lapsed Codex made connecting Grok look like a second account and
-        // the empty session stayed on Codex — asking for a codex login while
-        // the picker read Grok 4.6. What matters is whether the session's own
-        // provider can answer, not how many others are linked.
-        // Both halves matter: the session is stranded on something that cannot
-        // answer, AND the provider just re-checked can. A FAILED re-check leaves
-        // it unusable, and handing the empty session to it there would start a
-        // session against an agent that just refused to authenticate.
-        const nowUsable = this.usableProviders();
-        const strandedOnUnusable = !session.hasHistory
-          && !nowUsable.includes(session.provider)
-          && nowUsable.includes(provider);
-        // Say it worked. An empty session looks exactly like a re-check that did
-        // nothing, and this is the moment someone most wants confirmation. Only
-        // on a conversation with no history — a real transcript is its own
-        // evidence, and the panel would cover it.
-        // Announced once, after whichever branch ran, and only when the re-check
-        // actually succeeded. It was previously wired into two of the four
-        // outcomes and missed the most ordinary one — the session is already on
-        // this provider and simply starts — so the confirmation the owner asked
-        // for did not appear in the case he was testing.
-        const confirmConnected = () => {
-          if (session.hasHistory || !this.usableProviders().includes(provider)) return;
-          // No folder to start in — "You can start grokking!" would be a lie.
-          // startSession already painted no-project.
-          if (this.host.canSwitchWorkspaceFolder && !this.openWorkspaceFolders().length) return;
-          this.emit(session, {
-            type: "onboarding",
-            state: "provider-connected",
-            platform: process.platform,
-            provider,
-          });
-        };
-        if (adopted.has(session)) {
-          this.postSessionsList();
-        } else if (strandedOnUnusable) {
-          session.provider = provider;
-          await this.rememberProjectProvider(this.sessionCwd(session), provider);
-          await this.startSession(undefined, session);
-        } else if (session.provider === provider && !session.client) {
-          // Retry a provider whose first real session exposed a credential error.
-          await this.startSession(session.hasHistory ? session.activeSessionId : undefined, session);
-        } else {
-          // Adding a second account must not restart or change a conversation
-          // with history on screen. But an EMPTY one has nothing to protect,
-          // and leaving its picker stale meant the newly connected agent's
-          // models only appeared after clicking New session — for a session
-          // that already was new. Re-post the catalog so the picker picks it up
-          // in place.
-          if (isAdapterProvider(provider)) this.scheduleAdapterHistoryRefresh(provider, this.sessionCwd(session));
-          if (!session.hasHistory) this.postSessionModels(session);
-          this.postSessionsList();
-        }
-        // Re-post after the branches, not just after setProviderConnected: the
-        // credential re-probe and any retarget above change what a provider row
-        // should say, and Settings → Providers reads this. Without it a freshly
-        // connected agent still showed its old state there until something else
-        // happened to refresh the panel.
-        this.postProviderState();
-        confirmConnected();
+        // Evidence, then promotion — never the other way round. Marking the
+        // account connected BEFORE the probe meant a failed check left it
+        // "connected but needs to sign in again" for an account that was
+        // never signed in at all, which is exactly what the owner saw on a
+        // fresh cloud machine (2026-08-31). The Providers refresh has always
+        // promoted this way; this handler was the one that did not.
+        //
+        // A failure never demotes, either: a lapsed account keeps its row and
+        // gets the sign-in action, which is what needsLogin is for.
+        const rechecked = await this.reprobeProviderCredentials(provider);
+        if (rechecked) await this.setProviderConnected(provider, true);
+        await this.adoptSessionsForConnectedProvider(provider, session);
         break;
       }
       case "retryProviderSession": {

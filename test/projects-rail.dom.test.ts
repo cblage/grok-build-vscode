@@ -401,6 +401,68 @@ describe("projects rail", () => {
     expect(sessionNames(h.doc, repoNames(h.doc).indexOf("alpha"))).toEqual(["alpha one"]);
   });
 
+  it("paints the rail before any catalog on a cloud machine, and not on a laptop", () => {
+    // The rail waits for `repos` because an extension older than v2.0.5 never
+    // sends one. A cloud machine cannot be that: the relay provisions it and
+    // installs the host. Without this the old single-column layout — the one
+    // this product had before it had a rail — was the whole screen for as long
+    // as a sleeping machine took to wake (owner, 2026-08-31; measured at 4.2s
+    // against a host that answered in four seconds).
+    const cloud = bootWebview({
+      remote: true,
+      beforeScripts: (w: any) => { withRail(w); w.grokCloudHost = true; },
+    });
+    expect(cloud.doc.body.classList.contains("has-rail")).toBe(true);
+    expect((cloud.doc.getElementById("projects-rail") as HTMLElement).hidden).toBe(false);
+
+    // A linked laptop still waits: its host may predate the frame.
+    const laptop = bootWebview({ remote: true, beforeScripts: (w: any) => withRail(w) });
+    expect(laptop.doc.body.classList.contains("has-rail")).toBe(false);
+    expect((laptop.doc.getElementById("projects-rail") as HTMLElement).hidden).toBe(true);
+  });
+
+  it("fills the cloud rail from the catalog when it finally arrives", () => {
+    const h = bootWebview({
+      remote: true,
+      beforeScripts: (w: any) => { withRail(w); w.grokCloudHost = true; },
+    });
+    dispatch(h.window, { type: "repos", entries: repos, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
+    dispatch(h.window, sessionsFrame([row("a1", "/work/alpha", "alpha one", 9)]));
+    expect(repoNames(h.doc)).toContain("alpha");
+    expect(sessionNames(h.doc, repoNames(h.doc).indexOf("alpha"))).toEqual(["alpha one"]);
+  });
+
+  it("re-probes after a reconnect instead of libelling the host for ever", async () => {
+    // The verdict is inferred from EIGHT SECONDS OF SILENCE, and a cloud
+    // machine that is waking, or busy running a CLI sign-out, misses that
+    // window. The owner's host had just done both and the page then said
+    // "Sessions need a newer Grok Build" about a current build for as long as
+    // it stayed open — nothing ever asked again (2026-08-31).
+    const h = bootWebview({
+      remote: true,
+      beforeScripts: (w: any) => { withRail(w); w.__grokRailProbeTimeoutMs = 5; },
+    });
+    dispatch(h.window, { type: "repos", entries: repos, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
+    dispatch(h.window, sessionsFrame([row("a1", "/work/alpha", "alpha one", 9)]));
+    await new Promise((r) => setTimeout(r, 40));
+    expect([...h.doc.querySelectorAll(".rail-note")].map((e) => e.textContent))
+      .toContain("Sessions need a newer Grok Build");
+
+    // A reconnect: every remote snapshot opens with initialState.
+    h.posted.length = 0;
+    dispatch(h.window, {
+      type: "initialState", effort: "", cwd: "/work/alpha", useCtrlEnter: false, extVersion: "3.19.9",
+      showThinking: false, expandCommandOutputs: false, steerByDefault: false, soundNotifications: false,
+      processingSound: false, readRepliesAloud: false, appPurpose: "coding", capabilities: {},
+    });
+    dispatch(h.window, { type: "repos", entries: repos, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
+
+    // It asks again rather than repeating a verdict about a host that is gone.
+    expect(h.posted.some((m: any) => m.type === "listRepoSessions")).toBe(true);
+    expect([...h.doc.querySelectorAll(".rail-note")].map((e) => e.textContent))
+      .not.toContain("Sessions need a newer Grok Build");
+  });
+
   it("never shows that hint to a host that does answer", async () => {
     const h = bootWebview({
       remote: true,
