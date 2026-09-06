@@ -167,12 +167,67 @@ html, body {
   top: 50%;
   transform: translateY(-50%);
   z-index: 1;
-  width: 22px;
-  height: 22px;
+  /* 28x28 with a 20px glyph, matching the file panel's .gfp-icon-button and the
+     house rule stated in chat.css: "min 28x28 (36 under (hover: none) and
+     (pointer: coarse))". This was 22x22 with a 13px glyph — visibly smaller
+     than the explorer's control right beside it, and below the touch floor. */
+  width: 28px;
+  height: 28px;
 }
-.rail-add-project svg { width: 13px; height: 13px; }
-/* The empty rail's only control — a link, not a button: there is no chrome
-   around it to belong to. */
+.rail-add-project svg { width: 20px; height: 20px; }
+
+/* The rail had NO touch sizing of any kind, which is why its controls stayed
+   desk-sized on a phone while the rest of the app grew. */
+@media (hover: none), (pointer: coarse) {
+  .rail-add-project { width: 36px; height: 36px; right: 6px; }
+}
+/* "+ Add project" — the full-width control under the project list, and the
+   empty rail's only control.
+
+   Button height rather than a link, because it is the primary action on this
+   surface and the rail is mostly empty space when you have one project or
+   none. Secondary button colours, not primary: it should read as available,
+   not as the thing you came here to press. */
+.rail-add-project-wide {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: calc(100% - 16px);
+  margin: 6px 8px 2px;
+  padding: 6px 12px;
+  min-height: 30px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground, CanvasText));
+  /* A neutral fill, NOT --vscode-button-secondaryBackground, and this is the one
+     place this file departs from its twin in chat.css. Dark Modern — VS Code's
+     default theme, so most users — sets button.secondaryBackground to a fully
+     transparent colour and leans on button.border to keep a secondary button
+     visible. This control has no border, so it read as bare text until you
+     hovered it. The fill below is exactly what chat.css resolves to on the web
+     client (which defines no button vars, so its var() falls through to this),
+     which is what keeps the two rails looking alike. Grey at low alpha, not a
+     hex colour: it tints whatever surface the theme paints, light or dark. */
+  background: rgba(128, 128, 128, 0.2);
+}
+.rail-add-project-wide:hover {
+  /* Themed hover is out for the same reason: Dark Modern's
+     button.secondaryHoverBackground is DARKER than the fill above, so the button
+     would dim under the pointer instead of lifting. */
+  background: rgba(128, 128, 128, 0.3);
+}
+.rail-add-project-wide-plus { font-size: 14px; line-height: 1; opacity: 0.9; }
+/* The same 36px touch floor the rest of the app uses. */
+@media (hover: none), (pointer: coarse) {
+  .rail-add-project-wide { min-height: 44px; font-size: 13.5px; }
+}
+
+/* SUPERSEDED by .rail-add-project-wide, which the empty rail now uses too.
+   Kept only because other rail notes may still reference the class. */
 .rail-empty-action {
   display: block;
   margin-top: 6px;
@@ -229,7 +284,13 @@ html, body {
   cursor: pointer;
 }
 
+/* Carried hover — see holdHoverAfterRebuild in projects-rail.js. The rail
+   rebuilds wholesale and a boot sends a burst of frames that each trigger one;
+   the browser recomputes :hover AFTER the lifecycle that paints the new nodes,
+   so the row under a stationary cursor paints un-hovered for exactly one frame,
+   once per frame that lands. This class is what the row wears for that frame. */
 .rail-repo-head:hover,
+.rail-repo-head.rail-hover-hold,
 .rail-repo-head:focus-within { background: var(--rail-hover-bg); }
 .rail-repo-head:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: -1px; }
 
@@ -255,13 +316,18 @@ html, body {
 .rail-twisty[data-repo-color="coral"] { color: var(--repo-color-coral); }
 .rail-twisty[data-repo-color="purple"] { color: var(--repo-color-purple); }
 
-.rail-action-btn { width: 25px; height: 27px; cursor: pointer; }
+/* VS CODE TIER: 24x24 box, 14px glyph. Deliberately tighter than Desktop and
+   Remote — a VS Code sidebar is meant to be dense, and the file panel is
+   desktop-only (sidebar.ts: "the shared file-panel asset is desktop-only"), so
+   nothing sits beside this rail to disagree with it. A 24px button also fits
+   the 24px row without growing it. */
+.rail-action-btn { width: 24px; height: 24px; cursor: pointer; }
 .rail-action-btn:hover,
 .rail-action-btn.active { color: var(--vscode-foreground); background: transparent; }
 .rail-action-btn:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: -1px; }
 .rail-action-btn:disabled { opacity: .35; pointer-events: none; cursor: default; }
 .rail-twisty svg,
-.rail-action-btn svg { width: 13px; height: 13px; }
+.rail-action-btn svg { width: 14px; height: 14px; }
 .rail-twisty svg { width: var(--rail-icon-size); height: var(--rail-icon-size); }
 
 .rail-repo-name {
@@ -327,13 +393,18 @@ html, body {
       transparent 0%,
       var(--vscode-sideBar-background) 28%
     );
-  padding-left: 14px;
+  /* 28px, not 14: the scrim's fade runs from 0 to 28% of its own width, so a
+     wider element is what makes the trailing label dissolve rather than stop.
+     At 14px the gradient had ~18px to work in and read as an edge. */
+  padding-left: 28px;
   border-radius: 4px;
 }
 
 .rail-repo-head:hover .rail-repo-actions,
+.rail-repo-head.rail-hover-hold .rail-repo-actions,
 .rail-repo-head:focus-within .rail-repo-actions,
 .rail-session:hover .rail-session-actions,
+.rail-session.rail-hover-hold .rail-session-actions,
 .rail-session:focus-within .rail-session-actions { opacity: 1; pointer-events: auto; }
 
 .rail-rebuilding .rail-repo-actions,
@@ -378,7 +449,8 @@ html, body {
 }
 
 .rail-session { --provider-badge-ring: var(--rail-bg, var(--vscode-sideBar-background)); }
-.rail-session:hover { color: var(--vscode-foreground); background: var(--rail-hover-bg); --provider-badge-ring: var(--rail-hover-bg); }
+.rail-session:hover,
+.rail-session.rail-hover-hold { color: var(--vscode-foreground); background: var(--rail-hover-bg); --provider-badge-ring: var(--rail-hover-bg); }
 .rail-session.active {
   color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
   background: var(--vscode-list-activeSelectionBackground);
@@ -449,8 +521,8 @@ html, body {
 }
 
 .rail-pinned { margin-bottom: 2px; }
-.rail-session-actions .rail-action-btn { width: 25px; height: 24px; }
-.rail-session-actions .rail-action-btn svg { width: 12px; height: 12px; }
+.rail-session-actions .rail-action-btn { width: 24px; height: 24px; }
+.rail-session-actions .rail-action-btn svg { width: 14px; height: 14px; }
 
 .rail-more {
   align-self: flex-start;

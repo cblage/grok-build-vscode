@@ -16,6 +16,10 @@
     folderClosed: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 408 408" fill="currentColor" aria-hidden="true"><path d="M372,88.661H206.32l-33-39.24c-0.985-1.184-2.461-1.848-4-1.8H36c-19.956,0.198-36.023,16.443-36,36.4v240c-0.001,19.941,16.06,36.163,36,36.36h336c19.94-0.197,36.001-16.419,36-36.36v-199C408.001,105.08,391.94,88.859,372,88.661z"/></svg>`,
     folderOpen: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -57 511.99973 511" fill="currentColor" aria-hidden="true"><path d="m506.039062 180.988281c-7.78125-12.546875-21.53125-20.046875-36.78125-20.046875h-339.5625c-16.832031 0-32.140624 9.488282-39.011718 24.179688l-89.8125 188.308594c3.390625 13.789062 16.269531 24.089843 31.609375 24.089843h361.269531c15.445312 0 29.5625-8.734375 36.460938-22.554687l77.628906-155.59375c6.128906-12.3125 5.449218-26.660156-1.800782-38.382813zm0 0"/><path d="m72.402344 156.15625c6.863281-14.6875 22.175781-24.179688 39.011718-24.179688h319.753907v-40.898437c0-16.859375-14.222657-30.578125-31.703125-30.578125h-186.445313c-.273437 0-.460937-.070312-.53125-.121094l-33.371093-46.660156c-5.910157-8.277344-15.671876-13.21875-26.101563-13.21875h-121.304687c-17.488282 0-31.710938 13.71875-31.710938 30.578125v276.875zm0 0"/></svg>`,
     plus: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>`,
+    // New session. The SAME glyph the chat header's New button uses (ICON.squarePen
+    // in media/chat.js) — one action should not have two icons depending on which
+    // control you reach it from. The rail's "+" now means only "add a project".
+    squarePen: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg>`,
     pin: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="m5 17 2-7V5l-2-2h14l-2 2v5l2 7Z"/></svg>`,
     pinFilled: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="m5 17 2-7V5l-2-2h14l-2 2v5l2 7Z" fill="currentColor"/></svg>`,
     ellipsis: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>`,
@@ -687,6 +691,50 @@
       .slice(0, RECENT_CAP);
   }
 
+  /**
+   * Carry the pointer's hover across a wholesale rebuild.
+   *
+   * `render()` empties #rail-scroll and builds it again, and one boot does that
+   * a dozen times or more as each project's rows arrive. The browser recomputes
+   * :hover only AFTER the lifecycle that paints the new nodes, so the row under
+   * a cursor that never moved paints WITHOUT its hover fill and without its
+   * action buttons for one frame, every time — which is the blinking the owner
+   * saw while the rail loaded. .rail-rebuilding only silenced the fade; the
+   * frame at the wrong state was still painted.
+   *
+   * So find the row the pointer is over in the same task that builds it and mark
+   * it, before anything is painted. The mark is dropped on the next real pointer
+   * move, which is exactly when :hover becomes authoritative again.
+   */
+  let railPointer = null;
+  let railHoverHeld = null;
+
+  function dropHoverHold() {
+    if (railHoverHeld) railHoverHeld.classList.remove("rail-hover-hold");
+    railHoverHeld = null;
+  }
+
+  function holdHoverAfterRebuild() {
+    dropHoverHold();
+    if (!railPointer || typeof document.elementFromPoint !== "function") return;
+    const at = document.elementFromPoint(railPointer.x, railPointer.y);
+    const row = at && at.closest ? at.closest(".rail-session, .rail-repo-head") : null;
+    if (!row) return;
+    row.classList.add("rail-hover-hold");
+    railHoverHeld = row;
+  }
+
+  document.addEventListener("pointermove", (e) => {
+    railPointer = { x: e.clientX, y: e.clientY };
+    dropHoverHold();
+  }, true);
+  // Leaving the window (or a touch ending) means there is no pointer to carry.
+  // documentElement, and NOT capturing: pointerleave does not bubble, but a
+  // capturing listener on document would still see the copy fired at every row
+  // the pointer crosses, and switch the carry off on the first move.
+  document.documentElement.addEventListener("pointerleave", () => { railPointer = null; dropHoverHold(); });
+  document.addEventListener("pointercancel", () => { railPointer = null; dropHoverHold(); }, true);
+
   function render() {
     const root = document.getElementById("rail-scroll");
     if (!root) return;
@@ -778,6 +826,12 @@
           }));
         }
         root.appendChild(list);
+        // A full-width target under the list, not only the small "+" beside the
+        // group title. The owner's reason, and it is about where the eye goes:
+        // with one project or none the rail is mostly empty space, and the only
+        // way to add another is a 28px glyph in a header. Same control, said
+        // where there is room to say it.
+        if (state.canAddProject && !q) root.appendChild(addProjectWideButton());
       }
       shown = true;
     }
@@ -813,18 +867,35 @@
       // An empty rail that only says "No projects yet" is a dead end on the one
       // screen where the user has nothing else to click — and with no group
       // heads rendered, the "+" above has nowhere to be.
-      if (!q && state.canAddProject) {
-        const add = document.createElement("button");
-        add.type = "button";
-        add.className = "rail-empty-action";
-        add.textContent = "Add a project";
-        add.onclick = () => openAddProjectMenu(add);
-        note.appendChild(add);
-      }
+      if (!q && state.canAddProject) note.appendChild(addProjectWideButton());
       root.appendChild(note);
     }
 
+    holdHoverAfterRebuild();
     requestAnimationFrame(() => root.classList.remove("rail-rebuilding"));
+  }
+
+  /**
+   * "+ Add project", full width, at button height.
+   *
+   * ONE builder for both places it appears — under the project list and in the
+   * empty rail — because two spellings of the same control is how the two drift
+   * into different wording, which has happened here before with the clone hint.
+   * It replaces the empty state's text link: a link and a button offering the
+   * same action in the same rail is a second mechanism, not a second affordance.
+   */
+  function addProjectWideButton() {
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "rail-add-project-wide";
+    const plus = document.createElement("span");
+    plus.className = "rail-add-project-wide-plus";
+    plus.setAttribute("aria-hidden", "true");
+    plus.textContent = "+";
+    add.appendChild(plus);
+    add.appendChild(document.createTextNode("Add project"));
+    add.onclick = () => openAddProjectMenu(add);
+    return add;
   }
 
   function staticGroupHead(title) {
@@ -1190,7 +1261,7 @@
       const add = document.createElement("button");
       add.type = "button";
       add.className = "rail-action-btn";
-      add.innerHTML = ICON.plus;
+      add.innerHTML = ICON.squarePen;
       add.title = "New session";
       add.onclick = (e) => {
         e.stopPropagation();

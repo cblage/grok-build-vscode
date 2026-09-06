@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.1.1-sandbox.1 — 2026-09-01
+## 4.1.2-sandbox.1 — 2026-09-02
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,36 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.1.1 — 2026-09-02
+
+**A clone that lands where you are standing, and one icon scale you can read.** Cloning a private repository from a phone worked and then left the tab looking at the project it started from — the files were there, just not on the screen that had asked for them. And the icons on that screen came in several sizes depending on which panel they happened to belong to. Both are settled here, along with the rail's own small dishonesties.
+
+### Fixed
+
+- **A clone now enters the project for the tab that asked.** Cloning onto a cloud machine from a phone cloned the repository and put it in the rail, and then the file explorer was empty and New Session did nothing — two symptoms with one cause: a browser tab carries its own selected repository, and the clone only ever told the host. Creating a project had the identical defect and no report against it, because nobody had made one from a browser yet. A network change mid-clone no longer turns a successful clone into a reported failure, and a brand-new user's very first clone — the case with no project open at all — is no longer skipped by the guard meant to protect it.
+
+- **The context donut did nothing in knowledge work,** which is the default mode. Hiding the technical breakdown there also skipped the two lines that open the popover, so clicking the number opened nothing at all: no usage, no Compact. The breakdown stays hidden in that mode on purpose — somebody writing a document is not asking what the tool definitions cost — and the popover opens.
+
+- **Switching project no longer reports your message as failed.** Leaving a conversation on purpose — switching repository, starting a new session, opening a row in another project — cleared the same remembered identity that a genuine loss clears, so the app announced "1 queued action was not sent" for something you had just chosen to do. The text still returns to the composer; the sentence now says where it went instead of announcing a failure.
+
+### Icons and spacing
+
+- **Two scales, split by panel, instead of one scale and an outlier.** The file explorer's controls were 20px while the rail's were 12–13px on the same screen, which is what made the rail read as a lesser control. Chat chrome stays at 20; the rail, the row above the messages and the file panel meet at 16, all in the same 28px box, so nothing reflows. VS Code's sidebar rail is deliberately its own denser tier — a 24px box with a 14px glyph — because nothing sits beside it to disagree with. On touch every one of them is a 20px glyph in a 36px target.
+
+- **The row above the messages was missed twice.** Three surfaces build that header with three different sets of ids, so scoping the first fix to one of them left the desktop app and the browser at 20px glyphs with a 2px gap. All three are sized now, per surface, with no JavaScript deciding it.
+
+- **Two controls leave the row on touch rather than shrink:** the per-session pin, which the row's ⋯ menu already carries, and the "+" beside PROJECTS, where the full-width Add project under the list is the better target by every measure.
+
+### The rail
+
+- **"Add project" is visible without hovering it.** VS Code's default theme paints secondary buttons fully transparent and keeps them readable with a border this control does not draw, so the button existed only under the pointer.
+
+- **Rail rows stopped blinking while the rail loads.** One boot rebuilds the rail a dozen times or more as each project's rows arrive, and the row under a stationary cursor lost its hover — fill and buttons both — for a frame on every one of them.
+
+- **One action, one icon.** The rail's new-session button wore a "+" while the New button above the messages wore the square-pen; "+" now means only "add a project". That button also sits under the project list at full width, which is where it earns its keep when the list is short or empty.
+
+- **Small things found on a phone.** "Signed in to GitHub. Clone again." became "Try to clone again" — you only ever see that sentence after a clone has failed. The Cloning button carries the same blinking dots every other progress indicator here uses. And slash-command rows were set in the editor's monospace font while the @-mention rows beside them used the UI font; a menu item is being read, not edited, so the two popovers now agree.
 
 ## 4.1.0 — 2026-09-01
 

@@ -95,9 +95,18 @@ const BLANK_ICONS = `() => {
   return bad;
 }`;
 
-/** Bar-icon primitive: every visible icon-only chrome member is 20×20 with
- *  an unpainted box (no border, transparent background). Pencil stays 16;
- *  the in-tab X stays 14 (15 on coarse). Overflow … is a tab, not a member. */
+/** Bar-icon primitive: an unpainted box (no border, transparent background)
+ *  around a glyph at one of TWO sizes, split by region rather than by class.
+ *
+ *  20px — chat chrome that is not part of a panel: the composer's buttons and
+ *         the rail's open control.
+ *  16px — the PANEL scale, shared by the file explorer (header and rows), the
+ *         row above the messages, and the project rail's in-row controls. These
+ *         three sit side by side on one screen, and until 2026-09-02 the rail's
+ *         were 13px against the explorer's 20px, which is what the owner saw.
+ *
+ *  Pencil stays 16; the in-tab X stays 14 (15 on coarse). Overflow … is a tab,
+ *  not a member. */
 const BAR_ICONS = `() => {
   const isTransparent = (c) => {
     if (!c || c === "transparent") return true;
@@ -123,8 +132,16 @@ const BAR_ICONS = `() => {
     return { borderNone, bgClear: isTransparent(s.backgroundColor), bg: s.backgroundColor, border: s.borderTopStyle };
   };
   const labelOf = (el) => el.id || el.getAttribute("aria-label") || el.title || String(el.className || "").trim().split(/\\s+/)[0] || "?";
-  const SEL = [
-    ".icon-btn:not(.session-name-edit):not(#session-head-edit)",
+  // What is LEFT at 20: the composer's own buttons. Everything that belongs to a
+  // panel or to the bar above the messages is 16 (14 in VS Code).
+  const CHROME = [
+    ".icon-btn:not(.session-name-edit):not(#session-head-edit):not(#session-head .icon-btn):not(.top-bar .icon-btn)",
+  ].join(",");
+  const PANEL = [
+    // The whole header bar, not just its .rail-action-btn members: on remote,
+    // session-history and session-new are .icon-btn and sat at 20 beside a 16.
+    "#session-head .icon-btn:not(.session-name-edit):not(#session-head-edit)",
+    ".top-bar .icon-btn:not(.session-name-edit):not(#session-head-edit)",
     ".rail-icon-btn",
     ".desk-rail-open-btn",
     ".gfp-toggle",
@@ -135,6 +152,8 @@ const BAR_ICONS = `() => {
     "#session-head-actions .rail-action-btn",
     "#vscode-session-actions .rail-action-btn",
   ].join(",");
+  const SEL = CHROME + "," + PANEL;
+  const TOUCH = window.matchMedia && window.matchMedia("(hover: none)").matches;
   const bad = [];
   const seen = [];
   const members = [];
@@ -145,7 +164,13 @@ const BAR_ICONS = `() => {
     const box = noPaintedBox(el);
     const what = labelOf(el);
     members.push({ what, glyph: g, bg: box.bg, border: box.border });
-    if (Math.abs(g - 20) > 1) bad.push(what + " glyph " + g + "px (want 20)");
+    // THREE tiers, and the third is the viewport's, not the selector's: under
+    // (hover: none) the panel scale goes back to 20, because a 16px glyph read
+    // at arm's length inside a 36px target is not the same problem as a 16px
+    // glyph read at desk distance. Asserting 16 everywhere failed on the tablet
+    // render for a UI that was behaving correctly.
+    const want = el.matches(PANEL) ? (TOUCH ? 20 : 16) : 20;
+    if (Math.abs(g - want) > 1) bad.push(what + " glyph " + g + "px (want " + want + ")");
     if (!box.borderNone) bad.push(what + " border-style " + box.border);
     if (!box.bgClear) bad.push(what + " background " + box.bg);
   }
@@ -154,7 +179,8 @@ const BAR_ICONS = `() => {
     const g = glyphW(pencil);
     const box = noPaintedBox(pencil);
     members.push({ what: "pencil", glyph: g, exempt: true });
-    if (Math.abs(g - 16) > 1) bad.push("pencil glyph " + g + "px (want 16)");
+    const pw = TOUCH ? 20 : 16;
+    if (Math.abs(g - pw) > 1) bad.push("pencil glyph " + g + "px (want " + pw + ")");
     if (!box.borderNone) bad.push("pencil border-style " + box.border);
     if (!box.bgClear) bad.push("pencil background " + box.bg);
   }

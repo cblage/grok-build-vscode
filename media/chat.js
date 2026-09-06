@@ -27,6 +27,24 @@
       : "default"
   );
   const REMOTE_SESSION_KEY = "grok.remote.tabSession:" + REMOTE_STORAGE_SUFFIX;
+  /**
+   * "The user CHOSE to leave that conversation, and has not landed on another."
+   *
+   * The remembered identity is cleared both when a conversation is lost and
+   * when the user deliberately switches repo, starts a new session, or opens a
+   * row in another project. Downstream those two collapse into the same null,
+   * so the relay page reported a deliberate switch as
+   *   "1 queued action was not sent because this tab had no remembered
+   *    conversation to restore"
+   * — telling the owner his message had failed when he had simply moved on,
+   * mid-turn, on a phone (2026-09-01).
+   *
+   * A sibling storage key rather than a field on the identity, because the
+   * whole point is that there IS no identity at that moment. It is cleared the
+   * instant a real one is saved, so it bounds itself on an EVENT rather than a
+   * timer: it can only ever describe the gap between letting go and landing.
+   */
+  const REMOTE_SWITCH_KEY = "grok.remote.tabSwitchedByChoice:" + REMOTE_STORAGE_SUFFIX;
   // Set by the relay's page before this file loads. Only ever says "the host on
   // the other end is one the relay installed", which is why it can skip a
   // compatibility wait rather than change any behaviour.
@@ -79,9 +97,26 @@
     if (!IS_REMOTE) return;
     rememberedRemoteSession = value;
     try {
-      if (value) sessionStorage.setItem(REMOTE_SESSION_KEY, JSON.stringify(value));
-      else sessionStorage.removeItem(REMOTE_SESSION_KEY);
+      if (value) {
+        sessionStorage.setItem(REMOTE_SESSION_KEY, JSON.stringify(value));
+        // Landed. Whatever the user left behind is no longer the current story.
+        sessionStorage.removeItem(REMOTE_SWITCH_KEY);
+      } else sessionStorage.removeItem(REMOTE_SESSION_KEY);
     } catch (_) { /* storage unavailable/private mode */ }
+  }
+
+  /**
+   * Let go of the remembered conversation BECAUSE THE USER ASKED TO.
+   *
+   * Same clearing as `saveRememberedRemoteSession(null)`, plus a note saying so.
+   * Used only where a person acted: the repo chip, New session, and a rail row
+   * or repo in another project. Host-driven clears (a session deleted under us,
+   * a refused restore) deliberately keep the plain form — those really are
+   * losses and should still read as such.
+   */
+  function forgetRememberedSessionByChoice() {
+    saveRememberedRemoteSession(null);
+    try { sessionStorage.setItem(REMOTE_SWITCH_KEY, "1"); } catch (_) { /* private mode */ }
   }
 
   function replaceRemoteTabIdentity() {
@@ -1993,6 +2028,24 @@
     }
     contextPopover.appendChild(act);
 
+    // KNOWLEDGE WORK STOPS HERE: the number and the action on it, nothing else.
+    //
+    // Everything below is the technical account — system prompt, reasoning
+    // overhead, tool definitions, per-turn token and cost rows. That is the
+    // same class of thing knowledge work already hides everywhere else; the
+    // gear describes the mode as "Hides worktrees, thinking traces, and tool
+    // details", and this popover was simply missed when that rule was applied.
+    // Somebody writing a document does not need to know how many tokens the
+    // tool definitions cost, and "Context used 12,400 / 128,000 (10%)" plus a
+    // way to compact is the whole of what the donut is being asked.
+    //
+    // The two lines that make the popover VISIBLE are the last thing this
+    // function does, so returning early skipped them and the donut simply did
+    // nothing in the default mode. Found by review; my own test read
+    // textContent off the hidden element and passed, which is the same mistake
+    // as proving a package exists instead of proving the thing works.
+    if (!isCodingPurpose()) { showContextPopover(); return; }
+
     // Snapshot addends are internally consistent (overhead from snapshot.used).
     // Occupancy that has moved does not hide the group: an open popover
     // re-fetches session/info so header and rows become current together.
@@ -2095,6 +2148,12 @@
       : "Counted by the CLI at the end of each turn.";
     contextPopover.appendChild(fine);
 
+    showContextPopover();
+  }
+
+  /** Size it to its content, then reveal it. Both halves, always — see the
+   * knowledge-work return above for what happens when only some of it runs. */
+  function showContextPopover() {
     positionPopover(contextPopover, donutEl);
     contextPopover.hidden = false;
   }
@@ -4521,7 +4580,7 @@
         if (!repo.available || repoSwitcherLocked()) return;
         state.repoSwitchPending = true;
         renderRepoChip();
-        saveRememberedRemoteSession(null);
+        forgetRememberedSessionByChoice();
         vscode.postMessage({ type: "selectRepo", cwd: repo.cwd });
         closePopovers();
       };
@@ -6019,6 +6078,50 @@
     if (live) delete state.railCollapsed[live];
   }
 
+  /**
+   * Carry the pointer's hover across a wholesale rebuild.
+   *
+   * `renderRail()` empties the rail and builds it again, and one boot does that
+   * a dozen times or more as each project's rows arrive. The browser recomputes
+   * :hover only AFTER the lifecycle that paints the new nodes, so the row under
+   * a cursor that never moved paints WITHOUT its hover fill and without its
+   * action buttons for one frame, every time — which is the blinking the owner
+   * saw while the rail loaded. .rail-rebuilding only silenced the fade; the
+   * frame at the wrong state was still painted.
+   *
+   * So find the row the pointer is over in the same task that builds it and mark
+   * it, before anything is painted. The mark is dropped on the next real pointer
+   * move, which is exactly when :hover becomes authoritative again.
+   */
+  let railPointerXY = null;
+  let railHoverHeld = null;
+
+  function railDropHoverHold() {
+    if (railHoverHeld) railHoverHeld.classList.remove("rail-hover-hold");
+    railHoverHeld = null;
+  }
+
+  function railHoldHoverAfterRebuild() {
+    railDropHoverHold();
+    if (!railPointerXY || typeof document.elementFromPoint !== "function") return;
+    const at = document.elementFromPoint(railPointerXY.x, railPointerXY.y);
+    const row = at && at.closest ? at.closest(".rail-session, .rail-repo-head") : null;
+    if (!row) return;
+    row.classList.add("rail-hover-hold");
+    railHoverHeld = row;
+  }
+
+  document.addEventListener("pointermove", (e) => {
+    railPointerXY = { x: e.clientX, y: e.clientY };
+    railDropHoverHold();
+  }, true);
+  // Leaving the window (or a touch ending) means there is no pointer to carry.
+  // documentElement, and NOT capturing: pointerleave does not bubble, but a
+  // capturing listener on document would still see the copy fired at every row
+  // the pointer crosses, and switch the carry off on the first move.
+  document.documentElement.addEventListener("pointerleave", () => { railPointerXY = null; railDropHoverHold(); });
+  document.addEventListener("pointercancel", () => { railPointerXY = null; railDropHoverHold(); }, true);
+
   function renderRail() {
     const root = rail();
     if (!root) return;
@@ -6144,6 +6247,11 @@
         list.className = "rail-list rail-projects";
         for (const repo of repos) list.appendChild(renderRailRepo(repo, false));
         root.appendChild(list);
+        // Full-width target under the list, not only the small "+" in the group
+        // head. With one project or none the rail is mostly empty space and the
+        // header glyph is easy to miss — and on a phone, easy to miss AND hard
+        // to hit. Same control, said where there is room to say it.
+        if (canAddProjectFolder() && !q) root.appendChild(railAddProjectWide());
       }
       shownAnything = true;
     }
@@ -6179,12 +6287,7 @@
         // An empty rail that only says "No projects yet" is a dead end on the
         // one screen where the user has nothing else to click.
         const empty = railNote("No projects yet");
-        const add = document.createElement("button");
-        add.type = "button";
-        add.className = "rail-empty-action";
-        add.textContent = "Add a project";
-        add.onclick = () => openAddProjectMenu(add);
-        empty.appendChild(add);
+        empty.appendChild(railAddProjectWide());
         root.appendChild(empty);
       } else {
         root.appendChild(railNote(q ? "No matches." : "No projects yet"));
@@ -6203,6 +6306,7 @@
     // anchor button, and re-opening it mid-catalog-refresh is not worth the
     // bookkeeping. Closing avoids a fixed popover stranded over a gone row.
     if (railColorPickerEl) closeRailColorPicker();
+    railHoldHoverAfterRebuild();
     // Let the browser paint this rebuild with transitions off, then restore them
     // so an ordinary hover still fades. rAF (not a timer) so it lands after the
     // paint rather than at an arbitrary later moment.
@@ -6285,6 +6389,30 @@
    * it gets a separate `grok.projects` view (media/projects-rail.js), which
    * carries its own copy of this control.
    */
+  /**
+   * "+ Add project", full width, at button height.
+   *
+   * The TWIN of addProjectWideButton in projects-rail.js — the two rails are
+   * separate implementations and have drifted into different wording before,
+   * which is why the clone hint was moved to a shared builder. Keep these two
+   * in step: same class, same label, same behaviour. It replaces the empty
+   * state's text link rather than joining it; a link and a button offering one
+   * action in one rail is a second mechanism, not a second affordance.
+   */
+  function railAddProjectWide() {
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "rail-add-project-wide";
+    const plus = document.createElement("span");
+    plus.className = "rail-add-project-wide-plus";
+    plus.setAttribute("aria-hidden", "true");
+    plus.textContent = "+";
+    add.appendChild(plus);
+    add.appendChild(document.createTextNode("Add project"));
+    add.onclick = () => openAddProjectMenu(add);
+    return add;
+  }
+
   function railAddProjectButton() {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -6737,7 +6865,7 @@
     // the new conversation (they must differ from previousSessionId).
     const previousSessionId = state.activeSessionId;
     const repoCwd = state.selectedRepoCwd || state.activeRepoCwd || "";
-    saveRememberedRemoteSession(null);
+    forgetRememberedSessionByChoice();
     // Veil before the host-style reset so the click can unhide the welcome.
     // resetForNewSession marks the old nodes pending-clear, and a pending-clear
     // transcript must not grow an empty-state panel on top of it.
@@ -7120,7 +7248,7 @@
     const add = document.createElement("button");
     add.type = "button";
     add.className = "rail-action-btn";
-    add.innerHTML = ICON.plus;
+    add.innerHTML = ICON.squarePen;
     add.title = selected ? "New session here" : "Switch to this project and start a new session";
     // Deliberately NOT gated on repoSwitcherLocked(). Starting a conversation is
     // the one thing that should always be available, and a lock that disables it
@@ -7653,7 +7781,7 @@
       // `cwd` rides along so a session in another repo reopens in ITS checkout —
       // the host resolves sessions by cwd, and omitting it would look the id up
       // under the repo we happen to be in.
-      if (!sameCwd(repo.cwd, state.selectedRepoCwd)) saveRememberedRemoteSession(null);
+      if (!sameCwd(repo.cwd, state.selectedRepoCwd)) forgetRememberedSessionByChoice();
       postResumeSession(s.id, s.cwd || repo.cwd, { claim: true });
     };
   }
@@ -7693,7 +7821,7 @@
       window.__grokRailNewIntent = null;
     }
     renderRepoChip();
-    saveRememberedRemoteSession(null);
+    forgetRememberedSessionByChoice();
     vscode.postMessage({ type: "selectRepo", cwd: repo.cwd });
   }
 

@@ -6729,7 +6729,74 @@ Only continue if you trust this code.`,
    * something a knowledge-work user just named "Q3 Positioning" would be us
    * deciding they are writing software.
    */
-  async createProject(name: string): Promise<void> {
+  /**
+   * Finish "add a project" for the surface that ASKED for it.
+   *
+   * `addProjectFolder` registers the project with the HOST — on desktop it adds
+   * and activates a workspace folder. That is the whole job at a desk, where the
+   * person who clicked is looking at the window that just changed. It is only
+   * half the job for a browser tab: a remote client carries its OWN selected
+   * repository (`RemoteClientState`), and nothing here was touching it.
+   *
+   * So the owner cloned a private repository onto a cloud machine, watched it
+   * appear, and then found an empty file explorer and a New Session that did
+   * nothing visible — because his tab was still bound to the project he started
+   * from, and both of those follow the TAB's repository, not the host's. One
+   * cause, two symptoms that look unrelated.
+   *
+   * "Done" has to mean usable from the surface that asked. Host-owned: this
+   * reuses the same `selectRemoteRepo` an explicit tap goes through, including
+   * its archived/targetable checks, so it grants a remote nothing it could not
+   * already ask for.
+   */
+  private async enterProjectForRequester(
+    dest: string,
+    origin: MsgOrigin,
+    clientId?: string,
+    tabToken?: string,
+  ): Promise<void> {
+    if (origin !== "remote" || !clientId) return;
+    // FOLLOW THE TAB ACROSS A RECONNECT. A clone runs for seconds to minutes and
+    // a phone changing network in that window is ordinary, not exotic. When it
+    // reconnects, `identify()` moves the tab's state to a NEW client id and
+    // drops the old one — and `select()` THROWS for an id it does not know. So
+    // binding the id we were called with would report a successful clone as a
+    // failure, skip the `done` frame, leave the form spinning, and leave the tab
+    // on its old project: every symptom this method exists to prevent.
+    //
+    // `currentClient` resolves an old id to whatever connection owns that
+    // logical tab now, and returns undefined once the tab has genuinely gone —
+    // in which case there is nobody to enter the project for, and doing nothing
+    // is right. The tab binds itself on its next explicit resume.
+    // The TAB TOKEN is the durable identity; the client id is one connection.
+    // `currentClient` walks id -> token -> current id, which only works while
+    // the ORIGINAL id still remembers its token — and `deleteClient` deletes
+    // exactly that mapping. So when the relay reports the old connection's
+    // departure BEFORE the replacement identifies (an ordinary refresh, and
+    // ordinary ordering), the lookup came back empty and the clone reported
+    // success while leaving the tab on its previous project: the very symptom
+    // this method exists to close, found by the second review round.
+    //
+    // Capturing the token when the operation STARTS removes the dependency on
+    // that mapping surviving. Not a new mechanism — a better identifier.
+    const current = (tabToken && this.remoteClients.clientForTabToken(tabToken))
+      || this.remoteClients.currentClient(clientId);
+    // Registered, not "has a non-empty cwd" — and the difference is a user's
+    // FIRST project. `ready()` stores `defaultCwd`, which is "" when the host
+    // has no project open, and `select` gates on the key being PRESENT, not on
+    // it being truthy. Testing truthiness here skipped the bind for exactly the
+    // person who had nothing to bind to yet, then reported done. Found by the
+    // third review round; it was my own guard that introduced it.
+    if (!current || this.remoteClients.cwdIfPresent(current) === undefined) return;
+    await this.selectRemoteRepo(current, dest);
+  }
+
+  async createProject(name: string, origin: MsgOrigin = "local", clientId?: string): Promise<void> {
+    // Read BEFORE the long-running work: the connection that asked may be gone
+    // by the time it finishes, but its logical tab is what we want to land on.
+    const requesterTab = origin === "remote" && clientId
+      ? this.remoteClients.tabToken(clientId)
+      : undefined;
     const nameError = projectNameError(name);
     if (nameError) {
       this.postProjectSetup({ error: nameError });
@@ -6759,6 +6826,7 @@ Only continue if you trust this code.`,
       return;
     }
     await this.addProjectFolder(dest);
+    await this.enterProjectForRequester(dest, origin, clientId, requesterTab);
     this.postProjectSetup({ done: true });
   }
 
@@ -6774,7 +6842,12 @@ Only continue if you trust this code.`,
    * username prompt against a terminal that does not exist, and the form waits
    * for ever instead of reporting an auth failure it could offer to fix.
    */
-  async cloneProject(url: string): Promise<void> {
+  async cloneProject(url: string, origin: MsgOrigin = "local", clientId?: string): Promise<void> {
+    // Read BEFORE the long-running work: the connection that asked may be gone
+    // by the time it finishes, but its logical tab is what we want to land on.
+    const requesterTab = origin === "remote" && clientId
+      ? this.remoteClients.tabToken(clientId)
+      : undefined;
     const urlError = cloneUrlError(url);
     if (urlError) {
       this.postProjectSetup({ error: urlError });
@@ -6825,6 +6898,7 @@ Only continue if you trust this code.`,
       return;
     }
     await this.addProjectFolder(dest);
+    await this.enterProjectForRequester(dest, origin, clientId, requesterTab);
     this.postProjectSetup({ done: true });
   }
 
@@ -6938,7 +7012,7 @@ Only continue if you trust this code.`,
           this.host.appendLine(`[github] device login completed after ${elapsed}s`);
           send({
             status: "done",
-            message: "Signed in to GitHub. Clone again.",
+            message: "Signed in to GitHub. Try to clone again.",
           });
           return;
         }
@@ -11009,10 +11083,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await this.removeProjectFolder(msg.cwd);
         break;
       case "createProject":
-        await this.createProject(msg.name);
+        await this.createProject(msg.name, origin, clientId);
         break;
       case "cloneProject":
-        await this.cloneProject(msg.url);
+        await this.cloneProject(msg.url, origin, clientId);
         break;
       case "setupGithubCli":
         await this.setupGithubCli(
