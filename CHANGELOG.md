@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.1.4-sandbox.1 — 2026-09-03
+## 4.1.5-sandbox.1 — 2026-09-03
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.3.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.4.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,16 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.1.4 — 2026-09-03
+
+**A machine that could not settle, and an error message that blamed you for it.** One fix stops a host retrying a failed connection every second for ever; the other stops a conversation that simply would not open from reading like a fault in your installation.
+
+### Fixed
+
+- **A host that keeps losing its connection now backs off instead of hammering.** The retry delay was reset the moment a socket opened, which sounds right and is not: it meant the delay could only grow while connections FAILED, and never against one that connected and immediately dropped — which is the situation it exists for. A machine in that state retried once a second indefinitely. It now waits for a connection that actually lasted before treating the way as clear, so a flapping machine settles down while a healthy one still reconnects immediately. Most visible on cloud machines, which suspend when idle and lose their connection every time they do.
+
+- **A conversation that will not open says so in plain words.** It used to answer with the agent's own wording and an internal identifier — “Failed to start Claude: Resource not found: 85730a78-9918-43d7-a6c6-91a058348d89” — for something that is often entirely ordinary: a conversation whose first message never finished recording. The message now names what may have happened and what to do about it, and deliberately claims nothing more, because that same signal is also raised when the agent simply did not finish starting.
 
 ## 4.1.3 — 2026-09-03
 

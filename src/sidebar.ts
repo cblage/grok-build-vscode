@@ -87,7 +87,7 @@ import { VoiceRecorder, transcribeAudio, resolveWindowsAudioDevice } from "./voi
 import { PcmVoiceStreamer, VoiceStreamer } from "./voice-streamer";
 import { summarizeForSpeech } from "./speech-summary";
 import type { PromptResultMeta, PromptUsage, SessionInfoContext } from "./acp-dispatch";
-import { MediaRef, adapterCompactSignal, adapterContextOccupancy, agentTimestampMsFromMeta, autoCompactStartedNote, childStreamFromRoute, commandOutputForToolCall, commandOutputFromLiveTerminal, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isRateLimitError, isSubagentLifecycleUpdate, occupancyFromAdapterTurn, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sessionInfoCacheFresh, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement, type UpdateRoute } from "./acp-dispatch";
+import { MediaRef, adapterCompactSignal, adapterContextOccupancy, agentTimestampMsFromMeta, autoCompactStartedNote, childStreamFromRoute, commandOutputForToolCall, commandOutputFromLiveTerminal, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isResumeNotFound, isRateLimitError, isSubagentLifecycleUpdate, occupancyFromAdapterTurn, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sessionInfoCacheFresh, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement, type UpdateRoute } from "./acp-dispatch";
 import { createMcpPrepareState, prepareMcpToolCall } from "./mcp-tool";
 import { modeToRemember, startsInYolo } from "./mode-prefs";
 import { beginAuthRecovery, oauthShadowsXaiApiKey } from "./auth-recovery";
@@ -10408,6 +10408,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             `Failed to start Grok: ${msg}. This matches the Grok CLI 0.2.61–0.2.70 stdio ` +
             `regression (issue #22, fixed after 0.2.70). Workaround: run ` +
             `\`grok update --version ${GROK_STDIO_DOWNGRADE_TARGET}\` in a terminal, then start a new session.`,
+        });
+      } else if (isResumeNotFound(err)) {
+        // The person asked for a conversation and got the adapter's own words
+        // plus a uuid: “Failed to start Claude: Resource not found:
+        // 85730a78-9918-43d7-a6c6-91a058348d89”. That identifier is ours, not
+        // theirs, and “resource” is not a word for a conversation.
+        //
+        // Says only what is known. -32002 covers a thread that never recorded
+        // anything AND a query that died mid-resume, so it names both
+        // possibilities and offers the action that settles it, rather than
+        // picking one and being wrong half the time.
+        this.emit(session, {
+          type: "error",
+          text:
+            `This conversation could not be opened. It may never have recorded `
+            + `anything, or ${providerDisplayName(session.provider)} may not have `
+            + `finished starting — try opening it again, and start a new `
+            + `conversation if it stays this way.`,
         });
       } else {
         this.emit(session, { type: "error", text: `Failed to start ${providerDisplayName(session.provider)}: ${msg}` });

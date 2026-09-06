@@ -1119,6 +1119,29 @@ export function commandOutputForToolCall(
  * the agent is still rebindable. The host
  * uses this to fall back to a restart instead of surfacing the raw error.
  */
+/**
+ * A resume was refused with JSON-RPC -32002.
+ *
+ * DELIBERATELY NOT CALLED “empty thread”, which is what an earlier version of
+ * this assumed and shipped for exactly one review round. The pinned Claude
+ * adapter raises `RequestError.resourceNotFound` for TWO unrelated causes:
+ *
+ *   error.message === "Query closed before response received" ||
+ *   error.message.includes("No conversation found with session ID")
+ *
+ * The second is a thread that is missing or holds no messages. The FIRST is
+ * the SDK query dying mid-resume — which can happen to a conversation with
+ * twenty thousand bytes of somebody's work in it. The two are indistinguishable
+ * from here, so this can say a resume failed and nothing more.
+ *
+ * Treating it as emptiness would open a blank transcript and tell the person
+ * their conversation had never contained anything, while it sat on disk. That
+ * is why this only chooses better WORDS and never changes what happens.
+ */
+export function isResumeNotFound(err: any): boolean {
+  return err?.code === -32002 || err?.data?.code === -32002;
+}
+
 export function isIncompatibleAgentError(err: any): boolean {
   if (err?.data?.code === "MODEL_SWITCH_INCOMPATIBLE_AGENT") return true;
   // Fallback if a future CLI keeps the message but drops the structured code.

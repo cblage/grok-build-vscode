@@ -378,6 +378,26 @@ describe("deleting a conversation on a machine nobody sits at", () => {
     expect(sidebar).not.toContain("providerPrompted");
   });
 
+  it("a refused resume changes the words, never the behaviour", () => {
+    // The pinned Claude adapter raises -32002 for two unrelated causes:
+    //   "Query closed before response received"  (a query that died mid-resume)
+    //   "No conversation found with session ID"  (missing or message-less)
+    // The first happens to conversations holding real work. An earlier version
+    // read this code as "empty" and started a fresh session on it, which opens
+    // a blank transcript and tells the person their conversation never held
+    // anything — while it sits on disk. Reverted; this pins the reason.
+    const at = sidebar.indexOf("isResumeNotFound(err)");
+    expect(at).toBeGreaterThan(-1);
+    // Bounded to THIS branch: the next one legitimately quotes the adapter,
+    // which is correct for a failure we cannot describe better.
+    const branch = sidebar.slice(at, sidebar.indexOf("} else {", at));
+    expect(branch).not.toContain("newSession(");
+    expect(branch).not.toContain("activeSessionId =");
+    expect(branch).not.toContain("hasHistory =");
+    // And it must not quote the adapter or the id at the person.
+    expect(branch).not.toContain("${msg}");
+  });
+
   it("says WHY it refused, in the line it writes", () => {
     // The bare version said "owned elsewhere" and could not say by whom. The
     // answer was one field away and it cost an evening of guessing.

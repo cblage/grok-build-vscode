@@ -14,6 +14,7 @@ import {
   deviceClientLabel,
   sanitizeRelayDeviceField,
   buildLinkStartBody,
+  connectionWasHealthy,
   nextBackoffMs,
   INITIAL_BACKOFF_MS,
   MAX_BACKOFF_MS,
@@ -541,6 +542,34 @@ describe("richer device-row link/start fields", () => {
     });
     expect(body.clientLabel!.length).toBeLessThanOrEqual(64);
     expect(body.clientLabel).not.toMatch(/[\u0000-\u001F]/);
+  });
+});
+
+describe("connectionWasHealthy", () => {
+  // The reset used to happen on OPEN, which means the delay could only grow
+  // while connections FAILED and never against one that succeeded and then
+  // died — the exact case it exists to damp. A host whose socket opened and
+  // dropped retried once a second for ever, and each attempt cost the relay a
+  // database lookup: 65.8M of them in production, against 23.8k for the
+  // per-connection ownership query.
+  it("a connection that outlived the longest delay was working", () => {
+    expect(connectionWasHealthy(MAX_BACKOFF_MS)).toBe(true);
+    expect(connectionWasHealthy(MAX_BACKOFF_MS + 1)).toBe(true);
+    // The observed real case: a cloud machine suspends about a minute after
+    // going idle and its socket dies with it. That is healthy, not flapping —
+    // the next attempt should be immediate.
+    expect(connectionWasHealthy(60_000)).toBe(true);
+  });
+
+  it("a flap keeps the delay it earned", () => {
+    expect(connectionWasHealthy(0)).toBe(false);
+    expect(connectionWasHealthy(1)).toBe(false);
+    expect(connectionWasHealthy(MAX_BACKOFF_MS - 1)).toBe(false);
+  });
+
+  it("never resets from a socket that merely opened", () => {
+    // The whole defect in one assertion: opening is not evidence.
+    expect(connectionWasHealthy(0)).toBe(false);
   });
 });
 

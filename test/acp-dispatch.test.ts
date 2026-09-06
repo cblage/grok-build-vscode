@@ -17,6 +17,7 @@ import {
   gateZeroTokenMeta,
   isMediaGenToolCall,
   isIncompatibleAgentError,
+  isResumeNotFound,
   isMethodNotFoundError,
   isAuthErrorText,
   isCredentialError,
@@ -602,6 +603,23 @@ describe("response builders", () => {
       method: "session/new",
       params: { cwd: "." },
     });
+  });
+});
+
+describe("isResumeNotFound", () => {
+  it("recognises the code, in either position", () => {
+    expect(isResumeNotFound({ code: -32002, message: "Resource not found: abc" })).toBe(true);
+    expect(isResumeNotFound({ data: { code: -32002 } })).toBe(true);
+  });
+
+  it("does not match on the words alone", () => {
+    expect(isResumeNotFound({ message: "Resource not found: abc" })).toBe(false);
+  });
+
+  it("leaves other failures alone", () => {
+    expect(isResumeNotFound({ code: -32603, message: "Internal error" })).toBe(false);
+    expect(isResumeNotFound(new Error("spawn ENOENT"))).toBe(false);
+    expect(isResumeNotFound(undefined)).toBe(false);
   });
 });
 

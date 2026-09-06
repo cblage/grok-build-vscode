@@ -21,6 +21,7 @@ import {
   parseRelayFrame,
   nextBackoffMs,
   INITIAL_BACKOFF_MS,
+  connectionWasHealthy,
   redactRelayUrl,
   type RelayClientSource,
 } from "./remote-frames";
@@ -147,6 +148,8 @@ export function filterAuthorizedOutbound(
 export class RemoteUplink {
   private ws?: WebSocket;
   private backoff = INITIAL_BACKOFF_MS;
+  /** When the live socket opened, so a close can tell healthy from flapping. */
+  private openedAt = 0;
   private reconnectTimer?: NodeJS.Timeout;
   private disposed = false;
   private awaitingRosterCount = false;
@@ -361,7 +364,8 @@ export class RemoteUplink {
     const ws = new WebSocket(url);
     this.ws = ws;
     ws.on("open", () => {
-      this.backoff = INITIAL_BACKOFF_MS;
+      // NOT a backoff reset. Opening proves nothing — see connectionWasHealthy.
+      this.openedAt = Date.now();
       this.awaitingRosterCount = true;
       this.reconnectRoster = undefined;
       // Redacted: a relay may live behind a base path, and that path is not
@@ -427,6 +431,12 @@ export class RemoteUplink {
         }
         return;
       }
+      // A connection that lasted is evidence the relay is reachable, so the
+      // next attempt starts from the floor. One that did not keeps the delay
+      // it earned, which is what stops a flapping socket hammering the relay.
+      const connectedMs = this.openedAt ? Date.now() - this.openedAt : 0;
+      this.openedAt = 0;
+      if (connectionWasHealthy(connectedMs)) this.backoff = INITIAL_BACKOFF_MS;
       this.opts.log(`[remote] uplink disconnected (code ${code}); retrying in ${Math.round(this.backoff / 1000)}s`);
       this.reconnectTimer = setTimeout(() => this.connect(), this.backoff);
       this.backoff = nextBackoffMs(this.backoff);
