@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.0.1-sandbox.1 — 2026-08-31
+## 4.1.1-sandbox.1 — 2026-09-01
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.0.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,38 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.1.0 — 2026-09-01
+
+**The browser stops being the lesser half.** Rewinding a message, connecting Claude Code, signing in to GitHub and cloning a private repository were all things you had to walk to a desk to do — which on a cloud machine means walking to a computer that does not exist. All four now work from a phone. And a conversation no longer belongs to whichever tab opened it first: the tab you are holding wins.
+
+### From a browser
+
+- **Rewind and Edit, from whichever screen you are driving.** They were gated to the desk on the assumption that a remote could not be trusted with them — but there is no desk on a cloud machine, so the feature was simply missing there. An unsent message now belongs to its conversation and comes back to the surface that asked for it: edit from a phone and the text arrives on the phone, not in a draft at a laptop nobody is sitting at. If you switch conversations while the rewind is still running, the message parks on the conversation it was written for and comes back the next time that conversation loads. Nothing is lost.
+
+- **Claude Code connects from a browser.** It never could, because Claude's CLI does not print a device code and poll — it prints a link and waits for you to paste the result back. That is a different shape from Grok and Codex, and probing the wrong command is what kept it desk-only. The card now reads in the order you act: what you are about to do, the link that does it, then the field for what it gives back.
+
+- **Sign in to GitHub, and clone a private repository.** A cloud machine could only ever clone public repositories, which is most of the promise missing for most people's code. The old fix button opened a terminal on the host — on a hosted machine that is a screen with nobody at it. Signing in now happens where you are: a link and a short code, the same shape as connecting an agent. We never handle the token; `gh` stores its own credential, and git is wired to use it before the flow reports success, because a sign-in that leaves cloning broken is worse than no sign-in at all.
+
+- **When something genuinely cannot happen in a browser, it says so.** Installing the GitHub CLI needs elevation, so it stays a desk action — and rather than silently opening an invisible terminal, it tells you where to do it. On a cloud machine the message says the truth instead: `gh` ships with the image, so its absence is a broken machine, not a missing step.
+
+### One conversation, several tabs
+
+- **The tab you are holding wins.** A conversation used to belong to the tab that opened it for as long as that tab's connection lasted, and nothing ever expired — so a forgotten tab on a laptop could make a conversation unreachable from your phone, with a refusal that named "another tab" without being able to say which. Now an explicit ask takes it: tapping a session in the rail, picking one from history, or choosing Continue here. No timer, no idle threshold, nothing to configure.
+
+- **A tab that loses a conversation is told what happened, once.** It keeps its transcript, its controls freeze, and one button takes the conversation back. Reconnecting after a network change does not count as asking, so a phone waking from your pocket cannot silently steal a conversation back from the screen in your hand.
+
+### Fixed
+
+- **Re-focusing a live conversation showed the wrong agent.** Joining from a phone a conversation the desk already held left the model picker and the chrome describing whatever was there before — and on a session whose models had not arrived yet, the same path threw and wiped the transcript to an error.
+
+- **A machine that is waking now says so.** Opening a page for a sleeping cloud machine showed nothing at all while it came up, which reads as a broken link rather than a machine getting out of bed.
+
+- **Knowledge work says where cloning went.** Clone from GitHub is a coding affordance and is absent in knowledge-work mode, where an absent thing explains nothing. The menu now says it is one setting away, and selecting the hint opens that setting.
+
+- **A rewind while another rewind was still parked no longer replaces it.** Narrow to trigger, and fixed anyway: the outcome was a message you wrote disappearing from the transcript and the composer at once.
+
+- **Cloud machines with no SVG decoder no longer die on a missing icon.** New machines carry the fix; existing ones are upgraded in place.
 
 ## 4.0.0 — 2026-08-31
 

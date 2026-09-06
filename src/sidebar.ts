@@ -109,7 +109,13 @@ import {
   noRemoteSignInMessage,
   deviceLoginUnavailable,
 } from "./device-login";
-import { runDeviceLogin, type DeviceLoginHandle } from "./device-login-run";
+import { probeClaudeAuthStatus, runDeviceLogin, type DeviceLoginHandle } from "./device-login-run";
+import {
+  GITHUB_CLI_BIN,
+  githubDeviceLoginFailureText,
+  isGithubCliMissing,
+  runGithubDeviceLogin,
+} from "./github-device-login";
 import {
   GITHUB_CLI_DOWNLOAD,
   classifyCloneFailure,
@@ -261,13 +267,13 @@ import {
 } from "./plan-review";
 import { isPrimerText } from "./grok-primer";
 import { AsyncSerialQueue } from "./async-serial";
-import { HOST_CAPABILITIES, HostMsg, INTERRUPTED_SEND_CODE, WebviewMsg, type SandboxProfileRules } from "./protocol";
+import { HOST_CAPABILITIES, HostMsg, INTERRUPTED_SEND_CODE, SESSION_SUPERSEDED_CODE, WebviewMsg, type ProjectSetupGithub, type SandboxProfileRules } from "./protocol";
 import { withoutArchiveFields } from "./project-discovery";
 import { RemoteUplink } from "./remote-uplink";
 import { RemoteClientState, serializesRemoteSessionTransition } from "./remote-client-state";
 import { RemotePcmIngress, acceptRemotePcm } from "./remote-voice";
 import { SessionRequestState } from "./session-request-state";
-import { allowFromRemote, capabilitiesForRemote, allowRemoteRepoTarget, bracketRemoteSnapshot, mayDeliverRemoteHostMsg, repoScopeFor, sessionCwdBelongsToRepo, sessionForRequest, shouldAdoptDeskSession, transformHostMsgForRemote, type MediaInlineDeps, type MsgOrigin, type RemoteTier } from "./remote-policy";
+import { allowFromRemote, capabilitiesForRemote, allowRemoteRepoTarget, bracketRemoteSnapshot, mayDeliverRemoteHostMsg, remoteRequiresBoundSession, repoScopeFor, sessionCwdBelongsToRepo, sessionForRequest, shouldAdoptDeskSession, transformHostMsgForRemote, type MediaInlineDeps, type MsgOrigin, type RemoteTier } from "./remote-policy";
 import {
   listRemoteProjectDir,
   projectFileContentForWire,
@@ -593,7 +599,7 @@ interface SessionLoadReservation {
 }
 
 type RemoteResumeTarget =
-  | { kind: "conflict"; selectedCwd: string }
+  | { kind: "conflict"; selectedCwd: string; ownerId: string; session: Session }
   | { kind: "repo-mismatch"; selectedCwd: string }
   | { kind: "live"; selectedCwd: string; session: Session }
   | { kind: "disk"; selectedCwd: string; actualCwd: string; provider: AcpProvider }
@@ -994,6 +1000,20 @@ export class GrokSidebar {
       send: (device: Extract<HostMsg, { type: "onboarding" }>["device"]) => void;
     }
   >();
+  /**
+   * Headless GitHub sign-in for the clone form. One at a time: a second tap
+   * while the first is polling would spawn a second child racing the first
+   * to write the same credential, and would replace a code the user may
+   * already be typing. Separate from `deviceLogins` because that map is
+   * keyed by agent provider.
+   */
+  private githubDeviceLogin?: {
+    handle?: DeviceLoginHandle;
+    clientId?: string;
+    tabToken?: string;
+    last?: ProjectSetupGithub;
+    send: (github: ProjectSetupGithub) => void;
+  };
   /** A Settings → Providers refresh in flight. Reported on `providerState` so
    *  the button can say it is working, and guards re-entry: a second click (or
    *  the page's own open-refresh landing on top of a click) must not start a
@@ -1054,8 +1074,17 @@ export class GrokSidebar {
   private diffSeq = 0;
   private readonly openDiffsByRequest =
     new SessionRequestState<Session, { left: Uri; right: Uri }>();
-  /** In-flight in-chat confirms, keyed by request id — see confirmInChat. */
-  private readonly pendingConfirms = new Map<string, (ok: boolean) => void>();
+  /**
+   * In-flight in-chat confirms, keyed by request id — see confirmInChat.
+   *
+   * The SESSION is stored with the resolver because the id alone is not an
+   * authorization: it is a sequential `confirm-N`, the map is host-global, and
+   * `uiConfirmAnswer` stopped being host-local when Rewind was opened to
+   * remotes. Without this, an answer sent while bound to conversation B
+   * resolves conversation A's confirm — and the thing on the other side of
+   * that confirm reverts files on disk.
+   */
+  private readonly pendingConfirms = new Map<string, { session: Session; resolve: (ok: boolean) => void }>();
   private confirmSeq = 0;
 
   /** Session names, pins, archives and the install id — held in `~/.grok` so a
@@ -1896,7 +1925,12 @@ export class GrokSidebar {
     let settled = false;
     const handle = runDeviceLogin(cliPath, plan.args, {
       onPrompt: (prompt) => {
-        send({ status: "waiting", url: prompt.url, code: prompt.code });
+        send({
+          status: "waiting",
+          url: prompt.url,
+          code: prompt.code,
+          ...(prompt.needsCode ? { needsCode: true } : {}),
+        });
       },
       onDone: (result) => {
         settled = true;
@@ -1935,7 +1969,7 @@ export class GrokSidebar {
           message: deviceLoginFailureText(provider, result.failure, displayName),
         });
       },
-    });
+    }, undefined, undefined, { needsCode: !!plan.needsCode });
     if (!settled) {
       entry.handle = handle;
       this.deviceLogins.set(provider, entry as typeof entry & { handle: DeviceLoginHandle });
@@ -1991,7 +2025,9 @@ export class GrokSidebar {
     const delays = [0, 2_000, 5_000, 10_000, 20_000];
     for (const delay of delays) {
       if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
-      if (await this.reprobeProviderCredentials(provider)) {
+      if (provider === "claude"
+        ? await this.deviceLoginCredentialReady(provider)
+        : await this.reprobeProviderCredentials(provider)) {
         this.host.appendLine(`[${provider}] device login: credential verified`);
         // Promote on evidence, exactly as the Providers refresh does. The probe
         // just proved the account works; without this the persisted `connected`
@@ -2039,6 +2075,27 @@ export class GrokSidebar {
     });
   }
 
+  /**
+   * Whether this host can treat the sign-in as landed.
+   *
+   * Grok and Codex still go through the ACP probe. Claude's file is in the
+   * keychain (or `~/.claude/`), so presence-of-auth.json cannot speak for it —
+   * `claude auth status` `{ loggedIn: true }` is the authority. An unreadable
+   * status falls back to the ACP probe rather than failing closed on a CLI
+   * that printed something we have not seen.
+   */
+  private async deviceLoginCredentialReady(provider: AcpProvider): Promise<boolean> {
+    if (provider === "claude") {
+      const cliPath = this.locateProvider("claude");
+      if (!cliPath) return false;
+      const loggedIn = await probeClaudeAuthStatus(cliPath);
+      if (loggedIn === true) return true;
+      if (loggedIn === false) return false;
+      return this.reprobeProviderCredentials(provider);
+    }
+    return this.reprobeProviderCredentials(provider);
+  }
+
   /** Does the provider's own credential file exist? Deliberately shallow —
    *  presence only, no validity claim: it separates "sign-in never landed"
    *  from "landed, but our probe is unhappy", which lead a person to
@@ -2061,6 +2118,8 @@ export class GrokSidebar {
   private cancelAllDeviceLogins(): void {
     for (const { handle } of this.deviceLogins.values()) handle.cancel();
     this.deviceLogins.clear();
+    this.githubDeviceLogin?.handle?.cancel();
+    this.githubDeviceLogin = undefined;
   }
 
   /** Observe an interactive terminal login without requiring a reload. Terminal
@@ -2338,6 +2397,47 @@ export class GrokSidebar {
    * one with history is left alone, because changing the model list under a
    * live thread is a different thing entirely.
    */
+  /**
+   * The identity frame for a conversation that is already live.
+   *
+   * Re-focusing one replays its transcript and its UI snapshot and, until
+   * 2026-09-01, stopped there. `sessionUiSnapshot` carries `modelChanged`, so
+   * the model PICKER updated — but `session` is the only frame that sets the
+   * provider, and it was never sent on this path. Switching from a Grok
+   * conversation to a live Codex one therefore left the client believing it was
+   * still on Grok: the composer said "Ask Grok", the working indicator said
+   * "grokking", the model list stayed the old session's, and steering was
+   * attempted against a CLI that has no such method (owner, from a phone,
+   * 2026-09-01 — the model picker showing the right model while everything
+   * around it showed the wrong agent is exactly this frame's absence).
+   *
+   * The same omission the `sessionName` note in focusSession records, one field
+   * over: send the small identity frame the client needs, rather than rebuild a
+   * catalog to carry it.
+   *
+   * `newSession: false` — a re-focus is not a new conversation, matching what
+   * startSession passes for a resume.
+   */
+  private sessionIdentityFrame(session: Session): HostMsg | undefined {
+    const client = session.client;
+    if (!client?.sessionId) return undefined;
+    return {
+      type: "session",
+      sessionId: client.sessionId,
+      // `?? []` is load-bearing. A session can have a sessionId before its
+      // model list arrives — a phone JOINING a conversation the desk already
+      // holds is the ordinary case — and `modelsForSession` maps over this
+      // array unconditionally. Without the fallback it threw here, after
+      // `clearMessages` had already gone out, so the client was left cleared
+      // with an error instead of a transcript. Ten integration tests said so
+      // and I had not run them.
+      models: this.modelsForSession(session, client.availableModels ?? [], client.currentModelId, false),
+      currentModelId: client.currentModelId,
+      worktree: !!session.worktree,
+      provider: session.provider,
+    };
+  }
+
   private postSessionModels(session: Session): void {
     const client = session.client;
     // `hasHistory` no longer disqualifies a session: a NEW provider's models
@@ -4384,10 +4484,26 @@ Only continue if you trust this code.`,
    * fenced selection blocks and `[Image #N]` tags. Only the bubble has those
    * peeled off.
    */
-  private async editLastMessage(userBubbleIndex: number, text: string, totalUserBubbles?: number): Promise<void> {
-    const session = this.focused;
+  /**
+   * `session` and `requester` are explicit since rewind/edit became reachable
+   * from a remote (2026-09-01). Both are load-bearing:
+   *
+   * - the session, because a phone driving a different repo must not rewind
+   *   whatever happens to be focused at the desk — that is exactly the bug that
+   *   forced the worktree rollback on 2026-08-07;
+   * - the requester, because every message below used to be a native modal on
+   *   the host. On a cloud machine there is nobody at that screen, and one of
+   *   them was awaited, so the handler simply hung.
+   */
+  private async editLastMessage(
+    userBubbleIndex: number,
+    text: string,
+    totalUserBubbles?: number,
+    session: Session = this.focused,
+    requester?: RemoteRequester,
+  ): Promise<void> {
     if (!session.client || !session.activeSessionId) {
-      return void this.host.showWarningMessage("Start a session before editing a message.");
+      return void this.reportRequester(requester, "warning", "Start a session before editing a message.");
     }
     if (session.status === "working" || session.status === "needs-you") {
       // Name the state. "Wait for the current turn" is useless when the turn
@@ -4396,7 +4512,9 @@ Only continue if you trust this code.`,
       this.host.appendLine(
         `[edit] refused: session.status=${session.status} bubble=${userBubbleIndex}`,
       );
-      return void this.host.showWarningMessage(
+      return void this.reportRequester(
+        requester,
+        "warning",
         session.status === "needs-you"
           ? "Answer the pending permission or plan card first, then edit your last message."
           : "Wait for the current turn to finish (or Stop it) before editing your last message.",
@@ -4405,7 +4523,9 @@ Only continue if you trust this code.`,
     try {
       const points = await session.client.listRewindPoints();
       if (points === "unsupported") {
-        return void this.host.showWarningMessage(
+        return void this.reportRequester(
+          requester,
+          "warning",
           "Editing a sent message needs a newer Grok Build CLI. Update via Settings → About.",
         );
       }
@@ -4416,19 +4536,23 @@ Only continue if you trust this code.`,
         this.host.appendLine(
           `[rewind] map mismatch: ${userFacingRewindPoints(points).length} wire points vs ${totalUserBubbles} visible messages`,
         );
-        return void this.host.showWarningMessage(
+        return void this.reportRequester(
+          requester,
+          "warning",
           "Grok's restore points no longer line up with this conversation, so rewinding could remove the wrong turn. Reload the window and try again.",
         );
       }
       const target = resolveEditRewindTarget(points, userBubbleIndex);
       if (!target) {
-        const copy = "Copy text to composer";
-        const pick = await this.host.showInformationMessage(
-          "Grok has no restore point for this message, so it can't be rolled back. You can still copy the text and send it again.",
-          copy,
+        // Was a modal offering "Copy text to composer" and awaiting the click.
+        // Nobody can click it on a cloud machine, so the handler hung there —
+        // and the button was the only sensible answer anyway. Do it, and say so.
+        this.restoreComposerFor(session, requester, text);
+        return void this.reportRequester(
+          requester,
+          "info",
+          "Grok has no restore point for that message, so it can't be rolled back. Its text is back in the composer.",
         );
-        if (pick === copy) this.emit(session, { type: "restoreComposer", text });
-        return;
       }
 
       // Confirm ONLY when the turn actually changed files on disk. Editing a
@@ -4450,13 +4574,15 @@ Only continue if you trust this code.`,
         mode: "all",
       });
       if (result === "unsupported") {
-        return void this.host.showWarningMessage(
+        return void this.reportRequester(
+          requester,
+          "warning",
           "Editing a sent message needs a newer Grok Build CLI. Update via Settings → About.",
         );
       }
       if (!result.success) {
         // Surface the CLI's own words — e.g. rewinding past a compaction point.
-        return void this.host.showErrorMessage(result.error || "Couldn't roll back that message.");
+        return void this.reportRequester(requester, "error", result.error || "Couldn't roll back that message.");
       }
 
       const reportedFiles = result.revertedFiles.length;
@@ -4467,34 +4593,113 @@ Only continue if you trust this code.`,
       const surviving = survivingUserMessagesAfterRewind(points, target);
       await this.truncateSessionCardsAfterRewind(resumeId, surviving);
       this.applyRewindToView(session, surviving);
-      this.emit(session, { type: "restoreComposer", text });
+      this.restoreComposerFor(session, requester, text);
       if (reportedFiles > 0) {
-        void this.host.showInformationMessage(
+        this.reportRequester(
+          requester,
+          "info",
           "Message moved back to the composer. Files were rolled back — anything created after that point may still be on disk.",
         );
       }
     } catch (e: any) {
-      this.host.showErrorMessage(`Couldn't edit that message: ${e?.message ?? e}`);
+      this.reportRequester(requester, "error", `Couldn't edit that message: ${e?.message ?? e}`);
     }
   }
 
-  async rewindFocusedSession(userBubbleIndex?: number, bubbleText?: string, totalUserBubbles?: number): Promise<void> {
-    const session = this.focused;
+  /**
+   * Hand a rewound message back to the surface that ASKED for it, and only that
+   * one.
+   *
+   * `restoreComposer` APPENDS to whatever is already typed — deliberately, since
+   * silently destroying a draft is the bug Edit exists to fix. Sent through
+   * `emit` it reaches the focused desk webview and every remote holder of the
+   * session, so a phone tapping Edit would paste its message on top of an unsent
+   * draft at the computer and steal focus there. Nobody at that desk asked for
+   * it, and the appended text is the thing the usage model calls unacceptable.
+   *
+   * Reachable from a remote only since rewind/edit were widened, which is what
+   * makes it a defect this change introduced; the desk-to-phone mirror of it was
+   * always possible and is fixed by the same narrowing.
+   *
+   * The SESSION check is the half a first attempt at this dropped, and the
+   * review caught it: `emit` delivered locally only while that session was
+   * focused and remotely only to clients still holding it, so replacing it with
+   * a plain "send to whoever asked" opened a worse hole than the one being
+   * closed. Rewind is an RPC to the CLI and takes seconds; switching
+   * conversation while it runs is ordinary impatience, not an exotic race, and
+   * the text would have landed in a different conversation's composer — a
+   * different REPOSITORY's, at that.
+   */
+  private restoreComposerFor(
+    session: Session,
+    requester: RemoteRequester | undefined,
+    text: string,
+  ): void {
+    if (!text) return;
+    const message: HostMsg = { type: "restoreComposer", text };
+    if (requester) {
+      // Resolve through the tab, so a phone that reconnected while the rewind
+      // was in flight still receives its own text — then check the tab is still
+      // ON this conversation. `sendRemoteRequester` alone would deliver to
+      // whatever that tab is showing NOW.
+      const clientId = this.resolveRemoteRequester(requester);
+      if (clientId && this.remoteClients.active(clientId) === session) {
+        this.sendRemoteClient(clientId, message);
+        return;
+      }
+    } else if (this.focused === session) {
+      // Same check for the desk: postLocal posts to the focused webview
+      // whatever it is displaying.
+      this.postLocal(message);
+      return;
+    }
+    // The asking surface has moved to another conversation. Refusing to deliver
+    // is only half an answer: the rewind has ALREADY removed the message from
+    // the transcript, so dropping it here loses the user's text outright — the
+    // failure the previous attempt traded the cross-session paste for.
+    //
+    // Park it on the conversation it belongs to instead. `rememberQueuedDraft`
+    // exists for exactly this and says so: a conversation is the only place a
+    // draft can be handed back without guessing who is watching what.
+    const id = session.activeSessionId;
+    if (!id) return;
+    // APPEND, never replace. The slot holds one string, so a second rewind
+    // parked before the first was collected would overwrite it — and the first
+    // message is already gone from the transcript, so that loses it outright.
+    // The webview's own `restoreComposer` appends for exactly this reason
+    // ("anything already typed is the user's"); the store follows the same rule
+    // rather than being the one place that silently drops a message.
+    const parked = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]?.queuedDraft;
+    void this.rememberQueuedDraft(id, parked ? `${parked}\n\n${text}` : text);
+  }
+
+  /** See {@link editLastMessage} for why `session` and `requester` are explicit. */
+  async rewindFocusedSession(
+    userBubbleIndex?: number,
+    bubbleText?: string,
+    totalUserBubbles?: number,
+    session: Session = this.focused,
+    requester?: RemoteRequester,
+  ): Promise<void> {
     if (!session.client || !session.activeSessionId) {
-      return void this.host.showWarningMessage("Start a session before rewinding it.");
+      return void this.reportRequester(requester, "warning", "Start a session before rewinding it.");
     }
     if (session.status === "working" || session.status === "needs-you") {
-      return void this.host.showWarningMessage(
+      return void this.reportRequester(
+        requester,
+        "warning",
         "Wait for the current turn to finish (or Stop it) before rewinding.",
       );
     }
     if (!session.hasHistory) {
-      return void this.host.showInformationMessage("Nothing to rewind yet — this session has no conversation.");
+      return void this.reportRequester(requester, "info", "Nothing to rewind yet — this session has no conversation.");
     }
     try {
       const points = await session.client.listRewindPoints();
       if (points === "unsupported") {
-        return void this.host.showWarningMessage(
+        return void this.reportRequester(
+          requester,
+          "warning",
           "Rewind needs a newer Grok Build CLI. Update via Settings → About.",
         );
       }
@@ -4506,7 +4711,9 @@ Only continue if you trust this code.`,
         this.host.appendLine(
           `[rewind] map mismatch: ${userFacingRewindPoints(points).length} wire points vs ${totalUserBubbles} visible messages`,
         );
-        return void this.host.showWarningMessage(
+        return void this.reportRequester(
+          requester,
+          "warning",
           "Grok's restore points no longer line up with this conversation, so rewinding could remove the wrong turn. Reload the window and try again.",
         );
       }
@@ -4515,10 +4722,23 @@ Only continue if you trust this code.`,
         // Bubble button: map visible user bubble → wire prompt_index (skips legacy hidden turns).
         target = resolveUserBubbleRewind(points, userBubbleIndex);
         if (!target) {
-          return void this.host.showInformationMessage(
+          return void this.reportRequester(
+            requester,
+            "info",
             "Can't rewind to this message — it's the latest turn, or the checkpoint is unavailable.",
           );
         }
+      } else if (requester) {
+        // The picker below is a host QuickPick, which a remote cannot see or
+        // answer — and on a cloud machine nobody can. Every remote rewind comes
+        // from a bubble button and carries its index, so this is unreachable in
+        // practice; it exists so that a future caller without one fails loudly
+        // instead of opening a dialog on an empty screen.
+        return void this.reportRequester(
+          requester,
+          "info",
+          "Pick the message to rewind to using the Rewind button on that message.",
+        );
       } else {
         // Gear / command palette: pick among user-facing points that aren't the tip.
         const facing = userFacingRewindPoints(points);
@@ -4573,13 +4793,15 @@ Only continue if you trust this code.`,
         mode: "all",
       });
       if (result === "unsupported") {
-        return void this.host.showWarningMessage(
+        return void this.reportRequester(
+          requester,
+          "warning",
           "Rewind needs a newer Grok Build CLI. Update via Settings → About.",
         );
       }
       if (!result.success) {
         const err = result.error || "Rewind did not apply (no changes).";
-        return void this.host.showErrorMessage(err);
+        return void this.reportRequester(requester, "error", err);
       }
 
       const reportedFiles = result.revertedFiles.length;
@@ -4604,18 +4826,20 @@ Only continue if you trust this code.`,
       // off. So the QuickPick path (no bubble) restores nothing rather than
       // pasting plumbing into the composer.
       const restored = (bubbleText ?? "").trim();
-      if (restored) this.emit(session, { type: "restoreComposer", text: restored });
+      if (restored) this.restoreComposerFor(session, requester, restored);
       // Only speak up when something happened the chat itself doesn't show.
       // The messages vanishing and the text landing in the composer are their
       // own feedback; a toast restating them is noise. Reverted files are NOT
       // visible in the chat, so those still get reported.
       if (reportedFiles > 0) {
-        void this.host.showInformationMessage(
+        this.reportRequester(
+          requester,
+          "info",
           "Rewound. Files were rolled back — anything created after that point may still be on disk.",
         );
       }
     } catch (e: any) {
-      void this.host.showErrorMessage(`Rewind failed: ${e?.message ?? e}`);
+      this.reportRequester(requester, "error", `Rewind failed: ${e?.message ?? e}`);
     }
   }
 
@@ -6482,6 +6706,15 @@ Only continue if you trust this code.`,
     };
   }
 
+  /** Last GitHub device-login card, only for the tab that started it. */
+  private githubProjectSetupExtra(clientId: string): { github?: ProjectSetupGithub } {
+    const entry = this.githubDeviceLogin;
+    if (!entry?.last) return {};
+    const live = entry.tabToken ? this.remoteClients.clientForTabToken(entry.tabToken) : undefined;
+    if (live === clientId || entry.clientId === clientId) return { github: entry.last };
+    return {};
+  }
+
   private postProjectSetup(
     extra: Omit<Extract<HostMsg, { type: "projectSetup" }>, "type" | "root"> = {},
   ): void {
@@ -6596,14 +6829,18 @@ Only continue if you trust this code.`,
   }
 
   /**
-   * Run the GitHub CLI step the failed clone needs, in a terminal on the desk.
+   * Run the GitHub CLI step the failed clone needs.
    *
-   * Both commands are interactive — `gh auth login` asks questions and opens a
-   * browser; a package manager asks for elevation — so this shows a terminal
-   * rather than pretending to do it silently. Host-local by policy: a remote
-   * could neither see the questions nor answer them.
+   * A LOCAL webview still opens a terminal: `gh auth login` asks questions
+   * and opens a browser, and a package manager asks for elevation. A REMOTE
+   * `auth` has no terminal to look at, so it runs the headless device-code
+   * flow and reports the URL and code on `projectSetup.github`.
    */
-  async setupGithubCli(action: "install" | "auth"): Promise<void> {
+  async setupGithubCli(
+    action: "install" | "auth",
+    origin: MsgOrigin = "local",
+    clientId?: string,
+  ): Promise<void> {
     // `sendText`, not `shellPath`/`shellArgs`: both of these are command LINES
     // rather than one binary with arguments. Signing in has to run two commands
     // in order — see githubSignInCommand for why the second is not optional —
@@ -6611,9 +6848,27 @@ Only continue if you trust this code.`,
     // host routes it through planRunCommandInTerminal, which keeps the window
     // open so the outcome stays readable).
     if (action === "auth") {
+      if (origin === "remote") {
+        this.startGithubDeviceLogin(clientId);
+        return;
+      }
       const term = this.host.createTerminal({ name: "GitHub sign-in" });
       term.show();
       term.sendText(githubSignInCommand(process.platform));
+      return;
+    }
+    // INSTALL IS DESK-ONLY, and the check belongs here rather than in the
+    // client that already declines to send it. `setupGithubCli` is `full` in
+    // remote-policy.ts so that `auth` can run headlessly — but the policy gates
+    // a message TYPE, not the action inside it, so widening the type handed a
+    // remote the installer as well. A package manager asks for elevation, so
+    // there is no headless path to offer: the honest answer is the same one the
+    // clone form shows, and the relay-is-policy-free invariant means the HOST
+    // has to be the one refusing.
+    if (origin === "remote") {
+      this.postProjectSetup({
+        error: `Install the GitHub CLI from ${GITHUB_CLI_DOWNLOAD} on that computer, then try again.`,
+      });
       return;
     }
     const install = githubCliInstallCommand(process.platform);
@@ -6626,6 +6881,123 @@ Only continue if you trust this code.`,
     const term = this.host.createTerminal({ name: "Install GitHub CLI" });
     term.show();
     term.sendText(install.display);
+  }
+
+  /**
+   * Headless `gh auth login --web` plus `gh auth setup-git`, reported only to
+   * the client that asked. A code is for the person holding that device.
+   */
+  private startGithubDeviceLogin(clientId?: string): void {
+    const running = this.githubDeviceLogin;
+    if (running?.handle) {
+      running.clientId = clientId;
+      if (clientId) running.tabToken = this.remoteClients.tabToken(clientId) ?? running.tabToken;
+      if (running.last) running.send(running.last);
+      this.host.appendLine("[github] device login already in flight; repeated its state to the new tap");
+      return;
+    }
+
+    const send = (github: ProjectSetupGithub) => {
+      if (this.githubDeviceLogin) this.githubDeviceLogin.last = github;
+      const message = this.projectSetupMessage({ github });
+      const id = this.githubAskerId(clientId);
+      if (id) this.sendRemoteClient(id, message);
+      else this.post(message);
+    };
+
+    this.githubDeviceLogin = {
+      clientId,
+      tabToken: clientId ? this.remoteClients.tabToken(clientId) : undefined,
+      send,
+    };
+
+    if (!commandOnPath(GITHUB_CLI_BIN)) {
+      this.finishGithubDeviceLoginMissing();
+      return;
+    }
+
+    send({ status: "starting" });
+    this.host.appendLine("[github] device login started");
+    const workId = this.beginDeviceLoginWork();
+    const startedAt = Date.now();
+    let settled = false;
+    const handle = runGithubDeviceLogin(GITHUB_CLI_BIN, {
+      onPrompt: (prompt) => {
+        send({
+          status: "waiting",
+          url: prompt.url,
+          ...(prompt.code ? { code: prompt.code } : {}),
+        });
+      },
+      onDone: (result) => {
+        settled = true;
+        if (this.githubDeviceLogin) this.githubDeviceLogin.handle = undefined;
+        this.endDeviceLoginWork(workId);
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        if (result.ok) {
+          this.host.appendLine(`[github] device login completed after ${elapsed}s`);
+          send({
+            status: "done",
+            message: "Signed in to GitHub. Clone again.",
+          });
+          return;
+        }
+        if ("failure" in result) {
+          const failure = isGithubCliMissing(result.output) ? "missing" as const : result.failure;
+          this.host.appendLine(`[github] device login failed (${failure}) after ${elapsed}s`);
+          this.finishGithubDeviceLoginFailure(failure, { setupGit: !!result.setupGit });
+          return;
+        }
+        this.host.appendLine(`[github] device login cancelled after ${elapsed}s`);
+      },
+    });
+    if (!settled && this.githubDeviceLogin) {
+      this.githubDeviceLogin.handle = handle;
+    }
+  }
+
+  /** The tab that started GitHub sign-in, wherever its socket is now. */
+  private githubAskerId(fallback?: string): string | undefined {
+    const entry = this.githubDeviceLogin;
+    const live = entry?.tabToken ? this.remoteClients.clientForTabToken(entry.tabToken) : undefined;
+    return live ?? entry?.clientId ?? fallback;
+  }
+
+  private postGithubProjectSetup(
+    extra: Omit<Extract<HostMsg, { type: "projectSetup" }>, "type" | "root">,
+  ): void {
+    const message = this.projectSetupMessage(extra);
+    const id = this.githubAskerId();
+    if (id) this.sendRemoteClient(id, message);
+    else this.post(message);
+  }
+
+  private finishGithubDeviceLoginMissing(): void {
+    const offer = githubFixFor(process.platform, commandOnPath);
+    const extra: Omit<Extract<HostMsg, { type: "projectSetup" }>, "type" | "root"> =
+      offer.kind === "install"
+        ? { error: githubDeviceLoginFailureText("missing"), fix: "install-gh", fixCommand: offer.command }
+        : offer.kind === "download"
+          ? { error: `${githubDeviceLoginFailureText("missing")} Install it from ${offer.where} first.` }
+          : { error: githubDeviceLoginFailureText("missing"), fix: "install-gh" };
+    this.postGithubProjectSetup(extra);
+    this.githubDeviceLogin = undefined;
+  }
+
+  private finishGithubDeviceLoginFailure(
+    failure: Parameters<typeof githubDeviceLoginFailureText>[0],
+    opts: { setupGit?: boolean } = {},
+  ): void {
+    if (failure === "missing") {
+      this.finishGithubDeviceLoginMissing();
+      return;
+    }
+    const error = githubDeviceLoginFailureText(failure, opts);
+    this.postGithubProjectSetup({
+      error,
+      ...(failure === "unsupported" ? {} : { fix: "auth-gh" as const }),
+    });
+    this.githubDeviceLogin = undefined;
   }
 
   /**
@@ -7064,7 +7436,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // Re-selecting a repo whose conversation is already live must replay its
       // buffer. focusRemoteSession needs no CLI; openRemoteSession would mint
       // onboarding over a clientless live member. Another tab's live session
-      // still goes through openRemoteSession, which refuses the steal.
+      // still goes through openRemoteSession without a claim, which refuses
+      // the steal — selecting a repo is not an explicit conversation claim.
       if (liveSession && !ownedByOther) this.focusRemoteSession(clientId, liveSession, false);
       else await this.openRemoteSession(clientId, newest.id, newest.cwd, false);
     } else {
@@ -9943,6 +10316,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const cwd = this.remoteClients.cwd(clientId);
     const active = this.remoteClients.active(clientId);
     if (active) return active;
+    if (this.remoteClients.requiresExplicitSession(clientId)) {
+      throw new Error(`Remote client ${clientId} has no session`);
+    }
     // A tab arriving with nothing of its own — "Continue remotely", or a first
     // visit — CONTINUES WHAT THE DESK IS DOING. That is the feature's whole
     // promise, and desk↔remote co-attach is what finally makes it possible:
@@ -9971,11 +10347,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private async onMessage(msg: WebviewMsg, origin: MsgOrigin, clientId?: string): Promise<void> {
-    const session = origin === "remote" && clientId
-      ? msg.type === "selectRepo"
-        ? this.remoteClients.active(clientId) ?? this.focused
-        : this.remoteSessionFor(clientId)
-      : this.focused;
+    const remoteBound = origin === "remote" && clientId
+      ? this.remoteClients.active(clientId)
+      : undefined;
+    if (
+      origin === "remote" &&
+      clientId &&
+      remoteRequiresBoundSession(msg.type) &&
+      !remoteBound
+    ) {
+      this.refuseUnboundRemoteSession(clientId);
+      return;
+    }
+    const session = remoteBound ?? this.focused;
     const requester = origin === "remote" && clientId
       ? this.captureRemoteRequester(clientId)
       : undefined;
@@ -10230,18 +10614,31 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await this.rewindFocusedSession(
           typeof msg.userBubbleIndex === "number" ? msg.userBubbleIndex : undefined,
           msg.text,
+          // Was dropped here while editLastMessage forwarded it, so the
+          // bubble<->restore-point consistency check never ran for the Rewind
+          // button — the one path that reverts files without the user naming a
+          // target from a list. It matters more now that a remote can ask.
+          msg.totalUserBubbles,
+          session,
+          requester,
         );
         break;
       case "uiConfirmAnswer": {
-        const resolve = this.pendingConfirms.get(msg.id);
-        if (resolve) {
+        const pending = this.pendingConfirms.get(msg.id);
+        // Only from the conversation the confirm was ASKED in. `emit` showed it
+        // to every surface holding that session, so any of them may answer —
+        // what a mismatch means is an answer for somebody else's conversation,
+        // and dropping it is right. Ignoring it cannot hang the caller either:
+        // the real answer still resolves, and an abandoned confirm already
+        // fails closed when the webview goes away.
+        if (pending && pending.session === session) {
           this.pendingConfirms.delete(msg.id);
-          resolve(msg.ok === true);
+          pending.resolve(msg.ok === true);
         }
         break;
       }
       case "editLastMessage":
-        await this.editLastMessage(msg.userBubbleIndex, msg.text, msg.totalUserBubbles);
+        await this.editLastMessage(msg.userBubbleIndex, msg.text, msg.totalUserBubbles, session, requester);
         break;
       case "workflowControl":
         await this.controlWorkflow(msg.action, msg.displayName, session);
@@ -10618,8 +11015,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await this.cloneProject(msg.url);
         break;
       case "setupGithubCli":
-        // host-local by policy, so `origin` is always local here.
-        await this.setupGithubCli(msg.action === "install" ? "install" : "auth");
+        await this.setupGithubCli(
+          msg.action === "install" ? "install" : "auth",
+          origin,
+          clientId,
+        );
         break;
       case "welcomeTipShown": {
         // Idempotent per day: `withShownTip` answers null when this tip is
@@ -10858,6 +11258,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         });
         break;
       }
+      case "submitDeviceLoginCode": {
+        const provider: AcpProvider = isAcpProvider(msg.provider) ? msg.provider : "grok";
+        const running = this.deviceLogins.get(provider);
+        if (!running) break;
+        const code = typeof msg.code === "string" ? msg.code.trim() : "";
+        if (!code) break;
+        // Re-bind the tapper the same way a re-tap does: they left for the
+        // vendor's page and came back under a new socket.
+        if (clientId) {
+          running.clientId = clientId;
+          running.tabToken = this.remoteClients.tabToken(clientId) ?? running.tabToken;
+        }
+        running.handle.submitCode(code);
+        if (running.last && running.last.status === "waiting") {
+          running.send({ ...running.last, submitted: true });
+        }
+        break;
+      }
       case "cancelDeviceLogin": {
         const provider: AcpProvider = isAcpProvider(msg.provider) ? msg.provider : "grok";
         const running = this.deviceLogins.get(provider);
@@ -10958,7 +11376,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (origin === "remote" && clientId) {
           this.sendRemoteClient(clientId, this.buildSessionsList(messageCwd, {
           offset: msg.offset, limit: msg.limit, query: msg.query, providerCursor: msg.providerCursor,
-          }, session.activeSessionId));
+          }, this.remoteActiveSessionId(clientId)));
         } else {
         this.postSessionsList({ offset: msg.offset, limit: msg.limit, query: msg.query, providerCursor: msg.providerCursor });
         }
@@ -10994,7 +11412,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       case "resumeSession":
         if (origin === "remote" && clientId) {
-          await this.openRemoteSession(clientId, msg.id, msg.cwd);
+          await this.openRemoteSession(clientId, msg.id, msg.cwd, true, msg.claim === true);
         }
         else await this.openSession(msg.id, msg.cwd);
         break;
@@ -14163,7 +14581,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   ): Promise<boolean> {
     const id = `confirm-${++this.confirmSeq}`;
     return new Promise<boolean>((resolve) => {
-      this.pendingConfirms.set(id, resolve);
+      this.pendingConfirms.set(id, { session, resolve });
       this.emit(session, { type: "uiConfirmRequest", id, ...opts });
     });
   }
@@ -16197,7 +16615,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const session = this.remoteClients.active(clientId);
     if (session?.activeSessionId) return session.activeSessionId;
     if (!session) return null;
-    for (const [id, reservation] of this.sessionLoadReservations) {
+    const reservations = this.sessionLoadReservations;
+    if (!reservations) return null;
+    for (const [id, reservation] of reservations) {
       if (reservation.session === session && this.isSessionLoadReserved(id)) return id;
     }
     return null;
@@ -16230,8 +16650,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.touch(session);
     this.markRead(session); // opening it clears any unread (green/red) badge
     const wv = this.view?.webview;
+    // Both surfaces need it, and the desk has the same gap the browser does —
+    // re-focusing a live conversation never said which agent it belongs to.
+    const identity = this.sessionIdentityFrame(session);
     if (wv) {
       wv.postMessage({ type: "clearMessages" });
+      if (identity) wv.postMessage(identity);
       wv.postMessage({ type: "historyReplay", active: true });
       for (const m of session.buffer) wv.postMessage(this.localizeHistoryMessage(m, wv));
       wv.postMessage({ type: "historyReplay", active: false });
@@ -16252,6 +16676,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (this.uplink) {
       const replay: HostMsg[] = [
         { type: "clearMessages" },
+        ...(identity ? [identity] : []),
         ...bracketRemoteSnapshot(session.buffer),
       ];
       for (const m of replay) {
@@ -16276,6 +16701,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // the small frame the client actually needs, instead of rebuilding a list
     // that has not changed.
     this.postSessionName(session);
+    // Same as the remote path, and for the same reason: restorePersistedDraft
+    // broadcasts, so it is not called here.
   }
 
   /**
@@ -16358,12 +16785,23 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private releaseRemoteClient(clientId: string): void {
     this.forgetPostedVoiceConfigured(`remote:${clientId}`);
     const current = this.remoteClients.active(clientId);
-    const preserveLogicalTab = !!current && (
-      current.needsProvider ||
-      !!current.strandedDraft ||
-      current.priming ||
-      current.queuedSends.length > 0 ||
-      current.chips.length > 0
+    const preserveLogicalTab = (
+      // A DEMOTED tab is a logical tab worth keeping, and it is the one case
+      // with no active session to prove it. `deleteClient` drops the tab's
+      // selected repo along with the latch, so an ordinary mobile network blip
+      // after a takeover would land the page on the host's default repo with a
+      // fresh session, its composer re-enabled and the old draft still in it —
+      // and the next Send would file text written for one conversation into
+      // another, in another REPOSITORY. `detachClient` keeps both for the same
+      // tab token, which is exactly what a reconnect needs.
+      this.remoteClients.requiresExplicitSession(clientId) ||
+      (!!current && (
+        current.needsProvider ||
+        !!current.strandedDraft ||
+        current.priming ||
+        current.queuedSends.length > 0 ||
+        current.chips.length > 0
+      ))
     );
     this.parkRemoteSession(clientId);
     this.dropRemoteVoice(clientId);
@@ -17249,6 +17687,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.touch(session);
     this.markRead(session);
     this.sendRemoteClient(clientId, { type: "clearMessages" });
+    // Before the transcript, so the replay renders under the right agent rather
+    // than being relabelled after the fact. See sessionIdentityFrame.
+    const identity = this.sessionIdentityFrame(session);
+    if (identity) this.sendRemoteClient(clientId, identity);
     for (const msg of bracketRemoteSnapshot(session.buffer)) this.sendRemoteClient(clientId, msg);
     for (const msg of sessionUiSnapshot(session, this.displayMode(session))) this.sendRemoteClient(clientId, msg);
     if (notifyCatalog) this.postRepoCatalog();
@@ -17258,6 +17700,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // name has to be re-announced here or the header loses its rename affordance
     // until something unrelated refreshes it.
     this.postSessionName(session);
+    // NOT restorePersistedDraft. It hands the draft back with session-wide
+    // `emit`, which appends it to every surface viewing the conversation — so
+    // calling it here re-created, on the switch-back, the desk-composer
+    // pollution this whole sequence removed. Parked text therefore returns on
+    // the next load of the conversation rather than the instant you switch to
+    // it. That is a narrower promise, kept, instead of a wider one that leaks.
   }
 
   private async newRemoteSession(clientId: string, notifyCatalog = true): Promise<void> {
@@ -17277,9 +17725,71 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.sendRemoteSessionList(session, ownerTabToken);
   }
 
-  private refuseRemoteResume(clientId: string, id: string, text: string, selectedCwd: string): void {
-    this.sendRemoteClient(clientId, { type: "error", text, resumeFailed: { id } });
+  private refuseRemoteResume(
+    clientId: string,
+    id: string,
+    text: string,
+    selectedCwd: string,
+    code?: typeof SESSION_SUPERSEDED_CODE,
+  ): void {
+    this.sendRemoteClient(clientId, {
+      type: "error",
+      text,
+      resumeFailed: { id },
+      ...(code ? { code } : {}),
+    });
     this.sendRemoteClient(clientId, this.buildSessionsList(selectedCwd, undefined, this.remoteActiveSessionId(clientId)));
+  }
+
+  private refuseUnboundRemoteSession(clientId: string): void {
+    const id = this.remoteClients.supersededSessionId(clientId);
+    this.host.appendLine(`[remote] refused session-bound message (tab has no active conversation)`);
+    this.sendRemoteClient(clientId, {
+      type: "error",
+      text: "This conversation is open in another tab. Continue here to take it back.",
+      ...(id ? { resumeFailed: { id } } : {}),
+      code: SESSION_SUPERSEDED_CODE,
+    });
+  }
+
+  /**
+   * Hand a live conversation from one remote tab to another. Same Session
+   * object — no cold-load, no second ACP process. The desk `focused` pointer
+   * is left alone so a claim of a desk-visible session co-attaches.
+   *
+   * Ownership moves synchronously: no await between deleteActive and setActive.
+   */
+  private transferRemoteResume(
+    winnerId: string,
+    target: Extract<RemoteResumeTarget, { kind: "conflict" }>,
+    notifyCatalog: boolean,
+  ): void {
+    const { ownerId: loserId, session, selectedCwd } = target;
+    const id = session.activeSessionId;
+    if (!id || this.remoteClients.active(loserId) !== session || loserId === winnerId) {
+      this.parkRemoteSession(winnerId, session);
+      this.dropRemoteVoice(winnerId);
+      this.focusRemoteSession(winnerId, session, notifyCatalog);
+      return;
+    }
+    this.remoteClients.deleteActive(loserId, session);
+    this.remoteClients.markRequiresExplicitSession(loserId, id);
+    this.pool.add(session);
+    this.parkRemoteSession(winnerId, session);
+    this.dropRemoteVoice(winnerId);
+    this.dropRemoteVoice(loserId);
+    this.focusRemoteSession(winnerId, session, notifyCatalog);
+    this.notifyRemoteSessionSuperseded(loserId, id, this.remoteClients.cwdIfPresent(loserId) ?? selectedCwd);
+  }
+
+  private notifyRemoteSessionSuperseded(clientId: string, id: string, selectedCwd: string): void {
+    this.sendRemoteClient(clientId, {
+      type: "error",
+      text: "This conversation is now open in another tab. Continue here to take it back.",
+      resumeFailed: { id },
+      code: SESSION_SUPERSEDED_CODE,
+    });
+    this.sendRemoteClient(clientId, this.buildSessionsList(selectedCwd, undefined, undefined));
   }
 
   /**
@@ -17336,7 +17846,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const conflictingOwner = this.remoteClients.clients().find((ownerId) =>
       ownerId !== clientId && this.remoteClients.active(ownerId)?.activeSessionId === id
     );
-    if (conflictingOwner) return { kind: "conflict", selectedCwd };
+    if (conflictingOwner) {
+      const session = this.remoteClients.active(conflictingOwner);
+      if (session) return { kind: "conflict", selectedCwd, ownerId: conflictingOwner, session };
+    }
     for (const session of this.pool) {
       if (session.activeSessionId === id && session.client) {
         if (!sessionCwdBelongsToRepo(this.sessionCwd(session), allowedCwds, pathsEqual)) {
@@ -17371,14 +17884,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     id: string,
     sessionCwd?: string,
     notifyCatalog = true,
+    explicitClaim = false,
   ): Promise<void> {
     // Same reason the local open owns its clock: a phone tapping a conversation
     // waits through the reservation, the repo adoption and the metadata reads
     // before `startSession` is reached, and a clock made down there reports
     // `resolve 0ms` however long that took.
     const clock = new OpenClock();
-    const claim = this.reserveSessionLoad(id, this.remoteClients.tabToken(clientId));
-    if (!claim) {
+    const load = this.reserveSessionLoad(id, this.remoteClients.tabToken(clientId));
+    if (!load) {
       const selectedCwd = this.remoteClients.cwd(clientId);
       this.host.appendLine(`[remote] dropped resumeSession (session load is reserved by another view)`);
       this.refuseRemoteResume(
@@ -17389,19 +17903,21 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       );
       return;
     }
-    if (claim.joined) {
+    if (load.joined) {
       this.host.appendLine(`[remote] joined in-flight session load for the same logical tab`);
-      await claim.reservation.completion;
+      await load.reservation.completion;
       return;
     }
     let failure: unknown;
     try {
-      await this.openRemoteSessionReserved(clientId, id, claim.reservation, sessionCwd, notifyCatalog, clock);
+      await this.openRemoteSessionReserved(
+        clientId, id, load.reservation, sessionCwd, notifyCatalog, clock, explicitClaim,
+      );
     } catch (error) {
       failure = error;
       throw error;
     } finally {
-      this.releaseSessionLoad(id, claim.reservation, failure);
+      this.releaseSessionLoad(id, load.reservation, failure);
     }
     const opened = this.remoteClients.active(clientId);
     if (opened) this.sweepEmptySessions(this.sessionCwd(opened));
@@ -17441,6 +17957,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     sessionCwd?: string,
     notifyCatalog = true,
     clock?: OpenClock,
+    explicitClaim = false,
   ): Promise<void> {
     // A remote may name a session that lives in a DIFFERENT repo of the catalog
     // it was shown — the projects rail lists every repo's sessions at once, so
@@ -17467,19 +17984,34 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (held?.token !== reservation.token) return;
       target = this.findRemoteResumeTarget(clientId, id, sessionCwd);
     }
-    // Tabs stay mutually exclusive: each browser tab is its own conversation,
-    // and the duplicate-tab theft guard builds on that. The VS Code view is
-    // NOT a rival tab — a session open (or parked) at the desk is joined, not
-    // refused: emit() fans every frame of a session to the focused webview and
+    // Remote holders are mutually exclusive. The newest tab that EXPLICITLY
+    // claims a conversation wins; a reconnect restore (no claim bit) still
+    // refuses, so a thawing background tab cannot steal it back. The VS Code
+    // view is NOT a rival tab — a session open (or parked) at the desk is
+    // joined, not refused: emit() fans every frame to the focused webview and
     // to each remote holder, so the desk and the phone stay in sync.
     if (target.kind === "conflict") {
-      this.host.appendLine(`[remote] dropped resumeSession (session is open in another tab)`);
-      this.refuseRemoteResume(
-        clientId,
-        id,
-        "Could not restore this conversation because it is already open in another tab.",
-        target.selectedCwd,
-      );
+      const stillHeld = this.remoteClients.active(target.ownerId) === target.session
+        && target.ownerId !== clientId;
+      if (stillHeld && explicitClaim) {
+        this.host.appendLine(`[remote] transferred resumeSession from ${target.ownerId} to ${clientId}`);
+        this.transferRemoteResume(clientId, target, notifyCatalog);
+        return;
+      }
+      if (stillHeld) {
+        this.host.appendLine(`[remote] dropped resumeSession (session is open in another tab)`);
+        this.refuseRemoteResume(
+          clientId,
+          id,
+          "Could not restore this conversation because it is already open in another tab.",
+          target.selectedCwd,
+          SESSION_SUPERSEDED_CODE,
+        );
+        return;
+      }
+      this.parkRemoteSession(clientId, target.session);
+      this.dropRemoteVoice(clientId);
+      this.focusRemoteSession(clientId, target.session, notifyCatalog);
       return;
     }
     if (target.kind === "repo-mismatch") {
@@ -18182,12 +18714,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         return;
       }
       this.remoteClients.ready(clientId);
+      if (remoteRequiresBoundSession(m.type) && !this.remoteClients.active(clientId)) {
+        this.refuseUnboundRemoteSession(clientId);
+        return;
+      }
       const requester = this.captureRemoteRequester(clientId);
       const transition = async (currentClientId: string) => {
         if (m.type === "newSession") {
           await this.newRemoteSession(currentClientId);
         } else if (m.type === "resumeSession") {
-          await this.openRemoteSession(currentClientId, m.id, m.cwd);
+          await this.openRemoteSession(currentClientId, m.id, m.cwd, true, m.claim === true);
         } else if (m.type === "selectRepo") {
           await this.selectRemoteRepo(currentClientId, m.cwd);
         }
@@ -18238,6 +18774,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Empty default cwd (no desktop project yet) is not a bound repo. The
     // snapshot still goes out unbound; adopting/starting here would throw.
     if (!this.remoteClients.cwdIfPresent(clientId)) return;
+    // A tab that lost this conversation to another tab's claim must not
+    // adopt the desk session or mint a blank one on reconnect. The snapshot
+    // below stays unbound; an automatic restore (no claim bit) then lands
+    // in the taken-over state instead of stealing the conversation back.
+    if (this.remoteClients.requiresExplicitSession(clientId) && !this.remoteClients.active(clientId)) {
+      return;
+    }
     const session = this.remoteSessionFor(clientId);
     if (session.client && !session.needsProvider) {
       this.restorePersistedDraft(session);
@@ -18579,7 +19122,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // was away comes back unbound rather than resuming inside it.
     const authorized = this.remoteAuthorizedSessionCwds();
     const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
-    const session = cwd ? this.remoteSessionFor(clientId) : this.remoteClients.active(clientId);
+    const demoted = this.remoteClients.requiresExplicitSession(clientId)
+      && !this.remoteClients.active(clientId);
+    const session = demoted
+      ? undefined
+      : cwd
+        ? this.remoteSessionFor(clientId)
+        : this.remoteClients.active(clientId);
     // Catalog is already open-folder-filtered on desktop; still the sole source.
     const entries = this.localRepoCatalogEntries();
     // Never put a closed cwd on the wire (choke point rejects it); empty = unbound.
@@ -18602,8 +19151,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // once-a-day rule never applied — the host was recording faithfully and
     // nobody was listening.
     snap.push(this.welcomeTipsMessage());
-    snap.push(this.projectSetupMessage());
-    snap.push({ type: "clearMessages" });
+    snap.push(this.projectSetupMessage(this.githubProjectSetupExtra(clientId)));
+    // A demoted tab already has a frozen transcript. clearMessages here would
+    // wipe it on a same-page reconnect (mobile thaw). A rebuilt page starts
+    // empty, so skipping the clear is a no-op there.
+    if (!demoted) snap.push({ type: "clearMessages" });
     // Conversation buffer only when the bound session still lives under an
     // authorized cwd (revoke disposes doomed sessions; this is the belt).
     if (session && sessionCwdOk && !session.replaying) {
@@ -18642,6 +19194,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         sessionCwdOk ? this.remoteActiveSessionId(clientId) : null,
       ),
     );
+    if (demoted) {
+      const supersededId = this.remoteClients.supersededSessionId(clientId);
+      snap.push({
+        type: "error",
+        text: "This conversation is now open in another tab. Continue here to take it back.",
+        ...(supersededId ? { resumeFailed: { id: supersededId } } : {}),
+        code: SESSION_SUPERSEDED_CODE,
+      });
+    }
     if (session && sessionCwdOk && session.activeSessionId) {
       snap.push({
         type: "sessionName",

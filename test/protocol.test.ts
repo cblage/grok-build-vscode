@@ -4,6 +4,7 @@ import {
   HOST_CAPABILITIES,
   HOST_MESSAGE_TYPES as TS_HOST,
   INTERRUPTED_SEND_CODE,
+  SESSION_SUPERSEDED_CODE,
   WEBVIEW_MESSAGE_TYPES as TS_WEBVIEW,
 } from "../src/protocol";
 // The webview's own copy of the contract (plain JS — it can't import the TS types).
@@ -20,6 +21,13 @@ describe("host <-> webview message contract (src/protocol.ts is the source of tr
   it("pins the interrupted-send error code so harnesses do not match copy", () => {
     expect(INTERRUPTED_SEND_CODE).toBe("interrupted-send");
     expect(chatSrc).toContain('el.setAttribute("data-error-code", code)');
+  });
+
+  it("pins the session-superseded error code so a takeover is not matched on copy", () => {
+    expect(SESSION_SUPERSEDED_CODE).toBe("session-superseded");
+    expect(chatSrc).toContain('const SESSION_SUPERSEDED_CODE = "session-superseded"');
+    expect(chatSrc).toContain("opts.claim");
+    expect(chatSrc).toContain("Continue here");
   });
 
   it("advertises remote voice as a host protocol capability", () => {
@@ -40,6 +48,14 @@ describe("host <-> webview message contract (src/protocol.ts is the source of tr
       // so the client must gate the Connect control on this rather than offer a
       // button that does nothing.
       remoteAgentSignIn: true,
+      // Same for GitHub in the clone form: older hosts DROP `setupGithubCli`.
+      remoteGithubSignIn: true,
+      // Same again for Rewind and Edit, which 4.1.0 opened to remotes. Every
+      // host before it classifies `rewindSession` / `editLastMessage` as
+      // host-local and drops them, and the relay always deploys ahead of the
+      // extension — so without this the browser shows two dead buttons to
+      // everyone who has not updated yet.
+      remoteRewind: true,
     });
   });
 

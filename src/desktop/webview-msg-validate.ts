@@ -161,9 +161,14 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "unlinkRemoteDevice":
       break;
     case "runGrokLogin":
+    case "cancelDeviceLogin":
     case "logout":
     case "recheckConnection":
     case "retryProviderSession":
+      if (raw.provider !== undefined && raw.provider !== "grok" && raw.provider !== "codex" && raw.provider !== "claude") return null;
+      break;
+    case "submitDeviceLoginCode":
+      if (!isString(raw.code)) return null;
       if (raw.provider !== undefined && raw.provider !== "grok" && raw.provider !== "codex" && raw.provider !== "claude") return null;
       break;
     case "setMode":
@@ -301,6 +306,7 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "resumeSession":
       if (!isString(raw.id)) return null;
       if (!opt(raw.cwd, isString)) return null;
+      if (!opt(raw.claim, isBoolean)) return null;
       break;
     case "renameSession":
       if (!isString(raw.id) || !isString(raw.name)) return null;

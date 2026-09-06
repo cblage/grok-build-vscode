@@ -109,10 +109,41 @@ export const HOST_CAPABILITIES = {
   // the dead end it replaced, because a dead end at least tells you where to
   // go. Field presence, never a version check.
   remoteAgentSignIn: true,
+  // Same shape, for GitHub in the clone form. Older hosts classify
+  // `setupGithubCli` as `host-local` and drop it silently, so the Sign in
+  // button must not be offered as a working control until this is present.
+  remoteGithubSignIn: true,
+  // Same shape again, for Rewind and Edit on user bubbles. Every host built
+  // before 4.1.0 classifies `rewindSession` / `editLastMessage` /
+  // `uiConfirmAnswer` as host-local and drops them, so a browser client — which
+  // is always as new as the relay deploy — would show two controls that do
+  // nothing at all for every user who has not updated yet. That window is not
+  // hypothetical: the relay ships first, by release-order rule.
+  remoteRewind: true,
 } as const;
+
+/** Device-code GitHub sign-in carried on `projectSetup`. Additive. */
+export type ProjectSetupGithub = {
+  status: "starting" | "waiting" | "done" | "failed";
+  url?: string;
+  code?: string;
+  message?: string;
+};
 
 /** Machine-readable `error.code` for a send abandoned after its userMessage echo. */
 export const INTERRUPTED_SEND_CODE = "interrupted-send" as const;
+
+/**
+ * Machine-readable `error.code` when a remote tab lost a conversation to an
+ * explicit claim from another tab, or when a non-claim resume found that
+ * conversation already held. Additive: older clients ignore `code` and still
+ * see `resumeFailed`.
+ */
+export const SESSION_SUPERSEDED_CODE = "session-superseded" as const;
+
+export type HostErrorCode =
+  | typeof INTERRUPTED_SEND_CODE
+  | typeof SESSION_SUPERSEDED_CODE;
 
 /** Host-kind affordances merged into `initialState.capabilities` at post time. */
 export type HostUiCapabilities = {
@@ -139,6 +170,19 @@ export type HostUiCapabilities = {
    * drop. See HOST_CAPABILITIES for why silence is the failure mode.
    */
   remoteAgentSignIn?: boolean;
+  /**
+   * Whether this host can run `gh auth login` headlessly for a remote and
+   * report the URL and code in the clone form. OPT-IN: absent/false = the
+   * remote clone form keeps the honest dead-end rather than posting
+   * `setupGithubCli` at a host that would drop it.
+   */
+  remoteGithubSignIn?: boolean;
+  /**
+   * Whether this host accepts Rewind and Edit from a remote. OPT-IN:
+   * absent/false = the browser hides both controls rather than offering
+   * buttons an older host drops in silence. See HOST_CAPABILITIES.
+   */
+  remoteRewind?: boolean;
   /**
    * Whether a remote may sign an agent OUT on this host.
    *
@@ -336,6 +380,11 @@ export type HostMsg =
       fixCommand?: string;
       /** A project was actually made — the form closes on this, not on silence. */
       done?: boolean;
+      /**
+       * Headless GitHub CLI sign-in, shown only inside the clone form.
+       * Additive: an older client ignores it and renders the form as before.
+       */
+      github?: ProjectSetupGithub;
     }
   /** Connected agents plus host-observed, view-only version facts. Version
    * fields are additive so an older host/client keeps the connection UI.
@@ -594,11 +643,17 @@ export type HostMsg =
       launched?: boolean;
       device?: {
         /** starting: spawned, nothing printed yet. waiting: URL and code are on
-         *  screen and the CLI is polling. done/failed: terminal. unavailable:
-         *  this provider has no flow that works without a terminal. */
+         *  screen and the CLI is polling (or, with needsCode, waiting for a
+         *  paste). done/failed: terminal. unavailable: this provider has no
+         *  flow that works without a terminal. */
         status: "starting" | "waiting" | "verifying" | "done" | "failed" | "unavailable";
         url?: string;
         code?: string;
+        /** Paste-code flow: the person must type a code into the card. Set from
+         *  the plan, not inferred from a missing printed code. Additive. */
+        needsCode?: boolean;
+        /** The paste was written to the CLI; the card can stop offering input. */
+        submitted?: boolean;
         /** Said to the person, not logged — a failure or an explanation. */
         message?: string;
         /**
@@ -620,7 +675,9 @@ export type HostMsg =
   // the browser outbox can fail closed. Older clients ignore the extra field.
   // code is additive too — a harness must not match user-facing `text`.
   // "interrupted-send" is a send abandoned after its userMessage echo.
-  | { type: "error"; text: string; resumeFailed?: { id: string }; code?: typeof INTERRUPTED_SEND_CODE }
+  // "session-superseded" is a tab that lost (or failed to restore) a
+  // conversation another tab now holds — see resumeSession.claim.
+  | { type: "error"; text: string; resumeFailed?: { id: string }; code?: HostErrorCode }
   | { type: "hostNotice"; level: "info" | "warning"; text: string }
   | { type: "xaiNotification"; update?: unknown }
   // Persisted xAI lifecycle (method _x.ai/session/update): subagent spawn/finish
@@ -871,10 +928,11 @@ export type WebviewMsg =
    */
   | { type: "cloneProject"; url: string }
   /**
-   * Install or sign in to the GitHub CLI, in a terminal on the desk.
+   * Install or sign in to the GitHub CLI.
    *
-   * Offered only after a clone failed in a way `gh` would fix. Host-local: it
-   * opens an interactive terminal, which a remote can neither see nor answer.
+   * Offered only after a clone failed in a way `gh` would fix. A local webview
+   * still opens a terminal. A remote `auth` runs the headless device-code flow
+   * and reports the URL and code on `projectSetup.github`.
    */
   | { type: "setupGithubCli"; action: "install" | "auth" }
   // `panel-right` / `panel-bottom` dock the panel on that edge before revealing;
@@ -927,6 +985,10 @@ export type WebviewMsg =
   // Stop a headless sign-in the host is running. Only reachable while one is in
   // flight, and it kills a child process this same user started moments ago.
   | { type: "cancelDeviceLogin"; provider?: "grok" | "codex" | "claude" }
+  // Paste-code half of a headless sign-in: the person typed the vendor's code
+  // into the card and we write it to the CLI's stdin. Additive — an older host
+  // simply has no handler, and an older client never posts it.
+  | { type: "submitDeviceLoginCode"; provider?: "grok" | "codex" | "claude"; code: string }
   | { type: "logout"; provider?: "grok" | "codex" | "claude" }
   | { type: "checkGrokUpdate" }
   | { type: "updateGrok" }
@@ -962,7 +1024,13 @@ export type WebviewMsg =
   | { type: "setRepoColor"; cwd: string; color: string }
   // cwd is required to reopen a worktree-isolated session (sessions are keyed
   // by cwd on disk). Omitted → host resolves from meta / workspace root.
-  | { type: "resumeSession"; id: string; cwd?: string }
+  //
+  // `claim` is additive: only an explicit user action (rail row, history pick,
+  // pinned row, Continue here) sets it. A reconnect restore MUST omit it —
+  // without that distinction a thawing background tab steals the conversation
+  // back from the tab in the user's hand. Absent/false = today's refusal when
+  // another tab already holds the session.
+  | { type: "resumeSession"; id: string; cwd?: string; claim?: boolean }
   // cwd names the PROJECT the row belongs to, so a client listing several of
   // them (the browser rail) can act on a conversation without first switching
   // to its repo. Optional and additive: omitted → the host authorizes against
@@ -1068,8 +1136,11 @@ export type WebviewMsg =
   /** Edit-and-resend (#56): rewind past this (latest) user message and hand its
    *  text back to the composer. `text` is the bubble's own cleaned copy text. */
   | { type: "editLastMessage"; userBubbleIndex: number; text: string; totalUserBubbles?: number }
-  /** Reply to `uiConfirmRequest`. Host-local only: this is the last gate before
-   *  a rewind reverts files, so a remote must never be able to answer one. */
+  /** Reply to `uiConfirmRequest`. Answerable by whichever client was shown the
+   *  dialog, remote included, since 2026-09-01: the confirm moved in-chat in
+   *  2.0.0, so `host-local` here did not buy a more careful check — it meant a
+   *  remote could be shown a dialog it could never answer, leaving the rewind
+   *  pending forever. See remote-policy.ts on rewindSession. */
   | { type: "uiConfirmAnswer"; id: string; ok: boolean }
   // Workflow card controls (P2-10): pause / resume / stop by display name.
   | { type: "workflowControl"; action: "pause" | "resume" | "stop"; displayName: string }
@@ -1124,7 +1195,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, setVoiceSendPhrase: true, setVoiceKeyterms: true, setTelemetryEnabled: true, setThumbsFeedback: true, summarizeSpeech: true, requestImageFull: true, composerFocus: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
   questionCancel: true, setModel: true, installCodex: true, cancelCodexInstall: true, runInstallCmd: true, runGrokLogin: true,
-  cancelDeviceLogin: true,
+  cancelDeviceLogin: true, submitDeviceLoginCode: true,
   logout: true, checkGrokUpdate: true, updateGrok: true, recheckConnection: true, refreshProviders: true, retryProviderSession: true,
   listSessions: true, listRepoSessions: true, selectRepo: true, toggleRepoPin: true, toggleSessionPin: true,
   setRepoArchived: true, setRepoColor: true,

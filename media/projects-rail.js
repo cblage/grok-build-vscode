@@ -107,6 +107,7 @@
     /** Display form of the one directory new projects land in (`~/Grok Build`),
      *  from `projectSetup`. The form shows the destination as you type. */
     projectRoot: "",
+    projectGithub: null,
   };
 
   let menuEl = null;
@@ -929,7 +930,12 @@
     }
     const spec = helpers.addProjectMenuItems(addProjectCaps());
     const run = (id) => {
-      if (id === "import") vscode.postMessage({ type: "addProjectFolder" });
+      // Same hint as the chat rail, and the same rule: it acts rather than
+      // instructs. This view has no settings overlay of its own, so it asks the
+      // host for the editor tab.
+      if (id === "clone-needs-coding") {
+        vscode.postMessage({ type: "openSettingsSurface", category: "general" });
+      } else if (id === "import") vscode.postMessage({ type: "addProjectFolder" });
       else openAddProjectForm(id);
     };
     // One way in is a click, not a menu that asks permission to be a click.
@@ -998,7 +1004,7 @@
       closeAddProjectForm();
     };
     document.addEventListener("keydown", addProjectFormKeydown, true);
-    api.update({ root: state.projectRoot });
+    api.update({ root: state.projectRoot, github: state.projectGithub || undefined });
     api.focus();
   }
 
@@ -1531,6 +1537,7 @@
         type: "resumeSession",
         id: s.id,
         cwd: s.cwd || repo.cwd,
+        claim: true,
       });
     };
 
@@ -1552,8 +1559,15 @@
         if (typeof msg.root === "string" && msg.root) state.projectRoot = msg.root;
         // `done` is the only close signal: a failed attempt also stops being
         // busy, and closing on that would throw away the error to be read.
-        if (msg.done) { closeAddProjectForm(); break; }
-        if (addProjectFormApi) addProjectFormApi.update(msg);
+        if (msg.done) {
+          state.projectGithub = null;
+          closeAddProjectForm();
+          break;
+        }
+        if (msg.busy) state.projectGithub = null;
+        else if (msg.github && typeof msg.github === "object") state.projectGithub = msg.github;
+        else if (msg.error) state.projectGithub = null;
+        if (addProjectFormApi) addProjectFormApi.update({ ...msg, github: state.projectGithub || msg.github });
         break;
       case "repos": {
         const leaving = state.currentCwd;

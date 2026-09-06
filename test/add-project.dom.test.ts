@@ -68,11 +68,21 @@ function installOpener(h: Harness) {
 }
 
 describe("add project", () => {
-  it("offers naming and importing in Knowledge work", () => {
+  it("offers naming and importing in Knowledge work, and says where cloning went", () => {
     const h = boot();
     installOpener(h);
     openMenu(h);
-    expect(menuItems(h)).toEqual(["New project", "Import a folder"]);
+    // Cloning is a coding affordance, so it is absent here — and an absent
+    // thing explains nothing. Someone who came to clone a repository would
+    // otherwise find two options that are not it and no way to learn that the
+    // third is one setting away (owner, 2026-09-01).
+    expect(menuItems(h)).toEqual(["New project", "Import a folder", "Clone from GitHub?"]);
+    const hint = [...h.doc.querySelectorAll(".rail-menu-item")].at(-1);
+    expect(hint?.textContent).toContain("Coding mode");
+    // It ACTS: selecting it opens the setting rather than describing where it
+    // is. In this host that is the in-page overlay, not a host message.
+    click(h.window, hint!);
+    expect(h.doc.querySelector("#settings-overlay, .settings-overlay")).toBeTruthy();
   });
 
   it("adds cloning in Coding, at the top, and takes nothing away", () => {
@@ -87,7 +97,13 @@ describe("add project", () => {
     installOpener(h);
     openMenu(h);
     const descriptions = [...h.doc.querySelectorAll(".rail-menu-desc")].map((el) => el.textContent);
-    expect(descriptions).toEqual(["Name it. We make the folder.", "Choose one you already have."]);
+    expect(descriptions).toEqual([
+      "Name it. We make the folder.",
+      "Choose one you already have.",
+      // The hint earns a description for the same reason the others do: the
+      // label alone says what it is, not what happens when you pick it.
+      "Switch to Coding mode in the settings.",
+    ]);
   });
 
   it("stays a plain picker on a host that offers nothing else", () => {
@@ -205,6 +221,121 @@ describe("add project", () => {
     expect(form(h)).toBeTruthy();
   });
 
+  it("posts setupGithubCli from a remote when the host can run headless GitHub sign-in", () => {
+    const h = boot({
+      remote: true,
+      coding: true,
+      caps: { ...CAPS, remoteGithubSignIn: true },
+    });
+    installOpener(h);
+    openMenu(h);
+    click(h.window, [...h.doc.querySelectorAll(".rail-menu-item")][0]);
+    dispatch(h.window, {
+      type: "projectSetup",
+      root: "~/Grok Build",
+      error: "Git couldn't authenticate.",
+      fix: "auth-gh",
+    });
+    click(h.window, fix(h)!);
+    expect(h.posted).toContainEqual({ type: "setupGithubCli", action: "auth" });
+  });
+
+  it("does not post setupGithubCli from a remote at a host that would drop it", () => {
+    const h = boot({ remote: true, coding: true });
+    installOpener(h);
+    openMenu(h);
+    click(h.window, [...h.doc.querySelectorAll(".rail-menu-item")][0]);
+    dispatch(h.window, {
+      type: "projectSetup",
+      root: "~/Grok Build",
+      error: "Git couldn't authenticate.",
+      fix: "auth-gh",
+    });
+    click(h.window, fix(h)!);
+    expect(h.posted.some((m) => m.type === "setupGithubCli")).toBe(false);
+    expect(problem(h)?.textContent).toMatch(/Sign in to GitHub on the computer/);
+  });
+
+  it("renders the device code in the clone form, with a copy button and a link", () => {
+    const h = boot({ coding: true });
+    installOpener(h);
+    openMenu(h);
+    click(h.window, [...h.doc.querySelectorAll(".rail-menu-item")][0]);
+    input(h).value = "https://github.com/you/private.git";
+    input(h).dispatchEvent(new h.window.Event("input", { bubbles: true }));
+    dispatch(h.window, {
+      type: "projectSetup",
+      root: "~/Grok Build",
+      github: {
+        status: "waiting",
+        url: "https://github.com/login/device",
+        code: "0D15-6BD9",
+      },
+    });
+    expect(form(h)).toBeTruthy();
+    const box = h.doc.querySelector(".add-project-github") as HTMLElement | null;
+    expect(box?.hidden).toBe(false);
+    expect(box?.textContent).toContain("0D15-6BD9");
+    expect(box?.textContent).toContain("Open the link, then confirm this code");
+    expect(box?.textContent).toContain("Keep this page open");
+    const link = h.doc.querySelector(".add-project-github-open") as HTMLAnchorElement | null;
+    expect(link?.hidden).toBe(false);
+    expect(link?.getAttribute("href")).toBe("https://github.com/login/device");
+    expect(link?.textContent).toBe("Open the sign-in page");
+    expect(link?.target).toBe("_blank");
+    expect(h.doc.querySelector(".add-project-github-copy")).toBeTruthy();
+    expect(fix(h)?.hidden).toBe(true);
+    expect(submit(h).disabled).toBe(false);
+  });
+
+  it("stays open on success and tells them to clone again", () => {
+    const h = boot({ coding: true });
+    installOpener(h);
+    openMenu(h);
+    click(h.window, [...h.doc.querySelectorAll(".rail-menu-item")][0]);
+    input(h).value = "https://github.com/you/private.git";
+    input(h).dispatchEvent(new h.window.Event("input", { bubbles: true }));
+    dispatch(h.window, {
+      type: "projectSetup",
+      root: "~/Grok Build",
+      github: { status: "done", message: "Signed in to GitHub. Clone again." },
+    });
+    expect(form(h)).toBeTruthy();
+    expect(h.doc.querySelector(".add-project-github")?.textContent).toContain("Clone again");
+    expect(submit(h).textContent).toBe("Clone");
+    expect(submit(h).disabled).toBe(false);
+  });
+
+  it("reopens the clone form on a waiting github frame so a reconnect can finish", () => {
+    const h = boot({ remote: true, coding: true, caps: { ...CAPS, remoteGithubSignIn: true } });
+    dispatch(h.window, {
+      type: "projectSetup",
+      root: "~/Grok Build",
+      github: {
+        status: "waiting",
+        url: "https://github.com/login/device",
+        code: "0D15-6BD9",
+      },
+    });
+    expect(form(h)).toBeTruthy();
+    expect(h.doc.querySelector(".add-project-github")?.textContent).toContain("0D15-6BD9");
+  });
+
+  it("ignores github on an older frame that does not carry it", () => {
+    const h = boot({ coding: true });
+    installOpener(h);
+    openMenu(h);
+    click(h.window, [...h.doc.querySelectorAll(".rail-menu-item")][0]);
+    dispatch(h.window, {
+      type: "projectSetup",
+      root: "~/Grok Build",
+      error: "Git couldn't authenticate.",
+      fix: "auth-gh",
+    });
+    expect(h.doc.querySelector(".add-project-github")?.hidden).toBe(true);
+    expect(fix(h)?.hidden).toBe(false);
+  });
+
   it("names the install command when the CLI is missing", () => {
     const h = boot({ coding: true });
     installOpener(h);
@@ -221,6 +352,37 @@ describe("add project", () => {
     expect(fix(h)?.textContent).toContain("winget install --id GitHub.cli -e");
     click(h.window, fix(h)!);
     expect(h.posted).toContainEqual({ type: "setupGithubCli", action: "install" });
+  });
+
+  /**
+   * Installing has no headless path and is not getting one — a package manager
+   * asks for elevation, so the host opens a terminal. On a cloud machine that
+   * terminal is an Xvfb screen nobody is at, and pressing again just opens
+   * another. The sign-in capability says the host can SIGN IN headlessly; it
+   * says nothing about installing, and admitting every fix behind it put the
+   * inaccessible-terminal dead end straight back on this branch.
+   *
+   * Found by review before release.
+   */
+  it("never posts an install from a remote, however capable the host says it is", () => {
+    // Merge, don't replace: the form needs the project capabilities to render
+    // at all, and a bare override silently produces a page with no menu.
+    const h = boot({ coding: true, remote: true, caps: { ...CAPS, remoteGithubSignIn: true } });
+    installOpener(h);
+    openMenu(h);
+    click(h.window, [...h.doc.querySelectorAll(".rail-menu-item")][0]);
+    dispatch(h.window, {
+      type: "projectSetup",
+      root: "~/Grok Build",
+      error: "Git couldn't authenticate.",
+      fix: "install-gh",
+      fixCommand: "sudo apt install gh",
+    });
+    click(h.window, fix(h)!);
+    expect(h.posted.some((m: { type?: string }) => m.type === "setupGithubCli")).toBe(false);
+    // And it says something a person can act on instead of going quiet.
+    expect(h.doc.querySelector(".add-project-error")?.textContent || "")
+      .toMatch(/GitHub CLI/i);
   });
 
   it("clears a stale fix when the next failure does not earn one", () => {

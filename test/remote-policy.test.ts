@@ -3,6 +3,8 @@ import {
   INBOUND_DISPOSITION,
   OUTBOUND_DISPOSITION,
   OUTBOUND_PROJECT_AUTH,
+  REMOTE_REQUIRES_BOUND_SESSION,
+  remoteRequiresBoundSession,
   allowFromRemote,
   allowRemoteRepoTarget,
   bracketRemoteSnapshot,
@@ -33,6 +35,16 @@ describe("remote-policy classification tables", () => {
   // guards the compiled-JS path the same way protocol.test.ts does.
   it("classifies every WebviewMsg type (no drift behind the protocol)", () => {
     expect(sorted(Object.keys(INBOUND_DISPOSITION))).toEqual(sorted(WEBVIEW_MESSAGE_TYPES));
+  });
+
+  it("classifies every WebviewMsg type for bound-session enforcement", () => {
+    expect(sorted(Object.keys(REMOTE_REQUIRES_BOUND_SESSION))).toEqual(sorted(WEBVIEW_MESSAGE_TYPES));
+    expect(remoteRequiresBoundSession("send")).toBe(true);
+    expect(remoteRequiresBoundSession("permissionAnswer")).toBe(true);
+    expect(remoteRequiresBoundSession("resumeSession")).toBe(false);
+    expect(remoteRequiresBoundSession("newSession")).toBe(false);
+    expect(remoteRequiresBoundSession("selectRepo")).toBe(false);
+    expect(remoteRequiresBoundSession("listSessions")).toBe(false);
   });
 
   it("classifies every HostMsg type", () => {
@@ -101,7 +113,13 @@ describe("remote-policy classification tables", () => {
     expect(INBOUND_DISPOSITION.newWorktreeSession).toBe("host-local");
     expect(INBOUND_DISPOSITION.applyWorktree).toBe("host-local");
     expect(INBOUND_DISPOSITION.removeWorktree).toBe("host-local");
-    expect(INBOUND_DISPOSITION.rewindSession).toBe("host-local");
+    // Rewind, edit-and-resend and the confirm that gates them are reachable
+    // from a remote since 2026-09-01. The three move together on purpose: an
+    // admitted rewind whose confirm is refused would hang forever, since
+    // confirmInChat resolves only on an answer.
+    expect(INBOUND_DISPOSITION.rewindSession).toBe("propose");
+    expect(INBOUND_DISPOSITION.editLastMessage).toBe("propose");
+    expect(INBOUND_DISPOSITION.uiConfirmAnswer).toBe("propose");
     // relay account actions manage THIS machine's device token
     expect(INBOUND_DISPOSITION.remoteSignIn).toBe("host-local");
     expect(INBOUND_DISPOSITION.remoteSignOut).toBe("host-local");
@@ -753,9 +771,15 @@ describe("allowFromRemote tier gating", () => {
   it("lets a remote start a sign-in, but only at full", () => {
     expect(allowFromRemote("runGrokLogin", "full")).toBe(true);
     expect(allowFromRemote("cancelDeviceLogin", "full")).toBe(true);
+    expect(allowFromRemote("submitDeviceLoginCode", "full")).toBe(true);
+    expect(INBOUND_DISPOSITION.submitDeviceLoginCode).toBe("full");
+    expect(allowFromRemote("setupGithubCli", "full")).toBe(true);
+    expect(INBOUND_DISPOSITION.setupGithubCli).toBe("full");
     for (const tier of ["read-only", "propose"] as const) {
       expect(allowFromRemote("runGrokLogin", tier)).toBe(false);
       expect(allowFromRemote("cancelDeviceLogin", tier)).toBe(false);
+      expect(allowFromRemote("submitDeviceLoginCode", tier)).toBe(false);
+      expect(allowFromRemote("setupGithubCli", tier)).toBe(false);
     }
   });
 

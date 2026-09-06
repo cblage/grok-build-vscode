@@ -230,9 +230,12 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // remote can say what, never where.
   createProject: "full",
   cloneProject: "full",
-  // The follow-up when a clone failed on credentials: opens an INTERACTIVE
-  // terminal on the desk, which a remote can neither see nor answer.
-  setupGithubCli: "host-local",
+  // The follow-up when a clone failed on credentials. A remote `auth` runs
+  // the same headless device-code flow as `runGrokLogin` and reports the
+  // URL and code in the clone form — the person asking is the only one who
+  // can see it. Install still opens a terminal (package managers ask for
+  // elevation). Signing in is not bound to a conversation.
+  setupGithubCli: "full",
   resumeSession: "view",
   renameSession: "view",
   // read-only workspace file-name lookup (the composer's @ popover)
@@ -282,13 +285,31 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   newWorktreeSession: "host-local",
   applyWorktree: "host-local",
   removeWorktree: "host-local",
-  // Rewind discards work already on disk — stays host-local. Desktop (local
-  // host) supports it via confirmInChat; remote must not.
-  rewindSession: "host-local",
-  // Edit-and-resend is a rewind underneath, so the same host-local gate.
-  editLastMessage: "host-local",
-  // The last gate before a rewind reverts files — only the local webview answers.
-  uiConfirmAnswer: "host-local",
+  // Rewind and edit-and-resend were `host-local` until 2026-09-01, on the
+  // grounds that rewind discards work already on disk and only the careful
+  // local surface should be able to ask for it. Two things retired that
+  // argument, and the owner made the call:
+  //
+  //   1. A remote can already tell the agent to rewrite or delete any file in
+  //      the repo — that is the product. Refusing the rewind of edits it was
+  //      allowed to request is a locked door beside an open one, not a
+  //      safeguard.
+  //   2. There is no longer a more careful surface to prefer. The confirmation
+  //      moved in-chat in 2.0.0 (`confirmInChat` -> `uiConfirmRequest`), so the
+  //      desk webview and the browser render the SAME dialog from the same
+  //      frame. `host-local` bought a different asker, not a different check.
+  //
+  // The actor here is the account holder acting on their own machine, so this
+  // is a scoping rule, not a security boundary (CLAUDE-ops § Name who is harmed
+  // before you harden anything). `propose`, matching forkSession and send.
+  rewindSession: "propose",
+  // Edit-and-resend is a rewind underneath, so it moves with it.
+  editLastMessage: "propose",
+  // MUST move in the same commit as rewindSession. `confirmInChat` resolves
+  // only when an answer comes back; a client that can be shown the dialog and
+  // cannot answer it leaves the promise pending forever, the rewind silently
+  // never happens, and the entry leaks in `pendingConfirms`.
+  uiConfirmAnswer: "propose",
   // Workflow pause/resume/stop is a slash turn (same class as queueSend/steer).
   workflowControl: "propose",
   // Donut popover re-fetch — read-only meter, no turn / no mutation.
@@ -352,6 +373,9 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // Stops a flow this same remote started. Refusing it would leave the only
   // party who can see the panel unable to close it.
   cancelDeviceLogin: "full",
+  // The paste that finishes the same flow. Refusing it would leave the only
+  // party who can see the card unable to finish.
+  submitDeviceLoginCode: "full",
   // host-local: native pickers/editors/config/mic on the dev box
   // Replacing the CLI binary belongs here, not in "full" (2026-08-11). The
   // binaries live on the desk machine and only the desk can replace them, so a
@@ -462,6 +486,148 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   openUpdateRelease: "host-local",
   restartToUpdate: "host-local",
 };
+
+/**
+ * Session-bound remote messages. After a tab's active mapping is removed
+ * (another tab claimed the conversation), these are refused until the tab
+ * explicitly resumes, selects a repo, or starts a new session. `remoteSessionFor`
+ * used to adopt the desk session or mint a blank one when there was no mapping,
+ * so a stale Send from a frozen transcript could silently start or target
+ * another conversation.
+ *
+ * Exhaustive on WebviewMsg so a new type cannot land unclassified.
+ */
+export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> = {
+  ready: false,
+  remotePreferences: false,
+  listSessions: false,
+  listRepoSessions: false,
+  selectRepo: false,
+  toggleRepoPin: false,
+  setRepoArchived: false,
+  setRepoColor: false,
+  toggleSessionPin: false,
+  dismissWelcomeTip: false,
+  welcomeTipShown: false,
+  createProject: false,
+  cloneProject: false,
+  setupGithubCli: false,
+  resumeSession: false,
+  renameSession: false,
+  mentionQuery: true,
+  listProjectDir: false,
+  readProjectFile: false,
+  send: true,
+  newSession: false,
+  cancel: true,
+  setMode: true,
+  setEffort: true,
+  setModel: true,
+  installCodex: false,
+  cancelCodexInstall: false,
+  questionAnswer: true,
+  questionCancel: true,
+  queueSend: true,
+  dequeueSend: true,
+  clearQueuedSends: true,
+  steerSend: true,
+  turnFeedback: true,
+  forkSession: true,
+  newWorktreeSession: false,
+  applyWorktree: true,
+  removeWorktree: true,
+  rewindSession: true,
+  editLastMessage: true,
+  uiConfirmAnswer: true,
+  workflowControl: true,
+  refreshContextDetails: true,
+  pasteImage: true,
+  uploadFile: true,
+  writeProjectFile: false,
+  removeChip: true,
+  toggleChip: true,
+  addMentionFile: true,
+  recheckConnection: false,
+  refreshProviders: false,
+  retryProviderSession: true,
+  permissionAnswer: true,
+  exitPlanAnswer: true,
+  logout: false,
+  deleteSession: false,
+  clearAllSessions: false,
+  runInstallCmd: false,
+  runGrokLogin: false,
+  cancelDeviceLogin: false,
+  submitDeviceLoginCode: false,
+  updateGrok: false,
+  checkGrokUpdate: false,
+  pickModel: true,
+  openFile: false,
+  showInFolder: false,
+  openUrl: false,
+  openText: false,
+  openDiff: false,
+  exportExpr: false,
+  addProjectFolder: false,
+  removeProjectFolder: false,
+  openGlobalConfig: false,
+  openProjectConfig: false,
+  listMcpServers: false,
+  listRoutines: false,
+  saveRoutine: false,
+  deleteRoutine: false,
+  setRoutinePaused: false,
+  runRoutineNow: false,
+  connectMcpConnector: false,
+  disconnectMcpConnector: false,
+  showLogs: false,
+  toggleDevTools: false,
+  openSettings: false,
+  openSettingsSurface: false,
+  closeSettingsSurface: false,
+  moveView: false,
+  dropFile: true,
+  pickFile: true,
+  voiceStart: true,
+  voiceStop: true,
+  // Remote voice owns its OWN admission check, per client rather than per
+  // session, and refusing a chunk from a client with no live capture is the
+  // thing it exists to do — visibly, with a `voiceError` the person can see.
+  // Refusing these here instead would swap that visible rejection for a silent
+  // one, which is how a phone ends up holding a dead microphone button with no
+  // explanation. Voice is not session-bound in the first place.
+  remoteVoiceStart: false,
+  remoteVoiceChunk: false,
+  remoteVoiceStop: false,
+  setShowThinking: false,
+  setExpandCommandOutputs: false,
+  setSteerByDefault: false,
+  setSoundNotifications: false,
+  setProcessingSound: false,
+  // Host-local (see REMOTE_MSG_TIER above) — never reaches this check from a
+  // remote in the first place.
+  setSandbox: false,
+  setReadRepliesAloud: false,
+  setSummarizeRepliesAloud: false,
+  setVoiceSendPhrase: false,
+  setVoiceKeyterms: false,
+  setTelemetryEnabled: false,
+  setThumbsFeedback: false,
+  setAppPurpose: false,
+  summarizeSpeech: true,
+  requestImageFull: true,
+  composerFocus: false,
+  remoteSignIn: false,
+  remoteSignOut: false,
+  unlinkRemoteDevice: false,
+  openRemotePortal: false,
+  openUpdateRelease: false,
+  restartToUpdate: false,
+};
+
+export function remoteRequiresBoundSession(type: WebviewMsg["type"]): boolean {
+  return REMOTE_REQUIRES_BOUND_SESSION[type];
+}
 
 const TIER_RANK: Record<RemoteTier, number> = { "read-only": 0, propose: 1, full: 2 };
 

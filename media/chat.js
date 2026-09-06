@@ -186,6 +186,15 @@
     resolveRemoteTabTokenReady = resolve;
   });
 
+  const SESSION_SUPERSEDED_CODE = "session-superseded";
+
+  /** Explicit user actions set `claim`. Reconnect restore MUST omit it. */
+  function postResumeSession(id, cwd, opts) {
+    const msg = { type: "resumeSession", id, cwd: cwd || undefined };
+    if (opts && opts.claim) msg.claim = true;
+    vscode.postMessage(msg);
+  }
+
   function restoreRememberedRemoteSession() {
     const saved = rememberedRemoteSession;
     if (!IS_REMOTE || !saved) return;
@@ -195,7 +204,9 @@
     // Startup restore has no display name in the remembered payload, and the
     // page is already on the welcome/"Starting" hold. Treating it like a
     // user click would invent a title we do not have.
-    vscode.postMessage({ type: "resumeSession", id: saved.id, cwd: saved.cwd || undefined });
+    // Deliberately NOT a claim: a thawing background tab must not steal the
+    // conversation back from the tab that asked for it.
+    postResumeSession(saved.id, saved.cwd || undefined);
   }
   const ttsAvailable = !!window.speechSynthesis && typeof window.SpeechSynthesisUtterance === "function";
 
@@ -498,6 +509,10 @@
     // that drops `toggleSessionPin`, which is a control that looks broken
     // rather than absent (the same trap the repo chip avoids).
     pinnedSessionsKnown: false,
+    // Remote tab lost this conversation to another tab's explicit claim.
+    // Transcript stays; composer and turn controls freeze until Continue here
+    // (a claim) or a different conversation is opened.
+    sessionSuperseded: null,
     /** Desktop update rail — `updateAvailable` (notice) or `updateReady` (restart). */
     appUpdate: null,
     repoPreviews: {},
@@ -743,6 +758,9 @@
     // the Add project form shows the destination as you type, so it needs this
     // before anyone has typed anything.
     projectRoot: "",
+    // Last `projectSetup.github` from the host, so a reconnect can reopen the
+    // clone form onto the code the CLI is still polling.
+    projectGithub: null,
     // Empty-state tip facts from the host (`welcomeTips`): the two counts the
     // chat client never receives on its own plus the retired ids. null until
     // the frame lands, which suppresses the count-dependent tips rather than
@@ -4264,6 +4282,23 @@
     return state.activeProvider !== "claude" && state.activeProvider !== "codex";
   }
 
+  /**
+   * Rewind and edit-and-resend ride grok's `_x.ai/rewind/*` extension. Codex
+   * and Claude answer `unsupported`, and until 2026-09-01 the buttons rendered
+   * for them anyway — clicking one produced a host-side warning, which is a
+   * poor answer at a desk and NO answer at all on a cloud machine, where
+   * nobody is at the screen to read it. Same shape as steerableProvider().
+   */
+  function rewindCapableProvider() {
+    if (state.activeProvider === "claude" || state.activeProvider === "codex") return false;
+    // A host older than 4.1.0 classifies rewindSession / editLastMessage as
+    // host-local and drops them without a reply, so the buttons would be dead
+    // for every remote user who has not updated — and the relay always ships
+    // first. Field presence, never a version check; the desk is never gated.
+    if (IS_REMOTE && !(state.hostCaps && state.hostCaps.remoteRewind)) return false;
+    return true;
+  }
+
   function providerDisplayName(provider) {
     if (provider === "codex") return "Codex";
     if (provider === "claude") return "Claude";
@@ -4751,7 +4786,7 @@
         row.onclick = () => {
           if (active) { closePopovers(); return; }
           startRailResumeTransition(s.id, s.cwd, s.cwd, s.displayName);
-          vscode.postMessage({ type: "resumeSession", id: s.id, cwd: s.cwd });
+          postResumeSession(s.id, s.cwd, { claim: true });
           closePopovers();
         };
       }
@@ -5635,6 +5670,7 @@
    * model.
    */
   function startRailTransition(fields) {
+    if (state.sessionSuperseded) clearSessionSuperseded();
     clearRailTransitionTimer();
     const token = ++railTransitionSeq;
     state.railTransition = { token, ...fields };
@@ -6309,7 +6345,10 @@
     }
     const spec = helpers.addProjectMenuItems(addProjectCaps());
     const run = (id) => {
-      if (id === "import") vscode.postMessage({ type: "addProjectFolder" });
+      // The knowledge-work hint acts instead of instructing: it opens the
+      // setting that would put Clone in this menu.
+      if (id === "clone-needs-coding") openSettingsCategory("general");
+      else if (id === "import") vscode.postMessage({ type: "addProjectFolder" });
       else openAddProjectForm(id);
     };
     // One way in is a click, not a menu that asks permission to be a click.
@@ -6366,12 +6405,53 @@
         );
       },
       onCancel: closeAddProjectForm,
-      // Host-local, and the form stays open behind it: signing in happens in a
-      // terminal on the desk, and the user comes back here to try again.
-      onFix: (fix) => vscode.postMessage({
-        type: "setupGithubCli",
-        action: fix === "install-gh" ? "install" : "auth",
-      }),
+      // Local: signing in happens in a terminal, and the form stays open so
+      // they can clone again afterwards.
+      //
+      // Remote: older hosts classify `setupGithubCli` as host-local and DROP
+      // it silently. A new host advertises `remoteGithubSignIn` and runs the
+      // headless device-code flow into this form. Capability, never a version
+      // check — the same reason Connect is gated on `remoteAgentSignIn`.
+      onFix: (fix) => {
+        const install = fix === "install-gh";
+        // INSTALL has no headless path and is not getting one: a package
+        // manager asks for elevation, so the host opens a terminal for it. On a
+        // cloud machine that terminal is an Xvfb screen nobody is at, and
+        // pressing the button again just opens another one — the very dead end
+        // the sign-in flow exists to remove, reintroduced on the other branch.
+        // Caught by review before release. The capability says the host can
+        // sign in headlessly; it says nothing about installing.
+        if (IS_REMOTE && install) {
+          if (addProjectFormApi) {
+            addProjectFormApi.update({
+              error: IS_CLOUD_HOST
+                // A cloud machine ships gh, so this is a broken machine rather
+                // than a missing step, and there is no computer to walk to.
+                ? "The GitHub CLI is missing on this cloud machine, which should not happen. "
+                  + "Reset the machine from Settings, or tell us and we will look."
+                // Literal, not the host's GITHUB_CLI_DOWNLOAD: that constant
+                // lives in project-create.ts and is not in scope here, so
+                // referencing it would throw at the moment of the click.
+                : "Install the GitHub CLI on the computer running this workspace — cli.github.com — then try again here.",
+            });
+          }
+          return;
+        }
+        if (IS_REMOTE && !(state.hostCaps && state.hostCaps.remoteGithubSignIn)) {
+          const cloud = IS_CLOUD_HOST;
+          if (addProjectFormApi) {
+            addProjectFormApi.update({
+              error: cloud
+                ? "Signing in to GitHub needs a terminal, and a cloud machine has none. "
+                  + "Public repositories clone as they are; private ones need this, and it is coming."
+                : "Sign in to GitHub on the computer running this workspace — a terminal opens there — then try again here.",
+            });
+          }
+          return;
+        }
+        // Local keeps both actions: a terminal there is one the person can see.
+        vscode.postMessage({ type: "setupGithubCli", action: install ? "install" : "auth" });
+      },
     });
     if (!api) return;
     const scrim = document.createElement("div");
@@ -6388,7 +6468,7 @@
       closeAddProjectForm();
     };
     document.addEventListener("keydown", addProjectFormKeydown, true);
-    api.update({ root: state.projectRoot });
+    api.update({ root: state.projectRoot, github: state.projectGithub || undefined });
     api.focus();
   }
 
@@ -7574,7 +7654,7 @@
       // the host resolves sessions by cwd, and omitting it would look the id up
       // under the repo we happen to be in.
       if (!sameCwd(repo.cwd, state.selectedRepoCwd)) saveRememberedRemoteSession(null);
-      vscode.postMessage({ type: "resumeSession", id: s.id, cwd: s.cwd || repo.cwd });
+      postResumeSession(s.id, s.cwd || repo.cwd, { claim: true });
     };
   }
 
@@ -8590,6 +8670,7 @@
   }
 
   function resetForNewSession() {
+    clearSessionSuperseded();
     stopProcessingCue();
     cancelPendingSpeech();
     // The transcript is about to be emptied wholesale; drop the reference so a
@@ -8845,7 +8926,31 @@
       + `data-provider="${escapeHtml(provider)}">Cancel</button>`;
 
     if (device && device.status === "waiting" && device.url) {
-      status("Confirm the code");
+      status(device.needsCode ? (device.submitted ? "Confirming sign-in" : "Paste the code") : "Confirm the code");
+      const paste = !!device.needsCode;
+      const codeChip = !paste && device.code
+        ? `<p class="onb-desc">Open the link, then confirm this code:</p>` +
+          // Same markup as every other copyable value in this panel, so it
+          // inherits the existing copy handler and its copied state.
+          `<div class="onb-cmd">` +
+            `<code>${escapeHtml(device.code)}</code>` +
+            `<button class="onb-copy" type="button" title="Copy" data-cmd="${escapeHtml(device.code)}">${ICON.copy}</button>` +
+          `</div>`
+        : (!paste ? `<p class="onb-desc">Open the link to finish signing in.</p>` : "");
+      // Paste-code is a SEQUENCE, and the card now reads in that order: what
+      // you are about to do, the link that does it, then the field for what it
+      // gives you back. The field used to sit ABOVE the link, so the first
+      // thing on screen was somewhere to paste a code you had no way to have
+      // yet (owner, 2026-09-01).
+      const pasteIntro = paste && !device.submitted
+        ? `<p class="onb-desc">Open the sign-in page, sign in, then paste the code it shows you:</p>`
+        : "";
+      const pasteEntry = paste && !device.submitted
+        ? `<div class="onb-cmd onb-code-entry">` +
+            `<input class="onb-code-input" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste code" aria-label="Paste sign-in code">` +
+            `<button class="onb-action" type="button" data-act="submitDeviceLoginCode" data-provider="${escapeHtml(provider)}">Submit</button>` +
+          `</div>`
+        : "";
       return `<div class="onb">` +
         `<p class="onb-heading">${device.preflight ? "Step 2 of 2 &mdash; confirm the code" : `Finish signing in to ${escapeHtml(name)}`}</p>` +
         // The vendor's own page warns that device codes are used in phishing
@@ -8853,16 +8958,11 @@
         // BEFORE they meet it turns an alarming page into an expected one
         // (owner, with the screenshot, 2026-08-31).
         (device.note ? `<p class="onb-desc onb-note">${onbRich(device.note)}</p>` : "") +
-        (device.code
-          ? `<p class="onb-desc">Open the link, then confirm this code:</p>` +
-            // Same markup as every other copyable value in this panel, so it
-            // inherits the existing copy handler and its copied state.
-            `<div class="onb-cmd">` +
-              `<code>${escapeHtml(device.code)}</code>` +
-              `<button class="onb-copy" type="button" title="Copy" data-cmd="${escapeHtml(device.code)}">${ICON.copy}</button>` +
-            `</div>`
-          : `<p class="onb-desc">Open the link to finish signing in.</p>`) +
+        codeChip +
+        pasteIntro +
         `<a class="onb-action" href="${escapeHtml(device.url)}" target="_blank" rel="noopener noreferrer">Open the sign-in page</a>` +
+        // AFTER the link: you cannot have a code until you have been there.
+        pasteEntry +
         // The setting to check, beside the code it gates — not on a screen
         // before it that cost an extra click to get past.
         (device.preflight && Array.isArray(device.preflight.steps) && device.preflight.steps.length
@@ -8872,9 +8972,13 @@
               .join("")}</ol>`
           : "") +
         cancel +
-        // Said plainly because the instinct is to come back and press something
-        // else. Nothing else needs pressing.
-        `<p class="onb-desc">Keep this page open &mdash; it finishes on its own.</p>` +
+        // Device-code finishes without another tap. Paste-code does not, until
+        // the code has been written back.
+        `<p class="onb-desc">${paste
+          ? (device.submitted
+            ? "Code sent &mdash; keep this page open, it finishes on its own."
+            : "This page stays open so you can paste the code back.")
+          : "Keep this page open &mdash; it finishes on its own."}</p>` +
       `</div>`;
     }
 
@@ -8960,17 +9064,11 @@
     const cloudFresh = !!(state.hostCaps && state.hostCaps.remoteAgentSignOut) && nothingConnected;
     const offer = provider && !cloudFresh ? [provider] : ["grok", "codex", "claude"];
     // A cloud machine's three agents are not equal offers: Grok is the native
-    // one, and Claude cannot be connected there yet — a button that always
-    // ends in "not available" is a dead end wearing an affordance.
+    // one. Ranking is the cloud-only part; every agent that has a headless
+    // flow is offered, including Claude Code's paste-code sign-in.
     const cloudHost = !!(state.hostCaps && state.hostCaps.remoteAgentSignOut);
-    // Ranking is the cloud-only part: Grok Build is the agent this environment
-    // is built around, and Claude Code cannot be connected here yet, so it is
-    // stated rather than offered. The NAMES above are the same everywhere.
     const buttons = offer
       .map((id) => {
-        if (cloudHost && id === "claude") {
-          return `<p class="onb-desc onb-agent-note">Claude Code — we're working on adding it, not available yet.</p>`;
-        }
         const rec = cloudHost && id === "grok" ? " (recommended)" : "";
         // The mark the reader already knows from the model picker and the
         // provider rows. currentColor, so it takes the button's foreground.
@@ -9490,8 +9588,13 @@
       actions.appendChild(copyBtn);
       // Rewind sits next to Copy on user bubbles only (P2-9). Latest message
       // has nothing after it to discard — hidden via refreshUserRewindButtons.
-      // Desktop-only: the host rewind flow runs native VS Code UI.
-      if (role === "user" && !IS_REMOTE) {
+      //
+      // Built for every client since 2026-09-01: remote clients used to be
+      // excluded here because the host's rewind flow ran native VS Code UI, and
+      // that stopped being true when the confirmation moved in-chat. Visibility
+      // is decided in refreshUserRewindButtons, which also owns the provider
+      // gate — so a session that switches provider does not need re-rendering.
+      if (role === "user") {
         const rewindBtn = document.createElement("button");
         rewindBtn.className = "msg-action-btn msg-rewind-btn";
         rewindBtn.type = "button";
@@ -9588,6 +9691,14 @@
       if (ed) ed.hidden = true;
     }
     const prefixCount = state.historyPrefixUserCount || 0;
+    // One provider gate for both buttons: the RPC underneath either exists on
+    // this session's CLI or it does not, and a control that always fails is
+    // worse than an absent one.
+    const capable = rewindCapableProvider();
+    // A conversation another tab has taken is frozen: these act on it, so they
+    // are disabled rather than merely dimmed. Visible, so the transcript still
+    // reads normally, but genuinely unclickable.
+    const frozen = !!state.sessionSuperseded;
     users.forEach((el, i) => {
       el.dataset.userBubbleIndex = String(prefixCount + i);
       const isLast = i === users.length - 1;
@@ -9595,12 +9706,16 @@
       if (btn) {
         // Hide on the tip: that message is Edit's, which does the same rewind
         // and returns the text. Not a wire limitation — execute accepts the tip.
-        btn.hidden = users.length <= 1 || isLast;
+        btn.hidden = !capable || users.length <= 1 || isLast;
+        btn.disabled = frozen;
       }
       // Edit is the exact complement: only the tip, which is the message a
       // rewind can't remove and the one you most often want to retype (#56).
       const edit = el.querySelector(".msg-edit-btn");
-      if (edit) edit.hidden = !isLast;
+      if (edit) {
+        edit.hidden = !capable || !isLast;
+        edit.disabled = frozen;
+      }
     });
   }
 
@@ -11202,6 +11317,103 @@
     scrollToBottom();
   }
 
+  function sessionSupersededCwd(id) {
+    const row = (state.sessions || []).find((s) => s && s.id === id)
+      || (state.pinnedSessions || []).find((s) => s && s.id === id)
+      || (state.railSelectedRows || []).find((s) => s && s.id === id);
+    return (row && row.cwd) || state.activeRepoCwd || state.selectedRepoCwd || state.cwd || "";
+  }
+
+  /** Every composer control, not just the textarea. A frozen conversation that
+   *  still offers Add context, the mode picker or Send is offering actions the
+   *  host will refuse — and `disabled` is what makes them genuinely unclickable
+   *  rather than merely faded (owner, 2026-09-01). */
+  function setComposerFrozen(frozen) {
+    for (const el of [input, micBtn, addBtn, gearBtn, modeBtn, sendBtn]) {
+      if (el) el.disabled = frozen;
+    }
+    // Rewind and Edit hang off the message bubbles rather than the composer,
+    // and they act on this conversation, so they freeze with it.
+    refreshUserRewindButtons();
+  }
+
+  function renderSessionSupersededBanner() {
+    let el = document.getElementById("session-superseded-banner");
+    if (!state.sessionSuperseded) {
+      if (el) el.remove();
+      document.body.classList.remove("session-superseded");
+      setComposerFrozen(false);
+      updateSendButton();
+      return;
+    }
+    document.body.classList.add("session-superseded");
+    setComposerFrozen(true);
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "session-superseded-banner";
+      el.className = "session-superseded-banner";
+      const composer = document.querySelector(".composer");
+      if (composer) composer.insertBefore(el, composer.firstChild);
+      else return;
+    }
+    // A CARD standing where the composer would be, not a stripe above it.
+    // The composer is the thing that no longer works, so the explanation takes
+    // its place instead of hovering over something that still looks usable — a
+    // 12px strip over a live-looking composer read as ignorable chrome, and the
+    // wording had to carry the whole state in one muted line (owner,
+    // 2026-09-01, from a phone).
+    el.replaceChildren();
+    const title = document.createElement("p");
+    title.className = "session-superseded-title";
+    title.textContent = "This conversation moved to another tab";
+    const body = document.createElement("p");
+    body.className = "session-superseded-body";
+    // Says the thing a person actually wants to know first: nothing is lost.
+    body.textContent = "Nothing was lost — it is still here. Take it back to carry on in this tab.";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "session-superseded-btn";
+    btn.textContent = "Continue here";
+    btn.onclick = () => {
+      const held = state.sessionSuperseded;
+      if (!held) return;
+      postResumeSession(held.id, held.cwd, { claim: true });
+    };
+    el.append(title, body, btn);
+  }
+
+  function enterSessionSuperseded(id, cwd) {
+    if (!id) return;
+    state.sessionSuperseded = { id, cwd: cwd || sessionSupersededCwd(id) };
+    // STOP THE MICROPHONE FIRST, and treat a takeover as a cancel.
+    //
+    // The frozen card hides the composer, and the mic button lives in it — so
+    // the only in-page way to stop a capture goes away with it. A start already
+    // waiting on the browser's permission prompt is worse: it resumes after the
+    // takeover, checks only its own `cancelled` flag, installs the capture and
+    // starts streaming. The tab would then be recording with no visible control
+    // and nothing but the 120-second timer to end it.
+    //
+    // Both halves of that were introduced here — admitting voice without a
+    // bound session, and hiding the composer — so both are closed here.
+    if (IS_REMOTE) {
+      if (remoteMicStart) remoteMicStart.cancelled = true;
+      if (remoteMic) stopBrowserMic(true);
+      else if (remoteMicStart) remoteMicStart = null;
+      state.mic = "idle";
+      clearVoiceInsertion();
+      state.voiceLive = false;
+      renderMic();
+    }
+    renderSessionSupersededBanner();
+  }
+
+  function clearSessionSuperseded() {
+    if (!state.sessionSuperseded) return;
+    state.sessionSuperseded = null;
+    renderSessionSupersededBanner();
+  }
+
   // Does this surface open files in a host editor tab? Opt-out polarity on
   // capabilities.openInEditor (absent/true = yes). Remote always answers no:
   // the caps a phone receives are the DESK machine's, and a tap must never
@@ -12772,6 +12984,7 @@
       // the card in one press instead of walking every option.
       btn.tabIndex = i === (defaultIndex >= 0 ? defaultIndex : 0) ? 0 : -1;
       btn.onclick = () => {
+        if (state.sessionSuperseded) return;
         vscode.postMessage({
           type: "permissionAnswer",
           requestId,
@@ -13891,7 +14104,15 @@
     modeBtn.classList.toggle("disabled", state.busyLocked);
     modeBtn.title = modeButtonTitle(state.currentModeId);
     updateSandboxBtn();
-    if (state.onboardingMode === "no-project") {
+    if (state.sessionSuperseded) {
+      sendBtn.innerHTML = ICON.arrowUp;
+      sendBtn.title = "This conversation is open in another tab";
+      sendBtn.disabled = true;
+      if (newBtn) {
+        newBtn.disabled = false;
+        newBtn.title = "New session";
+      }
+    } else if (state.onboardingMode === "no-project") {
       sendBtn.innerHTML = ICON.arrowUp;
       sendBtn.title = "Add a project folder first";
       sendBtn.disabled = true;
@@ -13929,6 +14150,7 @@
   // both Enter and the button click funnel through, so send-intent can never
   // turn into a cancel (#37). A composer holding only an attachment is send-intent.
   function queueFromComposer() {
+    if (state.sessionSuperseded) return true;
     if (state.pendingPaste > 0) return true;
     const t = input.value.trim();
     const chips = explicitVisibleChips(state.chips);
@@ -14003,6 +14225,7 @@
   }
 
   function sendOrStop() {
+    if (state.sessionSuperseded) return;
     if (state.onboardingMode === "no-project") return;
     if (state.busy) {
       // Typed text signals send-intent — queue it; text present never cancels.
@@ -14132,6 +14355,7 @@
   }
 
   function toggleMic() {
+    if (state.sessionSuperseded) return;
     if (IS_REMOTE) {
       toggleBrowserMic();
       return;
@@ -14528,6 +14752,7 @@
   // back to the queue, which is the safe home for the text either way.
   // Attachments ride `_x.ai/interject` `content` (same encoder as a send).
   function queueOutgoing(text, chips) {
+    if (state.sessionSuperseded) return;
     const attachments = Array.isArray(chips) ? chips : explicitVisibleChips(state.chips);
     if (
       state.steerByDefault && state.steerSupported && steerableProvider() && state.busy && !state.busyLocked
@@ -14659,6 +14884,7 @@
       steerBtn.onpointerdown = (e) => {
         e.preventDefault();
         e.stopPropagation();
+        if (state.sessionSuperseded) return;
         // steerSend first so the host can snapshot the queue before this
         // clear races (webview handlers are not serialized across awaits).
         const msg = { type: "steerSend", text, fromQueue: true };
@@ -15623,8 +15849,20 @@
         // `done` is the only close signal. Silence is not one: a failed attempt
         // also stops being busy, and closing on that would throw away the error
         // the user needs to read.
-        if (msg.done) { closeAddProjectForm(); break; }
-        if (addProjectFormApi) addProjectFormApi.update(msg);
+        if (msg.done) {
+          state.projectGithub = null;
+          closeAddProjectForm();
+          break;
+        }
+        if (msg.busy) state.projectGithub = null;
+        else if (msg.github && typeof msg.github === "object") state.projectGithub = msg.github;
+        else if (msg.error) state.projectGithub = null;
+        // Reconnect: the form is gone, the CLI is still polling, and the
+        // snapshot carried the code. Reopen the clone form so they can finish.
+        if (!addProjectFormApi && msg.github && (msg.github.status === "starting" || msg.github.status === "waiting")) {
+          openAddProjectForm("clone");
+        }
+        if (addProjectFormApi) addProjectFormApi.update({ ...msg, github: state.projectGithub || msg.github });
         break;
       case "welcomeTips":
         // Deliberately NOT an advance: this frame arrives on startup and after
@@ -17033,6 +17271,32 @@
           setConversationLoading(false);
           renderRepoChip();
         }
+        {
+          const supersededId = msg.code === SESSION_SUPERSEDED_CODE
+            && msg.resumeFailed && typeof msg.resumeFailed.id === "string"
+            ? msg.resumeFailed.id
+            : (msg.code === SESSION_SUPERSEDED_CODE ? (state.activeSessionId || "") : "");
+          // A takeover names the conversation it displaced. Abort only a rail
+          // transition TO that id — an unrelated newer click must not be
+          // cancelled by it, and must not freeze this view into the old one.
+          if (supersededId) {
+            const resumeToThis = state.railTransition
+              && state.railTransition.kind === "resume"
+              && state.railTransition.sessionId === supersededId;
+            const transitioningElsewhere = !!state.railTransition && !resumeToThis;
+            if (resumeToThis) abortRailTransition();
+            if (!transitioningElsewhere) {
+              // Deliberately no transcript error. The card IS the message, and
+              // adding one printed the same sentence twice — once calmly where
+              // the composer used to be, once in red above it, which reads as
+              // two different things having gone wrong (owner, 2026-09-01).
+              // Nothing failed here: the conversation moved, and it is one tap
+              // back.
+              enterSessionSuperseded(supersededId, sessionSupersededCwd(supersededId));
+            }
+            break;
+          }
+        }
         // A generic error cannot be attributed to a specific rail transition
         // (the frame carries no request id). An error from a superseded resume
         // therefore aborts whatever is currently in flight — worst case the
@@ -17756,6 +18020,24 @@
       // remote request means the headless flow — so there is one capability
       // here, not two, and nothing new for the policy table to gate.
       else if (act === "connectRemote") vscode.postMessage({ type: "runGrokLogin", provider: onbAction.dataset.provider });
+      else if (act === "submitDeviceLoginCode") {
+        const root = onbAction.closest(".onb");
+        const input = root && root.querySelector(".onb-code-input");
+        const code = input ? String(input.value || "").trim() : "";
+        if (!code) return;
+        vscode.postMessage({ type: "submitDeviceLoginCode", provider: onbAction.dataset.provider, code: code });
+        // Deliberately NOT disabled here. This message can be dropped: the
+        // relay client's outbox keeps queue releases and authored input across
+        // a reconnect and drops everything else, and the reconnect is not an
+        // edge case in this flow — a phone leaves for the vendor's page to get
+        // the code and comes back on a new socket, which is the ONLY way to
+        // reach this button. Disabling on the click meant a dropped code left a
+        // dead field, a waiting CLI, and no way back but reopening Connect.
+        //
+        // The host echoes `submitted: true` once it has actually written the
+        // code to the CLI, and the card disables the field on that frame. No
+        // acknowledgement, no disable — so tapping Submit again just works.
+      }
       else if (act === "cancelDeviceLogin") {
         vscode.postMessage({ type: "cancelDeviceLogin", provider: onbAction.dataset.provider });
         // Close on the click, not on the host's answer. The person has said
@@ -17888,6 +18170,14 @@
     } else if (/^[a-zA-Z]:[\\/]/.test(href) || href.startsWith("\\\\") || !/^[a-z][a-z0-9+.-]*:/i.test(href)) {
       vscode.postMessage({ type: "openFile", path: href });
     }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    const input = e.target && e.target.closest && e.target.closest(".onb-code-input");
+    if (!input || input.disabled) return;
+    e.preventDefault();
+    const btn = input.closest(".onb") && input.closest(".onb").querySelector('[data-act="submitDeviceLoginCode"]');
+    if (btn && !btn.disabled) btn.click();
   });
 
   /** Href a user would paste elsewhere, or "" when the link has no external
