@@ -105,6 +105,7 @@ import {
   deviceLoginFailureText,
   deviceLoginPlan,
   deviceLoginPreflight,
+  deviceLoginCodeNote,
   noRemoteSignInMessage,
   deviceLoginUnavailable,
 } from "./device-login";
@@ -978,7 +979,16 @@ export class GrokSidebar {
    *  not two codes racing to write the same file. */
   private readonly deviceLogins = new Map<
     AcpProvider,
-    { handle: DeviceLoginHandle; clientId?: string }
+    {
+      handle: DeviceLoginHandle;
+      clientId?: string;
+      /** What the flow last told its client, so a re-tap — usually a client
+       *  that RECONNECTED while visiting the vendor's code page — can be
+       *  shown the same code instead of silence. */
+      last?: Extract<HostMsg, { type: "onboarding" }>["device"];
+      /** Sends to whichever client currently owns the flow. */
+      send: (device: Extract<HostMsg, { type: "onboarding" }>["device"]) => void;
+    }
   >();
   /** A Settings → Providers refresh in flight. Reported on `providerState` so
    *  the button can say it is working, and guards re-entry: a second click (or
@@ -1757,18 +1767,44 @@ export class GrokSidebar {
     clientId?: string,
   ): Promise<void> {
     const displayName = providerDisplayName(provider);
-    const send = (device: Extract<HostMsg, { type: "onboarding" }>["device"]) => {
-      const message: HostMsg = {
-        type: "onboarding",
-        state: providerLoginState(provider),
-        platform: process.platform,
-        provider,
-        launched: true,
-        device,
-      };
-      if (clientId) this.sendRemoteClient(clientId, message);
-      else this.post(message);
+    // The entry is created before the runner so `send` reads the CURRENT
+    // client off it: a phone that visits the vendor's code page and comes
+    // back has reconnected under a fresh clientId, and the re-tap path below
+    // re-binds this entry to it.
+    const entry: {
+      handle?: DeviceLoginHandle;
+      clientId?: string;
+      last?: Extract<HostMsg, { type: "onboarding" }>["device"];
+      preflight?: Extract<HostMsg, { type: "onboarding" }>["device"] extends infer D
+        ? D extends { preflight?: infer P } ? P : never
+        : never;
+      note?: string;
+      send: (device: Extract<HostMsg, { type: "onboarding" }>["device"]) => void;
+    } = {
+      clientId,
+      send: (device) => {
+        // The setting-to-check travels with every card of this flow, so it is
+        // still on screen when the code is.
+        if (device && entry.preflight && !device.preflight) {
+          device = { ...device, preflight: entry.preflight };
+        }
+        if (device && entry.note && device.status === "waiting" && !device.note) {
+          device = { ...device, note: entry.note };
+        }
+        entry.last = device;
+        const message: HostMsg = {
+          type: "onboarding",
+          state: providerLoginState(provider),
+          platform: process.platform,
+          provider,
+          launched: true,
+          device,
+        };
+        if (entry.clientId) this.sendRemoteClient(entry.clientId, message);
+        else this.post(message);
+      },
     };
+    const send = entry.send;
 
     const isCloud = isCloudEnvironment();
     const unavailable = deviceLoginUnavailable(provider, { isCloud });
@@ -1788,12 +1824,30 @@ export class GrokSidebar {
     // wait for a failure almost everyone gets. It is advice, though, not a gate,
     // so the second attempt runs. If the setting is still off, the real failure
     // is classified and says so (classifyDeviceLoginFailure).
+    // Advice that RIDES ALONG with the flow rather than replacing it. It used
+    // to be sent on its own and return, so connecting Codex took two clicks:
+    // one to read the advice, another to actually start (owner, 2026-08-31).
+    // Now the first click starts the sign-in and the card carries the setting
+    // to check, which is the only ordering where the advice arrives in time to
+    // be useful — the code is worthless until that setting is on.
+    // Step 1 of 2, and it is a GATE on purpose. The code is worthless until
+    // the account setting is on, and a person who has just been handed a code
+    // does not go and read a settings page first. It shows once per provider
+    // per session; the button posts `runGrokLogin` again and lands past here.
     const preflight = deviceLoginPreflight(provider, { isCloud });
     if (preflight && !this.deviceLoginPreflightShown.has(provider)) {
       this.deviceLoginPreflightShown.add(provider);
-      send({ status: "unavailable", message: preflight.reason, preflight: { ...preflight, steps: [...preflight.steps] } });
+      send({
+        status: "unavailable",
+        message: preflight.reason,
+        preflight: { ...preflight, steps: [...preflight.steps] },
+      });
       return;
     }
+    // Step 2 keeps the setting visible next to the code it gates, and adds the
+    // heads-up about the vendor's own security warning.
+    entry.preflight = preflight ? { ...preflight, steps: [...preflight.steps] } : undefined;
+    entry.note = deviceLoginCodeNote(provider);
     if (unavailable || !plan) {
       // Not an error, and it must not read as one: the agent can still be
       // connected, just not from here. Saying which is the difference between
@@ -1808,35 +1862,154 @@ export class GrokSidebar {
     // One flow per provider. A second tap while the first is polling would
     // spawn a second child racing the first to write the same credential file,
     // and would replace a code the user may already be typing.
+    //
+    // But answering the tap with SILENCE made the button read as dead for up
+    // to fifteen minutes (the first real cloud test, 2026-08-31): on a phone,
+    // every trip to the vendor's code page reconnects this client, and the
+    // reconnected tab had no card and was sent nothing. Adopt the tapper and
+    // repeat the flow's current state to them.
     const running = this.deviceLogins.get(provider);
     if (running) {
       running.clientId = clientId;
+      if (running.last) running.send(running.last);
+      this.host.appendLine(`[${provider}] device login already in flight; repeated its state to the new tap`);
       return;
     }
 
     send({ status: "starting" });
+    this.host.appendLine(`[${provider}] device login started`);
+    // Before the CLI is even spawned: the window that kills these flows opens
+    // immediately, while the person is walking to the vendor's page. Held until
+    // the credential is verified, not merely until the CLI exits.
+    const workId = this.beginDeviceLoginWork();
+    const startedAt = Date.now();
+    // Set once onDone has run, which can happen SYNCHRONOUSLY on a spawn
+    // failure — and registering the entry after that would park a settled
+    // flow in the map forever, silently blocking every later attempt.
+    let settled = false;
     const handle = runDeviceLogin(cliPath, plan.args, {
       onPrompt: (prompt) => {
         send({ status: "waiting", url: prompt.url, code: prompt.code });
       },
       onDone: (result) => {
+        settled = true;
         this.deviceLogins.delete(provider);
-        if (!result.ok && "cancelled" in result) return;
-        if (result.ok) {
-          send({ status: "done" });
-          // Same reprobe the desk path uses. The CLI exiting 0 says the vendor
-          // approved it; only a credential probe says this host can now use it.
-          this.watchProviderLogin(provider);
+        // The hold is NOT released here on success: confirmDeviceLogin is still
+        // to come, it probes the CLI, and a machine paused underneath that is
+        // the same failure one step later. Its `finally` is the single exit.
+        // Cancellation arrives here too (runDeviceLogin settles `cancelled`),
+        // so this covers the cancel path without the handler knowing the token.
+        if (!result.ok) this.endDeviceLoginWork(workId);
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        if (!result.ok && "cancelled" in result) {
+          // Every settle leaves a line. The first real cloud test needed
+          // shell access to the machine to learn a flow had ended at all.
+          this.host.appendLine(`[${provider}] device login cancelled after ${elapsed}s`);
           return;
         }
-        this.host.appendLine(`[${provider}] device login failed: ${result.output.slice(-2000)}`);
+        if (result.ok) {
+          // The CLI exiting 0 says the vendor approved the code. It does NOT
+          // say a credential landed: codex 0.147 exited 0 on a flow that wrote
+          // no auth.json, and announcing "done" here told the user Connected
+          // while Settings said disconnected. Verify first, announce after.
+          // The card is still on "waiting", whose own copy promises the flow
+          // finishes on its own.
+          this.host.appendLine(`[${provider}] device login approved by the vendor after ${elapsed}s; verifying the credential`);
+          // The page must change when the vendor approves — "nothing happened"
+          // during a silent 30s probe was the owner's very first retest note.
+          send({ status: "verifying" });
+          void this.confirmDeviceLogin(provider, send, displayName, workId);
+          return;
+        }
+        this.host.appendLine(`[${provider}] device login failed (${result.failure}) after ${elapsed}s: ${result.output.slice(-2000)}`);
         send({
           status: "failed",
           message: deviceLoginFailureText(provider, result.failure, displayName),
         });
       },
     });
-    this.deviceLogins.set(provider, { handle, clientId });
+    if (!settled) {
+      entry.handle = handle;
+      this.deviceLogins.set(provider, entry as typeof entry & { handle: DeviceLoginHandle });
+    }
+  }
+
+  /**
+   * Announce a device login only once the credential is USABLE on this host.
+   *
+   * Bounded retries, because vendors write the file a beat after the CLI
+   * exits; a verdict either way, because "Connected" with no credential and
+   * silence were the two halves of the first real cloud test's worst bug.
+   * Runs detached from the flow entry — by the time this fails, offering the
+   * user a fresh attempt must not be blocked by the old one.
+   */
+  private async confirmDeviceLogin(
+    provider: AcpProvider,
+    send: (device: Extract<HostMsg, { type: "onboarding" }>["device"]) => void,
+    displayName: string,
+    workId: number,
+  ): Promise<void> {
+    try {
+      await this.confirmDeviceLoginInner(provider, send, displayName);
+    } finally {
+      // One door out, whatever happened above — and only this operation's.
+      this.endDeviceLoginWork(workId);
+    }
+  }
+
+  private async confirmDeviceLoginInner(
+    provider: AcpProvider,
+    send: (device: Extract<HostMsg, { type: "onboarding" }>["device"]) => void,
+    displayName: string,
+  ): Promise<void> {
+    const delays = [0, 2_000, 5_000, 10_000, 20_000];
+    for (const delay of delays) {
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      if (await this.reprobeProviderCredentials(provider)) {
+        this.host.appendLine(`[${provider}] device login: credential verified`);
+        // Promote on evidence, exactly as the Providers refresh does. The probe
+        // just proved the account works; without this the persisted `connected`
+        // flag stays false, so Settings keeps offering Connect and never offers
+        // Sign out for an account that is plainly signed in (owner, 2026-08-31).
+        await this.setProviderConnected(provider, true);
+        send({ status: "done" });
+        return;
+      }
+    }
+    // Two very different failures share this exit, and the message must not
+    // blame the credential when the credential is fine: the first real cloud
+    // test's sign-in was valid the whole time — the PROBE was failing (a
+    // session/delete quirk) while the verdict said "no usable credential".
+    if (this.providerCredentialFilePresent(provider)) {
+      this.host.appendLine(`[${provider}] device login: credential present but the probe never passed`);
+      send({
+        status: "failed",
+        message: `${displayName} is signed in, but the agent did not answer this machine's check yet. Try again in a moment — the sign-in itself does not need repeating.`,
+      });
+      return;
+    }
+    this.host.appendLine(`[${provider}] device login: vendor approved, but no usable credential landed on this machine`);
+    send({
+      status: "failed",
+      message: `${displayName} approved the sign-in, but no usable credential landed on this machine. Try connecting again.`,
+    });
+  }
+
+  /** Does the provider's own credential file exist? Deliberately shallow —
+   *  presence only, no validity claim: it separates "sign-in never landed"
+   *  from "landed, but our probe is unhappy", which lead a person to
+   *  different next actions. */
+  private providerCredentialFilePresent(provider: AcpProvider): boolean {
+    try {
+      if (provider === "codex") return fs.existsSync(path.join(resolveCodexHome(), "auth.json"));
+      // GROK_HOME, not a hardcoded ~/.grok: the CLI honours it and so does the
+      // rest of this host, so hardcoding made the fallback miss a credential
+      // that was plainly there and tell the user to sign in again (review).
+      if (provider === "grok") return fs.existsSync(path.join(resolveGrokHome(process.env), "auth.json"));
+      return false;
+    } catch {
+      return false;
+    }
   }
 
   /** Stop every headless sign-in. Called on dispose so a child polling a device
@@ -2074,14 +2247,35 @@ export class GrokSidebar {
     // connected agent appeared in the picker only after a New session, which is
     // exactly what the owner saw with Codex. Push the catalog again once the
     // models actually exist.
+    // A provider the cache had NOTHING for is a newly connected agent, and it
+    // must appear in the picker of the conversation the person is looking at —
+    // not only in an empty one. The owner connected Codex from a session with
+    // history and it stayed missing until he reloaded (2026-08-31). Adding
+    // options cannot disturb a live thread: the current model is re-sent
+    // unchanged, so nothing about the running conversation moves.
+    const providerIsNew = !current[provider] || (current[provider].models ?? []).length === 0;
     void Promise.resolve(stored).then(() => {
-      for (const session of this.emptySessionsForModelRefresh()) this.postSessionModels(session);
+      const sessions = providerIsNew
+        ? this.sessionsForModelRefresh()
+        : this.emptySessionsForModelRefresh();
+      for (const session of sessions) this.postSessionModels(session);
     });
     return stored;
   }
 
   /** Sessions whose picker may be refreshed in place: no history, so there is
    *  nothing a changed model list could disturb. */
+  /** Every session with a live client. Used only when a provider appears for
+   *  the first time, where the change is purely additive. */
+  private sessionsForModelRefresh(): Session[] {
+    const seen = new Set<Session>();
+    for (const session of [this.focused, ...this.pool]) {
+      if (!session || seen.has(session)) continue;
+      seen.add(session);
+    }
+    return [...seen].filter((session) => session.client?.sessionId);
+  }
+
   private emptySessionsForModelRefresh(): Session[] {
     const seen = new Set<Session>();
     for (const session of [this.focused, ...this.pool]) {
@@ -2102,7 +2296,10 @@ export class GrokSidebar {
    */
   private postSessionModels(session: Session): void {
     const client = session.client;
-    if (!client?.sessionId || session.hasHistory) return;
+    // `hasHistory` no longer disqualifies a session: a NEW provider's models
+    // are additive and the selection is re-sent unchanged (see
+    // cacheProviderModels). Callers decide which sessions to refresh.
+    if (!client?.sessionId) return;
     this.emit(session, {
       type: "session",
       sessionId: client.sessionId,
@@ -7377,6 +7574,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           // reports success that never happened, so that path is desk-only.
           if (!opts.fromRemote) {
             this.host.createTerminal({ name: `${name} Logout`, shellPath: cliPath, shellArgs: logoutArgs }).show();
+            // The cause, in the log, next to the sentence that hides it. This
+            // branch fires when the resolved CLI cannot be executed at all —
+            // on Windows that is almost always an extensionless npm shim run
+            // without a shell — and the user-facing text cannot say that, so
+            // for months the only record was "could not be observed" with no
+            // path and no errno (owner hit it on a stale extension host,
+            // 2026-08-31).
+            this.host.appendLine(`[providers] ${provider} logout spawn failed: ${cliPath} (${code}) ${errorDetail(error)}`);
             fail(`${name} sign-out could not be observed, so it was opened in a terminal. The account remains connected until sign-out is confirmed.`);
           } else {
             fail(`${name} sign-out could not run here: ${errorDetail(error)}. The account remains connected.`);
@@ -10509,6 +10714,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const running = this.deviceLogins.get(provider);
         if (!running) break;
         this.deviceLogins.delete(provider);
+        // The hold is released by onDone, which cancel() settles synchronously
+        // — the token belongs to that operation, not to this handler.
         running.handle.cancel();
         // Back to the plain sign-in panel, with no code and no failure. The
         // person cancelled; telling them it failed would be a small lie.
@@ -16487,6 +16694,38 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * stops costing money. Nothing is lost either way — opening the page wakes
    * the machine and the card is still there.
    */
+  /** Sign-in operations in flight — spawning, polling a vendor, or having a
+   *  credential verified afterwards. Deliberately NOT the `deviceLogins` guard
+   *  map (populated after the runner starts, cleared before verification, so
+   *  keep-awake read it as "no work" through the whole dangerous window), and
+   *  deliberately keyed by OPERATION rather than by provider: a successful
+   *  login leaves the guard map before it finishes verifying, so a second tab
+   *  can legitimately start the same provider meanwhile, and a provider-keyed
+   *  hold let the older operation's cleanup release the newer one's machine
+   *  (both found in review, 2026-08-31). */
+  private readonly deviceLoginWork = new Set<number>();
+  private deviceLoginWorkSeq = 0;
+
+  /** A sign-in is in progress somewhere. Counts as work for the keep-awake
+   *  above: the machine must not be paused underneath it. */
+  private deviceLoginInFlight(): boolean {
+    return this.deviceLoginWork.size > 0;
+  }
+
+  /** Take the keep-awake hold for one sign-in. The token is the ownership. */
+  private beginDeviceLoginWork(): number {
+    const id = ++this.deviceLoginWorkSeq;
+    this.deviceLoginWork.add(id);
+    if (this.deviceLoginWork.size === 1) this.refreshKeepAwake();
+    return id;
+  }
+
+  /** Release one sign-in's hold. Idempotent, and only ever its own. */
+  private endDeviceLoginWork(id: number): void {
+    if (!this.deviceLoginWork.delete(id)) return;
+    if (this.deviceLoginWork.size === 0) this.refreshKeepAwake();
+  }
+
   private anyTurnWorking(): boolean {
     // A command that is still running is the one answer that does not depend on
     // reading a status. An agent can start a twenty-five-minute build and THEN
@@ -18094,11 +18333,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // machine, and a suspended machine takes the turn down with it. Not gated
       // on the opt-out — that setting is about a laptop's battery, and this
       // costs a few bytes a minute on a socket that is already open.
-      try { this.uplink?.setWorking(this.anyTurnWorking()); } catch { /* never worth failing over */ }
+      try {
+        // A device sign-in is WORK, even though no turn is running. The relay
+        // holds a cloud machine awake only while frames keep arriving, and a
+        // machine with nothing to say goes quiet, gets released after 90s and
+        // is paused by the platform seconds later — killing the CLI's polling
+        // connection mid-flow. cloud-environments.md recorded exactly that
+        // ("a grok login --device-auth was left polling, the sprite paused,
+        // and the login never completed"), and it is the likeliest cause of
+        // the first Codex attempt that approved at the vendor and wrote no
+        // credential. The phone is on another tab by then, so nothing else is
+        // generating traffic either (owner, 2026-08-31).
+        this.uplink?.setWorking(this.anyTurnWorking() || this.deviceLoginInFlight());
+      } catch { /* never worth failing over */ }
       if (shouldKeepAwake({
         enabled,
         linked: !!this.uplink,
         turnInFlight,
+        cloudHost: isCloudEnvironment(),
       })) {
         this.keepAwake.start();
       } else {

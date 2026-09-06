@@ -99,9 +99,8 @@ export function noRemoteSignInMessage(
   opts: { isCloud?: boolean } = {},
 ): string {
   if (opts.isCloud) {
-    return `${displayName} cannot be connected from a cloud environment yet: its sign-in needs `
-      + "a real terminal, and there is no desk machine here to fall back to. "
-      + "Grok and Codex both sign in here.";
+    return `${displayName} isn't available on cloud machines yet — we're working on adding it. `
+      + "Grok and Codex both sign in right here.";
   }
   return `${displayName} has no sign-in that works without a terminal. Connect it at your computer.`;
 }
@@ -123,12 +122,33 @@ export function noRemoteSignInMessage(
  * warning about a problem the reader does not have.
  */
 export interface DeviceLoginPreflight {
+  /** Heading for the step, e.g. "Step 1 of 2 — …". */
+  title?: string;
+  /** Label for the button that starts the sign-in. */
+  continueLabel?: string;
   /** One sentence on why this is here. */
   reason: string;
   /** The exact path through the vendor's settings. */
   steps: readonly string[];
   /** Where to go and do it. */
   url?: string;
+}
+
+/**
+ * What to say next to the code itself, per provider.
+ *
+ * OpenAI's device page shows a security warning: device codes are used in
+ * phishing attacks, only continue if the sign-in was started in the Codex CLI.
+ * That warning is correct and we cannot suppress it — so the honest move is
+ * to name it first, and tell the reader the one thing the warning asks them to
+ * confirm: yes, the Codex CLI on this machine started this (owner, with a
+ * screenshot of the warning, 2026-08-31).
+ */
+export function deviceLoginCodeNote(provider: AcpProvider): string | undefined {
+  if (provider !== "codex") return undefined;
+  return "OpenAI will show a security warning about device codes. That is expected here: "
+    + "the Codex CLI on this machine started this sign-in, and the code below is the one it printed. "
+    + "Never use a code you did not start yourself.";
 }
 
 export function deviceLoginPreflight(
@@ -138,18 +158,19 @@ export function deviceLoginPreflight(
   if (!opts.isCloud) return undefined;
   if (provider !== "codex") return undefined;
   return {
+    title: "Step 1 of 2 — turn on device sign-in",
     reason:
-      "Codex needs one setting turned on before it can sign in here. It is off by "
-      + "default for everyone — OpenAI disables device-code sign-in unless you ask "
-      + "for it.",
+      "Codex needs one setting turned on before a code will be accepted. It is "
+      + "off by default for everyone — OpenAI disables device-code sign-in "
+      + "unless you ask for it.",
     steps: [
       "Open ChatGPT and go to Settings → Security",
       // The setting sits at the very BOTTOM of a long page, and people reported
       // not finding it. `**` is rendered as bold by the panel.
       "Turn on \"Device code authorization for Codex\" **at the very bottom**",
-      "Come back and connect — the code appears here",
     ],
     url: "https://chatgpt.com/#settings/Security",
+    continueLabel: "Done — continue",
   };
 }
 

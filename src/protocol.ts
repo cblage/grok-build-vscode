@@ -596,7 +596,7 @@ export type HostMsg =
         /** starting: spawned, nothing printed yet. waiting: URL and code are on
          *  screen and the CLI is polling. done/failed: terminal. unavailable:
          *  this provider has no flow that works without a terminal. */
-        status: "starting" | "waiting" | "done" | "failed" | "unavailable";
+        status: "starting" | "waiting" | "verifying" | "done" | "failed" | "unavailable";
         url?: string;
         code?: string;
         /** Said to the person, not logged — a failure or an explanation. */
@@ -610,7 +610,10 @@ export type HostMsg =
          * Cloud environments only — at a desk the browser flow works and this
          * setting never comes up.
          */
-        preflight?: { reason: string; steps: string[]; url?: string };
+        preflight?: { title?: string; reason: string; steps: string[]; url?: string; continueLabel?: string };
+        /** Said BESIDE the code: the vendor page carries a phishing warning and
+         *  the reader needs to know it is expected before they meet it. */
+        note?: string;
       };
     }
   // resumeFailed is additive: a remote resume refusal names the requested id so

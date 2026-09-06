@@ -478,6 +478,18 @@ const TIER_RANK: Record<RemoteTier, number> = { "read-only": 0, propose: 1, full
  */
 const CLOUD_DISPOSITION: Partial<Record<WebviewMsg["type"], InboundDisposition>> = {
   logout: "full",
+  // Re-observing the accounts is host-local on a desk because a phone should
+  // not be able to spawn CLI probes on somebody's laptop. On a cloud machine
+  // the remote is the ONLY user, and withholding it meant the promotion that
+  // makes a sign-in stick never ran there at all: connect an agent, refresh,
+  // and the page offered Connect again for an account that was signed in
+  // (owner, 2026-08-31). Read-only observation, promoting only on evidence.
+  refreshProviders: "full",
+  // Preferences about the machine the person is looking at. Read-only on a
+  // remote because a desk owner can set them at the desk; on a cloud machine
+  // there is no desk, so read-only means never (owner, 2026-08-31).
+  setTelemetryEnabled: "full",
+  setThumbsFeedback: "full",
 };
 
 /** May this WebviewMsg type, arriving from a remote connection of `tier`, be
@@ -922,7 +934,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
  * the projects rail asks for a preview of a SIBLING project on purpose, so
  * "the recipient does not own this cwd" is the normal case, not an attack.
  * Treating them alike silently dropped every `repoSessions` answer over the
- * relay — the phone's rail then sat on "Update Grok Build to preview" forever
+ * relay — the phone's rail then sat on its update-Grok-Build note forever
  * against a host that was perfectly current and had already answered.
  *
  * Authorization is unchanged either way: {@link mayDeliverRemoteHostMsg} checks

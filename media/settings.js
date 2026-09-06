@@ -91,13 +91,13 @@
   const CONNECTOR_BLURB_HERE =
     "These apps are available to Grok, Codex, and Claude. Most open a browser to sign in; GitHub uses a personal access token you paste here. Tokens stay on this machine.";
   const CONNECTOR_BLURB_HERE_REMOTE =
-    "These apps are connected on the desk machine. Sign-in happens there — a phone cannot change which tools an agent has.";
+    "These apps are connected on the machine running this workspace. Sign-in happens there — it cannot be changed from this page.";
   const CONNECTOR_BLURB_GROK =
     "These follow your Grok account, so they are shared across every Grok session on every machine.";
   const CONNECTOR_BLURB_LOCAL =
     "Declared in this machine's Grok config files. Grok only.";
   const CONNECTOR_BLURB_LOCAL_REMOTE =
-    "Declared in this machine's Grok config files. Grok only. These are managed on the desk machine only.";
+    "Declared in this machine's Grok config files. Grok only. These are managed on the host machine only.";
   const ICON_EXTERNAL_LINK =
     '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>';
   // lucide `settings` — same path as chat.js ICON.gear. Local Open is config,
@@ -195,6 +195,93 @@
    * is connecting. Each is gated on its own capability, so a host that offers
    * one and not the other renders exactly what it can actually do.
    */
+  /** The host advertises `remoteAgentSignOut` only when it is a hosted cloud
+   *  machine (3.19.7) — capability detection doubling as environment truth,
+   *  used here only to choose words. */
+  function hostIsCloud(env) {
+    return !!(env && env.isRemote && env.hostCaps && env.hostCaps.remoteAgentSignOut);
+  }
+
+  /** A device-code sign-in in flight for this provider, mirrored from the
+   *  host's onboarding frames by the mounting page. */
+  function deviceLoginFlow(env, id) {
+    const flow = env && env.deviceLogin && env.deviceLogin[id];
+    return flow && flow.status ? flow : undefined;
+  }
+
+  /** Steps the host wants read BEFORE the code is used (Codex's account
+   *  setting). Rendered as real nodes, never innerHTML — `**bold**` becomes a
+   *  <strong>, everything else stays text. */
+  function deviceFlowSteps(flow) {
+    const steps = flow && flow.preflight && flow.preflight.steps;
+    return Array.isArray(steps) ? steps : [];
+  }
+
+  /** The step heading, when the host gave one ("Step 1 of 2 — …"). */
+  function deviceFlowTitle(flow) {
+    if (!flow) return "";
+    if (flow.status === "unavailable" && flow.preflight && flow.preflight.title) return flow.preflight.title;
+    // Only a flow that HAD a first step gets a second one's number. Grok's
+    // sign-in is a single step and numbering it invents a step that never
+    // happened (seen in the state matrix, 2026-08-31).
+    if (flow.status === "waiting" && flow.preflight) return "Step 2 of 2 — confirm the code";
+    return "";
+  }
+
+  function deviceFlowHint(flow) {
+    return (flow && flow.preflight && flow.preflight.reason) || "";
+  }
+
+  function deviceFlowDescription(flow) {
+    if (!flow) return "";
+    if (flow.status === "unavailable" && flow.preflight) return flow.preflight.reason || "";
+    if (flow.status === "starting") return "Asking the CLI for a sign-in code…";
+    if (flow.status === "waiting") {
+      return "Open the sign-in page and confirm the code. It finishes on its own — keep this page open.";
+    }
+    if (flow.status === "verifying") return "Signed in — confirming the credential on this machine…";
+    if (flow.status === "done") return "Connected. The agent's models are on their way.";
+    if (flow.status === "failed") return flow.message || "The sign-in did not finish. Try connecting again.";
+    if (flow.status === "unavailable") return flow.message || "";
+    return "";
+  }
+
+  /** Whether the provider's DEDICATED flow row renders. One row per provider
+   *  at a time — the owner's retest read the flow row + the ordinary row as a
+   *  duplicate. Live flows own the space; a done flow keeps it only until the
+   *  snapshot confirms the account; failed/unavailable fold back into the
+   *  ordinary row's description instead. */
+  function deviceFlowRowVisible(s, env, id) {
+    const flow = deviceLoginFlow(env, id);
+    if (!flow) return false;
+    // Step 1 of 2 lives in this row too, or a Connect clicked here would send
+    // the reader to a card they cannot see (the transcript's onboarding panel
+    // refuses to paint over a conversation).
+    if (flow.status === "unavailable" && flow.preflight) return true;
+    if (flow.status === "starting" || flow.status === "waiting" || flow.status === "verifying") return true;
+    if (flow.status === "done") {
+      const provider = providerOf(s, id);
+      return !(provider && provider.connected);
+    }
+    return false;
+  }
+
+  /** The ordinary row's description, with a settled flow's outcome folded in. */
+  function providerRemoteDescribe(s, env, id) {
+    const flow = deviceLoginFlow(env, id);
+    if (flow && (flow.status === "failed" || flow.status === "unavailable") && flow.message) {
+      return flow.message;
+    }
+    const provider = providerOf(s, id);
+    const base = providerDescription(provider);
+    // On a cloud machine the three agents are NOT equal offers — Grok is the
+    // native one (owner, 2026-08-31).
+    if (id === "grok" && hostIsCloud(env) && !(provider && provider.connected)) {
+      return "Recommended. " + base;
+    }
+    return base;
+  }
+
   function remoteProviderActionable(snapshot, env, id) {
     return remoteProviderIsSettled(snapshot, id)
       ? canSignOutFromRemote(env)
@@ -371,7 +458,9 @@
       description: TELEMETRY_COPY,
       kind: "toggle",
       defaultValue: true,
-      visible: (s, env) => !!(env && env.isDesktop && !env.isRemote),
+      // A cloud remote is the machine's only surface, so the toggle belongs
+      // there too; a desk remote still shows the read-only row below.
+      visible: (s, env) => !!(env && ((env.isDesktop && !env.isRemote) || hostIsCloud(env))),
       get: (s) => !s || s.telemetryEnabled !== false,
       message: (value) => ({ type: "setTelemetryEnabled", value }),
     },
@@ -391,7 +480,7 @@
       title: "Anonymous usage stats",
       description: "",
       kind: "status",
-      visible: (s, env) => !!(env && env.isRemote),
+      visible: (s, env) => !!(env && env.isRemote && !hostIsCloud(env)),
       describe: (s) => {
         const known = s && typeof s.telemetryEnabled === "boolean";
         const state = known ? (s.telemetryEnabled ? "On. " : "Off. ") : "";
@@ -405,7 +494,7 @@
       description: THUMBS_COPY,
       kind: "toggle",
       defaultValue: false,
-      visible: (s, env) => !env || !env.isRemote,
+      visible: (s, env) => !env || !env.isRemote || hostIsCloud(env),
       get: (s) => !!(s && s.thumbsFeedback),
       message: (value) => ({ type: "setThumbsFeedback", value }),
     },
@@ -415,7 +504,7 @@
       title: "Thumbs feedback to SpaceXAI",
       description: "",
       kind: "status",
-      visible: (s, env) => !!(env && env.isRemote),
+      visible: (s, env) => !!(env && env.isRemote && !hostIsCloud(env)),
       describe: (s) => {
         const known = s && typeof s.thumbsFeedback === "boolean";
         const state = known ? (s.thumbsFeedback ? "On. " : "Off. ") : "";
@@ -465,7 +554,7 @@
       kind: "status",
       describe: (s) => (s && s.voiceConfigured)
         ? "Voice is ready on this machine."
-        : "Voice is not configured on the desk that is hosting this session.",
+        : "Voice is not configured on the machine hosting this session.",
       visible: (s, env) => !!(env && (env.isRemote || env.isDesktop)),
     },
     {
@@ -572,6 +661,47 @@
           : { type: "runGrokLogin", provider: "claude" };
       },
     },
+    // A device-code sign-in IN FLIGHT, rendered where the click happened.
+    // The transcript's connect card refuses to render over a painted
+    // conversation (revealWelcome holds), so without these rows a Connect
+    // click from this page had no visible effect at all — the first real
+    // cloud test's "clicking Connect does nothing" (owner, 2026-08-31).
+    {
+      id: "providerGrokFlow",
+      category: "providers",
+      logo: "grok",
+      title: "Grok",
+      description: "",
+      kind: "deviceflow",
+      providerId: "grok",
+      flow: (s, env) => deviceLoginFlow(env, "grok"),
+      visible: (s, env) => !!(env && env.isRemote && deviceFlowRowVisible(s, env, "grok")),
+      describe: (s, env) => deviceFlowDescription(deviceLoginFlow(env, "grok")),
+    },
+    {
+      id: "providerCodexFlow",
+      category: "providers",
+      logo: "codex",
+      title: "Codex",
+      description: "",
+      kind: "deviceflow",
+      providerId: "codex",
+      flow: (s, env) => deviceLoginFlow(env, "codex"),
+      visible: (s, env) => !!(env && env.isRemote && deviceFlowRowVisible(s, env, "codex")),
+      describe: (s, env) => deviceFlowDescription(deviceLoginFlow(env, "codex")),
+    },
+    {
+      id: "providerClaudeFlow",
+      category: "providers",
+      logo: "claude",
+      title: "Claude",
+      description: "",
+      kind: "deviceflow",
+      providerId: "claude",
+      flow: (s, env) => deviceLoginFlow(env, "claude"),
+      visible: (s, env) => !!(env && env.isRemote && deviceFlowRowVisible(s, env, "claude")),
+      describe: (s, env) => deviceFlowDescription(deviceLoginFlow(env, "claude")),
+    },
     // Remote provider rows come in a PAIR, and which one shows is the point.
     // This page rendered status-only for a remote from 3.9.0, when a remote
     // genuinely could not sign a provider in. `0fa6661` gave it the device-code
@@ -586,8 +716,9 @@
       description: "",
       kind: "status",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
-        && !remoteProviderActionable(s, env, "grok")),
-      describe: (s) => providerDescription(providerOf(s, "grok")),
+        && !remoteProviderActionable(s, env, "grok")
+        && !deviceFlowRowVisible(s, env, "grok")),
+      describe: (s, env) => providerRemoteDescribe(s, env, "grok"),
     },
     {
       id: "providerGrokRemote",
@@ -597,8 +728,14 @@
       description: "",
       kind: "action",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
-        && remoteProviderActionable(s, env, "grok")),
-      describe: (s) => providerDescription(providerOf(s, "grok")),
+        && remoteProviderActionable(s, env, "grok")
+        && !deviceFlowRowVisible(s, env, "grok")),
+      // The flow this click starts reports RIGHT HERE (the deviceflow row),
+      // so the overlay must survive the click — closing it was how "Connect
+      // does nothing" happened: the transcript card cannot render over a
+      // painted conversation, and the overlay had already left the screen.
+      keepOpen: (s, env) => !!(env && env.isRemote),
+      describe: (s, env) => providerRemoteDescribe(s, env, "grok"),
       actionLabel: (s) => providerAction(providerOf(s, "grok")),
       // Same two messages the desk row sends, reached through the same test.
       // Which one is offered is decided by visibility above, so this cannot
@@ -618,8 +755,9 @@
       description: "",
       kind: "status",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
-        && !remoteProviderActionable(s, env, "codex")),
-      describe: (s) => providerDescription(providerOf(s, "codex")),
+        && !remoteProviderActionable(s, env, "codex")
+        && !deviceFlowRowVisible(s, env, "codex")),
+      describe: (s, env) => providerRemoteDescribe(s, env, "codex"),
     },
     {
       id: "providerCodexRemote",
@@ -629,8 +767,14 @@
       description: "",
       kind: "action",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
-        && remoteProviderActionable(s, env, "codex")),
-      describe: (s) => providerDescription(providerOf(s, "codex")),
+        && remoteProviderActionable(s, env, "codex")
+        && !deviceFlowRowVisible(s, env, "codex")),
+      // The flow this click starts reports RIGHT HERE (the deviceflow row),
+      // so the overlay must survive the click — closing it was how "Connect
+      // does nothing" happened: the transcript card cannot render over a
+      // painted conversation, and the overlay had already left the screen.
+      keepOpen: (s, env) => !!(env && env.isRemote),
+      describe: (s, env) => providerRemoteDescribe(s, env, "codex"),
       actionLabel: (s) => providerAction(providerOf(s, "codex")),
       // Same two messages the desk row sends, reached through the same test.
       // Which one is offered is decided by visibility above, so this cannot
@@ -650,8 +794,23 @@
       description: "",
       kind: "status",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
-        && !remoteProviderActionable(s, env, "claude")),
-      describe: (s) => providerDescription(providerOf(s, "claude")),
+        && !hostIsCloud(env)
+        && !remoteProviderActionable(s, env, "claude")
+        && !deviceFlowRowVisible(s, env, "claude")),
+      describe: (s, env) => providerRemoteDescribe(s, env, "claude"),
+    },
+    // On a cloud machine, Claude gets the answer BEFORE the click: a Connect
+    // button that always ends in "not available" is a dead end wearing an
+    // affordance (owner, 2026-08-31).
+    {
+      id: "providerClaudeCloud",
+      category: "providers",
+      logo: "claude",
+      title: "Claude",
+      description: "Claude Code isn't available on cloud machines yet — we're working on adding it. Grok and Codex both sign in right here.",
+      kind: "status",
+      visible: (s, env) => !!(env && env.isRemote && env.providersKnown && hostIsCloud(env)
+        && !(providerOf(s, "claude") && providerOf(s, "claude").connected)),
     },
     {
       id: "providerClaudeRemote",
@@ -661,8 +820,15 @@
       description: "",
       kind: "action",
       visible: (s, env) => !!(env && env.isRemote && env.providersKnown
-        && remoteProviderActionable(s, env, "claude")),
-      describe: (s) => providerDescription(providerOf(s, "claude")),
+        && !hostIsCloud(env)
+        && remoteProviderActionable(s, env, "claude")
+        && !deviceFlowRowVisible(s, env, "claude")),
+      // The flow this click starts reports RIGHT HERE (the deviceflow row),
+      // so the overlay must survive the click — closing it was how "Connect
+      // does nothing" happened: the transcript card cannot render over a
+      // painted conversation, and the overlay had already left the screen.
+      keepOpen: (s, env) => !!(env && env.isRemote),
+      describe: (s, env) => providerRemoteDescribe(s, env, "claude"),
       actionLabel: (s) => providerAction(providerOf(s, "claude")),
       // Same two messages the desk row sends, reached through the same test.
       // Which one is offered is decided by visibility above, so this cannot
@@ -837,8 +1003,12 @@
       id: "hostConfigRemote",
       category: "advanced",
       title: "Host configuration",
-      description: "Host config is managed on the desk.",
+      description: "",
       kind: "status",
+      // "The desk" was nonsense on a cloud machine — there is no desk.
+      describe: (s, env) => hostIsCloud(env)
+        ? "Host configuration lives on your cloud machine and is not editable from this page."
+        : "Host config is managed on the machine running this workspace.",
       visible: (s, env) => !!(env && env.isRemote),
     },
     {
@@ -2466,6 +2636,112 @@
       span.className = "settings-value";
       span.textContent = String(value ?? "—");
       control.appendChild(span);
+    } else if (row.kind === "deviceflow") {
+      const flow = (row.flow ? row.flow(snapshot, env) : undefined) || {};
+      el.classList.add("settings-deviceflow");
+      const preflightStep = flow.status === "unavailable" && !!flow.preflight;
+      const live = preflightStep || flow.status === "starting" || flow.status === "waiting" || flow.status === "verifying";
+      const stepTitle = deviceFlowTitle(flow);
+      if (stepTitle) {
+        const heading = document.createElement("div");
+        heading.className = "settings-row-desc settings-deviceflow-step";
+        heading.textContent = stepTitle;
+        // Above the description, not after it: the row builds copy as
+        // name → desc, and appending here put the heading under its own body.
+        title.insertBefore(heading, desc);
+      }
+      // Step 1 shows the reason as the row description already; step 2 keeps
+      // the setting visible beside the code it gates.
+      const hint = preflightStep ? "" : (live ? deviceFlowHint(flow) : "");
+      const steps = live ? deviceFlowSteps(flow) : [];
+      if (hint) {
+        const note = document.createElement("div");
+        note.className = "settings-row-desc settings-deviceflow-hint";
+        note.textContent = hint;
+        title.appendChild(note);
+      }
+      if (flow.note) {
+        const note = document.createElement("div");
+        note.className = "settings-row-desc settings-deviceflow-note";
+        note.textContent = flow.note;
+        title.appendChild(note);
+      }
+      if (steps.length) {
+        const list = document.createElement("ol");
+        list.className = "settings-deviceflow-steps";
+        for (const step of steps) {
+          const li = document.createElement("li");
+          // `**bold**` → <strong>, as DOM nodes. The setting people cannot find
+          // sits at the bottom of a long page, and the emphasis is the point.
+          const parts = String(step).split(/\*\*([^*\n]+)\*\*/);
+          parts.forEach((part, index) => {
+            if (!part) return;
+            if (index % 2 === 1) {
+              const strong = document.createElement("strong");
+              strong.textContent = part;
+              li.appendChild(strong);
+            } else {
+              li.appendChild(document.createTextNode(part));
+            }
+          });
+          list.appendChild(li);
+        }
+        title.appendChild(list);
+      }
+      if (preflightStep) {
+        if (flow.preflight.url) {
+          const open = document.createElement("button");
+          open.type = "button";
+          open.className = "settings-action settings-action-quiet";
+          open.dataset.deviceOpen = flow.preflight.url;
+          open.textContent = "Open settings";
+          control.appendChild(open);
+        }
+        const go = document.createElement("button");
+        go.type = "button";
+        go.className = "settings-action";
+        go.dataset.deviceContinue = row.providerId || "";
+        go.textContent = flow.preflight.continueLabel || "Done — continue";
+        control.appendChild(go);
+      }
+      if (flow.status === "waiting") {
+        if (flow.code) {
+          // The person is about to type this somewhere else. Selectable as a
+          // unit, big enough to read across the room — and copyable in one
+          // tap, because a code you can see but not copy is busywork.
+          const code = document.createElement("code");
+          code.className = "settings-devicecode";
+          code.textContent = flow.code;
+          control.appendChild(code);
+          const copy = document.createElement("button");
+          copy.type = "button";
+          copy.className = "settings-action settings-action-quiet";
+          copy.dataset.deviceCopy = flow.code;
+          copy.textContent = "Copy";
+          control.appendChild(copy);
+        }
+        if (flow.url) {
+          const open = document.createElement("button");
+          open.type = "button";
+          open.className = "settings-action";
+          open.dataset.deviceOpen = flow.url;
+          open.textContent = "Open sign-in page";
+          control.appendChild(open);
+        }
+      } else if (flow.status === "done") {
+        const mark = document.createElement("span");
+        mark.className = "settings-value";
+        mark.textContent = "Connected";
+        control.appendChild(mark);
+      }
+      if (flow.status === "starting" || flow.status === "waiting" || flow.status === "verifying") {
+        const cancelBtn = document.createElement("button");
+        cancelBtn.type = "button";
+        cancelBtn.className = "settings-action settings-action-quiet";
+        cancelBtn.dataset.deviceCancel = row.providerId || "";
+        cancelBtn.textContent = "Cancel";
+        control.appendChild(cancelBtn);
+      }
     } else if (row.kind === "action") {
       const btn = document.createElement("button");
       btn.type = "button";
@@ -2588,7 +2864,10 @@
      *  clients see the answer — `providerState` is mirrored — but must not spawn
      *  the desk's CLIs to get it, which is why the rows there are status-only. */
     function canRefreshProviders() {
-      return !env.isRemote && env.providersKnown === true;
+      if (env.providersKnown !== true) return false;
+      // A cloud machine has no desk to do this for it — see CLOUD_DISPOSITION
+      // in remote-policy.ts, which is what lets the frame through.
+      return !env.isRemote || hostIsCloud(env);
     }
 
     function requestProvidersRefresh() {
@@ -2640,7 +2919,8 @@
       }
       const message = rowMessage(row, undefined, snapshot);
       if (message) post(message);
-      if (opts.closeOnAction && onClose) onClose();
+      const keep = typeof row.keepOpen === "function" ? row.keepOpen(snapshot, env) : !!row.keepOpen;
+      if (opts.closeOnAction && !keep && onClose) onClose();
     }
 
     function paintKey() {
@@ -2996,6 +3276,36 @@
           const btn = el.querySelector(".settings-action");
           if (!btn) return;
           btn.onclick = (e) => { e.stopPropagation(); runAction(row); };
+        } else if (row.kind === "deviceflow") {
+          const open = el.querySelector("[data-device-open]");
+          if (open) {
+            open.onclick = (e) => { e.stopPropagation(); openExternalHref(open.dataset.deviceOpen); };
+          }
+          const copy = el.querySelector("[data-device-copy]");
+          if (copy) {
+            copy.onclick = (e) => {
+              e.stopPropagation();
+              try {
+                navigator.clipboard.writeText(copy.dataset.deviceCopy);
+                copy.textContent = "Copied";
+                setTimeout(() => { copy.textContent = "Copy"; }, 1500);
+              } catch { /* clipboard denied — the code is still selectable */ }
+            };
+          }
+          const go = el.querySelector("[data-device-continue]");
+          if (go) {
+            go.onclick = (e) => {
+              e.stopPropagation();
+              post({ type: "runGrokLogin", provider: go.dataset.deviceContinue });
+            };
+          }
+          const cancelBtn = el.querySelector("[data-device-cancel]");
+          if (cancelBtn) {
+            cancelBtn.onclick = (e) => {
+              e.stopPropagation();
+              post({ type: "cancelDeviceLogin", provider: cancelBtn.dataset.deviceCancel });
+            };
+          }
         }
       });
       function closeKeyForm() {

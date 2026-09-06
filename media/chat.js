@@ -317,6 +317,9 @@
     providersChecking: false,
     onboardingMode: null,
     onboardingInfo: {},
+    /** provider -> the device-login card last sent by the host. Mirrored into
+     *  Settings so a connect started there reports where the click happened. */
+    deviceLoginByProvider: {},
     codexInstall: { phase: "idle", receivedBytes: 0, totalBytes: 0, reason: "" },
     availableModels: [],
     currentModeId: "agent",
@@ -2717,6 +2720,7 @@
     return {
       isRemote: IS_REMOTE,
       isDesktop: isDesktopHostCaps(),
+      deviceLogin: state.deviceLoginByProvider,
       clientOwnsFontScale: CLIENT_OWNS_FONT_SCALE,
       ttsAvailable,
       steerSupported: state.steerSupported !== false,
@@ -7150,7 +7154,7 @@
       // NEVER answer, and the probe is sent for one repo only — so every other
       // repo would sit on a spinner forever with nothing coming.
       if (state.repoPreviewsUnsupported) {
-        const note = railNote("Update Grok Build to preview");
+        const note = railNote("Sessions need a newer Grok Build");
         note.title =
           "Grok Build on your computer — the extension or the desktop app — is older " +
           "than this page, so it can't list another project's sessions without " +
@@ -7760,6 +7764,11 @@
       worktreeSupported: state.worktreeSupported !== false,
       inWorktree: !!state.isWorktree,
       altAgentConnected: !state.providersKnown || altConnected,
+      // A cloud machine can connect agents from here and cannot connect Claude
+      // Code at all; both change what the providers tip should say and whether
+      // it may be shown.
+      cloudHost: !!(state.hostCaps && state.hostCaps.remoteAgentSignOut),
+      remoteCanConnectAgents: !!(state.hostCaps && state.hostCaps.remoteAgentSignIn),
       routineCount: host.routineCount,
       connectorCount: host.connectorCount,
       // A phone's read-aloud is its own client-side preference, not the desk's.
@@ -7942,7 +7951,9 @@
     if (existing && existing.dataset.tip === tip.id) return;
     drop();
 
-    const parts = helpers.splitWelcomeTipCopy(tip.copy);
+    const parts = helpers.splitWelcomeTipCopy(
+      typeof helpers.welcomeTipCopy === "function" ? helpers.welcomeTipCopy(tip, welcomeTipFacts()) : tip.copy,
+    );
     const el = document.createElement("p");
     el.id = "welcome-tip";
     el.className = "welcome-tip welcome-advice muted";
@@ -8775,7 +8786,12 @@
     if (device && device.status === "waiting" && device.url) {
       status("Confirm the code");
       return `<div class="onb">` +
-        `<p class="onb-heading">Finish signing in to ${escapeHtml(name)}</p>` +
+        `<p class="onb-heading">Step 2 of 2 &mdash; confirm the code</p>` +
+        // The vendor's own page warns that device codes are used in phishing
+        // and to continue only if the CLI started the sign-in. Saying that
+        // BEFORE they meet it turns an alarming page into an expected one
+        // (owner, with the screenshot, 2026-08-31).
+        (device.note ? `<p class="onb-desc onb-note">${escapeHtml(device.note)}</p>` : "") +
         (device.code
           ? `<p class="onb-desc">Open the link, then confirm this code:</p>` +
             // Same markup as every other copyable value in this panel, so it
@@ -8786,6 +8802,14 @@
             `</div>`
           : `<p class="onb-desc">Open the link to finish signing in.</p>`) +
         `<a class="onb-action" href="${escapeHtml(device.url)}" target="_blank" rel="noopener noreferrer">Open the sign-in page</a>` +
+        // The setting to check, beside the code it gates — not on a screen
+        // before it that cost an extra click to get past.
+        (device.preflight && Array.isArray(device.preflight.steps) && device.preflight.steps.length
+          ? `<p class="onb-desc">${escapeHtml(device.preflight.reason || "")}</p>` +
+            `<ol class="onb-steps">${device.preflight.steps
+              .map((s) => `<li>${escapeHtml(String(s)).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")}</li>`)
+              .join("")}</ol>`
+          : "") +
         cancel +
         // Said plainly because the instinct is to come back and press something
         // else. Nothing else needs pressing.
@@ -8799,6 +8823,14 @@
         `<p class="onb-heading">Connecting ${escapeHtml(name)}</p>` +
         `<p class="onb-desc">Asking the ${escapeHtml(name)} CLI for a sign-in code&hellip;</p>` +
         cancel +
+      `</div>`;
+    }
+
+    if (device && device.status === "verifying") {
+      status("Confirming sign-in");
+      return `<div class="onb">` +
+        `<p class="onb-heading">Almost there</p>` +
+        `<p class="onb-desc">Signed in — confirming the credential on this machine…</p>` +
       `</div>`;
     }
 
@@ -8826,7 +8858,7 @@
         .map((s) => `<li>${escapeHtml(String(s)).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")}</li>`)
         .join("");
       return `<div class="onb">` +
-        `<p class="onb-heading">Turn on device sign-in for ${escapeHtml(name)}</p>` +
+        `<p class="onb-heading">${escapeHtml(pf.title || `Turn on device sign-in for ${name}`)}</p>` +
         `<p class="onb-desc">${escapeHtml(pf.reason || "")}</p>` +
         (steps ? `<ol class="onb-steps">${steps}</ol>` : "") +
         (pf.url
@@ -8834,7 +8866,7 @@
           : "") +
         // Still offered, because the setting may already be on — and because a
         // screen that only sends you elsewhere is a dead end with a link on it.
-        `<button class="onb-action onb-secondary" type="button" data-act="connectRemote" data-provider="${escapeHtml(provider)}">I've turned it on — connect</button>` +
+        `<button class="onb-action onb-secondary" type="button" data-act="connectRemote" data-provider="${escapeHtml(provider)}">${escapeHtml(pf.continueLabel || "I've turned it on — connect")}</button>` +
       `</div>`;
     }
 
@@ -8857,9 +8889,31 @@
     // does not decide which of these can work headlessly — it asks, and the host
     // answers `unavailable` with a reason for any that cannot.
     status("Connect an agent");
-    const offer = provider ? [provider] : ["grok", "codex", "claude"];
+    // A cloud machine with NOTHING connected gets the whole menu, even when the
+    // frame names one provider (the session's agent needing auth). On a fresh
+    // machine that narrowing hid the choice entirely: the owner saw only Grok
+    // where all three belong (2026-08-31). Once something IS connected, the
+    // frame's provider is the specific thing being asked for again.
+    const nothingConnected = !((state.providers || []).some((p) => p && p.connected));
+    const cloudFresh = !!(state.hostCaps && state.hostCaps.remoteAgentSignOut) && nothingConnected;
+    const offer = provider && !cloudFresh ? [provider] : ["grok", "codex", "claude"];
+    // A cloud machine's three agents are not equal offers: Grok is the native
+    // one, and Claude cannot be connected there yet — a button that always
+    // ends in "not available" is a dead end wearing an affordance.
+    const cloudHost = !!(state.hostCaps && state.hostCaps.remoteAgentSignOut);
+    // On a cloud machine the agents are named as products and ranked: Grok
+    // Build is the one this environment is built around, and Claude Code is
+    // not connectable here yet, so it is stated rather than offered.
+    const CLOUD_NAMES = { grok: "Grok Build", codex: "Codex", claude: "Claude Code" };
     const buttons = offer
-      .map((id) => `<button class="onb-action" type="button" data-act="connectRemote" data-provider="${id}">Connect ${NAMES[id]}</button>`)
+      .map((id) => {
+        if (cloudHost && id === "claude") {
+          return `<p class="onb-desc onb-agent-note">Claude Code — we're working on adding it, not available yet.</p>`;
+        }
+        const label = cloudHost ? CLOUD_NAMES[id] : NAMES[id];
+        const rec = cloudHost && id === "grok" ? " (recommended)" : "";
+        return `<button class="onb-action" type="button" data-act="connectRemote" data-provider="${id}">Connect ${label}${rec}</button>`;
+      })
       .join("");
     return `<div class="onb">` +
       `<p class="onb-heading">${provider ? `Connect ${escapeHtml(name)}` : "Connect an agent"}</p>` +
@@ -10858,6 +10912,28 @@
     el.textContent = "Context from previous session applied";
     appendTranscriptChild(el);
     scrollToBottom();
+  }
+
+  /**
+   * An outdated host cannot describe its own age, so the client says it.
+   *
+   * Observed 2026-08-31: an old desktop answered a new session with "That
+   * project folder is no longer open on the desktop" while the rail, on the
+   * same screen, said every project needed a newer Grok Build. Both were the
+   * same fact -- the host is behind -- and only one of them said so. The host
+   * that produced the sentence is the one that cannot be taught a better one,
+   * so the newest thing in the loop supplies the missing half.
+   *
+   * Matched on the literal because an old host offers no other signal; the
+   * sentence is APPENDED, never replaced, so if the folder really is closed
+   * the original answer still stands.
+   */
+  function errorTextForHostAge(text) {
+    if (!state.repoPreviewsUnsupported) return text;
+    if (!/no longer open on the desktop|archived, so it is not available from here/.test(text)) return text;
+    return text
+      + " That machine is also running an older Grok Build, which can report projects"
+      + " incorrectly — updating it there is worth trying first.";
   }
 
   function addError(text, code) {
@@ -15309,6 +15385,27 @@
         state.providersKnown = true;
         state.providers = Array.isArray(msg.providers) ? msg.providers.filter((provider) =>
           provider && (provider.id === "grok" || provider.id === "codex" || provider.id === "claude")) : [];
+        // A confirmed account retires its device-flow mirror. Without this the
+        // "Connected" flow row would resurface in Settings after a later
+        // sign-out, describing a connection that no longer exists.
+        for (const provider of state.providers) {
+          const mirrored = state.deviceLoginByProvider[provider.id];
+          if (!mirrored) continue;
+          // A terminal "done" can always lie: connected, it is redundant with
+          // the snapshot; disconnected, it claims an account the user just
+          // signed out of. A `failed` or `unavailable` mirror is the
+          // explanation for what just happened, so it survives the refresh
+          // Providers sends on open (round 2) — but only while the provider is
+          // still unhealthy. Once a snapshot says the account is connected and
+          // working, that explanation is history, and keeping it left a row
+          // offering Sign out above the reason a previous attempt failed
+          // (round 3).
+          var healthy = provider.connected && provider.needsLogin !== true;
+          var terminal = mirrored.status === "failed" || mirrored.status === "unavailable";
+          if (mirrored.status === "done" || (healthy && terminal)) {
+            delete state.deviceLoginByProvider[provider.id];
+          }
+        }
         // Read, never latched on click: a host too old to know `refreshProviders`
         // sends no frame at all, and a locally-set flag would spin forever.
         // Absent means idle, which is also what every pre-refresh host means.
@@ -16613,6 +16710,27 @@
           showOnboarding(msg.state, { platform: msg.platform, reason: msg.reason, provider: msg.provider, device: msg.device }, () => {
             if (msg.launched) markOnboardingLaunchedByHost(msg.provider);
           });
+          // Mirror the device flow into Settings → Providers. The welcome card
+          // above cannot render over a painted conversation, so for a click
+          // made from the settings overlay this mirror IS the feedback.
+          if (msg.provider) {
+            // A terminal "done" is only worth mirroring while the snapshot has
+            // not caught up. Storing it unconditionally left a latent card that
+            // reappeared as "Connected" after a later sign-out in the same tab,
+            // hiding the real Connect row (review, 2026-08-31) -- providerState
+            // can arrive BEFORE this frame, so the retirement below cannot be
+            // the only cure.
+            var settledDone = msg.device && msg.device.status === "done";
+            var alreadyConnected = (state.providers || []).some(function (p) {
+              return p && p.id === msg.provider && p.connected;
+            });
+            if (msg.device && !(settledDone && alreadyConnected)) {
+              state.deviceLoginByProvider[msg.provider] = msg.device;
+            } else {
+              delete state.deviceLoginByProvider[msg.provider];
+            }
+            refreshSettingsOverlay();
+          }
         break;
       case "error":
         // The relay bounces a quota-refused frame as a plain error, which
@@ -16662,7 +16780,7 @@
           renderQueuedBlocks();
           updateSendButton();
         }
-        addError(msg.text, msg.code);
+        addError(errorTextForHostAge(msg.text), msg.code);
         break;
       case "hostNotice":
         addPlanNotice(msg.text);
