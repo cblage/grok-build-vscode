@@ -61,6 +61,15 @@ function makeUplink(overrides: Partial<ConstructorParameters<typeof RemoteUplink
 describe("RemoteUplink client identity and targeted sends", () => {
   beforeEach(() => { wsMock.sockets.length = 0; });
 
+  it("logs an outbound frame refused while the uplink is disconnected", () => {
+    const logs: string[] = [];
+    const uplink = makeUplink({ log: (line) => logs.push(line) });
+    uplink.broadcastTo(["tab-a"], {
+      type: "repoSessions", cwd: "/work/open", entries: [], dots: {}, total: 0,
+    });
+    expect(logs).toContain("[remote] could not send repoSessions (uplink is not connected)");
+  });
+
   it("hello is legacy-shaped without client metadata and includes mapped client when supplied", () => {
     const uplink = makeUplink({ deviceName: "Dell (Windows 11)" });
     uplink.start();
@@ -451,6 +460,39 @@ describe("RemoteUplink socket-level project authorization", () => {
     const closedPreview = { ...preview, cwd: "/work/closed", entries: [] } as HostMsg;
     uplink.broadcastTo(["tab-a"], closedPreview, "/work/closed");
     expect(socket.sent.map(JSON.parse).filter((f: { t: string }) => f.t === "host-to")).toEqual([]);
+    uplink.dispose();
+  });
+
+  it("writes the authorized rows from a mixed repoSessions frame", () => {
+    const logs: string[] = [];
+    const uplink = makeUplink({
+      auth: {
+        authorizedCwds: () => ["/work/project"],
+        scopeCwdForClient: () => "/work/other",
+        sameCwd: pathsEqual,
+      },
+      log: (line) => logs.push(line),
+    });
+    uplink.start();
+    const socket = wsMock.sockets[0];
+    socket.emit("open");
+
+    uplink.broadcastTo(["tab-a"], {
+      type: "repoSessions",
+      cwd: "/work/project",
+      entries: [
+        { id: "kept", title: "Kept", cwd: "/work/project" } as any,
+        { id: "worktree", title: "Worktree", cwd: "/tmp/worktree" } as any,
+      ],
+      dots: { kept: "working", worktree: "needs-you" },
+      total: 2,
+    }, "/work/project");
+
+    const [frame] = socket.sent.map(JSON.parse).filter((item: { t: string }) => item.t === "host-to");
+    expect(frame.msg.entries.map((entry: { id: string }) => entry.id)).toEqual(["kept"]);
+    expect(frame.msg.dots).toEqual({ kept: "working" });
+    expect(frame.msg.total).toBe(1);
+    expect(logs.some((line) => line.includes("filtered 1 unauthorized repoSessions entry"))).toBe(true);
     uplink.dispose();
   });
 

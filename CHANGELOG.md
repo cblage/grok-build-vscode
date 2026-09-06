@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.1.2-sandbox.1 — 2026-09-02
+## 4.1.3-sandbox.1 — 2026-09-02
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.2.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,22 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.1.2 — 2026-09-02
+
+**Things that quietly did nothing now do something, or say why.** A click on a sleeping cloud machine, a Clone that vanished, a Hide that was never going to work, a project telling you to update software that was already current — four different silences, one release.
+
+### Fixed
+
+- **A click wakes a sleeping cloud machine.** Two things woke one: attaching a browser, and the connection dropping while you were marked present. Presence lapses while you READ — reading is not interacting — so if you came back to the page and clicked, nothing was going to wake anything, and the click bounced into silence. Refreshing cured it only because attaching is a wake trigger and clicking was not. A send that finds no machine now wakes it: the send is the strongest evidence there is that somebody wants it.
+
+- **A control action that cannot be delivered says so.** Clone, Hide, rename, delete, new session and the rest were posted and, if the connection was between sockets, discarded without a word — no progress, no error, nothing. They now either reach your machine or tell you they did not, once, with nothing changed. They are deliberately not queued for later: a clone that lands minutes afterwards moves the tab of somebody who has since gone elsewhere.
+
+- **A project's conversations stop accusing your installation of being out of date.** One project could show “Sessions need a newer Grok Build” on a host running the newest release; reloading did not help and opening the project cured it. The message was never a version check — it was an eight-second silence being turned into a claim about your software. Underneath were two real faults: on a page with a remembered conversation the request never left the browser at all, and a preview whose entries included a worktree was thrown away whole on the way back. Both are fixed, the request always gets an answer, and silence now reads as “couldn't load these” with a Retry.
+
+- **“Hide project” is no longer offered where it cannot work.** On a phone or a cloud machine the menu item drew, posted, and was refused by the host in silence. It was gated on the capability for ADDING a project, which stopped meaning what it said once creating and cloning became things a browser could do. It now asks for the capability it actually needs, and confirms before it acts — the editor's rail always did, the chat rail did not.
+
+- **Host names in error messages.** Four places said “open VS Code on that machine” for a host that may be Cursor, Antigravity, Grok Build Desktop, or a cloud machine with no editor anywhere near it.
 
 ## 4.1.1 — 2026-09-02
 

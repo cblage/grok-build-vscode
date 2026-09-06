@@ -9,6 +9,7 @@ import {
   allowRemoteRepoTarget,
   bracketRemoteSnapshot,
   mayDeliverRemoteHostMsg,
+  repoSessionsMessageForRemote,
   routinesMessageForRemote,
   repoScopeFor,
   sessionForRequest,
@@ -275,6 +276,39 @@ describe("mayDeliverRemoteHostMsg (outbound project authorization)", () => {
         same,
       ),
     ).toBe(true);
+  });
+
+  it("filters an unauthorized repoSessions row instead of dropping authorized rows", () => {
+    const mixed = {
+      type: "repoSessions",
+      cwd: open[0],
+      entries: [
+        { id: "ordinary", cwd: open[0], title: "Ordinary" },
+        { id: "worktree", cwd: "/tmp/worktree", title: "Worktree" },
+      ],
+      dots: { ordinary: "working", worktree: "needs-you" },
+      total: 2,
+    } as Extract<HostMsg, { type: "repoSessions" }>;
+
+    // The raw mixed frame still fails closed; the outbound rewriter makes the
+    // authorized subset pass the same gate.
+    expect(mayDeliverRemoteHostMsg(mixed, open, undefined, same)).toBe(false);
+    const filtered = repoSessionsMessageForRemote(mixed, open, same);
+    expect(filtered.entries.map((entry) => entry.id)).toEqual(["ordinary"]);
+    expect(filtered.dots).toEqual({ ordinary: "working" });
+    expect(filtered.total).toBe(1);
+    expect(mayDeliverRemoteHostMsg(filtered, open, undefined, same)).toBe(true);
+  });
+
+  it("allows a coarse empty repoSessions refusal to answer an unauthorized request", () => {
+    expect(mayDeliverRemoteHostMsg({
+      type: "repoSessions",
+      cwd: closed,
+      entries: [],
+      dots: {},
+      total: 0,
+      error: "project-unavailable",
+    }, open, undefined, same)).toBe(true);
   });
 
   describe("the routines frame", () => {
@@ -1371,6 +1405,31 @@ describe("capabilities a remote may see", () => {
     // The host keeps serving its LOCAL webview from this same object.
     expect(original).toHaveProperty("showInFolder");
   });
+
+  it("withholds removing a project from a remote driving a DESK", () => {
+    // A phone must not rearrange the projects on somebody's laptop. Drawing
+    // the control there is the bug this whole change is about: it rendered,
+    // posted, and was dropped in silence.
+    const caps = { removeProjectFolder: true, uploadFile: true } as unknown as
+      Parameters<typeof capabilitiesForRemote>[0];
+    const seen = capabilitiesForRemote(caps) as Record<string, unknown>;
+    expect(seen).not.toHaveProperty("removeProjectFolder");
+    expect(seen.uploadFile).toBe(true);
+  });
+
+  it("withholds it on a CLOUD machine too, because Hide there is one-way", () => {
+    // The tempting argument is that a cloud remote is the only user, so it may
+    // as well close a folder. Authority was never the problem. RECOVERY is:
+    // Add project on a phone is Create and Clone, importing an existing folder
+    // needs a picker no remote has, and Create refuses a destination that is
+    // already on disk. A hidden project would be gone from every surface that
+    // person has, under a dialog promising it could be brought back.
+    const caps = { removeProjectFolder: true, uploadFile: true } as unknown as
+      Parameters<typeof capabilitiesForRemote>[0];
+    const seen = capabilitiesForRemote(caps) as Record<string, unknown>;
+    expect(seen).not.toHaveProperty("removeProjectFolder");
+    expect(seen.uploadFile).toBe(true);
+  });
 });
 
 describe("a cloud environment is its own desk", () => {
@@ -1400,6 +1459,14 @@ describe("a cloud environment is its own desk", () => {
     // signing an agent OUT, re-observing the accounts (the promotion that makes
     // a sign-in stick), and the two General preferences about this machine
     // which were otherwise read-only forever (owner, 2026-08-31).
+    // removeProjectFolder joined these during 4.1.2 and was taken back out
+    // before release. "The remote is the only user" establishes AUTHORITY and
+    // says nothing about whether the act can be undone: on a cloud machine Add
+    // project is Create and Clone only, importing an existing folder needs a
+    // native picker no remote has, and Create refuses a destination that
+    // already exists — so Hide there was one-way, under a confirmation that
+    // promised otherwise. Reversible put-away is the archive feature, not a
+    // disposition override.
     expect([...promoted].sort()).toEqual([
       "logout", "refreshProviders", "setTelemetryEnabled", "setThumbsFeedback",
     ]);

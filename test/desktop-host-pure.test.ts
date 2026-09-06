@@ -4654,6 +4654,24 @@ describe("openFile / openDiff session roots (P2-4 / P2-5)", () => {
     const previewBody = sidebar.slice(previewStart, previewEnd);
     expect(previewBody).toContain("resolveLocalRepoTarget");
     expect(previewBody).not.toContain("this.repoCatalog()");
+    expect(previewBody).not.toContain("return undefined");
+    expect(previewBody).toContain('error: "project-unavailable"');
+    expect(previewBody).toContain('error: "sessions-unavailable"');
+
+    const remoteSendStart = sidebar.indexOf("private sendRepoSessionsPreview(", previewStart);
+    const localSendEnd = sidebar.indexOf("private async selectRepo(", remoteSendStart);
+    const sendBodies = sidebar.slice(remoteSendStart, localSendEnd);
+    expect(sendBodies).toContain("this.sendRemoteClient(clientId, msg)");
+    expect(sendBodies).toContain("this.postLocal(msg)");
+    expect(sendBodies).not.toMatch(/if \(msg\)/);
+
+    const remoteHandlerStart = sidebar.indexOf("private handleRemoteMessage(");
+    const remoteHandlerEnd = sidebar.indexOf("private handleRemoteClientReady(", remoteHandlerStart);
+    const remoteHandler = sidebar.slice(remoteHandlerStart, remoteHandlerEnd);
+    expect(remoteHandler).toContain('m.type !== "selectRepo" && m.type !== "listRepoSessions"');
+    expect(remoteHandler).toMatch(
+      /if \(m\.type === "listRepoSessions"\)[\s\S]*type: "repoSessions"[\s\S]*error: "project-unavailable"/,
+    );
 
     // Rejected setActiveWorkspaceFolder aborts — no history open / session spawn.
     const switchStart = sidebar.indexOf("private async switchLocalWorkspaceFolderExclusive(");

@@ -397,10 +397,7 @@ describe("projects rail", () => {
     expect(rail(doc).hidden).toBe(false);
   });
 
-  // A host too old to answer `listRepoSessions` replies with silence, and the
-  // probe only ever names ONE repo — so every other repo would spin forever with
-  // nothing coming. After the deadline the rail says what to do about it.
-  it("tells you to update the host when the probe goes unanswered", async () => {
+  it("reports the timed-out project truthfully and offers a retry", async () => {
     const h = bootWebview({
       remote: true,
       beforeScripts: (w: any) => { withRail(w); w.__grokRailProbeTimeoutMs = 5; },
@@ -411,10 +408,8 @@ describe("projects rail", () => {
     await new Promise((r) => setTimeout(r, 40));
 
     const notes = [...h.doc.querySelectorAll(".rail-note")].map((e) => e.textContent);
-    // Every repo we are not in — including the ones never probed, which is the
-    // half that used to hang.
-    expect(notes.filter((t) => t === "Sessions need a newer Grok Build")).toHaveLength(2);
-    expect(notes).not.toContain("Loading…");
+    expect(notes.filter((t) => t === "Couldn't load these conversations. Retry")).toHaveLength(1);
+    expect(notes).not.toContain("Sessions need a newer Grok Build");
     // The repo we ARE in still shows its sessions: that list needs no new frame.
     expect(sessionNames(h.doc, repoNames(h.doc).indexOf("alpha"))).toEqual(["alpha one"]);
   });
@@ -450,12 +445,7 @@ describe("projects rail", () => {
     expect(sessionNames(h.doc, repoNames(h.doc).indexOf("alpha"))).toEqual(["alpha one"]);
   });
 
-  it("re-probes after a reconnect instead of libelling the host for ever", async () => {
-    // The verdict is inferred from EIGHT SECONDS OF SILENCE, and a cloud
-    // machine that is waking, or busy running a CLI sign-out, misses that
-    // window. The owner's host had just done both and the page then said
-    // "Sessions need a newer Grok Build" about a current build for as long as
-    // it stayed open — nothing ever asked again (2026-08-31).
+  it("re-probes after a reconnect and clears the old request state", async () => {
     const h = bootWebview({
       remote: true,
       beforeScripts: (w: any) => { withRail(w); w.__grokRailProbeTimeoutMs = 5; },
@@ -464,7 +454,7 @@ describe("projects rail", () => {
     dispatch(h.window, sessionsFrame([row("a1", "/work/alpha", "alpha one", 9)]));
     await new Promise((r) => setTimeout(r, 40));
     expect([...h.doc.querySelectorAll(".rail-note")].map((e) => e.textContent))
-      .toContain("Sessions need a newer Grok Build");
+      .toContain("Couldn't load these conversations. Retry");
 
     // A reconnect: every remote snapshot opens with initialState.
     h.posted.length = 0;
@@ -478,7 +468,7 @@ describe("projects rail", () => {
     // It asks again rather than repeating a verdict about a host that is gone.
     expect(h.posted.some((m: any) => m.type === "listRepoSessions")).toBe(true);
     expect([...h.doc.querySelectorAll(".rail-note")].map((e) => e.textContent))
-      .not.toContain("Sessions need a newer Grok Build");
+      .not.toContain("Couldn't load these conversations. Retry");
   });
 
   it("never shows that hint to a host that does answer", async () => {
@@ -490,11 +480,36 @@ describe("projects rail", () => {
     dispatch(h.window, {
       type: "repoSessions", cwd: "/work/beta", entries: [row("b1", "/work/beta", "beta one", 4)], dots: {}, total: 1,
     });
+    dispatch(h.window, { type: "repoSessions", cwd: "/work/gamma", entries: [], dots: {}, total: 0 });
 
     await new Promise((r) => setTimeout(r, 40));
 
     const notes = [...h.doc.querySelectorAll(".rail-note")].map((e) => e.textContent);
-    expect(notes).not.toContain("Sessions need a newer Grok Build");
+    expect(notes).not.toContain("Couldn't load these conversations. Retry");
+  });
+
+  it("does not mark a transport-refused preview in flight and retries only on request", () => {
+    let accept = false;
+    const h = bootWebview({
+      remote: true,
+      beforeScripts: withRail,
+      postMessage: (message) => message.type === "listRepoSessions" ? accept : undefined,
+    });
+    dispatch(h.window, { type: "repos", entries: repos, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
+
+    expect(h.posted.filter((m) => m.type === "listRepoSessions")).toHaveLength(1);
+    expect([...h.doc.querySelectorAll(".rail-note")].map((e) => e.textContent))
+      .toContain("Couldn't load these conversations. Retry");
+
+    // A catalog repaint is not a background retry.
+    dispatch(h.window, { type: "repos", entries: repos, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
+    expect(h.posted.filter((m) => m.type === "listRepoSessions")).toHaveLength(1);
+
+    accept = true;
+    click(h.window, h.doc.querySelector(".rail-note-retry") as HTMLElement);
+    expect(h.posted.filter((m) => m.type === "listRepoSessions")).toHaveLength(2);
+    expect([...h.doc.querySelectorAll(".rail-note")].map((e) => e.textContent))
+      .not.toContain("Couldn't load these conversations. Retry");
   });
 
   it("fans out to the remaining repos only once a preview comes back", () => {
@@ -2490,18 +2505,25 @@ describe("rail overflow menus toggle", () => {
     expect(chip().disabled).toBe(false);
   });
 
-  it("offers Hide project only where the host can close folders", () => {
+  it("offers Hide project only where the host can close folders", async () => {
     // Desktop's rail IS the open-folder set, so putting a project away means
-    // closing it. The browser client has no business closing folders on the
-    // machine it is borrowing, and gates on the same capability as the "+" that
-    // adds them.
+    // closing it.
+    //
+    // It gates on its OWN capability since 4.1.2, not on the "+" that adds
+    // projects. Those agreed only while "+" meant the native picker, which no
+    // remote has; once create and clone shipped as remote-capable ways in, the
+    // shared gate started answering true on a phone and Hide came with it —
+    // drawn, posted, and dropped by remote-policy without a word.
     const h = bootWebview({ beforeScripts: withRail });
     dispatch(h.window, {
       type: "initialState",
       effort: "medium", cwd: "/work/alpha", useCtrlEnter: false, extVersion: "0",
       showThinking: true, expandCommandOutputs: false, steerByDefault: false,
       soundNotifications: false, processingSound: false, readRepliesAloud: false,
-      capabilities: { uploadFile: true, remoteVoice: false, addProjectFolder: true },
+      capabilities: {
+        uploadFile: true, remoteVoice: false,
+        addProjectFolder: true, removeProjectFolder: true,
+      },
     });
     dispatch(h.window, { type: "repos", entries: repos, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
 
@@ -2509,6 +2531,12 @@ describe("rail overflow menus toggle", () => {
     const hide = menuItem(openMenu(h.window, beta), "Hide project");
     expect(hide).toBeTruthy();
     click(h.window, hide as HTMLElement);
+    // It ASKS now, like the VS Code rail always has. Nothing is posted on the
+    // click alone — the row leaves every linked device at once, and one
+    // surface guarding that gesture while the other did not was the drift.
+    expect(h.posted.filter((p) => p.type === "removeProjectFolder")).toEqual([]);
+    click(h.window, h.doc.querySelector(".confirm-btn.confirm-primary") as HTMLElement);
+    await Promise.resolve();
     expect(h.posted.filter((p) => p.type === "removeProjectFolder"))
       .toEqual([{ type: "removeProjectFolder", cwd: "/work/beta" }]);
 

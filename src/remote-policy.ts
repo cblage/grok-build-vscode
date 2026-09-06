@@ -648,6 +648,7 @@ const TIER_RANK: Record<RemoteTier, number> = { "read-only": 0, propose: 1, full
  */
 const CLOUD_DISPOSITION: Partial<Record<WebviewMsg["type"], InboundDisposition>> = {
   logout: "full",
+
   // Re-observing the accounts is host-local on a desk because a phone should
   // not be able to spawn CLI probes on somebody's laptop. On a cloud machine
   // the remote is the ONLY user, and withholding it meant the promotion that
@@ -717,6 +718,19 @@ export function allowRemoteRepoTarget(msg: WebviewMsg, isKnownCwd: (cwd: string)
     // that is not named here is one refactor away from being trusted.
     case "newSession":
       return !msg.cwd || isKnownCwd(msg.cwd);
+    // Admitted from a remote on cloud (CLOUD_DISPOSITION), so it MUST be named
+    // here. The comment on newSession above is the whole reason: the default
+    // branch returns true, and a cwd-bearing message that is not listed is one
+    // refactor away from being trusted. The host bounds the path too; this is
+    // the explicit catalog gate every admitted cwd goes through.
+    case "removeProjectFolder":
+      // NOT the `!msg.cwd || isKnownCwd(...)` shape used above, and the
+      // difference matters: an absent cwd is harmless for newSession, but the
+      // host resolves this one as `cwd || workspaceRoot()`, so a bare frame
+      // would close whatever the machine currently has open — catalog gate and
+      // all. A remote must NAME a project the catalog already knows. The empty
+      // string falls back the same way, so it is refused too.
+      return !!msg.cwd && isKnownCwd(msg.cwd);
     default:
       return true;
   }
@@ -788,6 +802,17 @@ export function repoScopeFor(
  */
 export const DESK_ONLY_CAPABILITIES = [
   "servesMediaRanges",
+  // Hiding a project is desk-only, and 4.1.2 briefly made it a cloud
+  // capability before an independent review showed what that costs: on a
+  // cloud machine Add project is Create and Clone only — importing an
+  // existing folder needs the native picker, which no remote has — and
+  // Create refuses a destination that already exists. So Hide there was
+  // one-way, from the only surface that person has, under a confirmation
+  // that promised Add project would bring it back. Withholding the
+  // capability is what stops the control being drawn at all; reversible
+  // put-away belongs to the archive model, which is a feature and not an
+  // override (see the backlog entry).
+  "removeProjectFolder",
   "showInFolder",
   "previewInApp",
   "settingsEditor",
@@ -1180,6 +1205,12 @@ export function mayDeliverRemoteHostMsg(
     }
     case "message-cwd": {
       if (msg.type === "repoSessions") {
+        // A refusal only echoes the cwd the requester supplied and carries no
+        // host data. Let it return even when that cwd is not authorized so an
+        // invalid request gets a coarse answer instead of silence.
+        if (msg.error) {
+          return msg.entries.length === 0 && Object.keys(msg.dots).length === 0 && msg.total === 0;
+        }
         if (!cwdIsAuthorized(msg.cwd, authorizedCwds, sameCwd)) return false;
         return msg.entries.every(
           (e) => !e.cwd || cwdIsAuthorized(e.cwd, authorizedCwds, sameCwd),
@@ -1442,6 +1473,26 @@ export function routinesMessageForRemote(
       .filter((e) => cwdIsAuthorized(e.cwd, authorizedCwds, sameCwd))
       .map((e) => ({ ...e, runs: e.runs.map((run) => redactRun(run, authorizedCwds, sameCwd)) })),
     projects: msg.projects.filter((p) => cwdIsAuthorized(p.cwd, authorizedCwds, sameCwd)),
+  };
+}
+
+/** Filter unauthorized rows rather than suppressing an entire repo preview. */
+export function repoSessionsMessageForRemote(
+  msg: Extract<HostMsg, { type: "repoSessions" }>,
+  authorizedCwds: readonly string[],
+  sameCwd: (a: string, b: string) => boolean,
+): Extract<HostMsg, { type: "repoSessions" }> {
+  if (msg.error) return msg;
+  const entries = msg.entries.filter(
+    (entry) => !entry.cwd || cwdIsAuthorized(entry.cwd, authorizedCwds, sameCwd),
+  );
+  if (entries.length === msg.entries.length) return msg;
+  const keptIds = new Set(entries.map((entry) => entry.id));
+  return {
+    ...msg,
+    entries,
+    dots: Object.fromEntries(Object.entries(msg.dots).filter(([id]) => keptIds.has(id))),
+    total: entries.length,
   };
 }
 

@@ -24,7 +24,11 @@ import {
   redactRelayUrl,
   type RelayClientSource,
 } from "./remote-frames";
-import { isSelfScopedOutbound, mayDeliverRemoteHostMsg } from "./remote-policy";
+import {
+  isSelfScopedOutbound,
+  mayDeliverRemoteHostMsg,
+  repoSessionsMessageForRemote,
+} from "./remote-policy";
 
 /**
  * Live project-scope inputs for the outbound write gate. Re-read on every
@@ -132,9 +136,12 @@ export function filterAuthorizedOutbound(
   scopeCwd: string | undefined,
   sameCwd: (a: string, b: string) => boolean,
 ): HostMsg[] {
-  return msgs.filter((msg) =>
-    mayDeliverRemoteHostMsg(msg, authorizedCwds, scopeCwd, sameCwd),
-  );
+  return msgs.flatMap((message) => {
+    const msg = message.type === "repoSessions"
+      ? repoSessionsMessageForRemote(message, authorizedCwds, sameCwd)
+      : message;
+    return mayDeliverRemoteHostMsg(msg, authorizedCwds, scopeCwd, sameCwd) ? [msg] : [];
+  });
 }
 
 export class RemoteUplink {
@@ -224,30 +231,43 @@ export class RemoteUplink {
    */
   deliver(target: RemoteDeliveryTarget, msg: HostMsg): void {
     const unique = [...new Set(target.clientIds)];
-    if (!unique.length || this.ws?.readyState !== WebSocket.OPEN) return;
+    if (!unique.length) return;
+    if (this.ws?.readyState !== WebSocket.OPEN) {
+      this.opts.log(`[remote] could not send ${msg.type} (uplink is not connected)`);
+      return;
+    }
+    const authorized = this.opts.auth.authorizedCwds();
+    const outbound = msg.type === "repoSessions"
+      ? repoSessionsMessageForRemote(msg, authorized, this.opts.auth.sameCwd)
+      : msg;
+    if (msg.type === "repoSessions" && outbound.type === "repoSessions"
+      && outbound.entries.length !== msg.entries.length) {
+      const removed = msg.entries.length - outbound.entries.length;
+      this.opts.log(`[remote] filtered ${removed} unauthorized repoSessions ${removed === 1 ? "entry" : "entries"}`);
+    }
     // A frame that names its own project (`repoSessions`, `sessionName`) is
     // ABOUT that project, not payload from the recipient's conversation, so the
     // ownership filter below must not see it: the rail asks about a sibling
     // project by design and every answer was being dropped as "does not own
     // scope". authorizeWrite still checks the frame's own cwd against the live
     // authorized set, so this widens delivery, never authorization.
-    const scopeCwd = isSelfScopedOutbound(msg.type) ? undefined : target.scopeCwd;
+    const scopeCwd = isSelfScopedOutbound(outbound.type) ? undefined : target.scopeCwd;
 
     if (scopeCwd !== undefined) {
       const owners = filterRecipientsOwningScope(unique, scopeCwd, this.opts.auth);
       for (const id of unique) {
         if (!owners.includes(id)) {
           this.opts.log(
-            `[remote] dropped ${msg.type} for client ${id} (does not own scope: ${scopeCwd})`,
+            `[remote] dropped ${outbound.type} for client ${id} (does not own scope: ${scopeCwd})`,
           );
         }
       }
       if (!owners.length) return;
-      if (!this.authorizeWrite(msg, scopeCwd)) return;
+      if (!this.authorizeWrite(outbound, scopeCwd)) return;
       try {
-        this.ws.send(JSON.stringify(hostToFrame(owners, msg)));
+        this.ws.send(JSON.stringify(hostToFrame(owners, outbound)));
       } catch {
-        /* teardown race; reconnect handles it */
+        this.opts.log(`[remote] could not send ${outbound.type} (uplink write failed)`);
       }
       return;
     }
@@ -256,29 +276,29 @@ export class RemoteUplink {
     // multi-tab send cannot borrow another tab's open project.
     if (unique.length === 1) {
       const scope = this.opts.auth.scopeCwdForClient(unique[0]);
-      if (!this.authorizeWrite(msg, scope)) return;
+      if (!this.authorizeWrite(outbound, scope)) return;
       try {
-        this.ws.send(JSON.stringify(hostToFrame(unique, msg)));
+        this.ws.send(JSON.stringify(hostToFrame(unique, outbound)));
       } catch {
-        /* teardown race; reconnect handles it */
+        this.opts.log(`[remote] could not send ${outbound.type} (uplink write failed)`);
       }
       return;
     }
     const allowed: string[] = [];
     for (const id of unique) {
       const scope = this.opts.auth.scopeCwdForClient(id);
-      if (this.authorizeWrite(msg, scope, /* silent */ true)) allowed.push(id);
+      if (this.authorizeWrite(outbound, scope, /* silent */ true)) allowed.push(id);
       else {
         this.opts.log(
-          `[remote] dropped ${msg.type} for client ${id} (project scope not authorized: ${scope ?? "<none>"})`,
+          `[remote] dropped ${outbound.type} for client ${id} (project scope not authorized: ${scope ?? "<none>"})`,
         );
       }
     }
     if (!allowed.length) return;
     try {
-      this.ws.send(JSON.stringify(hostToFrame(allowed, msg)));
+      this.ws.send(JSON.stringify(hostToFrame(allowed, outbound)));
     } catch {
-      /* teardown race; reconnect handles it */
+      this.opts.log(`[remote] could not send ${outbound.type} (uplink write failed)`);
     }
   }
 

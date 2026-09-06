@@ -268,6 +268,12 @@ export type HostUiCapabilities = {
    * and VS Code deliberately does not — its workspace is VS Code's to manage.
    */
   addProjectFolder?: boolean;
+  /** May this surface take a project back OUT of the list?
+   *  Separate from addProjectFolder on purpose: that one answers "is the
+   *  native picker here", which is false on every remote, and Hide rode on it
+   *  until create/clone made it true on remotes and produced a control that
+   *  rendered, posted, and was dropped in silence. */
+  removeProjectFolder?: boolean;
   /**
    * Add project can also MAKE one: a typed name becomes a folder in the host's
    * project root. OPT-IN — absent/false means the menu offers only the folder
@@ -753,7 +759,15 @@ export type HostMsg =
   // would clobber the list the user is actually reading. `cwd` echoes the scope
   // the host resolved, which is also the capability signal — a client that
   // never sees this frame keeps its single-repo fallback.
-  | { type: "repoSessions"; cwd: string; entries: SessionListEntry[]; dots: Record<string, Dot>; total: number }
+  | {
+      type: "repoSessions";
+      cwd: string;
+      entries: SessionListEntry[];
+      dots: Record<string, Dot>;
+      total: number;
+      /** Additive refusal detail. Older clients ignore it and render the empty page. */
+      error?: "project-unavailable" | "sessions-unavailable";
+    }
   // Every pinned conversation, across ALL repos — the projects rail's Pinned
   // group. Deliberately not per-repo: a pin is only worth anything if it lifts a
   // conversation OUT of the project you would otherwise have to open first, so

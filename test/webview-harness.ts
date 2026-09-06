@@ -82,12 +82,16 @@ export function bootWebview(opts: {
   ready?: boolean;
   remote?: boolean;
   vscode?: boolean;
+  postMessage?: (message: Posted) => unknown;
   beforeScripts?: (window: Window) => void;
 } = {}): Harness {
   const window = new Window({ url: "https://localhost/" });
   const posted: Posted[] = [];
   (window as any).acquireVsCodeApi = () => ({
-    postMessage: (m: Posted) => posted.push(m),
+    postMessage: (m: Posted) => {
+      posted.push(m);
+      return opts.postMessage ? opts.postMessage(m) : undefined;
+    },
     setState: () => {},
     getState: () => undefined,
   });
