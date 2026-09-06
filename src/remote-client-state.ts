@@ -55,7 +55,25 @@ export class RemoteClientState<T, C = never> {
       if (detached) {
         this.detachedByTabToken.delete(tabToken);
         this.cwdByClient.set(clientId, detached.cwd);
-        if (detached.active !== undefined) this.activeByClient.set(clientId, detached.active);
+        // A SEAT CAN BE TAKEN WHILE YOU ARE AWAY.
+        //
+        // While this tab was disconnected it owned nothing, so an empty
+        // conversation it had been given could legitimately be handed to
+        // another tab. Restoring the pointer blindly then puts TWO remotes on
+        // one conversation: the returning tab's next message lands in the
+        // other tab's conversation, and a refresh hits the conflicting-owner
+        // refusal and leaves it with nothing. Every other remote path treats
+        // one-remote-per-conversation as the rule; coming back from a
+        // disconnect is not an exception to it.
+        //
+        // Dropped rather than contested: the caller then gives this tab a
+        // conversation of its own, which is what it would have got had it
+        // reconnected a moment later.
+        const takenByAnother = detached.active !== undefined
+          && [...this.activeByClient].some(([other, value]) => other !== clientId && value === detached.active);
+        if (detached.active !== undefined && !takenByAnother) {
+          this.activeByClient.set(clientId, detached.active);
+        }
         if (detached.metadata !== undefined) this.metadataByClient.set(clientId, detached.metadata);
         this.restoreExplicitSession(clientId, detached.requiresExplicitSession, detached.supersededSessionId);
       }

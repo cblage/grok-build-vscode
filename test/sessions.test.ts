@@ -25,6 +25,7 @@ import {
   isPathInside,
   listSessions,
   mostRecentSession,
+  neighbourAfterDelete,
   normalizeRepoPath,
   orderedResumeCwdCandidates,
   readContextUsage,
@@ -246,6 +247,29 @@ describe("mostRecentSession", () => {
 
   it("does not treat a subagent catalog entry as conversation history", () => {
     expect(mostRecentSession([entry("child", 40, "subagent"), entry("chat", 20)])?.id).toBe("chat");
+  });
+});
+
+describe("neighbourAfterDelete", () => {
+  const row = (id: string) => ({ id });
+
+  it("picks the row below the deleted one", () => {
+    expect(neighbourAfterDelete([row("a"), row("b"), row("c")], "a")?.id).toBe("b");
+    expect(neighbourAfterDelete([row("a"), row("b"), row("c")], "b")?.id).toBe("c");
+  });
+
+  it("picks the row above when the deleted one was last", () => {
+    expect(neighbourAfterDelete([row("a"), row("b"), row("c")], "c")?.id).toBe("b");
+  });
+
+  it("returns nothing when the list is empty after the delete", () => {
+    expect(neighbourAfterDelete([row("only")], "only")).toBeUndefined();
+    expect(neighbourAfterDelete([], "gone")).toBeUndefined();
+  });
+
+  it("excludes the deleted id even when a stale cache still carries it, and still picks a neighbour when it is already gone", () => {
+    expect(neighbourAfterDelete([row("gone"), row("keep")], "gone")?.id).toBe("keep");
+    expect(neighbourAfterDelete([row("keep"), row("other")], "gone")?.id).toBe("keep");
   });
 });
 

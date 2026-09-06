@@ -17,6 +17,48 @@ describe("RemoteClientState", () => {
     expect(state.clientsForCwd("C:\\Work\\A")).toEqual(["tab-b"]);
   });
 
+  it("does not restore a conversation another tab has taken meanwhile", () => {
+    // While a tab is disconnected it owns nothing, so an empty conversation it
+    // held can legitimately be handed to another tab. Restoring the pointer
+    // blindly put TWO remotes on one conversation: the returning tab’s next
+    // message landed in the other tab’s conversation, and a refresh hit the
+    // conflicting-owner refusal and left it with nothing.
+    const state = new RemoteClientState<object>("C:\Work\A", norm);
+    const shared = { id: "empty-1" };
+
+    state.ready("tab-a");
+    state.identify("tab-a", "token-a");
+    state.setActive("tab-a", shared);
+    state.detachClient("tab-a");
+
+    // Another tab picks up the now-unowned conversation.
+    state.ready("tab-b");
+    state.setActive("tab-b", shared);
+
+    // The first tab comes back on the same browser tab identity.
+    state.ready("tab-a2");
+    state.identify("tab-a2", "token-a");
+
+    expect(state.active("tab-b")).toBe(shared);
+    expect(state.active("tab-a2")).toBeUndefined();
+    expect(state.clientsForActiveValue(shared)).toEqual(["tab-b"]);
+  });
+
+  it("still restores a conversation nobody else took", () => {
+    const state = new RemoteClientState<object>("C:\Work\A", norm);
+    const mine = { id: "empty-2" };
+
+    state.ready("tab-a");
+    state.identify("tab-a", "token-a");
+    state.setActive("tab-a", mine);
+    state.detachClient("tab-a");
+
+    state.ready("tab-a2");
+    state.identify("tab-a2", "token-a");
+
+    expect(state.active("tab-a2")).toBe(mine);
+  });
+
   it("follows a tab across a reconnect, and reports nothing once it is gone", () => {
     // This is what attachment ownership resolves through AFTER its await. If a
     // departed tab resolved to anything at all, its image would be delivered to

@@ -278,6 +278,24 @@ export function mostRecentSession(entries: readonly SessionListEntry[]): Session
     );
 }
 
+/**
+ * The row a person would see next after `deletedId` disappears from the list
+ * they are looking at. Uses that list's own order, not an internal sort.
+ * `deletedId` is excluded even when a stale cache still carries it.
+ */
+export function neighbourAfterDelete<T extends { id: string }>(
+  entries: readonly T[],
+  deletedId: string,
+): T | undefined {
+  const remaining = entries.filter((entry) => entry.id !== deletedId);
+  if (remaining.length === 0) return undefined;
+  const at = entries.findIndex((entry) => entry.id === deletedId);
+  if (at < 0) return remaining[0];
+  const below = entries[at + 1];
+  if (below && below.id !== deletedId) return below;
+  return remaining[Math.max(0, at - 1)];
+}
+
 export interface RepoPin {
   cwd: string;
   pinnedAt: number;

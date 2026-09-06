@@ -429,9 +429,36 @@ describe("message actions stay dimmed until hover or focus", () => {
     );
   });
 
-  it("keeps the dimmed row as the touch resting state", () => {
+  it("lets the touch resting row READ, muting it with the token not opacity", () => {
+    // The row used to rest at 0.4 on touch, and on touch that resting state is
+    // permanent — there is no hover to reveal it. Two mutings then multiply:
+    // `descriptionForeground` is already the muted token (~4.9:1 on white) and
+    // 0.4 of it lands near 1.7:1, under even the 3:1 floor for interface
+    // elements. The row still reads as secondary, because the token says so.
     expect(css).toMatch(
-      /@media \(hover: none\)\s*\{\s*\.msg\.user \.msg-actions,\s*\.msg\.agent \.msg-actions\s*\{[^}]*opacity:\s*0\.4/,
+      /@media \(hover: none\)\s*\{\s*\.msg\.user \.msg-actions,\s*\.msg\.agent \.msg-actions\s*\{[^}]*opacity:\s*1/,
     );
+  });
+
+  it("gives the revealed row one colour, so the icons match the timestamp", () => {
+    // Hover used to brighten the glyph to `foreground` while the timestamp
+    // beside it stayed on `descriptionForeground`, so a revealed row showed two
+    // greys and the copy icon read darker than the time. The pill is the
+    // affordance; the colour does not need to move as well.
+    const hover = css.match(/\.msg-action-btn:hover \{[^}]*\}/);
+    expect(hover).toBeTruthy();
+    expect(hover![0]).toContain("toolbar-hoverBackground");
+    expect(hover![0]).not.toContain("color:");
+  });
+
+  it("puts white on the destructive confirm, not near-black", () => {
+    // `errorForeground` is a FOREGROUND token used as a background, so its
+    // lightness is whatever the theme chose for error text. The old #1e1e1e
+    // suited the pale dark-theme fallback and was ~2.3:1 on the dark reds light
+    // themes use. White is ~7.5:1 there and ~5:1 on the brighter red.
+    const btn = css.match(/\.confirm-btn\.confirm-danger \{[^}]*\}/);
+    expect(btn).toBeTruthy();
+    expect(btn![0]).toMatch(/color:\s*#ffffff/);
+    expect(btn![0]).not.toContain("#1e1e1e");
   });
 });

@@ -71,6 +71,10 @@ describe("local repo scope", () => {
     // the folder would split them. Opening a conversation is not a request to
     // change which project you are in.
     const body = methodBody("// The history list follows the conversation the LOCAL user just opened.");
+    // `return true` since openSession began reporting its outcome: the
+    // conversation IS open on this path, and only the VS Code half of the
+    // switch is skipped. Reading it as a failure would have made a caller
+    // mint a blank conversation over a perfectly good one.
     expect(body).toMatch(/if \(this\.host\.canSwitchWorkspaceFolder\) return;/);
     expect(body).toMatch(/this\.selectedRepoCwd = openedIn\.cwd;/);
   });
@@ -146,7 +150,10 @@ describe("cross-project fallout of following the selection", () => {
     // Delete the active conversation while the rail sits on project B and the
     // window has A open: the replacement used to start in A, silently, with
     // history and the rail still reading B.
-    const at = sidebar.indexOf("if (wasFocused) {");
+    // Renamed from `wasFocused`: the snapshot taken before the provider
+    // teardown could not see a view that navigated onto the conversation
+    // while it was being deleted. The cwd rule this test guards is unchanged.
+    const at = sidebar.indexOf("if (viewNeedsHome) {");
     expect(at).toBeGreaterThan(-1);
     const arm = sidebar.slice(at, sidebar.indexOf("}", sidebar.indexOf("startSession()", at)));
     expect(arm).toMatch(/this\.setSessionCwd\(\s*this\.focused,\s*this\.historyCwdFor\("local"\)/);

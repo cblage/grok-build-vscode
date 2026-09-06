@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.1.5-sandbox.1 — 2026-09-03
+## 4.1.6-sandbox.1 — 2026-09-03
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.4.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.5.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,28 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.1.5 — 2026-09-03
+
+**Deleting a conversation now deletes it.** The one you are looking at used to disappear and come straight back as an identical empty row, so it looked as though nothing had happened. Along with it: the small print in a message footer is readable on a phone, and the Delete button's label is white instead of near-black on red.
+
+### Fixed
+
+- **Deleting the conversation you have open removes it and moves you to the next one.** It used to be replaced immediately by a fresh empty conversation, which looked identical to the one just deleted — and because the new one sorted to the top, the list appeared to jump under your selection. You now land on the neighbouring row, and a new conversation is created only when the project has none left. If you had typed a follow-up while the agent was working, deleting no longer leaves the conversation behind as a row that returns.
+
+- **Two identical “New session” rows stop appearing.** Creating a blank conversation now reuses an unused empty one in that project instead of adding a second, which is where the duplicates came from.
+
+- **A machine that keeps losing its connection settles down instead of hammering.** Reconnect delay was reset the moment a socket opened, so a host that connected and immediately dropped retried once a second indefinitely. It now waits for a connection that lasted. Most visible on cloud machines, which lose their connection every time they suspend.
+
+- **Two browser tabs can no longer end up in one conversation.** Deleting from one tab could move it onto the conversation another tab was already using, and returning from a disconnect could do the same — in both cases the next message went into somebody else's tab. Each tab now gets a conversation of its own.
+
+- **A conversation that will not open says so in plain words** rather than repeating the agent's wording and an internal identifier.
+
+### Readability
+
+- **The Delete button's label is white.** It was near-black on red — about 2.3:1 against the darker reds light themes use, under the 4.5:1 needed to read comfortably.
+
+- **The timestamp and icons under a message are legible on a phone.** They rested at 40% of an already-muted colour, which compounds to roughly 1.7:1; on touch there is no hover, so that faint state was the permanent one. The row is still quiet, just no longer twice-quietened. The copy icon also stopped reading darker than the time beside it.
 
 ## 4.1.4 — 2026-09-03
 

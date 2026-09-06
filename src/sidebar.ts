@@ -343,6 +343,7 @@ import {
   isRepoColor,
   REPO_COLOR_IDS,
   mostRecentSession,
+  neighbourAfterDelete,
   normalizeRepoPath,
   orderedResumeCwdCandidates,
   persistSessionContext,
@@ -13258,7 +13259,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // be refused outright rather than merely awkward. `disposeSession` ends the
     // turn, drops the client and disposes it, so by the time the files go there
     // is nothing left that could write them again.
-    const wasFocused = !!live && live === this.focused;
+
+    const visibleEntries = this.buildSessionsList(
+      cwd,
+      { limit: Number.MAX_SAFE_INTEGER },
+      undefined,
+      origin === "local" ? "local" : "remote",
+    ).entries;
     if (isAdapterProvider(provider)) {
       // A FAILED DELETE MUST STILL REMOVE THE ROW.
       //
@@ -13344,6 +13351,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.host.appendLine(`[sessions] delete failed for ${id}: ${(e as Error).message}`);
       }
     }
+    // Said once, here, so anything downstream can tell a deleted conversation
+    // from a live one without re-deriving it from an id that outlives the
+    // directory.
+    if (live) live.deleted = true;
     this.sessionCache.delete(id);
     this.removePlanReviews(id); // snapshots live outside grok's session dir
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
@@ -13353,22 +13364,53 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       delete next[id];
       void this.state.update(SESSION_META_KEY, next);
     }
-    // Everyone who was reading it needs somewhere to be. `newRemoteSession`
-    // starts in that tab's OWN repo, which is the repo of the conversation just
-    // deleted — you were sitting in it. The catalog goes out once at the end
-    // rather than once per watcher.
-    if (wasFocused) {
-      this.focused = this.newLocalSession();
-      // …and so does the local view. Without this the replacement starts in the
-      // VS Code workspace folder while history and the rail stay on the project
-      // the deleted conversation belonged to — the exact split this repo scope
-      // exists to prevent, except now the user is typing into it. Same rule as
-      // newFocusedSession: the local scope IS the selection.
-      this.setSessionCwd(this.focused, this.historyCwdFor("local"), this.workspaceRoot());
-      this.focused.provider = this.defaultProviderForProject(this.historyCwdFor("local"));
-      await this.startSession();
+    // Re-home only the surfaces that were looking at it. The next row in the
+    // list they were looking at is the home; a blank session is minted only
+    // when that list is empty. Watchers share that same home. A viewer of a
+    // different conversation is not moved.
+    const neighbour = neighbourAfterDelete(visibleEntries, id);
+    // THE ONLY QUESTION: is the view sitting on something that no longer
+    // exists? If so it needs a home; if not, wherever the person is now is
+    // where they want to be.
+    //
+    // Asked after the teardown, never remembered from before it. Four review
+    // rounds went at this and every wrong answer was a PROXY — comparing focus
+    // to the neighbour, asking whether the open succeeded, trusting a snapshot
+    // taken earlier. Each minted a blank conversation over one the person had
+    // deliberately opened, in one direction or the other.
+    const viewNeedsHome = this.viewIsOnDeleted(id);
+    if (viewNeedsHome) {
+      if (neighbour) await this.openSession(neighbour.id, neighbour.cwd);
+      // Still here means the open declined — another view holds that
+      // session's load reservation — so there is nowhere to go but a new one.
+      if (this.viewIsOnDeleted(id)) {
+        this.focused = this.newLocalSession();
+        // Neighbour rows already live in this project. A minted replacement
+        // does not — without this it starts in the VS Code workspace folder
+        // while history and the rail stay on the project the deleted
+        // conversation belonged to. Same rule as newFocusedSession: the local
+        // scope IS the selection.
+        this.setSessionCwd(this.focused, this.historyCwdFor("local"), this.workspaceRoot());
+        this.focused.provider = this.defaultProviderForProject(this.historyCwdFor("local"));
+        await this.startSession();
+      }
     }
-    for (const watcher of watchers) await this.newRemoteSession(watcher, false);
+    // Every watcher goes through `openRemoteSession`, the function that
+    // enforces one remote per conversation.
+    //
+    // Attaching them straight to a live neighbour skipped that check, and two
+    // browser tabs ended up on one conversation: the deleter's next message
+    // went into the tab that was already there, and refreshing then hit the
+    // conflicting-owner refusal and left them with nothing. Sharing between
+    // the desk and a remote is fine; between two remotes it is not, and this
+    // loop is not the place to invent an exception.
+    for (const watcher of watchers) {
+      this.dropRemoteVoice(watcher);
+      if (neighbour) await this.openRemoteSession(watcher, neighbour.id, neighbour.cwd, false);
+      // No neighbour, or it would not take them: a blank conversation of their
+      // own, which is what v4.1.4 did for every watcher.
+      if (!this.remoteClients.active(watcher)) await this.newRemoteSession(watcher, false);
+    }
     if (watchers.length) this.postRepoCatalog();
     this.postSessionsList();
     // The rail's per-project rows come from `repoSessions`, which is a separate
@@ -16767,6 +16809,78 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * without re-running the suppress/clearMessages bookkeeping (that already ran
    * when each message was first buffered).
    */
+  private liveSessionById(id: string): Session | undefined {
+    if (this.focused.activeSessionId === id) return this.focused;
+    return [...this.pool].find((session) => session.activeSessionId === id);
+  }
+
+  /** An unused empty conversation is one nobody is looking at, with no real
+   *  work in it. Minting another while one of these exists is how a project
+   *  ends up with two identical "New session" rows. */
+  private sessionIsReusableEmpty(session: Session): boolean {
+    return !!session.activeSessionId
+      && !session.hasHistory
+      && !session.worktree
+      && session.chips.length === 0
+      && !session.priming
+      && !session.strandedDraft
+      && session.queuedSends.length === 0
+      && !session.needsProvider;
+  }
+
+  private findUnusedEmptySession(
+    cwd: string,
+    scope: "local" | "remote",
+    excludeId?: string,
+  ): { session?: Session; id: string; cwd: string } | undefined {
+    if (!cwd) return undefined;
+    for (const session of this.pool) {
+      const id = session.activeSessionId;
+      if (!id || id === excludeId) continue;
+      if (!pathsEqual(this.sessionCwd(session), cwd)) continue;
+      if (!this.sessionIsReusableEmpty(session)) continue;
+      if (this.sessionHasLiveOwner(session)) continue;
+      return { session, id, cwd: this.sessionCwd(session) };
+    }
+    // ONLY sessions this host is holding, never a row from the list.
+    //
+    // The cold-row branch that used to live here read `numMessages === 0` as
+    // “nobody has used this”. For Codex and Claude that field is HARDCODED to
+    // zero for every row (`provider-ui.ts`, adapterListEntry), so every
+    // conversation they own looked unused — and New Session would silently
+    // adopt one with somebody's work in it, sending their next message into a
+    // conversation they thought was new. An independent round caught it before
+    // release; a stale Grok shell that cannot be resumed was the same premise
+    // failing a second way.
+    //
+    // A live session in the pool is different in kind: emptiness is the host's
+    // own state, not an inference from a list field that means nothing here.
+    // So the reuse is narrower than first written, and only says what it knows.
+    return undefined;
+  }
+
+  /**
+   * Is the local view sitting on the conversation that was just deleted?
+   *
+   * By ID, and only by id. `disposeSession` does not clear `activeSessionId`,
+   * so a view still attached to the dead conversation still carries its id —
+   * which covers both the ordinary case and a view that moved onto it while
+   * the delete was in flight.
+   *
+   * Object identity was tried and removed. A `Session` is a container that
+   * gets RECYCLED: after the delete disposes it, a reasoning-effort change
+   * calls `startSession(undefined, session)` and the same object comes back
+   * holding a brand-new conversation. Identity then said “still on the deleted
+   * one” and moved the person off a conversation they had just started
+   * writing in. The id cannot make that mistake: it is the conversation, not
+   * the box it arrived in.
+   *
+   * Asked at the moment of the decision. A snapshot taken before the provider
+   * teardown answers a question about a view that has since moved.
+   */
+  private viewIsOnDeleted(id: string): boolean {
+    return !!id && this.focused.activeSessionId === id;
+  }
   private newLocalSession(): Session {
     return new Session();
   }
@@ -16943,6 +17057,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    */
   private parkFocused(): void {
     const cur = this.focused;
+    // A DELETED conversation is not parked, whatever state it is holding.
+    //
+    // Re-homing after a delete opens the neighbour, and a COLD neighbour
+    // reaches here while `this.focused` is still the just-disposed object. If
+    // the person had typed a follow-up while the agent worked, the arm below
+    // put it BACK in the pool — and the list builder synthesizes a row for any
+    // pool member with no directory on disk, so the conversation they deleted
+    // reappeared. Reaping will not take it either, because a queued send
+    // counts as a draft. Deleting it a second time works, which is exactly the
+    // “it came back” complaint this change set out to fix, by a new route.
+    if (cur.deleted) return;
     const busy = cur.status === "working" || cur.status === "needs-you";
     if (cur.needsProvider || cur.strandedDraft || cur.queuedSends.length > 0) {
       this.pool.add(cur);
@@ -17889,16 +18014,29 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.selectedRepoCwd = named.cwd;
     }
     const targetCwd = named?.cwd ?? this.historyCwdFor(origin);
+    const leavingId = this.focused.activeSessionId;
     this.parkFocused();
-    this.focused = this.newLocalSession();
-    this.setSessionCwd(this.focused, targetCwd, this.workspaceRoot());
-    this.focused.provider = this.defaultProviderForProject(targetCwd);
-    // The webview toolbar button clears its own DOM before posting newSession,
-    // but the Command Palette command lands here directly — without this clear
-    // the old transcript stayed onscreen under the fresh session. (The toolbar
-    // path just clears twice, a no-op.)
-    this.emit(this.focused, { type: "clearMessages" });
-    await this.startSession();
+    const unused = this.findUnusedEmptySession(targetCwd, "local", leavingId);
+    if (unused?.session?.client) {
+      this.focusSession(unused.session);
+    } else if (unused?.session) {
+      this.focused = unused.session;
+      this.pool.add(this.focused);
+      this.emit(this.focused, { type: "clearMessages" });
+      await this.startSession(unused.id, this.focused, "ensure");
+    } else if (unused) {
+      await this.openSession(unused.id, unused.cwd);
+    } else {
+      this.focused = this.newLocalSession();
+      this.setSessionCwd(this.focused, targetCwd, this.workspaceRoot());
+      this.focused.provider = this.defaultProviderForProject(targetCwd);
+      // The webview toolbar button clears its own DOM before posting newSession,
+      // but the Command Palette command lands here directly — without this clear
+      // the old transcript stayed onscreen under the fresh session. (The toolbar
+      // path just clears twice, a no-op.)
+      this.emit(this.focused, { type: "clearMessages" });
+      await this.startSession();
+    }
     await this.persistWorktreeBinding(this.focused);
     this.sweepEmptySessions(this.sessionCwd(this.focused));
     this.postRepoCatalog();
@@ -17942,8 +18080,28 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private async newRemoteSession(clientId: string, notifyCatalog = true): Promise<void> {
     const ownerTabToken = this.remoteClients.tabToken(clientId);
     const cwd = this.remoteClients.cwd(clientId);
+    const leavingId = this.remoteClients.active(clientId)?.activeSessionId;
     this.parkRemoteSession(clientId);
     this.dropRemoteVoice(clientId);
+    const unused = this.findUnusedEmptySession(cwd, "remote", leavingId);
+    if (unused?.session?.client) {
+      this.focusRemoteSession(clientId, unused.session, notifyCatalog);
+      return;
+    }
+    if (unused?.session) {
+      this.remoteClients.setActive(clientId, unused.session);
+      this.emit(unused.session, { type: "clearMessages" });
+      await this.startSession(unused.id, unused.session, "ensure");
+      await this.persistWorktreeBinding(unused.session);
+      this.sweepEmptySessions(this.sessionCwd(unused.session));
+      if (notifyCatalog) this.postRepoCatalog();
+      this.sendRemoteSessionList(unused.session, ownerTabToken);
+      return;
+    }
+    if (unused) {
+      await this.openRemoteSession(clientId, unused.id, unused.cwd, notifyCatalog);
+      return;
+    }
     const session = new Session();
     this.setSessionCwd(session, cwd, this.workspaceRoot());
     session.provider = this.defaultProviderForProject(cwd);

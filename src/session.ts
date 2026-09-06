@@ -118,6 +118,11 @@ export class Session {
     warningTimer?: ReturnType<typeof setTimeout>;
   };
 
+  /** The conversation behind this session has been deleted. Set once, at the
+   *  deletion, so nothing downstream parks it, revives it, or re-derives the
+   *  fact from an id that outlives the directory. */
+  deleted = false;
+
   /** This session has conversational history (vs. a fresh, empty one). */
   hasHistory = false;
 
