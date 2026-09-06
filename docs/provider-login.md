@@ -37,8 +37,17 @@ sign-in shipped, and what changed was the implementation rather than the policy:
 a remote request no longer opens a terminal on your desk. It can only *add* a credential
 that you obtain yourself, in your own browser, from the vendor.
 
-GitHub in the **clone / Add project form** is the same shape (`setupGithubCli`
-is `"full"` too) and the same runner. It is not a Settings row.
+GitHub is a Settings → Providers row as well as the clone form. Connection
+state comes from `gh api user --jq .login` (`githubState`): exit 0 and a
+non-empty login is connected; a failed call with `GH_TOKEN` or `GITHUB_TOKEN`
+set on the host is the named "env token in force and not working" case.
+Device-code sign-in is the same runner as before (`setupGithubCli` is
+`"full"`). Sign-out is `host-local` on a desk (same class as agent `logout`)
+and admitted on a cloud machine, where the remote is the only surface. A
+pasted token (`githubLoginWithToken`) is `"full"`: the secret crosses the
+relay once, is never echoed, and `gh auth login --with-token` stores it. If
+an env token is already in force, the paste is refused rather than stored
+behind a credential that would not be used.
 
 **Signing out stays `host-local`.** The asymmetry is intentional — connecting
 adds an option, disconnecting takes one away from every other surface at once.

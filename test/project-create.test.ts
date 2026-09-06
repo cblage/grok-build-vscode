@@ -16,6 +16,7 @@ import {
   cloneFailureText,
   cloneUrlError,
   displayPath,
+  normalizeCloneUrl,
   GITHUB_CLI_DOWNLOAD,
   githubCliInstallCommand,
   githubFixFor,
@@ -173,6 +174,17 @@ describe("clone URLs", () => {
     expect(cloneUrlError(undefined)).toMatch(/Paste a repository URL/);
     expect(cloneUrlError("https://github.com/x y")).not.toBeNull();
     expect(cloneUrlError("https://" + "x".repeat(600))).toMatch(/too long/);
+  });
+
+  it("accepts owner/repo and turns it into an https github.com URL", () => {
+    expect(cloneUrlError("phuryn/afkpilot")).toBeNull();
+    expect(normalizeCloneUrl("phuryn/afkpilot")).toBe("https://github.com/phuryn/afkpilot");
+    expect(cloneDestination(ROOT, "phuryn/afkpilot")).toBe(path.join(ROOT, "afkpilot"));
+  });
+
+  it("refuses a token embedded in the URL rather than cloning it into .git/config", () => {
+    expect(cloneUrlError("https://github_pat_abc@github.com/you/private")).toMatch(/token/i);
+    expect(cloneUrlError("https://x-access-token:ghp_abc@github.com/you/private")).toMatch(/token/i);
   });
 
   it("names the folder git itself would create", () => {

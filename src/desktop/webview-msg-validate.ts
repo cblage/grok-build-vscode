@@ -14,6 +14,7 @@ import {
   type WebviewMsg,
 } from "../protocol";
 import { MAX_CONNECTOR_KEY_CHARS } from "../mcp-connectors";
+import { MAX_GITHUB_TOKEN_CHARS } from "../github-auth";
 import { ROUTINE_PROMPT_MAX } from "../routines";
 
 /** Generous next to {@link ROUTINE_PROMPT_MAX}: this gate rejects the absurd,
@@ -161,11 +162,15 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "unlinkRemoteDevice":
       break;
     case "runGrokLogin":
-    case "cancelDeviceLogin":
     case "logout":
     case "recheckConnection":
     case "retryProviderSession":
       if (raw.provider !== undefined && raw.provider !== "grok" && raw.provider !== "codex" && raw.provider !== "claude") return null;
+      break;
+    case "cancelDeviceLogin":
+      if (raw.provider !== undefined
+        && raw.provider !== "grok" && raw.provider !== "codex"
+        && raw.provider !== "claude" && raw.provider !== "github") return null;
       break;
     case "submitDeviceLoginCode":
       if (!isString(raw.code)) return null;
@@ -404,9 +409,19 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       break;
     case "cloneProject":
       if (!isString(raw.url) || !raw.url || raw.url.length > 2048) return null;
+      if (!opt(raw.name, isString)) return null;
+      if (typeof raw.name === "string" && raw.name.length > 256) return null;
       break;
     case "setupGithubCli":
       if (raw.action !== "install" && raw.action !== "auth") return null;
+      if (raw.surface !== undefined && raw.surface !== "settings") return null;
+      break;
+    case "listGithubRepos":
+      break;
+    case "githubSignOut":
+      break;
+    case "githubLoginWithToken":
+      if (!isString(raw.token) || !raw.token || raw.token.length > MAX_GITHUB_TOKEN_CHARS) return null;
       break;
     case "welcomeTipShown":
     case "dismissWelcomeTip":

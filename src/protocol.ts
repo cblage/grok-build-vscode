@@ -113,6 +113,15 @@ export const HOST_CAPABILITIES = {
   // `setupGithubCli` as `host-local` and drop it silently, so the Sign in
   // button must not be offered as a working control until this is present.
   remoteGithubSignIn: true,
+  // And again for the two GitHub affordances added after it: pasting a token,
+  // and cancelling with `provider: "github"`. `remoteGithubSignIn` cannot stand
+  // in for either — it promises only the device-code flow, and every host that
+  // advertises it but predates these two would take a pasted credential across
+  // the relay and drop it in silence, while a cancel would be read as `grok`
+  // (the old handler maps any unrecognised provider to it) and either do
+  // nothing or cancel somebody's Grok sign-in instead. One flag covers both
+  // because they shipped together and always will.
+  remoteGithubToken: true,
   // Same shape again, for Rewind and Edit on user bubbles. Every host built
   // before 4.1.0 classifies `rewindSession` / `editLastMessage` /
   // `uiConfirmAnswer` as host-local and drops them, so a browser client — which
@@ -128,6 +137,32 @@ export type ProjectSetupGithub = {
   url?: string;
   code?: string;
   message?: string;
+};
+
+/**
+ * GitHub connection snapshot. Field presence is the capability: an older host
+ * never sends `githubState`, and the Settings row / clone picker stay hidden
+ * rather than offering controls that host would drop.
+ *
+ * Never carries a token. `envTokenInForce` is whether this process has
+ * `GH_TOKEN` or `GITHUB_TOKEN` set — not a gh credential-source string,
+ * which is not portably readable.
+ */
+export type GithubState = {
+  connected: boolean;
+  login?: string;
+  envTokenInForce?: boolean;
+  error?: boolean;
+  cliPresent?: boolean;
+  message?: string;
+  /** Live device-code card, when sign-in was started from Settings. */
+  loginFlow?: ProjectSetupGithub;
+};
+
+export type GithubRepoView = {
+  nameWithOwner: string;
+  isPrivate: boolean;
+  updatedAt: string;
 };
 
 /** Machine-readable `error.code` for a send abandoned after its userMessage echo. */
@@ -177,6 +212,14 @@ export type HostUiCapabilities = {
    * `setupGithubCli` at a host that would drop it.
    */
   remoteGithubSignIn?: boolean;
+  /**
+   * Whether this host accepts a pasted GitHub token (`githubLoginWithToken`)
+   * and understands `cancelDeviceLogin` with `provider: "github"`. OPT-IN:
+   * absent/false = the remote hides the token path entirely and does not send
+   * the GitHub cancel, because an older host drops the first in silence and
+   * misreads the second as `grok`.
+   */
+  remoteGithubToken?: boolean;
   /**
    * Whether this host accepts Rewind and Edit from a remote. OPT-IN:
    * absent/false = the browser hides both controls rather than offering
@@ -391,7 +434,22 @@ export type HostMsg =
        * Additive: an older client ignores it and renders the form as before.
        */
       github?: ProjectSetupGithub;
+      /**
+       * The derived folder name was already taken. Additive: the form then
+       * asks for a different name rather than failing the clone as a dead end.
+       */
+      collision?: string;
     }
+  /**
+   * GitHub connection for Settings and the clone picker. Additive: an older
+   * client ignores it. Never carries a token.
+   */
+  | { type: "githubState"; github: GithubState }
+  /**
+   * One page of repositories for the clone combobox. Fetched on form open,
+   * filtered on the client — a keystroke must not cross the relay.
+   */
+  | { type: "githubRepos"; repos: GithubRepoView[]; truncated?: boolean; error?: string }
   /** Connected agents plus host-observed, view-only version facts. Version
    * fields are additive so an older host/client keeps the connection UI.
    * `needsLogin` is the account that is still configured but answered an
@@ -940,15 +998,36 @@ export type WebviewMsg =
    * Same containment: a URL is not a destination. Git's own credential helper
    * does the authenticating — nothing here mints, stores or forwards a token.
    */
-  | { type: "cloneProject"; url: string }
+  | { type: "cloneProject"; url: string; name?: string }
   /**
    * Install or sign in to the GitHub CLI.
    *
-   * Offered only after a clone failed in a way `gh` would fix. A local webview
+   * Offered after a clone failed in a way `gh` would fix, and from the
+   * Settings GitHub row / the clone picker's connect row. A local webview
    * still opens a terminal. A remote `auth` runs the headless device-code flow
-   * and reports the URL and code on `projectSetup.github`.
+   * and reports the URL and code on `projectSetup.github` and `githubState`.
    */
-  | { type: "setupGithubCli"; action: "install" | "auth" }
+  | { type: "setupGithubCli"; action: "install" | "auth"; surface?: "settings" }
+  /**
+   * List this account's repositories for the clone combobox. Host runs
+   * `gh repo list --limit 200` once; the client filters. A remote may send
+   * this: the picker is how a phone clones, and it reveals nothing a clone
+   * of those URLs would not already reach.
+   */
+  | { type: "listGithubRepos" }
+  /**
+   * Sign out of GitHub on this machine. Same class as agent `logout`: desk
+   * remotes must not revoke a credential every surface shares; a cloud
+   * machine has no other surface, so CLOUD_DISPOSITION admits it there.
+   */
+  | { type: "githubSignOut" }
+  /**
+   * Store a pasted GitHub token via `gh auth login --with-token`. The token
+   * is a secret: the host must never echo it, log it, or put it in state the
+   * webview can read. A remote may send this — a cloud machine is exactly
+   * where a fine-grained token is the narrower credential to be holding.
+   */
+  | { type: "githubLoginWithToken"; token: string }
   // `panel-right` / `panel-bottom` dock the panel on that edge before revealing;
   // plain `panel` leaves the layout alone (view-move.ts § panelPositionFor).
   //
@@ -998,7 +1077,10 @@ export type WebviewMsg =
   | { type: "runGrokLogin"; provider?: "grok" | "codex" | "claude" }
   // Stop a headless sign-in the host is running. Only reachable while one is in
   // flight, and it kills a child process this same user started moments ago.
-  | { type: "cancelDeviceLogin"; provider?: "grok" | "codex" | "claude" }
+  // `github` is the clone-form / Settings `gh auth login --web` child, not an
+  // agent; an older host that does not know the value no-ops rather than
+  // cancelling Grok.
+  | { type: "cancelDeviceLogin"; provider?: "grok" | "codex" | "claude" | "github" }
   // Paste-code half of a headless sign-in: the person typed the vendor's code
   // into the card and we write it to the CLI's stdin. Additive — an older host
   // simply has no handler, and an older client never posts it.
@@ -1178,7 +1260,7 @@ export type WebviewMsg =
 // error). The runtime arrays are just the keys, so they can never drift from the
 // union without failing the build.
 const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
-  initialState: true, moveViewHint: true, welcomeTips: true, projectSetup: true, providerState: true, mcpServers: true, mcpConnectors: true, routines: true, codexInstallProgress: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true, updateReady: true, telemetryEnabled: true, thumbsFeedback: true,
+  initialState: true, moveViewHint: true, welcomeTips: true, projectSetup: true, githubState: true, githubRepos: true, providerState: true, mcpServers: true, mcpConnectors: true, routines: true, codexInstallProgress: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true, updateReady: true, telemetryEnabled: true, thumbsFeedback: true,
   initialized: true, cliUpdating: true, session: true, sessionName: true, modelChanged: true,
   modeChanged: true, modePolicy: true, sandboxState: true, openModePopover: true,
   voiceState: true, voiceConfigured: true,
@@ -1202,7 +1284,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   ready: true, remotePreferences: true, send: true, newSession: true, cancel: true, pickModel: true,
   setMode: true, setSandbox: true, removeChip: true, toggleChip: true, openFile: true, showInFolder: true, openUrl: true,
   openText: true, openDiff: true, exportExpr: true, setEffort: true, openGlobalConfig: true,
-  addProjectFolder: true, removeProjectFolder: true, createProject: true, cloneProject: true, setupGithubCli: true,
+  addProjectFolder: true, removeProjectFolder: true, createProject: true, cloneProject: true, setupGithubCli: true, listGithubRepos: true, githubSignOut: true, githubLoginWithToken: true,
   openProjectConfig: true, listMcpServers: true, connectMcpConnector: true, disconnectMcpConnector: true,
   listRoutines: true, saveRoutine: true, deleteRoutine: true, setRoutinePaused: true, runRoutineNow: true, showLogs: true, toggleDevTools: true, openSettings: true, openSettingsSurface: true, closeSettingsSurface: true, dismissWelcomeTip: true, welcomeTipShown: true, moveView: true,
   setShowThinking: true, setAppPurpose: true, setExpandCommandOutputs: true, setSteerByDefault: true,

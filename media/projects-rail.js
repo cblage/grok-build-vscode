@@ -112,9 +112,12 @@
      *  from `projectSetup`. The form shows the destination as you type. */
     projectRoot: "",
     projectGithub: null,
+    githubState: null,
+    githubRepos: null,
   };
 
   let menuEl = null;
+  let menuAnchorEl = null;
   let colorPickerEl = null;
 
   /**
@@ -384,6 +387,7 @@
       menuEl.remove();
       menuEl = null;
     }
+    menuAnchorEl = null;
   }
 
   function closeMenu() {
@@ -503,10 +507,15 @@
     const mw = el.offsetWidth;
     const mh = el.offsetHeight;
     const anchorTop = at ? at.y : rect.top;
+    const anchorBottom = at ? at.y : rect.bottom;
     let left = at ? at.x : rect.right - mw;
-    let top = (at ? at.y : rect.bottom) + 2;
+    // Prefer below the anchor. Flip above when there is no room — the wide
+    // Add project control sits at the bottom of the rail, so opening only
+    // downward would put the menu off-screen.
+    let top = anchorBottom + 2;
     left = Math.max(4, Math.min(left, window.innerWidth - mw - 4));
     if (top + mh > window.innerHeight - 4) top = Math.max(4, anchorTop - mh - 2);
+    if (top + mh > window.innerHeight - 4) top = Math.max(4, window.innerHeight - mh - 4);
     el.style.left = left + "px";
     el.style.top = top + "px";
   }
@@ -559,6 +568,7 @@
     }
     document.body.appendChild(menu);
     menuEl = menu;
+    menuAnchorEl = anchor;
     placePopover(menu, anchor, at);
   }
 
@@ -618,8 +628,16 @@
   }
 
   document.addEventListener("click", (e) => {
-    if (menuEl && !menuEl.contains(e.target)) closeMenu();
-    else if (colorPickerEl && !colorPickerEl.contains(e.target)) closeColorPicker();
+    if (menuEl) {
+      if (menuEl.contains(e.target)) return;
+      // The opening click bubbles here. The header + stops it; the wide
+      // Add project button did not, so the menu opened and immediately
+      // closed — which read as a button that does nothing.
+      if (menuAnchorEl && menuAnchorEl.contains(e.target)) return;
+      closeMenu();
+      return;
+    }
+    if (colorPickerEl && !colorPickerEl.contains(e.target)) closeColorPicker();
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeMenu();
@@ -894,7 +912,10 @@
     plus.textContent = "+";
     add.appendChild(plus);
     add.appendChild(document.createTextNode("Add project"));
-    add.onclick = () => openAddProjectMenu(add);
+    add.onclick = (e) => {
+      e.stopPropagation();
+      openAddProjectMenu(add);
+    };
     return add;
   }
 
@@ -1004,9 +1025,7 @@
       // Same hint as the chat rail, and the same rule: it acts rather than
       // instructs. This view has no settings overlay of its own, so it asks the
       // host for the editor tab.
-      if (id === "clone-needs-coding") {
-        vscode.postMessage({ type: "openSettingsSurface", category: "general" });
-      } else if (id === "import") vscode.postMessage({ type: "addProjectFolder" });
+      if (id === "import") vscode.postMessage({ type: "addProjectFolder" });
       else openAddProjectForm(id);
     };
     // One way in is a click, not a menu that asks permission to be a click.
@@ -1030,6 +1049,11 @@
   let addProjectFormKeydown = null;
 
   function closeAddProjectForm() {
+    const wasClone = !!(addProjectFormApi && addProjectFormApi.el && addProjectFormApi.el.dataset.kind === "clone");
+    if (wasClone) {
+      state.projectGithub = null;
+      vscode.postMessage({ type: "cancelDeviceLogin", provider: "github" });
+    }
     if (addProjectFormScrim) addProjectFormScrim.remove();
     // Capture-phase listener: leaving it attached would swallow Escape in this
     // view for the rest of the window.
@@ -1044,13 +1068,17 @@
     if (!helpers || typeof helpers.addProjectForm !== "function") return;
     closeAddProjectForm();
     closeMenu();
+    if (kind === "clone") {
+      state.projectGithub = null;
+      vscode.postMessage({ type: "cancelDeviceLogin", provider: "github" });
+    }
     const api = helpers.addProjectForm({
       kind,
       root: state.projectRoot,
-      onSubmit: (value) => {
+      onSubmit: (value, extra) => {
         vscode.postMessage(
           kind === "clone"
-            ? { type: "cloneProject", url: value }
+            ? { type: "cloneProject", url: value, ...(extra && extra.name ? { name: extra.name } : {}) }
             : { type: "createProject", name: value },
         );
       },
@@ -1059,6 +1087,15 @@
         type: "setupGithubCli",
         action: fix === "install-gh" ? "install" : "auth",
       }),
+      onConnect: () => vscode.postMessage({ type: "setupGithubCli", action: "auth" }),
+      onLoginWithToken: (token) => vscode.postMessage({ type: "githubLoginWithToken", token }),
+      onRequestRepos: () => vscode.postMessage({ type: "listGithubRepos" }),
+      githubState: state.githubState || undefined,
+      repos: state.githubRepos,
+      terminalSignIn: true,
+      onRecheck: () => vscode.postMessage({ type: "refreshProviders" }),
+      touch: typeof window.matchMedia === "function"
+        && window.matchMedia("(hover: none), (pointer: coarse)").matches,
     });
     if (!api) return;
     const scrim = document.createElement("div");
@@ -1075,7 +1112,11 @@
       closeAddProjectForm();
     };
     document.addEventListener("keydown", addProjectFormKeydown, true);
-    api.update({ root: state.projectRoot, github: state.projectGithub || undefined });
+    api.update({
+      root: state.projectRoot,
+      githubState: state.githubState || undefined,
+      repos: state.githubRepos,
+    });
     api.focus();
   }
 
@@ -1623,7 +1664,6 @@
         render();
         break;
       case "appPurpose":
-        // Only the Add project menu reads this here — Coding gains cloning.
         state.appPurpose = msg.value === "coding" ? "coding" : "knowledge";
         break;
       case "projectSetup":
@@ -1636,9 +1676,28 @@
           break;
         }
         if (msg.busy) state.projectGithub = null;
-        else if (msg.github && typeof msg.github === "object") state.projectGithub = msg.github;
+        else if (addProjectFormApi && msg.github && typeof msg.github === "object") state.projectGithub = msg.github;
         else if (msg.error) state.projectGithub = null;
-        if (addProjectFormApi) addProjectFormApi.update({ ...msg, github: state.projectGithub || msg.github });
+        if (addProjectFormApi) addProjectFormApi.update({
+          ...msg,
+          github: state.projectGithub || msg.github,
+          githubState: state.githubState || undefined,
+          repos: state.githubRepos,
+        });
+        break;
+      case "githubState":
+        state.githubState = msg.github && typeof msg.github === "object" ? msg.github : null;
+        if (addProjectFormApi) addProjectFormApi.update({ githubState: state.githubState });
+        break;
+      case "githubRepos":
+        state.githubRepos = Array.isArray(msg.repos) ? msg.repos : [];
+        if (addProjectFormApi) {
+          addProjectFormApi.update({
+            repos: state.githubRepos,
+            reposTruncated: msg.truncated === true,
+            reposError: typeof msg.error === "string" ? msg.error : "",
+          });
+        }
         break;
       case "repos": {
         const leaving = state.currentCwd;

@@ -355,3 +355,61 @@ describe("question card — resume restore (replayed tool_call)", () => {
     expect(card.querySelector(".question-answer")!.textContent).toBe("✓ Seven");
   });
 });
+
+/**
+ * #144 — the "Other" answer is a textarea, not a one-line input.
+ *
+ * The reporter wanted to paste a list or a couple of paragraphs into it and
+ * could not read back what they had typed. Everything the single-line input
+ * supported has to keep working, which is what the existing cases above
+ * cover; these assert the element itself and that a newline survives.
+ */
+describe("question card: the Other field takes more than one line (#144)", () => {
+  const withOther = (requestId: number) => ({
+    id: requestId,
+    questions: [{
+      question: "What should I do?",
+      options: [{ label: "Proceed", description: "go" }],
+      multiSelect: false,
+    }],
+  });
+
+  const openOther = (window: any, doc: any) => {
+    const card = doc.querySelector(".card.question") as HTMLElement;
+    const other = [...card.querySelectorAll(".question-option")]
+      .find((b) => b.textContent!.includes("Other")) as HTMLButtonElement;
+    click(window, other);
+    return card.querySelector(".question-other-input") as HTMLTextAreaElement;
+  };
+
+  it("renders a textarea", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "questionRequest", req: withOther(90) });
+    expect(openOther(window, doc).tagName).toBe("TEXTAREA");
+  });
+
+  it("starts at one row, so it is no heavier than the input it replaced", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "questionRequest", req: withOther(91) });
+    // happy-dom hands `rows` back as the raw attribute string.
+    expect(Number(openOther(window, doc).rows)).toBe(1);
+  });
+
+  it("carries a multi-line answer through to the host verbatim", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "questionRequest", req: withOther(92) });
+    const custom = openOther(window, doc);
+    const answer = "First paragraph.\n\n- one\n- two";
+    custom.value = answer;
+    custom.dispatchEvent(new window.Event("input", { bubbles: true }));
+    const card = doc.querySelector(".card.question") as HTMLElement;
+    click(window, card.querySelector(".card-actions .primary") as HTMLButtonElement);
+
+    expect(posted).toContainEqual({
+      type: "questionAnswer",
+      requestId: 92,
+      answers: { "What should I do?": answer },
+      annotations: {},
+    });
+  });
+});

@@ -283,6 +283,33 @@
       window.matchMedia("(hover: none), (pointer: coarse)").matches;
   }
 
+  /**
+   * How tall the composer may grow, in lines (owner, 2026-09-04).
+   *
+   * A phone stops sooner than a desktop, because there the composer is not the
+   * only thing competing for the screen: the keyboard already owns the bottom
+   * half, and a box that grows to nine lines on top of it leaves nothing of the
+   * conversation to read while you write about it. That is the same reason the
+   * box grows at all (#144) — being able to see what you are writing — applied
+   * to the other side of the trade.
+   *
+   * Coarse pointer AND no hover, the signal the add-project form already uses:
+   * a touchscreen laptop still has a mouse and is not a phone. Not gated on
+   * IS_REMOTE, because a phone is a phone whether it reached us through the
+   * relay or the native shell.
+   */
+  const COMPOSER_MAX_LINES_TOUCH = 6;
+  const COMPOSER_MAX_LINES_DESK = 10;
+  function composerMaxLines() {
+    return typeof window.matchMedia === "function"
+      && window.matchMedia("(hover: none), (pointer: coarse)").matches
+      ? COMPOSER_MAX_LINES_TOUCH
+      : COMPOSER_MAX_LINES_DESK;
+  }
+  // Exported for tests: happy-dom does no layout, so a height assertion would
+  // measure nothing. The decision is the testable part.
+  window.__grokComposerMaxLines = composerMaxLines;
+
   const $ = (id) => document.getElementById(id);
   const messagesEl = $("messages");
   const input = $("input");
@@ -365,6 +392,8 @@
     // Settings → Providers re-observation in flight. Host-owned; see the
     // `providerState` case for why the client never sets it on its own.
     providersChecking: false,
+    githubState: null,
+    githubRepos: null,
     onboardingMode: null,
     onboardingInfo: {},
     /** provider -> the device-login card last sent by the host. Mirrored into
@@ -791,8 +820,8 @@
     // the Add project form shows the destination as you type, so it needs this
     // before anyone has typed anything.
     projectRoot: "",
-    // Last `projectSetup.github` from the host, so a reconnect can reopen the
-    // clone form onto the code the CLI is still polling.
+    // Live `projectSetup.github` while the clone form is open. Closing or
+    // reopening cancels the login; this is not a reason to pop the modal.
     projectGithub: null,
     // Empty-state tip facts from the host (`welcomeTips`): the two counts the
     // chat client never receives on its own plus the retired ids. null until
@@ -1696,21 +1725,37 @@
     }).join("");
 
     function inline(t) {
+      // A code span and a link's href are LITERAL — nothing inside either is
+      // markdown. Both are pulled out to placeholders before the link and
+      // emphasis passes run, exactly as fenced blocks and math are pulled out
+      // of the document above, and restored at the end.
+      //
+      // Without this the passes run over their own output: `1*2` and `3*4`
+      // renders as one <em> spanning from the first code span to the second,
+      // because by then the asterisks are just characters in a string and the
+      // <code> tags mean nothing to a regex (#143). Same shape reaches a URL
+      // containing `*`, and a [link](x) written inside backticks.
+      //
+      // Link TEXT is deliberately left live: [**bold**](url) is valid markdown
+      // and worked before, so only the href is held.
+      const held = [];
+      const hold = (html) => `\x00C${held.push(html) - 1}\x00`;
       return t
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
         .replace(/`([^`\n]+)`/g, (_, code) => {
           if (looksLikeFileRef(code)) {
             const safe = code.replace(/"/g, "&quot;");
-            return `<a href="${safe}" class="file-ref-link"><code>${code}</code></a>`;
+            return hold(`<a href="${safe}" class="file-ref-link"><code>${code}</code></a>`);
           }
-          return `<code>${code}</code>`;
+          return hold(`<code>${code}</code>`);
         })
         .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, text, url) => {
           const safe = url.replace(/"/g, "&quot;");
-          return `<a href="${safe}">${text}</a>`;
+          return `<a href="${hold(safe)}">${text}</a>`;
         })
         .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
-        .replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
+        .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
+        .replace(/\x00C(\d+)\x00/g, (_, i) => held[+i]);
     }
 
     // GFM tables: header row | separator row (|---|---|) | data rows
@@ -2827,6 +2872,7 @@
       thumbsFeedback: !!state.thumbsFeedback,
       providers: state.providers || [],
       providersChecking: !!state.providersChecking,
+      githubState: state.githubState || undefined,
       extVersion: state.extVersion,
       cliVersion: state.cliVersion,
       hostKind: state.hostKind,
@@ -6436,7 +6482,10 @@
     plus.textContent = "+";
     add.appendChild(plus);
     add.appendChild(document.createTextNode("Add project"));
-    add.onclick = () => openAddProjectMenu(add);
+    add.onclick = (e) => {
+      e.stopPropagation();
+      openAddProjectMenu(add);
+    };
     return add;
   }
 
@@ -6519,8 +6568,7 @@
     const run = (id) => {
       // The knowledge-work hint acts instead of instructing: it opens the
       // setting that would put Clone in this menu.
-      if (id === "clone-needs-coding") openSettingsCategory("general");
-      else if (id === "import") vscode.postMessage({ type: "addProjectFolder" });
+      if (id === "import") vscode.postMessage({ type: "addProjectFolder" });
       else openAddProjectForm(id);
     };
     // One way in is a click, not a menu that asks permission to be a click.
@@ -6544,7 +6592,24 @@
   let addProjectFormScrim = null;
   let addProjectFormKeydown = null;
 
+  /**
+   * Cancel a GitHub device login, but only at a host that knows what that
+   * means. An older one maps every unrecognised provider to `grok`, so sending
+   * it there either does nothing (no Grok login running) or cancels somebody
+   * else's Grok sign-in. Silence costs the abandoned login its 15-minute
+   * timeout, which is exactly the behaviour those hosts already had.
+   */
+  function cancelGithubDeviceLoginIfSupported() {
+    if (IS_REMOTE && !(state.hostCaps && state.hostCaps.remoteGithubToken)) return;
+    vscode.postMessage({ type: "cancelDeviceLogin", provider: "github" });
+  }
+
   function closeAddProjectForm() {
+    const wasClone = !!(addProjectFormApi && addProjectFormApi.el && addProjectFormApi.el.dataset.kind === "clone");
+    if (wasClone) {
+      state.projectGithub = null;
+      cancelGithubDeviceLoginIfSupported();
+    }
     if (addProjectFormScrim) addProjectFormScrim.remove();
     // Capture-phase, so it must come off again — a listener left behind would
     // swallow Escape everywhere else in the app for the rest of the session.
@@ -6566,16 +6631,59 @@
     if (!helpers || typeof helpers.addProjectForm !== "function") return;
     closeAddProjectForm();
     closeRailMenu();
+    if (kind === "clone") {
+      state.projectGithub = null;
+      cancelGithubDeviceLoginIfSupported();
+    }
+    const githubSignIn = !IS_REMOTE || !!(state.hostCaps && state.hostCaps.remoteGithubSignIn);
+    // The token path is NOT covered by remoteGithubSignIn: that flag promises
+    // the device-code flow and nothing else, and a host advertising it but
+    // predating `githubLoginWithToken` takes the credential across the relay
+    // and drops it, clearing the field with no error.
+    const githubToken = !IS_REMOTE || !!(state.hostCaps && state.hostCaps.remoteGithubToken);
     const api = helpers.addProjectForm({
       kind,
       root: state.projectRoot,
-      onSubmit: (value) => {
+      canGithubCli: githubSignIn,
+      canUseToken: githubToken,
+      onSubmit: (value, extra) => {
         vscode.postMessage(
           kind === "clone"
-            ? { type: "cloneProject", url: value }
+            ? { type: "cloneProject", url: value, ...(extra && extra.name ? { name: extra.name } : {}) }
             : { type: "createProject", name: value },
         );
       },
+      onLoginWithToken: (token) => {
+        vscode.postMessage({ type: "githubLoginWithToken", token });
+      },
+      onConnect: () => {
+        // Same gate as onFix below, and for the same reason: a host that
+        // predates `remoteGithubSignIn` drops `setupGithubCli` silently, so
+        // without this the picker's Connect row is a button that does nothing.
+        // The client is always as new as the relay deploy while the extension
+        // is whatever the person installed, so "older host" is the ordinary
+        // case, not an edge one.
+        if (IS_REMOTE && !(state.hostCaps && state.hostCaps.remoteGithubSignIn)) {
+          if (addProjectFormApi) {
+            addProjectFormApi.update({
+              error: IS_CLOUD_HOST
+                ? "This machine's app is too old to connect GitHub from here. It updates itself shortly."
+                : "Sign in to GitHub on the computer running this workspace — a terminal opens there — then try again here.",
+            });
+          }
+          return;
+        }
+        vscode.postMessage({ type: "setupGithubCli", action: "auth" });
+      },
+      onRequestRepos: () => {
+        vscode.postMessage({ type: "listGithubRepos" });
+      },
+      githubState: state.githubState || undefined,
+      repos: state.githubRepos,
+      terminalSignIn: !IS_REMOTE,
+      onRecheck: () => vscode.postMessage({ type: "refreshProviders" }),
+      touch: remoteUsesTouchComposer() || (typeof window.matchMedia === "function"
+        && window.matchMedia("(hover: none), (pointer: coarse)").matches),
       onCancel: closeAddProjectForm,
       // Local: signing in happens in a terminal, and the form stays open so
       // they can clone again afterwards.
@@ -6640,7 +6748,11 @@
       closeAddProjectForm();
     };
     document.addEventListener("keydown", addProjectFormKeydown, true);
-    api.update({ root: state.projectRoot, github: state.projectGithub || undefined });
+    api.update({
+      root: state.projectRoot,
+      githubState: state.githubState || undefined,
+      repos: state.githubRepos,
+    });
     api.focus();
   }
 
@@ -10226,6 +10338,29 @@
     return parts.length ? parts.join(", ").replace(/^./, (c) => c.toUpperCase()) : "Tool calls";
   }
 
+  // Deliberate short trim (40 chars): a row reads as a scannable summary, not a
+  // wall of shell. Shared so the running header and the settled row clamp
+  // identically.
+  const clampToolTarget = (s) => (s && s.length > 40 ? s.slice(0, 40) + "…" : s);
+
+  /**
+   * What a search tool is looking for. The pattern is the useful thing — grep
+   * ships both `pattern` and `path:"."`, and the path is the unhelpful half.
+   *
+   * #145: the settled row has named the pattern for a long time, but the
+   * running header said a bare "Searching", so the one moment you actually
+   * want to know what is being searched was the one moment we would not say.
+   * Every neighbouring verb already carries its argument (Reading foo.ts,
+   * Listing src/, Editing bar.css); this makes search consistent with them.
+   * It is NOT the details block — a search row has no IN/OUT, because the IN
+   * would repeat this label and the OUT is the match list.
+   */
+  function searchPatternText(call) {
+    const r = (call && (call.rawInput || call.input)) || {};
+    const p = r.glob_pattern || r.pattern || r.query || r.regex || r.search;
+    return typeof p === "string" && p.trim() ? clampToolTarget(p.trim()) : "";
+  }
+
   function inProgressLabel(call) {
     const name = toolName(call);
     const kind = toolKind(call);
@@ -10236,9 +10371,15 @@
     if (/^(read_file|file_read)$/.test(name) || kind === "read") {
       return filePath ? `Reading ${prettyPath(filePath)}` : "Reading file";
     }
-    if (/^(web_search|search_web)$/.test(name)) return "Searching web";
+    if (/^(web_search|search_web)$/.test(name)) {
+      const q = searchPatternText(call);
+      return q ? `Searching web for "${q}"` : "Searching web";
+    }
     if (/^(web_fetch|webfetch)$/.test(name)) return "Fetching page";
-    if (/^(grep|ripgrep|search_files)$/.test(name) || kind === "search") return "Searching";
+    if (/^(grep|ripgrep|search_files)$/.test(name) || kind === "search") {
+      const p = searchPatternText(call);
+      return p ? `Searching for "${p}"` : "Searching";
+    }
     if (/^(write_file|file_write|write|edit_file|search_replace|str_replace)$/.test(name) || kind === "edit" || kind === "write") {
       const renamed = toolRenamePaths(call);
       if (renamed) return `Editing ${prettyPath(renamed.from)} → ${prettyPath(renamed.to)}`;
@@ -10262,10 +10403,10 @@
     const command = r.command || r.cmd;
     const pattern = r.glob_pattern || r.pattern || r.query || r.regex || r.search;
     const url = r.url || r.uri;
-    // Deliberate short trim (40 chars): collapsed rows read as a scannable
-    // summary, not a wall of shell — the full command lives one click away in
-    // the IN/OUT detail. (CSS still single-line-ellipsizes whatever remains.)
-    const clamp = (s) => (s && s.length > 40 ? s.slice(0, 40) + "…" : s);
+    // Collapsed rows read as a scannable summary, not a wall of shell — the
+    // full command lives one click away in the IN/OUT detail. (CSS still
+    // single-line-ellipsizes whatever remains.)
+    const clamp = clampToolTarget;
     // A search tool's *pattern* is the useful target — prefer it over the path it
     // searched (grep ships both `pattern` and `path:"."`, which would otherwise
     // render the unhelpful "root folder"). Match by kind OR name so it still wins
@@ -10892,6 +11033,20 @@
     }
     const labelEl = item.querySelector(".tool-item-label");
     if (labelEl) applyToolLabel(labelEl, merged);
+    // The running header names the NEWEST call (addToToolGroup), and its
+    // argument often arrives on an update rather than the first tool_call —
+    // Claude ships an empty rawInput and fills it in. Without this the header
+    // sits on a bare "Searching" for the whole search, which is the half of
+    // #145 worth fixing. Only while running: once the batch closes the header
+    // is a summary, not a verb.
+    if (groupCalls && groupCalls.classList.contains("in-progress") && Array.isArray(groupCalls._calls)) {
+      const newest = groupCalls._calls[groupCalls._calls.length - 1];
+      const hdrLabel = groupCalls.querySelector(".tool-group-label");
+      if (hdrLabel && newest && newest.toolCallId === id) {
+        hdrLabel.textContent = inProgressLabel(merged);
+        paintGroupDiffTotals(groupCalls); // textContent just wiped the totals slot
+      }
+    }
     // A shell command that only shows up on the update still earns its IN/OUT
     // box; attachCommandDetails is a no-op once the row already has one.
     // MCP args that arrive after a pending row use the same attach.
@@ -13561,23 +13716,54 @@
         };
         opts.appendChild(btn);
         if (isOther) {
-          const custom = document.createElement("input");
-          custom.type = "text";
+          // A textarea, not a single-line input (#144): an "Other" answer is
+          // often a list or a couple of paragraphs, and a one-line box meant
+          // the writer could not read back what they had typed. One row at
+          // rest so it looks no heavier than the input it replaces; it grows
+          // with the content and then scrolls, same rule as the composer.
+          const custom = document.createElement("textarea");
+          custom.rows = 1;
           custom.className = "question-other-input";
           custom.placeholder = "Type your answer";
           custom.setAttribute("aria-label", `${questionText(q)} — Other answer`);
           custom.hidden = true;
+          const autosize = () => {
+            const cs = window.getComputedStyle(custom);
+            const line = parseFloat(cs.lineHeight) || 20;
+            const pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0)
+              + (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+            // Same ceiling as the composer: it is the same trade about how much
+            // of the screen a writing box may take, and two different answers to
+            // it on one screen would be arbitrary.
+            const max = Math.round(line * composerMaxLines() + pad);
+            custom.style.height = "auto";
+            const content = custom.scrollHeight;
+            custom.style.height = Math.max(Math.round(line + pad), Math.min(content, max)) + "px";
+            custom.style.overflowY = content > max ? "auto" : "hidden";
+          };
           custom.oninput = () => {
             otherText[qi] = custom.value;
+            autosize();
             updateSubmit();
           };
           custom.onkeydown = (e) => {
-            if (e.key === "Enter" && submitBtn && !submitBtn.disabled) {
+            // The composer's rule, verbatim, so one convention covers both:
+            // Ctrl/Cmd+Enter when the user has chosen that, otherwise Enter —
+            // except on a touch composer, where Enter has to make a newline
+            // because a phone keyboard has no other way to.
+            const sendKey = state.useCtrlEnter
+              ? e.key === "Enter" && (e.metaKey || e.ctrlKey)
+              : !remoteUsesTouchComposer() && e.key === "Enter" && !e.shiftKey;
+            if (sendKey && submitBtn && !submitBtn.disabled) {
               e.preventDefault();
               submit();
             }
           };
           opts.appendChild(custom);
+          // Hidden until "Other" is picked, so the first measurement has to
+          // wait for it to be revealed — the click handler focuses it, and
+          // focus is what this rides on.
+          custom.onfocus = autosize;
         }
       }
       block.appendChild(opts);
@@ -14820,16 +15006,21 @@
   // Mirror the composer text onto the backdrop, wrapping a trailing send command
   // ("grok send") in an accent pill. Call whenever the input value changes.
   // Auto-grow the composer with its content: 2 lines at rest (Cursor-style,
-  // matching the textarea's rows attribute), expanding to 5 as the user
-  // types, then scrolling. The .input-highlight overlay is inset:0 in the
-  // same wrap, so it tracks the height for free; its scrollTop is synced in
-  // renderInputHighlight.
+  // matching the textarea's rows attribute), expanding to composerMaxLines()
+  // as the user types, then scrolling. The .input-highlight overlay is inset:0
+  // in the same wrap, so it tracks the height for free; its scrollTop is synced
+  // in renderInputHighlight.
+  //
+  // More than the original 5 (#144): a longer answer could not be read back
+  // while writing it. A drag handle was considered and rejected — a maximum you
+  // have to re-drag every time you want the history back is worse than one that
+  // is simply large enough. See composerMaxLines for why a phone gets fewer.
   function autosizeInput() {
     const cs = window.getComputedStyle(input);
     const line = parseFloat(cs.lineHeight) || 20;
     const pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
     const min = Math.round(line * 2 + pad);
-    const max = Math.round(line * 5 + pad);
+    const max = Math.round(line * composerMaxLines() + pad);
     input.style.height = "auto";
     const content = input.scrollHeight;
     input.style.height = Math.max(min, Math.min(content, max)) + "px";
@@ -15941,7 +16132,7 @@
     "initialState", "showThinking", "appPurpose", "expandCommandOutputs",
     "steerByDefault", "steerUnavailable", "soundNotifications", "processingSound",
     "readRepliesAloud", "summarizeRepliesAloud", "fontScale", "voiceConfigured",
-    "providerState", "mcpServers", "mcpConnectors", "remoteStatus", "telemetryEnabled", "thumbsFeedback", "grokUpdateStatus", "initialized",
+    "providerState", "githubState", "mcpServers", "mcpConnectors", "remoteStatus", "telemetryEnabled", "thumbsFeedback", "grokUpdateStatus", "initialized",
   ]);
 
   function handleHostMessage(msg) {
@@ -16023,14 +16214,28 @@
           break;
         }
         if (msg.busy) state.projectGithub = null;
-        else if (msg.github && typeof msg.github === "object") state.projectGithub = msg.github;
+        else if (addProjectFormApi && msg.github && typeof msg.github === "object") state.projectGithub = msg.github;
         else if (msg.error) state.projectGithub = null;
-        // Reconnect: the form is gone, the CLI is still polling, and the
-        // snapshot carried the code. Reopen the clone form so they can finish.
-        if (!addProjectFormApi && msg.github && (msg.github.status === "starting" || msg.github.status === "waiting")) {
-          openAddProjectForm("clone");
+        if (addProjectFormApi) addProjectFormApi.update({
+          ...msg,
+          github: state.projectGithub || msg.github,
+          githubState: state.githubState || undefined,
+          repos: state.githubRepos,
+        });
+        break;
+      case "githubState":
+        state.githubState = msg.github && typeof msg.github === "object" ? msg.github : null;
+        if (addProjectFormApi) addProjectFormApi.update({ githubState: state.githubState });
+        break;
+      case "githubRepos":
+        state.githubRepos = Array.isArray(msg.repos) ? msg.repos : [];
+        if (addProjectFormApi) {
+          addProjectFormApi.update({
+            repos: state.githubRepos,
+            reposTruncated: msg.truncated === true,
+            reposError: typeof msg.error === "string" ? msg.error : "",
+          });
         }
-        if (addProjectFormApi) addProjectFormApi.update({ ...msg, github: state.projectGithub || msg.github });
         break;
       case "welcomeTips":
         // Deliberately NOT an advance: this frame arrives on startup and after

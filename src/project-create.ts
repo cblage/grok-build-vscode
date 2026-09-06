@@ -220,19 +220,53 @@ export function withinRoot(root: string, candidate: string): boolean {
  * are passed as an array and never touch a shell. Both are refused here rather
  * than sanitised.
  */
+/** `owner/repo` as GitHub itself accepts it — no extra path, no scheme. */
+const GITHUB_OWNER_REPO = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+$/;
+
+/**
+ * Turn a typed clone target into a URL git can clone.
+ *
+ * `owner/repo` becomes `https://github.com/owner/repo`. Anything else is
+ * returned trimmed, for `cloneUrlError` to accept or refuse. Never inserts a
+ * token into the URL.
+ */
+export function normalizeCloneUrl(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const nwo = trimmed.replace(/\.git$/i, "");
+  if (GITHUB_OWNER_REPO.test(nwo)) return `https://github.com/${nwo}`;
+  return trimmed;
+}
+
+function httpUrlHasUserinfo(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    return !!(parsed.username || parsed.password);
+  } catch {
+    return false;
+  }
+}
+
 export function cloneUrlError(raw: unknown): string | null {
-  if (typeof raw !== "string") return "Paste a repository URL.";
-  const url = raw.trim();
-  if (!url) return "Paste a repository URL.";
+  if (typeof raw !== "string") return "Paste a repository URL or owner/repo.";
+  const url = normalizeCloneUrl(raw);
+  if (!url) return "Paste a repository URL or owner/repo.";
   if (url.length > 512) return "That URL is too long.";
   if (/\s/.test(url)) return "That doesn't look like a repository URL.";
   // Argument injection: git reads a leading dash as a flag, not an address.
   if (url.startsWith("-")) return "That doesn't look like a repository URL.";
+  // A token in the URL is written into `.git/config` on a machine the person
+  // may never inspect. We never construct one; we also refuse to clone one.
+  if (httpUrlHasUserinfo(url)) {
+    return "Don't put a token in the URL. Connect GitHub instead.";
+  }
   const httpish = /^https?:\/\/[^/]+\/.+/i.test(url);
   const sshUrl = /^ssh:\/\/[^/]+\/.+/i.test(url);
   const scp = /^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^:]+$/.test(url);
   if (!httpish && !sshUrl && !scp) {
-    return "Use an https:// or git@ repository URL.";
+    return "Use an https:// URL, git@, or owner/repo.";
   }
   if (!repoNameFromCloneUrl(url)) return "That URL doesn't name a repository.";
   return null;
@@ -267,7 +301,7 @@ export function repoNameFromCloneUrl(raw: unknown): string | null {
 
 /** Where a cloned repository lands, or null if the URL yields no usable name. */
 export function cloneDestination(root: string, url: string): string | null {
-  const name = repoNameFromCloneUrl(url);
+  const name = repoNameFromCloneUrl(normalizeCloneUrl(url) ?? url);
   return name ? projectDestination(root, name) : null;
 }
 

@@ -1467,8 +1467,13 @@ describe("a cloud environment is its own desk", () => {
     // already exists — so Hide there was one-way, under a confirmation that
     // promised otherwise. Reversible put-away is the archive feature, not a
     // disposition override.
+    // githubLoginWithToken was briefly promoted here and is deliberately NOT:
+    // it is plainly `full`, because a remote that could inject a token can
+    // already `send` and answer `permissionAnswer` on that machine, so the
+    // promotion protected nothing and removed the paste path from a phone
+    // driving a desk.
     expect([...promoted].sort()).toEqual([
-      "logout", "refreshProviders", "setTelemetryEnabled", "setThumbsFeedback",
+      "githubSignOut", "logout", "refreshProviders", "setTelemetryEnabled", "setThumbsFeedback",
     ]);
   });
 });

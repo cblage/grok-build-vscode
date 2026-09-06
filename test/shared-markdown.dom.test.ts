@@ -99,3 +99,61 @@ describe("CRLF files render like LF ones", () => {
     expect(render("# Old Mac\r\r- item\r")).toContain("<h1");
   });
 });
+
+/**
+ * #143 — a code span is LITERAL, and so is a link's href.
+ *
+ * `inline()` used to run its emphasis pass over its own output, by which point
+ * the <code> tags were just characters and the asterisks inside two separate
+ * code spans could pair with each other ACROSS the prose between them. The
+ * reporter's example rendered `1*2` and `3*4` as one italic run.
+ */
+describe("markdown: code spans and hrefs are literal (#143)", () => {
+  it("does not italicise across two code spans — the reported case", () => {
+    const html = render("`1*2` and `3*4`\n");
+    expect(html).not.toContain("<em>");
+    expect(html).toContain("<code>1*2</code>");
+    expect(html).toContain("<code>3*4</code>");
+  });
+
+  it("leaves a single code span's asterisks alone", () => {
+    expect(render("`a *b* c`\n")).toContain("<code>a *b* c</code>");
+  });
+
+  it("does not read markdown syntax inside a code span", () => {
+    // Backticks won the first pass even before the fix, but the LINK pass then
+    // matched the [a](b) sitting inside the <code> element it had just made.
+    const html = render("`[a](b)` stays literal\n");
+    expect(html).not.toContain('<a href="b"');
+    expect(html).toContain("<code>[a](b)</code>");
+  });
+
+  it("keeps an asterisk in a URL out of the emphasis pass", () => {
+    const html = render("[x](https://e.com/a*b*c)\n");
+    expect(html).toContain('href="https://e.com/a*b*c"');
+    expect(html).not.toContain("<em>");
+  });
+
+  it("still emphasises LINK TEXT — only the href is held", () => {
+    // Deliberate: [**bold**](url) is valid markdown and rendered correctly
+    // before, so the fix must not flatten it.
+    const html = render("[**bold**](https://e.com)\n");
+    expect(html).toContain("<strong>bold</strong>");
+    expect(html).toContain('href="https://e.com"');
+  });
+
+  it("still emphasises ordinary prose around code", () => {
+    const html = render("*yes* and `no` and **also**\n");
+    expect(html).toContain("<em>yes</em>");
+    expect(html).toContain("<strong>also</strong>");
+    expect(html).toContain("<code>no</code>");
+  });
+
+  it("leaves no placeholder sentinel in the output", () => {
+    // The holder uses a NUL-delimited token, same family as the document-level
+    // fence and math placeholders. One escaping to the output would be visible
+    // garbage, so assert the restore pass is total.
+    const NUL = new RegExp(String.fromCharCode(0));
+    expect(render("`a` `b` [c](d) *e*\n")).not.toMatch(NUL);
+  });
+});

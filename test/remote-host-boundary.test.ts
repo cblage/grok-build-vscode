@@ -60,7 +60,7 @@ describe("installing the GitHub CLI is a desk action, whoever asks", () => {
     await sidebar.setupGithubCli("auth", "remote", "client-1");
 
     expect(sidebar.host.createTerminal).not.toHaveBeenCalled();
-    expect(sidebar.startGithubDeviceLogin).toHaveBeenCalledWith("client-1");
+    expect(sidebar.startGithubDeviceLogin).toHaveBeenCalledWith("client-1", "clone");
   });
 });
 

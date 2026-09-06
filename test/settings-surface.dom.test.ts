@@ -39,6 +39,7 @@ function loadSettings() {
     SUPPORT_MAILTO: string;
     defaultSnapshot: (p?: Record<string, unknown>) => Record<string, unknown>;
     defaultEnv: (p?: Record<string, unknown>) => Record<string, unknown>;
+    githubTokenAvailable: (s: unknown, e: unknown) => boolean;
     visibleRows: (s: unknown, e: unknown) => Array<{ id: string; category: string; hostLocal?: boolean }>;
     visibleCategories: (s: unknown, e: unknown) => Array<{ id: string }>;
     filterRows: (q: string, s: unknown, e: unknown) => Array<{ id: string; category: string }>;
@@ -1901,6 +1902,95 @@ describe("Providers refresh", () => {
   });
 });
 
+describe("GitHub connection row", () => {
+  const githubCaps = {
+    hostCaps: {
+      relocateView: false, showOutput: false, toggleDevTools: true,
+      remoteGithubSignIn: true, remoteGithubToken: true,
+    },
+  };
+
+  it("stays hidden until the githubState frame arrives", () => {
+    const { root } = mountAt("providers");
+    expect(root.querySelector('[data-id="githubConnection"]')).toBeNull();
+  });
+
+  it("renders not connected, connected, and connected-but-broken", () => {
+    const missing = mountAt("providers", {
+      snapshot: { githubState: { connected: false, cliPresent: true } },
+    });
+    const missingRow = missing.root.querySelector('[data-id="githubConnection"]') as HTMLElement;
+    expect(missingRow).toBeTruthy();
+    expect(missingRow.textContent).toMatch(/Connect GitHub/);
+    expect(missingRow.querySelector(".settings-github-connect")?.textContent)
+      .toBe("Connect with GitHub CLI");
+    expect(missingRow.querySelector(".settings-github-advanced")?.textContent)
+      .toBe("Use a token instead");
+    expect(missingRow.querySelector(".settings-github-token")).toBeNull();
+    expect(missingRow.querySelector(".settings-github-flow")).toBeNull();
+
+    const ok = mountAt("providers", {
+      snapshot: {
+        githubState: { connected: true, login: "phuryn", cliPresent: true },
+      },
+    });
+    const okRow = ok.root.querySelector('[data-id="githubConnection"]') as HTMLElement;
+    expect(okRow.textContent).toMatch(/@phuryn/);
+    expect(okRow.querySelector("button")?.textContent).toBe("Sign out");
+
+    const broken = mountAt("providers", {
+      snapshot: {
+        githubState: { connected: false, envTokenInForce: true, error: true, cliPresent: true },
+      },
+    });
+    const brokenRow = broken.root.querySelector('[data-id="githubConnection"]') as HTMLElement;
+    expect(brokenRow.textContent).toMatch(/GH_TOKEN/);
+    expect(brokenRow.textContent).toMatch(/not working/);
+    expect(brokenRow.querySelector(".settings-github-connect")?.textContent)
+      .toBe("Connect with GitHub CLI");
+  });
+
+  it("lets a remote connect when the host advertised remoteGithubSignIn, and signs out only on a cloud host", () => {
+    const disconnected = mountAt("providers", {
+      env: { isRemote: true, ...githubCaps },
+      snapshot: { githubState: { connected: false, cliPresent: true } },
+    });
+    const connect = disconnected.root.querySelector('[data-id="githubConnectionRemote"] .settings-github-connect');
+    expect(connect?.textContent).toBe("Connect with GitHub CLI");
+    (connect as HTMLButtonElement).click();
+    expect(disconnected.posted).toContainEqual({
+      type: "setupGithubCli", action: "auth", surface: "settings",
+    });
+    expect(disconnected.root.querySelector(".settings-github-flow")).toBeTruthy();
+    expect(disconnected.root.querySelector(".settings-github-connect")).toBeNull();
+    const open = disconnected.root.querySelector(".settings-github-flow-open");
+    expect(open).toBeNull();
+
+    const deskRemote = mountAt("providers", {
+      env: { isRemote: true, ...githubCaps },
+      snapshot: {
+        githubState: { connected: true, login: "phuryn", cliPresent: true },
+      },
+    });
+    expect(deskRemote.root.querySelector('[data-id="githubConnectionRemote"]')).toBeNull();
+    expect(deskRemote.root.querySelector('[data-id="githubConnectionStatus"]')).toBeTruthy();
+
+    const cloud = mountAt("providers", {
+      env: {
+        isRemote: true,
+        hostCaps: { ...githubCaps.hostCaps, remoteAgentSignOut: true },
+      },
+      snapshot: {
+        githubState: { connected: true, login: "phuryn", cliPresent: true },
+      },
+    });
+    const signOut = cloud.root.querySelector('[data-id="githubConnectionRemote"] button');
+    expect(signOut?.textContent).toBe("Sign out");
+    (signOut as HTMLButtonElement).click();
+    expect(cloud.posted).toContainEqual({ type: "githubSignOut" });
+  });
+});
+
 describe("settings update() skips an unchanged snapshot", () => {
   it("does not rebuild the DOM when the displayed snapshot is identical", () => {
     const { root, surface } = mountAt("general", { snapshot: { appPurpose: "coding" } });
@@ -1968,5 +2058,216 @@ describe("settings switch knob theme", () => {
     expect(match![0]).not.toMatch(/#(?:fff|ffffff)\b/i);
     expect(match![0]).toMatch(/color-mix\s*\(/);
     expect(match![0]).toMatch(/--vscode-/);
+  });
+});
+
+/**
+ * The GitHub token row follows the same gate as the Connect row beside it:
+ * can this host sign in to GitHub for a remote at all?
+ *
+ * It was briefly cloud-only, to match a host policy that was itself briefly
+ * cloud-only. Both came back out — a remote that could inject a token can
+ * already drive the agent and approve its tool calls on that machine, so the
+ * gate protected nothing while removing the narrowest credential we can offer
+ * from a phone driving a desk.
+ *
+ * What these pin is that the CLIENT gate matches the HOST's. Whichever way that
+ * decision goes, offering a row the host will refuse is the one shape that is
+ * always wrong: it takes the paste and sends a credential across the relay for
+ * nothing.
+ */
+describe("settings: the GitHub token path matches what the host will accept", () => {
+  const S = loadSettings();
+  const tokenOffered = (env: Record<string, unknown>, githubState: Record<string, unknown>) =>
+    S.githubTokenAvailable(
+      S.defaultSnapshot({ githubState }),
+      S.defaultEnv(env),
+    );
+
+  it("offers it locally, where there is also a terminal", () => {
+    expect(tokenOffered({ isRemote: false }, { connected: false, cliPresent: true })).toBe(true);
+  });
+
+  it("offers it to a remote on a cloud machine — its only way in", () => {
+    expect(tokenOffered({
+      isRemote: true,
+      hostCaps: { remoteGithubSignIn: true, remoteGithubToken: true, remoteAgentSignOut: true },
+    }, { connected: false, cliPresent: true })).toBe(true);
+  });
+
+  it("offers it to a phone driving a desk too — the host accepts it there", () => {
+    expect(tokenOffered({
+      isRemote: true,
+      hostCaps: { remoteGithubSignIn: true, remoteGithubToken: true, remoteAgentSignOut: false },
+    }, { connected: false, cliPresent: true })).toBe(true);
+  });
+
+  it("withholds it from a remote whose host cannot sign in to GitHub at all", () => {
+    // The honest case: an older host drops `setupGithubCli` and would drop this
+    // too, so the row would be a paste that goes nowhere.
+    expect(tokenOffered({
+      isRemote: true,
+      hostCaps: { remoteGithubSignIn: false },
+    }, { connected: false, cliPresent: true })).toBe(false);
+  });
+
+  it("withholds it from a host that can do the DEVICE flow but not a token", () => {
+    // The gap `remoteGithubSignIn` cannot cover. Every host between 4.1.0 and
+    // the release that added `githubLoginWithToken` advertises the first and
+    // knows nothing of the second, and the relay always serves a client newer
+    // than the extension — so this is the ordinary case for anyone who has not
+    // updated, not an exotic one. Offering the row there sends a credential
+    // across the relay to be dropped in silence.
+    expect(tokenOffered({
+      isRemote: true,
+      hostCaps: { remoteGithubSignIn: true },
+    }, { connected: false, cliPresent: true })).toBe(false);
+  });
+
+  it("withholds it once GitHub is connected, on every surface", () => {
+    expect(tokenOffered({ isRemote: false }, { connected: true, login: "octocat", cliPresent: true }))
+      .toBe(false);
+    expect(tokenOffered({
+      isRemote: true,
+      hostCaps: { remoteGithubSignIn: true, remoteAgentSignOut: true },
+    }, { connected: true, login: "octocat", cliPresent: true })).toBe(false);
+  });
+
+  it("is an advanced second step on the GitHub row, not a sibling row", () => {
+    const { root, posted } = mountAt("providers", {
+      snapshot: { githubState: { connected: false, cliPresent: true } },
+    });
+    expect(root.querySelector('[data-id="githubToken"]')).toBeNull();
+    const row = root.querySelector('[data-id="githubConnection"]') as HTMLElement;
+    expect(row.querySelector(".settings-github-token")).toBeNull();
+    const advanced = row.querySelector(".settings-github-advanced") as HTMLButtonElement;
+    expect(advanced.textContent).toBe("Use a token instead");
+    advanced.click();
+    expect(posted.some((m) => m.type === "githubLoginWithToken")).toBe(false);
+    expect(root.querySelector(".settings-github-connect")).toBeNull();
+    expect(root.querySelector(".settings-github-token")).toBeTruthy();
+    expect(root.querySelector(".settings-github-token-input")).toBeTruthy();
+  });
+
+  it("the CLI path is two steps: a choice, then a card with a real open link", () => {
+    const { root, posted } = mountAt("providers", {
+      env: {
+        isRemote: true,
+        hostCaps: {
+          relocateView: false, showOutput: false, toggleDevTools: true,
+          remoteGithubSignIn: true,
+        },
+      },
+      snapshot: { githubState: { connected: false, cliPresent: true } },
+    });
+    const row = root.querySelector('[data-id="githubConnectionRemote"]') as HTMLElement;
+    expect(row.querySelector(".settings-github-flow")).toBeNull();
+    (row.querySelector(".settings-github-connect") as HTMLButtonElement).click();
+    expect(posted).toContainEqual({
+      type: "setupGithubCli", action: "auth", surface: "settings",
+    });
+    expect(root.querySelector(".settings-github-flow")).toBeTruthy();
+    expect(root.querySelector(".settings-github-connect")).toBeNull();
+
+    const { root: waiting, surface } = mountAt("providers", {
+      env: {
+        isRemote: true,
+        hostCaps: {
+          relocateView: false, showOutput: false, toggleDevTools: true,
+          remoteGithubSignIn: true,
+        },
+      },
+      snapshot: { githubState: { connected: false, cliPresent: true } },
+    });
+    surface.update({
+      githubState: {
+        connected: false,
+        cliPresent: true,
+        loginFlow: {
+          status: "waiting",
+          url: "https://github.com/login/device",
+          code: "0D15-6BD9",
+        },
+      },
+    });
+    const open = waiting.querySelector(".settings-github-flow-open") as HTMLAnchorElement;
+    expect(open).toBeTruthy();
+    expect(open.tagName).toBe("A");
+    expect(open.getAttribute("href")).toBe("https://github.com/login/device");
+    expect(open.target).toBe("_blank");
+    expect(waiting.textContent).toContain("0D15-6BD9");
+    expect(waiting.querySelector(".settings-github-connect")).toBeNull();
+  });
+
+  it("makes 'fine-grained token' a new-tab link in the token step", () => {
+    const { root } = mountAt("providers", {
+      snapshot: { githubState: { connected: false, cliPresent: true } },
+    });
+    const advanced = root.querySelector(".settings-github-advanced") as HTMLButtonElement;
+    advanced.click();
+    const link = root.querySelector(".settings-github-token-link") as HTMLAnchorElement;
+    expect(link).toBeTruthy();
+    expect(link.textContent).toBe("fine-grained token");
+    expect(link.getAttribute("href")).toBe("https://github.com/settings/personal-access-tokens/new");
+    expect(link.target).toBe("_blank");
+    expect(link.rel).toContain("noopener");
+  });
+
+  it("offers Re-check connection on a desk GitHub terminal sign-in", () => {
+    const { root, posted } = mountAt("providers", {
+      snapshot: { githubState: { connected: false, cliPresent: true } },
+    });
+    posted.length = 0;
+    (root.querySelector(".settings-github-connect") as HTMLButtonElement).click();
+    expect(posted).toContainEqual({ type: "setupGithubCli", action: "auth", surface: "settings" });
+    const recheck = root.querySelector(".settings-github-flow-recheck") as HTMLButtonElement;
+    expect(recheck).toBeTruthy();
+    expect(recheck.textContent).toBe("Re-check connection");
+    expect(root.querySelector(".settings-github-flow-cancel")?.textContent).toBe("Cancel");
+    posted.length = 0;
+    recheck.click();
+    expect(posted).toContainEqual({ type: "refreshProviders" });
+    // And ONLY that. The row binder claims any `.settings-action` inside a row
+    // as its primary control, so while this button carried that class it fired
+    // Connect first and opened a second sign-in terminal behind the refresh.
+    expect(posted.some((m) => m.type === "setupGithubCli")).toBe(false);
+  });
+
+  it("offers Re-check connection once a desk provider row starts a terminal sign-in", () => {
+    const { root, posted } = mountAt("providers", {
+      snapshot: {
+        providers: [{ id: "grok", connected: false, needsLogin: false }],
+      },
+    });
+    posted.length = 0;
+    const connect = root.querySelector('[data-id="providerGrok"] .settings-action') as HTMLButtonElement;
+    expect(connect.textContent).toBe("Connect");
+    connect.click();
+    expect(posted).toContainEqual({ type: "runGrokLogin", provider: "grok" });
+    expect(root.querySelector('[data-id="providerGrok"] .settings-action')?.textContent)
+      .toBe("Connecting…");
+    const recheck = root.querySelector(".settings-provider-recheck") as HTMLButtonElement;
+    expect(recheck).toBeTruthy();
+    expect(recheck.textContent).toBe("Re-check connection");
+    expect(root.querySelector(".settings-provider-terminal-cancel")?.textContent).toBe("Cancel");
+    posted.length = 0;
+    recheck.click();
+    expect(posted).toContainEqual({ type: "recheckConnection", provider: "grok" });
+  });
+
+  it("does not offer Re-check on a remote GitHub device-code wait", () => {
+    const { root } = mountAt("providers", {
+      env: {
+        isRemote: true,
+        hostCaps: {
+          relocateView: false, showOutput: false, toggleDevTools: true,
+          remoteGithubSignIn: true,
+        },
+      },
+      snapshot: { githubState: { connected: false, cliPresent: true } },
+    });
+    (root.querySelector(".settings-github-connect") as HTMLButtonElement).click();
+    expect(root.querySelector(".settings-github-flow-recheck")).toBeNull();
+    expect(root.querySelector(".settings-github-flow-cancel")).toBeTruthy();
   });
 });

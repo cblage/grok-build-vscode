@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.1.6-sandbox.1 — 2026-09-03
+## 4.1.7-sandbox.1 — 2026-09-04
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.5.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.6.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -20,6 +20,26 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.1.6 — 2026-09-04
+
+**Connect GitHub from anywhere, and clone by picking a repository.** Private repositories were out of reach on a cloud machine, because signing in needed a terminal that machine does not have. GitHub is now a connection with a home in Settings, and cloning starts from a list of your repositories instead of a URL you have to remember.
+
+### Added
+
+- **GitHub in Settings, beside the agents.** It says whether you are connected and as whom, connects, and signs out — which had no home at all before, so a machine handed on or a wrong account connected could not be undone from a browser. Connecting is two steps: choose how, then a code and a button that opens the sign-in page. A fine-grained token is offered as the advanced path, scoped to one repository rather than everything the account can reach.
+
+- **Clone by choosing a repository.** One field: type to filter the repositories that account can see, or type any URL or `owner/repo`. Cloning is offered in Knowledge work too, not only Coding.
+
+### Fixed
+
+- **Claude Code now reaches Connected on Windows** ([#146](https://github.com/phuryn/grok-build-vscode/issues/146)). Its model-cache warm-up doubles as the credential check, and cleaning up a temporary directory afterwards could fail on Windows and take the whole check down with it — so a working account read as a broken one, on every attempt. Reported with a diagnosis that was essentially correct, by @zfzfg.
+
+- **Code spans keep their asterisks** ([#143](https://github.com/phuryn/grok-build-vscode/issues/143)). `` `1*2` and `3*4` `` rendered as one italic run. Reported by @SimonEast.
+
+- **More room to write** ([#144](https://github.com/phuryn/grok-build-vscode/issues/144)). The composer grows to ten lines instead of five — six on a phone, where the keyboard already owns half the screen — and a question's "Other" answer takes more than one line. Reported by @SimonEast.
+
+- **A running search says what it is looking for** ([#145](https://github.com/phuryn/grok-build-vscode/issues/145)) rather than a bare "Searching". Reported by @padixa.
 
 ## 4.1.5 — 2026-09-03
 

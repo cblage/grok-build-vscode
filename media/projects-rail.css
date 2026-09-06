@@ -790,9 +790,9 @@ html, body {
   inset: 0;
   z-index: 60;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
-  padding: 16px;
+  padding: 8vh 16px 16px;
   background: rgba(0, 0, 0, 0.42);
 }
 .add-project-form {
@@ -840,6 +840,79 @@ html, body {
   border-color: var(--vscode-focusBorder, currentColor);
 }
 .add-project-input:disabled { opacity: 0.6; }
+.add-project-list {
+  display: flex;
+  flex-direction: column;
+  /* Five compact rows. Fixed, not max, so filtering cannot change the
+     dialog's height. flex-shrink lets a short phone keep Clone on screen. */
+  height: 13.75rem;
+  max-height: 13.75rem;
+  min-height: 5.5rem;
+  flex: 1 1 auto;
+  overflow: auto;
+  border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border, currentColor));
+  border-radius: 6px;
+  background: var(--vscode-input-background, Canvas);
+}
+.add-project-list[hidden] { display: none; }
+.add-project-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 7px 9px;
+  border: 0;
+  border-bottom: 1px solid color-mix(in oklab, var(--vscode-foreground) 8%, transparent);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.add-project-option:last-child { border-bottom: 0; }
+.add-project-option.is-active,
+.add-project-option:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+.add-project-option.is-connect { font-weight: 600; }
+.add-project-option-glyph {
+  flex: 0 0 auto;
+  width: 1em;
+  text-align: center;
+  opacity: 0.7;
+  font-size: 10px;
+}
+.add-project-option-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.add-project-option-name {
+  font-weight: 600;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.add-project-option-owner {
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--vscode-descriptionForeground, currentColor);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.add-project-option-when {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground, currentColor);
+  white-space: nowrap;
+}
 /* The destination, live. The whole point of the feature is that nobody has to
    choose a folder, which only works if they can see the one being chosen. */
 .add-project-dest {
@@ -878,29 +951,49 @@ html, body {
   gap: 8px;
   margin-top: 4px;
 }
+.add-project-github-choice,
+.add-project-github-card,
+.add-project-github-token {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 .add-project-github[hidden],
+.add-project-github-choice[hidden],
+.add-project-github-card[hidden],
+.add-project-github-token[hidden],
 .add-project-github-cmd[hidden],
 .add-project-github-open[hidden],
 .add-project-github-desc[hidden],
-.add-project-github-note[hidden] { display: none; }
+.add-project-github-note[hidden],
+.add-project-github-advanced[hidden],
+.add-project-github-recheck[hidden],
+.add-project-github-token-error[hidden] { display: none; }
 .add-project-github-heading { font-size: 13px; font-weight: 600; line-height: 1.3; }
 .add-project-github-desc,
-.add-project-github-note {
+.add-project-github-note,
+.add-project-github-token-error {
   margin: 0;
   font-size: 12px;
   line-height: 1.5;
   color: var(--vscode-descriptionForeground, currentColor);
 }
+.add-project-github-token-error { color: var(--vscode-errorForeground, currentColor); }
+.add-project-github-token-link {
+  color: var(--vscode-textLink-foreground, inherit);
+}
 .add-project-github-cmd {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-height: 28px;
   background: var(--vscode-textCodeBlock-background);
   border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border, currentColor));
   border-radius: 4px;
-  padding: 6px 6px 6px 10px;
+  padding: 4px 6px 4px 10px;
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 12px;
+  box-sizing: border-box;
 }
 .add-project-github-cmd code {
   background: none;
@@ -926,25 +1019,66 @@ html, body {
   color: var(--vscode-foreground, CanvasText);
 }
 .add-project-github-copy.copied { color: var(--vscode-charts-green); }
-.add-project-github-open {
-  display: flex;
+.add-project-github-open,
+.add-project-github-connect,
+.add-project-github-token-submit {
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 32px;
-  padding: 7px 10px;
+  align-self: flex-start;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid var(--vscode-button-border, transparent);
   border-radius: 4px;
   background: var(--vscode-button-background);
   color: var(--vscode-button-foreground);
   text-decoration: none;
+  font: inherit;
   font-size: 12px;
   box-sizing: border-box;
+  cursor: pointer;
 }
-.add-project-github-open:hover { background: var(--vscode-button-hoverBackground, var(--vscode-button-background)); }
+.add-project-github-open:hover,
+.add-project-github-connect:hover,
+.add-project-github-token-submit:hover {
+  background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
+  color: var(--vscode-button-foreground);
+  text-decoration: none;
+}
+a.add-project-github-open {
+  color: var(--vscode-button-foreground);
+}
+.add-project-github-advanced,
+.add-project-github-recheck {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 4px 0;
+  color: var(--vscode-descriptionForeground, currentColor);
+  font: inherit;
+  font-size: 12px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.add-project-github-advanced:hover,
+.add-project-github-recheck:hover { color: var(--vscode-foreground, CanvasText); }
+.add-project-github-token-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--vscode-input-foreground, CanvasText);
+  background: var(--vscode-input-background, Canvas);
+  border: 1px solid var(--vscode-input-border, var(--vscode-editorWidget-border, currentColor));
+  border-radius: 5px;
+}
 .add-project-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 4px;
+  flex-shrink: 0;
 }
 .add-project-btn {
   font: inherit;
@@ -968,5 +1102,12 @@ html, body {
 /* Touch: the universal 36px floor, same as every other control. */
 @media (hover: none), (pointer: coarse) {
   .add-project-btn, .add-project-fix, .add-project-input,
-  .add-project-github-copy, .add-project-github-open { min-height: 36px; }
+  .add-project-github-copy, .add-project-github-open, .add-project-github-connect,
+  .add-project-github-token-submit, .add-project-github-advanced, .add-project-github-recheck,
+  .add-project-option, .add-project-github-token-input, .add-project-github-cmd { min-height: 44px; }
+  .add-project-github-copy { min-width: 44px; }
+}
+@media (max-height: 520px) {
+  .add-project-scrim { padding-top: 12px; }
+  .add-project-list { height: 8.25rem; max-height: 8.25rem; }
 }
