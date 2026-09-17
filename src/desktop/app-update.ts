@@ -1,19 +1,28 @@
 /**
  * Desktop update helpers — pure, no network, no Electron.
  *
- * Packaged win32/darwin run electron-updater against the relay generic feed
- * (`desktopUpdateFeedConfig`). Check/download failure falls back to the GitHub
- * Releases notice. The updater itself is injected; this module never imports it.
+ * Packaged win32/darwin/linux run electron-updater against the relay generic
+ * feed (`desktopUpdateFeedConfig`). Check/download failure falls back to the
+ * GitHub Releases notice. The updater itself is injected; this module never
+ * imports it.
  * Contract: docs/desktop-update-spec.md.
  */
 
-/** Anchored installer asset suffixes. `.exe.blockmap` / `.zip.blockmap` must never match. */
+/**
+ * Anchored installer asset suffixes. `.exe.blockmap` / `.zip.blockmap` must
+ * never match.
+ *
+ * `x86_64` is electron-builder's AppImage arch spelling; every other target
+ * uses the short `x64`. A pattern that assumed otherwise matches nothing and
+ * fails silently.
+ */
 export const DESKTOP_INSTALLER_SUFFIXES = [
   "-mac-arm64.dmg",
   "-mac-x64.dmg",
   "-mac-arm64.zip",
   "-mac-x64.zip",
   "-win-x64.exe",
+  "-linux-x86_64.AppImage",
 ] as const;
 
 export type Semver = { major: number; minor: number; patch: number };
@@ -156,14 +165,25 @@ export const DESKTOP_UPDATE_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
 export const DESKTOP_UPDATE_FEED_ORIGIN = "https://afkpilot.com/update";
 
 /**
- * Generic-provider directory for this platform (trailing slash). electron-updater
- * appends `latest.yml` (win32) or `latest-mac.yml` (darwin). Null on Linux.
+ * Generic-provider directory for this platform (trailing slash).
+ * electron-updater appends `latest.yml` (win32), `latest-mac.yml` (darwin) or
+ * `latest-linux.yml` (linux). Null everywhere else.
+ *
+ * Linux was null until the AppImage became an offered download. It is safe to
+ * return a feed for the SAME artifact the cloud machines run, because
+ * `AppImageUpdater.isUpdaterActive()` returns false unless `process.env.APPIMAGE`
+ * is set — and a cloud machine execs the extracted `squashfs-root`, never the
+ * AppImage. `checkForUpdates()` then resolves null with a log line, no error
+ * event and no notice, so a sprite cannot self-update out from under the
+ * relay's refresh tooling. Do not add a cloud check here: the property is
+ * structural, and a check would be one more thing to keep true.
  */
 export function desktopUpdateFeedBase(
   platform: NodeJS.Platform | string | null | undefined,
 ): string | null {
   if (platform === "win32") return `${DESKTOP_UPDATE_FEED_ORIGIN}/win/`;
   if (platform === "darwin") return `${DESKTOP_UPDATE_FEED_ORIGIN}/mac/`;
+  if (platform === "linux") return `${DESKTOP_UPDATE_FEED_ORIGIN}/linux/`;
   return null;
 }
 
@@ -262,6 +282,14 @@ export function latestWinYmlHasInstaller(yml: string | null | undefined): boolea
   // Line-end anchor: `url:` / `path:` lines end with the name. A bare
   // `/win-x64\.exe/` also matches `win-x64.exe.blockmap`.
   return /win-x64\.exe\s*$/m.test(String(yml || ""));
+}
+
+/** latest-linux.yml from `electron-builder --linux` must list the AppImage. */
+export function latestLinuxYmlHasAppImage(yml: string | null | undefined): boolean {
+  // Same line-end anchor as the other two. An AppImage embeds its own block
+  // map, so unlike the Windows case there is no sibling file to exclude —
+  // the anchor is kept for consistency and against a future `.AppImage.zsync`.
+  return /linux-x86_64\.AppImage\s*$/m.test(String(yml || ""));
 }
 
 /**
@@ -437,7 +465,24 @@ export function attachDesktopAutoUpdate(opts: {
         return;
       }
       try {
-        await updater().checkForUpdates();
+        // `null` means the updater declined to act, and electron-updater says
+        // so without throwing -- so this is NOT covered by the catch below.
+        // On Linux that is `AppImageUpdater.isUpdaterActive()` returning false
+        // because `process.env.APPIMAGE` is unset, which happens whenever the
+        // AppImage was EXTRACTED rather than run: a cloud machine always, and a
+        // desk user who ran `--appimage-extract` because their distro has no
+        // libfuse2 -- the usual workaround, and Ubuntu 22.04+ ships without it.
+        //
+        // That desk user got the phase-1 notice before this channel existed,
+        // and silence would be a regression for exactly the people least able
+        // to run the file normally. So a declining updater falls back like a
+        // failing one.
+        //
+        // This needs no cloud check and must not grow one. `updateAvailable` is
+        // host-local outbound, and every client of a cloud host is a remote, so
+        // the notice this posts there reaches nobody.
+        const result = await updater().checkForUpdates();
+        if (!result) await fallbackNotice();
       } catch (e) {
         opts.ui.log(`[update] check failed: ${updaterLogLine(e)}`);
         apply({ type: "error" });

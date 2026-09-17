@@ -1,0 +1,725 @@
+// Turn-level "Changed N files" summary: path-deduped +/− across every edit in
+// the open agent turn, live as diffs land and pinned at turn end. Reuses the
+// same per-file tool diff on every surface, with independent card expansion.
+import { describe, it, expect } from "vitest";
+import { bootWebview, dispatch, click } from "./webview-harness";
+
+const diff = (path: string, oldText: string, newText: string) => ({
+  type: "diff" as const,
+  path,
+  oldText,
+  newText,
+});
+
+function editUpdate(toolCallId: string, path: string, oldText: string, newText: string) {
+  return {
+    type: "toolCallUpdate" as const,
+    call: { toolCallId, content: [diff(path, oldText, newText)] },
+  };
+}
+
+function editCall(toolCallId: string, path: string, title?: string) {
+  return {
+    type: "toolCall" as const,
+    call: { toolCallId, kind: "edit", title: title || `Edit ${path}` },
+  };
+}
+
+function rowByPath(doc: Document, re: RegExp) {
+  return [...doc.querySelectorAll(".turn-diff-file")].find((r) =>
+    re.test(r.querySelector(".turn-diff-file-path")?.textContent || ""),
+  ) as HTMLElement | undefined;
+}
+
+describe("turn-level file change summary", () => {
+  it("lists every edited file with path-deduped totals and reveals its diff", () => {
+    const { window, doc, posted } = bootWebview();
+
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, editCall("e1", "src/a.ts"));
+    // "x" → "y" = +1 −1
+    dispatch(window, editUpdate("e1", "src/a.ts", "x", "y"));
+    dispatch(window, editCall("e2", "src/b.ts"));
+    // "" → "hi" = +1 −0
+    dispatch(window, editUpdate("e2", "src/b.ts", "", "hi"));
+    // Second edit on a.ts — sum both region stats; openDiff spans first→last
+    dispatch(window, editCall("e3", "src/a.ts"));
+    dispatch(window, editUpdate("e3", "src/a.ts", "y", "yz"));
+    dispatch(window, { type: "agentEnd" });
+
+    const card = doc.querySelector(".turn-diff-summary") as HTMLElement;
+    expect(card).not.toBeNull();
+    expect(card.querySelector(".turn-diff-summary-title")!.textContent).toBe("Changed 2 files");
+    // a: (+1−1)+(+1−1 for y→yz) = +2 −2; b create "hi": +1 −0 → header +3 −2
+    expect(card.querySelector(".turn-diff-summary-header .diff-stat-add")!.textContent).toBe("+3");
+    expect(card.querySelector(".turn-diff-summary-header .diff-stat-del")!.textContent).toBe("−2");
+
+    const rows = [...card.querySelectorAll(".turn-diff-file")];
+    expect(rows).toHaveLength(2);
+    // Filename first, directory second. The two halves are laid out with a
+    // gap and carry no separator of their own, so the joined path lives on the
+    // title — which is what a hover and an assistive reader get.
+    expect((rows[0].querySelector(".turn-diff-file-path") as HTMLElement).title).toBe("src/a.ts");
+    expect(rows[0].querySelector(".turn-diff-file-name")!.textContent).toBe("a.ts");
+    expect(rows[0].querySelector(".turn-diff-file-dir")!.textContent).toBe("src");
+    expect(rows[0].querySelector(".diff-stat-add")!.textContent).toBe("+2");
+    expect(rows[0].querySelector(".diff-stat-del")!.textContent).toBe("−2");
+    expect((rows[1].querySelector(".turn-diff-file-path") as HTMLElement).title).toBe("src/b.ts");
+    expect(rows[1].querySelector(".turn-diff-file-name")!.textContent).toBe("b.ts");
+
+    click(window, rows[0] as HTMLElement);
+    // The row reveals that file's own tool row — there is no honest
+    // turn-level diff to post (see webview-helpers.js § aggregateTurnEdits).
+    expect(posted.filter((m: any) => m.type === "openDiff")).toHaveLength(0);
+    expect(doc.querySelector(".tool-item.expanded, .tool-item-flat.expanded")).toBeTruthy();
+  });
+
+  describe("same file edited multiple times in one turn", () => {
+    it("sums create + later edit across case-variant paths", () => {
+      const { window, doc, posted } = bootWebview();
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, editCall("c1", "F1.txt", "Write F1.txt"));
+      dispatch(window, editUpdate("c1", "d:\\Temp\\AITest\\F1.txt", "", "a\nb\nc"));
+      dispatch(window, editCall("c2", "f1.txt"));
+      dispatch(window, editUpdate("c2", "d:/Temp/AITest/f1.txt", "a\nb\nc", "A\nB\nC"));
+      dispatch(window, { type: "agentEnd" });
+
+      const rows = doc.querySelectorAll(".turn-diff-file");
+      expect(rows).toHaveLength(1);
+      // Create +3 −0 plus rewrite "a\nb\nc"→"A\nB\nC" = +3 −3 → sum +6 −3
+      expect(rows[0].querySelector(".diff-stat-add")!.textContent).toBe("+6");
+      expect(rows[0].querySelector(".diff-stat-del")!.textContent).toBe("−3");
+
+      click(window, rows[0] as HTMLElement);
+      // The row reveals that file's own tool row — there is no honest
+      // turn-level diff to post (see webview-helpers.js § aggregateTurnEdits).
+      expect(posted.filter((m: any) => m.type === "openDiff")).toHaveLength(0);
+      expect(doc.querySelector(".tool-item.expanded, .tool-item-flat.expanded")).toBeTruthy();
+    });
+
+    it("three sequential appends on F3 sum to +3", () => {
+      const { window, doc, posted } = bootWebview();
+      const v0 = "base\n";
+      const v1 = "base\npass1\n";
+      const v2 = "base\npass1\npass2\n";
+      const v3 = "base\npass1\npass2\npass3\n";
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, editCall("p1", "F3.txt"));
+      dispatch(window, editUpdate("p1", "F3.txt", v0, v1));
+      dispatch(window, editCall("p2", "F3.txt"));
+      dispatch(window, editUpdate("p2", "F3.txt", v1, v2));
+      dispatch(window, editCall("p3", "F3.txt"));
+      dispatch(window, editUpdate("p3", "F3.txt", v2, v3));
+      dispatch(window, { type: "agentEnd" });
+
+      const row = rowByPath(doc, /F3\.txt/)!;
+      expect(row.querySelector(".diff-stat-add")!.textContent).toBe("+3");
+      expect(row.querySelector(".diff-stat-del")!.textContent).toBe("−0");
+      click(window, row);
+      // The row reveals that file's own tool row — there is no honest
+      // turn-level diff to post (see webview-helpers.js § aggregateTurnEdits).
+      expect(posted.filter((m: any) => m.type === "openDiff")).toHaveLength(0);
+      expect(doc.querySelector(".tool-item.expanded, .tool-item-flat.expanded")).toBeTruthy();
+    });
+
+    it("add a line then remove that same line — both + and − appear in the sum", () => {
+      const { window, doc, posted } = bootWebview();
+      const before = "keep\n";
+      const withExtra = "keep\nTEMP\n";
+      const after = "keep\n";
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, editCall("a1", "note.txt"));
+      dispatch(window, editUpdate("a1", "note.txt", before, withExtra)); // +1
+      // Live card should already show the add
+      expect(rowByPath(doc, /note\.txt/)!.querySelector(".diff-stat-add")!.textContent).toBe("+1");
+
+      dispatch(window, editCall("a2", "note.txt"));
+      dispatch(window, editUpdate("a2", "note.txt", withExtra, after)); // −1
+      dispatch(window, { type: "agentEnd" });
+
+      const row = rowByPath(doc, /note\.txt/)!;
+      expect(row.querySelector(".diff-stat-add")!.textContent).toBe("+1");
+      expect(row.querySelector(".diff-stat-del")!.textContent).toBe("−1");
+      click(window, row);
+      // The row reveals that file's own tool row — there is no honest
+      // turn-level diff to post (see webview-helpers.js § aggregateTurnEdits).
+      expect(posted.filter((m: any) => m.type === "openDiff")).toHaveLength(0);
+      expect(doc.querySelector(".tool-item.expanded, .tool-item-flat.expanded")).toBeTruthy();
+    });
+
+    it("add content then rewrite that same content", () => {
+      const { window, doc } = bootWebview();
+      const v0 = "header\n";
+      const v1 = "header\nDRAFT\n";
+      const v2 = "header\nFINAL\n";
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, editCall("r1", "doc.txt"));
+      dispatch(window, editUpdate("r1", "doc.txt", v0, v1));
+      dispatch(window, editCall("r2", "doc.txt"));
+      dispatch(window, editUpdate("r2", "doc.txt", v1, v2));
+      dispatch(window, { type: "agentEnd" });
+
+      const row = rowByPath(doc, /doc\.txt/)!;
+      // +1 (append DRAFT) + (+1 −1 rewrite DRAFT→FINAL) = +2 −1
+      expect(row.querySelector(".diff-stat-add")!.textContent).toBe("+2");
+      expect(row.querySelector(".diff-stat-del")!.textContent).toBe("−1");
+    });
+
+    it("append, edit that line, then remove it — three-pass sum", () => {
+      const { window, doc, posted } = bootWebview();
+      const v0 = "stable\n";
+      const v1 = "stable\nX\n";
+      const v2 = "stable\nY\n";
+      const v3 = "stable\n";
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, editCall("t1", "f.txt"));
+      dispatch(window, editUpdate("t1", "f.txt", v0, v1));
+      dispatch(window, editCall("t2", "f.txt"));
+      dispatch(window, editUpdate("t2", "f.txt", v1, v2));
+      dispatch(window, editCall("t3", "f.txt"));
+      dispatch(window, editUpdate("t3", "f.txt", v2, v3));
+      dispatch(window, { type: "agentEnd" });
+
+      const row = rowByPath(doc, /^f\.txt$/)!;
+      // +1, then +1−1, then −1 → +2 −2
+      expect(row.querySelector(".diff-stat-add")!.textContent).toBe("+2");
+      expect(row.querySelector(".diff-stat-del")!.textContent).toBe("−2");
+      click(window, row);
+      // The row reveals that file's own tool row — there is no honest
+      // turn-level diff to post (see webview-helpers.js § aggregateTurnEdits).
+      expect(posted.filter((m: any) => m.type === "openDiff")).toHaveLength(0);
+      expect(doc.querySelector(".tool-item.expanded, .tool-item-flat.expanded")).toBeTruthy();
+    });
+
+    it("live card grows as a second edit lands on the same file (before agentEnd)", () => {
+      const { window, doc } = bootWebview();
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, editCall("l1", "live.txt"));
+      // Avoid trailing "\n" — computeLineDiff would count a phantom empty line.
+      dispatch(window, editUpdate("l1", "live.txt", "", "one"));
+      expect(doc.querySelector(".turn-diff-summary-header .diff-stat-add")!.textContent).toBe("+1");
+
+      dispatch(window, editCall("l2", "live.txt"));
+      dispatch(window, editUpdate("l2", "live.txt", "one", "one\ntwo"));
+      // Still one card, one row, summed counts
+      expect(doc.querySelectorAll(".turn-diff-summary")).toHaveLength(1);
+      expect(doc.querySelectorAll(".turn-diff-file")).toHaveLength(1);
+      expect(doc.querySelector(".diff-stat-add")!.textContent).toBe("+2");
+    });
+
+    it("interleaved A/B/A edits keep separate path rows with summed A", () => {
+      const { window, doc } = bootWebview();
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, editCall("i1", "a.ts"));
+      dispatch(window, editUpdate("i1", "a.ts", "1", "2"));
+      dispatch(window, editCall("i2", "b.ts"));
+      dispatch(window, editUpdate("i2", "b.ts", "", "x"));
+      dispatch(window, editCall("i3", "a.ts"));
+      dispatch(window, editUpdate("i3", "a.ts", "2", "3"));
+      dispatch(window, { type: "agentEnd" });
+
+      expect(doc.querySelectorAll(".turn-diff-file")).toHaveLength(2);
+      const a = rowByPath(doc, /a\.ts/)!;
+      const b = rowByPath(doc, /b\.ts/)!;
+      expect(a.querySelector(".diff-stat-add")!.textContent).toBe("+2"); // 1→2 and 2→3
+      expect(a.querySelector(".diff-stat-del")!.textContent).toBe("−2");
+      expect(b.querySelector(".diff-stat-add")!.textContent).toBe("+1");
+    });
+  });
+
+  describe("deletes", () => {
+    it("tracks Remove-Item shell deletes as Deleted rows", () => {
+      const { window, doc } = bootWebview();
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, {
+        type: "toolCall",
+        call: {
+          toolCallId: "w1",
+          kind: "edit",
+          title: "Write F2.txt",
+          content: [diff("d:\\Temp\\AITest\\F2.txt", "", "x\ny\nz")],
+        },
+      });
+      dispatch(window, {
+        type: "toolCall",
+        call: {
+          toolCallId: "d1",
+          kind: "execute",
+          title: "Shell",
+          rawInput: { command: "Remove-Item -Force 'd:\\Temp\\AITest\\F2.txt'" },
+        },
+      });
+      dispatch(window, {
+        type: "toolCall",
+        call: {
+          toolCallId: "d2",
+          kind: "execute",
+          title: "Shell",
+          rawInput: { command: "Remove-Item 'd:\\Temp\\AITest\\to-delete-1.txt'" },
+        },
+      });
+      dispatch(window, { type: "agentEnd" });
+
+      const card = doc.querySelector(".turn-diff-summary")!;
+      expect(card).not.toBeNull();
+      const deleted = [...card.querySelectorAll(".turn-diff-file.is-deleted")];
+      expect(deleted.length).toBeGreaterThanOrEqual(2);
+      expect(deleted.every((r) => r.querySelector(".turn-diff-file-status")?.textContent === "D")).toBe(true);
+      // The letter says it; no +/− count competes with it on the same row.
+      expect(deleted.every((r) => r.querySelector(".diff-stat") === null)).toBe(true);
+      // F2 was written then deleted → only Deleted, not +3
+      const f2 = deleted.find((r) =>
+        /F2\.txt/i.test(r.querySelector(".turn-diff-file-path")!.textContent || ""),
+      );
+      expect(f2).toBeTruthy();
+    });
+
+    it("prints git's letter in front of each path: A created, M edited, D deleted", () => {
+      const { window, doc } = bootWebview();
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, editCall("c1", "new.ts"));
+      dispatch(window, editUpdate("c1", "new.ts", "", "fresh"));
+      dispatch(window, editCall("m1", "old.ts"));
+      dispatch(window, editUpdate("m1", "old.ts", "before", "after"));
+      dispatch(window, {
+        type: "toolCall",
+        call: {
+          toolCallId: "d1",
+          kind: "execute",
+          title: "Shell",
+          rawInput: { command: "Remove-Item 'd:\\Temp\\AITest\\gone.txt'" },
+        },
+      });
+      dispatch(window, { type: "agentEnd" });
+
+      const letter = (re: RegExp) => rowByPath(doc, re)!.querySelector(".turn-diff-file-status")!;
+      expect(letter(/new\.ts/).textContent).toBe("A");
+      expect(letter(/new\.ts/).classList.contains("is-a")).toBe(true);
+      expect(letter(/old\.ts/).textContent).toBe("M");
+      expect(letter(/old\.ts/).classList.contains("is-m")).toBe(true);
+      expect(letter(/gone\.txt/).textContent).toBe("D");
+      expect(letter(/gone\.txt/).classList.contains("is-d")).toBe(true);
+      // First in the row, so the letters make a column down the card.
+      expect(rowByPath(doc, /old\.ts/)!.firstElementChild!.classList.contains("turn-diff-file-status")).toBe(true);
+    });
+
+    it("edit then delete then recreate only counts post-delete edits", () => {
+      const { window, doc, posted } = bootWebview();
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, editCall("x1", "x.txt"));
+      dispatch(window, editUpdate("x1", "x.txt", "old", "mid"));
+      dispatch(window, {
+        type: "toolCall",
+        call: {
+          toolCallId: "xd",
+          kind: "execute",
+          title: "Shell",
+          rawInput: { command: "rm -f x.txt" },
+        },
+      });
+      dispatch(window, editCall("x2", "x.txt", "Write x.txt"));
+      dispatch(window, editUpdate("x2", "x.txt", "", "brand\nnew")); // +2
+      dispatch(window, editCall("x3", "x.txt"));
+      dispatch(window, editUpdate("x3", "x.txt", "brand\nnew", "brand\nnew\nplus")); // +1
+      dispatch(window, { type: "agentEnd" });
+
+      const rows = [...doc.querySelectorAll(".turn-diff-file")];
+      expect(rows).toHaveLength(1);
+      expect(rows[0].classList.contains("is-deleted")).toBe(false);
+      // create +2, append +1 → +3 (pre-delete edit wiped)
+      expect(rows[0].querySelector(".diff-stat-add")!.textContent).toBe("+3");
+      click(window, rows[0] as HTMLElement);
+      // The row reveals that file's own tool row — there is no honest
+      // turn-level diff to post (see webview-helpers.js § aggregateTurnEdits).
+      expect(posted.filter((m: any) => m.type === "openDiff")).toHaveLength(0);
+      expect(doc.querySelector(".tool-item.expanded, .tool-item-flat.expanded")).toBeTruthy();
+    });
+  });
+
+  it("appears live as the first edit lands (before agentEnd)", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, editCall("e1", "foo.ts"));
+    dispatch(window, editUpdate("e1", "foo.ts", "a", "b"));
+    const card = doc.querySelector(".turn-diff-summary");
+    expect(card).not.toBeNull();
+    expect(card!.querySelector(".turn-diff-summary-title")!.textContent).toBe("Changed 1 file");
+  });
+
+  it("echo→completed repaint replaces counts (no double-count)", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, editCall("w1", "note.txt", "Write note.txt"));
+    // Echo for overwrite: oldText empty → pure adds
+    dispatch(window, editUpdate("w1", "note.txt", "", "new\nline"));
+    // Authoritative completed: real prior content
+    dispatch(window, {
+      type: "toolCallUpdate",
+      call: {
+        toolCallId: "w1",
+        status: "completed",
+        content: [diff("note.txt", "old\nline", "new\nline")],
+      },
+    });
+    dispatch(window, { type: "agentEnd" });
+
+    const card = doc.querySelector(".turn-diff-summary")!;
+    expect(card.querySelectorAll(".turn-diff-file")).toHaveLength(1);
+    // "old\nline" → "new\nline": del old, add new, ctx line → +1 −1
+    expect(card.querySelector(".diff-stat-add")!.textContent).toBe("+1");
+    expect(card.querySelector(".diff-stat-del")!.textContent).toBe("−1");
+  });
+
+  it("starts a fresh card on the next agent turn", () => {
+    const { window, doc } = bootWebview();
+
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, editCall("t1", "a.ts"));
+    dispatch(window, editUpdate("t1", "a.ts", "1", "2"));
+    dispatch(window, { type: "agentEnd" });
+    expect(doc.querySelectorAll(".turn-diff-summary")).toHaveLength(1);
+
+    dispatch(window, { type: "userMessage", text: "next" });
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, editCall("t2", "b.ts"));
+    dispatch(window, editUpdate("t2", "b.ts", "x", "y"));
+    dispatch(window, { type: "agentEnd" });
+
+    const cards = [...doc.querySelectorAll(".turn-diff-summary")];
+    expect(cards).toHaveLength(2);
+    expect(cards[0].querySelector(".turn-diff-file-path")!.textContent).toBe("a.ts");
+    expect(cards[1].querySelector(".turn-diff-file-path")!.textContent).toBe("b.ts");
+  });
+
+  it("rebuilds on session restore from completed tool_call diffs", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "historyReplay", active: true });
+    dispatch(window, { type: "userMessageChunk", text: "please edit" });
+    dispatch(window, {
+      type: "toolCall",
+      call: {
+        toolCallId: "r1",
+        kind: "edit",
+        title: "Edit restored.ts",
+        status: "completed",
+        content: [diff("restored.ts", "old", "new")],
+      },
+    });
+    dispatch(window, { type: "historyReplay", active: false });
+
+    const card = doc.querySelector(".turn-diff-summary");
+    expect(card).not.toBeNull();
+    expect(card!.querySelector(".turn-diff-file-path")!.textContent).toBe("restored.ts");
+  });
+
+  it("restore with multi-edit same file sums both completed tool_calls", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "historyReplay", active: true });
+    dispatch(window, { type: "userMessageChunk", text: "multi" });
+    dispatch(window, {
+      type: "toolCall",
+      call: {
+        toolCallId: "r1",
+        kind: "edit",
+        title: "Edit multi.txt",
+        status: "completed",
+        content: [diff("multi.txt", "", "one")],
+      },
+    });
+    dispatch(window, {
+      type: "toolCall",
+      call: {
+        toolCallId: "r2",
+        kind: "edit",
+        title: "Edit multi.txt",
+        status: "completed",
+        content: [diff("multi.txt", "one", "one\ntwo")],
+      },
+    });
+    dispatch(window, { type: "historyReplay", active: false });
+
+    const row = rowByPath(doc, /multi\.txt/)!;
+    expect(row.querySelector(".diff-stat-add")!.textContent).toBe("+2");
+    click(window, row);
+    // The row reveals that file's own tool row — there is no honest
+    // turn-level diff to post (see webview-helpers.js § aggregateTurnEdits).
+    expect(posted.filter((m: any) => m.type === "openDiff")).toHaveLength(0);
+    expect(doc.querySelector(".tool-item.expanded, .tool-item-flat.expanded")).toBeTruthy();
+  });
+
+  it("does not appear for non-edit tool turns", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, {
+      type: "toolCall",
+      call: { toolCallId: "r1", kind: "read", title: "Read foo.ts", rawInput: { path: "foo.ts" } },
+    });
+    dispatch(window, { type: "agentEnd" });
+    expect(doc.querySelector(".turn-diff-summary")).toBeNull();
+  });
+
+  // Filename FIRST, directory second — the order the Changes panel uses, so
+  // one file reads the same way on both surfaces. Each half is its own span so
+  // CSS can collapse the directory entirely before the name loses a character;
+  // the screens harness (scripts/turn-diff-screens.mjs) proves the pixels
+  // follow. Neither half carries the separator: they are laid out with a gap,
+  // and a stray slash between them would read as a broken path.
+  it("puts the filename first and the directory second, each its own span", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, editCall("p1", "packages/relay/src/deep/reconnect-policy.ts"));
+    dispatch(window, editUpdate("p1", "packages/relay/src/deep/reconnect-policy.ts", "a", "b"));
+    dispatch(window, { type: "agentEnd" });
+
+    const path = doc.querySelector(".turn-diff-file-path") as HTMLElement;
+    const spans = [...path.children].map((el) => el.className);
+    expect(spans).toEqual(["turn-diff-file-name", "turn-diff-file-dir"]);
+    expect(path.querySelector(".turn-diff-file-name")!.textContent).toBe("reconnect-policy.ts");
+    expect(path.querySelector(".turn-diff-file-dir")!.textContent).toBe("packages/relay/src/deep");
+    // The whole path stays reachable even when the directory is cut to nothing.
+    expect(path.title).toBe("packages/relay/src/deep/reconnect-policy.ts");
+  });
+
+  it("leaves a bare filename in one piece", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "agentStart" });
+    dispatch(window, editCall("p2", "README.md"));
+    dispatch(window, editUpdate("p2", "README.md", "a", "b"));
+    dispatch(window, { type: "agentEnd" });
+
+    const path = doc.querySelector(".turn-diff-file-path") as HTMLElement;
+    expect(path.querySelector(".turn-diff-file-dir")).toBeNull();
+    expect(path.textContent).toBe("README.md");
+  });
+
+  // Two independent reasons the card cannot open a native diff, and together
+  // they leave ONE behaviour rather than a per-surface branch. A remote may not
+  // post openDiff at all (host-local in src/remote-policy.ts). And a host has
+  // nothing honest to post: the wire carries each edit's REPLACED REGION, so a
+  // twice-edited file has no before/after without a pre-turn baseline. The row
+  // reveals that file's own tool row, where the real diff already is.
+  describe("the row reveals the file's own diff, on every surface", () => {
+    function editTurn(remote: boolean) {
+      const h = bootWebview(remote ? { remote: true } : {});
+      dispatch(h.window, { type: "appPurpose", value: "coding" });
+      dispatch(h.window, { type: "agentStart" });
+      dispatch(h.window, editCall("r1", "src/a.ts"));
+      dispatch(h.window, editUpdate("r1", "src/a.ts", "x", "y"));
+      dispatch(h.window, { type: "agentEnd" });
+      return h;
+    }
+
+    for (const remote of [false, true]) {
+      it(`expands the tool row and posts nothing (${remote ? "remote" : "host"})`, () => {
+        const { window, doc, posted } = editTurn(remote);
+        const row = doc.querySelector(".turn-diff-file") as HTMLElement;
+        expect(row.tagName).toBe("BUTTON");
+        expect(row.title).toBe("Show the diff");
+
+        click(window, row);
+        expect(posted.filter((m: any) => m.type === "openDiff")).toHaveLength(0);
+        // revealToolDiff opens the row AND its group, so the diff is on screen.
+        const item = doc.querySelector(".tool-item, .tool-item-flat");
+        expect(item!.classList.contains("expanded")).toBe(true);
+      });
+    }
+  });
+
+  describe("the way out of the card, into the Changes view", () => {
+    function editedTurn(window: any) {
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, editCall("c1", "src/a.ts"));
+      dispatch(window, editUpdate("c1", "src/a.ts", "x", "y"));
+      dispatch(window, { type: "agentEnd" });
+    }
+
+    // A stand-in for the mounted file panel. The card capability-detects the
+    // two methods, so a fake carrying them is the whole contract.
+    function fakePanel(available: boolean) {
+      const calls: string[] = [];
+      return {
+        calls,
+        canShowChanges: () => available,
+        showChanges: () => {
+          calls.push("showChanges");
+          return available;
+        },
+      };
+    }
+
+    it("offers the link when a panel is mounted and has a repository to show", () => {
+      const { window, doc } = bootWebview();
+      const panel = fakePanel(true);
+      (window as any).__grokDeskFilePanel = panel;
+      editedTurn(window);
+
+      const link = doc.querySelector(".turn-diff-open-changes") as HTMLElement;
+      expect(link).not.toBeNull();
+      expect(link.textContent).toBe("Open Changes");
+      click(window as any, link);
+      expect(panel.calls).toEqual(["showChanges"]);
+    });
+
+    it("offers nothing when no panel is mounted", () => {
+      const { window, doc } = bootWebview();
+      editedTurn(window);
+      expect(doc.querySelector(".turn-diff-open-changes")).toBeNull();
+    });
+
+    // Knowledge work and a folder that is not a repository both land here, and
+    // both are ordinary. A link that opens an empty explanation is worse than
+    // no link, which is why the card ASKS rather than assuming.
+    it("offers nothing when the panel says it has no changes view to show", () => {
+      const { window, doc } = bootWebview();
+      (window as any).__grokDeskFilePanel = fakePanel(false);
+      editedTurn(window);
+      expect(doc.querySelector(".turn-diff-open-changes")).toBeNull();
+    });
+
+    // An older panel — one built before showChanges existed — is exactly the
+    // legacy host this project ships against, and it must degrade to silence
+    // rather than to a control that throws.
+    it("offers nothing to a panel too old to know the method", () => {
+      const { window, doc } = bootWebview();
+      (window as any).__grokDeskFilePanel = { openPath: () => {} };
+      editedTurn(window);
+      expect(doc.querySelector(".turn-diff-open-changes")).toBeNull();
+    });
+  });
+
+  describe("when the roll-up earns its space", () => {
+    const HIDDEN = "hide-turn-diff-summary";
+
+    function editedTurn(window: any) {
+      dispatch(window, { type: "agentStart" });
+      dispatch(window, editCall("g1", "src/a.ts"));
+      dispatch(window, editUpdate("g1", "src/a.ts", "x", "y"));
+      dispatch(window, { type: "agentEnd" });
+    }
+
+    it("stays hidden in knowledge work, which is the default before the host speaks", () => {
+      const { window, doc } = bootWebview();
+      expect(doc.body.classList.contains(HIDDEN)).toBe(true);
+      editedTurn(window);
+      // Built, so it is there to reveal — but not shown.
+      expect(doc.querySelector(".turn-diff-summary")).not.toBeNull();
+      expect(doc.body.classList.contains(HIDDEN)).toBe(true);
+    });
+
+    it("shows in coding work while tool details stay collapsed", () => {
+      const { window, doc } = bootWebview();
+      dispatch(window, { type: "appPurpose", value: "coding" });
+      editedTurn(window);
+      expect(doc.body.classList.contains(HIDDEN)).toBe(false);
+      expect(doc.querySelector(".turn-diff-summary")).not.toBeNull();
+    });
+
+    it("stays visible when Expand tool details opens every diff inline", () => {
+      const { window, doc } = bootWebview();
+      dispatch(window, { type: "appPurpose", value: "coding" });
+      editedTurn(window);
+      expect(doc.body.classList.contains(HIDDEN)).toBe(false);
+      dispatch(window, { type: "expandCommandOutputs", value: true });
+      expect(doc.body.classList.contains(HIDDEN)).toBe(false);
+      expect(doc.querySelector(".turn-diff-summary-header")?.getAttribute("aria-expanded")).toBe("false");
+      // Tool preferences never change the independent card default.
+      dispatch(window, { type: "expandCommandOutputs", value: false });
+      expect(doc.body.classList.contains(HIDDEN)).toBe(false);
+      expect(doc.querySelector(".turn-diff-summary")).not.toBeNull();
+    });
+
+    it("ignores the session's Expand/Collapse All latch", () => {
+      const { window, doc } = bootWebview();
+      dispatch(window, { type: "appPurpose", value: "coding" });
+      editedTurn(window);
+      dispatch(window, { type: "expandDiffCard", value: true });
+      dispatch(window, { type: "setAllToolDetails", open: true });
+      expect(doc.body.classList.contains(HIDDEN)).toBe(false);
+      dispatch(window, { type: "setAllToolDetails", open: false });
+      expect(doc.body.classList.contains(HIDDEN)).toBe(false);
+      expect(doc.querySelector(".turn-diff-summary-header")?.getAttribute("aria-expanded")).toBe("true");
+    });
+
+    it("goes back to hidden when the user switches to knowledge work", () => {
+      const { window, doc } = bootWebview();
+      dispatch(window, { type: "appPurpose", value: "coding" });
+      editedTurn(window);
+      expect(doc.body.classList.contains(HIDDEN)).toBe(false);
+      dispatch(window, { type: "appPurpose", value: "knowledge" });
+      expect(doc.body.classList.contains(HIDDEN)).toBe(true);
+    });
+  });
+});
+
+
+describe("independent diff-card expansion", () => {
+  function turn(h: ReturnType<typeof bootWebview>, id: string) {
+    dispatch(h.window, { type: "agentStart" });
+    dispatch(h.window, editCall(id, id + ".ts"));
+    dispatch(h.window, editUpdate(id, id + ".ts", "a", "b"));
+  }
+  function header(card: Element) { return card.querySelector(".turn-diff-summary-header") as HTMLButtonElement; }
+  function expectOpen(card: Element, open: boolean) {
+    expect(header(card).tagName).toBe("BUTTON");
+    expect(header(card).getAttribute("aria-expanded")).toBe(String(open));
+    expect((card.querySelector(".turn-diff-summary-list") as HTMLElement).hidden).toBe(!open);
+    const foot = card.querySelector(".turn-diff-summary-foot") as HTMLElement;
+    if (foot) expect(foot.hidden).toBe(!open);
+  }
+
+  it("starts header-only and preserves a manual toggle through live repaint and turn end", () => {
+    const h = bootWebview();
+    (h.window as any).__grokDeskFilePanel = { canShowChanges: () => true, showChanges: () => true };
+    dispatch(h.window, { type: "appPurpose", value: "coding" });
+    turn(h, "first");
+    const card = h.doc.querySelector(".turn-diff-summary")!;
+    expectOpen(card, false);
+    expect(card.querySelector(".turn-diff-summary-chevron")).toBeTruthy();
+    click(h.window, header(card));
+    expectOpen(card, true);
+    dispatch(h.window, editUpdate("first", "first.ts", "a", "b\nc"));
+    expectOpen(card, true);
+    dispatch(h.window, { type: "agentEnd" });
+    expectOpen(card, true);
+    turn(h, "second");
+    const second = h.doc.querySelectorAll(".turn-diff-summary")[1];
+    expectOpen(second, false);
+    click(h.window, header(second));
+    click(h.window, header(card));
+    expectOpen(card, false);
+    expectOpen(second, true);
+  });
+
+  it("live preference overrides every existing card and becomes the next turn's default", () => {
+    const h = bootWebview();
+    dispatch(h.window, { type: "appPurpose", value: "coding" });
+    turn(h, "one"); dispatch(h.window, { type: "agentEnd" });
+    turn(h, "two"); dispatch(h.window, { type: "agentEnd" });
+    dispatch(h.window, { type: "expandDiffCard", value: true });
+    for (const card of h.doc.querySelectorAll(".turn-diff-summary")) expectOpen(card, true);
+    turn(h, "three"); dispatch(h.window, { type: "agentEnd" });
+    for (const card of h.doc.querySelectorAll(".turn-diff-summary")) expectOpen(card, true);
+    dispatch(h.window, { type: "expandDiffCard", value: false });
+    for (const card of h.doc.querySelectorAll(".turn-diff-summary")) expectOpen(card, false);
+  });
+
+  it("reads the host default and falls back to collapsed when an old host omits it", () => {
+    const h = bootWebview();
+    dispatch(h.window, { type: "initialState", appPurpose: "coding", expandDiffCard: true });
+    turn(h, "host"); dispatch(h.window, { type: "agentEnd" });
+    expectOpen(h.doc.querySelector(".turn-diff-summary")!, true);
+    dispatch(h.window, { type: "initialState", appPurpose: "coding" });
+    expectOpen(h.doc.querySelector(".turn-diff-summary")!, false);
+    turn(h, "old");
+    for (const card of h.doc.querySelectorAll(".turn-diff-summary")) expectOpen(card, false);
+  });
+
+  it("starts from the remote's stored choice, ignoring the desk's initial state and live frames", () => {
+    const h = bootWebview({ remote: true, beforeScripts: (w) => w.localStorage.setItem("grok.remote.expandDiffCard", "true") });
+    dispatch(h.window, { type: "initialState", appPurpose: "coding", expandDiffCard: false });
+    turn(h, "remote");
+    expectOpen(h.doc.querySelector(".turn-diff-summary")!, true);
+    dispatch(h.window, { type: "expandDiffCard", value: false });
+    expectOpen(h.doc.querySelector(".turn-diff-summary")!, true);
+  });
+});

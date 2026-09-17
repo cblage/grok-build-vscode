@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bootWebview, dispatch, click } from "./webview-harness";
+import { openAppSettings, bootWebview, dispatch, click } from "./webview-harness";
 
 /**
  * Client-owned font scale: AFK Pilot (IS_REMOTE) and the desktop Electron
@@ -36,11 +36,7 @@ function openSettingsGeneral(window: any, doc: Document) {
     selectedCwd: "/work/alpha",
     activeCwd: "/work/alpha",
   } as never);
-  const rail = doc.getElementById("rail-gear-btn");
-  click(window, (rail || doc.getElementById("gear-btn"))!);
-  const entry = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
-    .find((el) => /(^|\s)Settings$/.test((el.textContent || "").replace(/\s+/g, " ").trim()));
-  if (entry) click(window, entry as HTMLElement);
+  openAppSettings(window, doc);
 }
 
 function fontSlider(doc: Document): HTMLInputElement | null {
@@ -211,6 +207,6 @@ describe("VS Code webview font scale (host-owned)", () => {
     const { window, doc } = bootWebview();
     click(window, doc.getElementById("gear-btn")!);
     expect(doc.querySelector("#gear-popover input[type=range]")).toBeNull();
-    expect(firstGearLabel(doc)).toMatch(/Model and Effort/);
+    expect(doc.querySelector(".model-effort-strip")).toBeTruthy();
   });
 });

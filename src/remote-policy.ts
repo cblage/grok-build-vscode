@@ -209,6 +209,9 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // as archive/pin: rearranges the remote's rail and touches nothing on disk
   // beyond that note.
   setRepoColor: "full",
+  // Same class again: the project's mark is a globalState note that rearranges
+  // the remote's own rail. Nothing here reaches the workspace.
+  setRepoIcon: "full",
   // Writes host state (globalState), same as the repo pin — classified with it
   // rather than as a view op, even though nothing is destroyed.
   toggleSessionPin: "full",
@@ -270,6 +273,14 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // (writeProjectFile) at the mutation tier below.
   listProjectDir: "view",
   readProjectFile: "view",
+  readProviderConfig: "view",
+  // The Changes view's two reads. Same fence as the browse above — the host
+  // resolves the root through resolveRemoteFileRoot, not from the message.
+  // Neither can mutate anything: gitStatus and gitFileDiff run git with
+  // GIT_OPTIONAL_LOCKS=0 and no write path at all.
+  gitStatus: "view",
+  gitFileDiff: "view",
+  turnFileDiff: "view",
   // input/turn control (propose+)
   send: "propose",
   newSession: "propose",
@@ -339,6 +350,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   workflowControl: "propose",
   // Donut popover re-fetch — read-only meter, no turn / no mutation.
   refreshContextDetails: "view",
+  refreshSubscriptionUsage: "view",
   pasteImage: "propose",
   // Host validates the extension/name/bytes before staging under globalStorage.
   uploadFile: "propose",
@@ -346,6 +358,26 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // read-only remote must not rewrite the desk tree. Existing files only
   // (create/delete/rename are deliberately out of scope).
   writeProjectFile: "propose",
+  // Same file-editing gate; the host selects one exact allowlisted file.
+  writeProviderConfig: "propose",
+  restartProviderSession: "propose",
+  // Commit / push / new branch / revert one file, from a phone.
+  //
+  // "full" rather than "propose", and the reason is that the neighbouring rows
+  // already settle it: a remote holds `send: "propose"` and
+  // `permissionAnswer: "full"`, so it can already ask the agent to run any git
+  // command and approve the tool call that does it — with the credentials
+  // already on that machine. A closed set of four operations, each re-planned
+  // from the host's own fresh snapshot, adds strictly LESS capability than the
+  // path that is already open. Refusing it here would remove nothing an
+  // attacker has and would take the feature away from the surface the product
+  // exists for.
+  //
+  // What DOES bound it lives in git-status.ts: four operations, no arbitrary
+  // argv, paths validated against a snapshot the host just computed, branch
+  // names through a validator, and no `git clean` / `reset --hard` / `push
+  // --force` in the set at all.
+  gitRun: "full",
   removeChip: "propose",
   toggleChip: "propose",
   // attaches a chip only after an exact host mention-catalog lookup plus
@@ -363,6 +395,10 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   retryProviderSession: "propose",
   // approvals + destructive + host-CLI mutations (full only)
   permissionAnswer: "full",
+  // Headless CLI updates: progress and results travel in providerState, so a
+  // phone can finish the action without a host modal or terminal.
+  updateCodex: "full",
+  updateClaude: "full",
   exitPlanAnswer: "full",
   // Provider accounts belong to the desk. A remote may observe providerState,
   // but it must never clear credentials or open a login terminal on the host.
@@ -416,6 +452,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   openUrl: "host-local",
   openText: "host-local",
   openDiff: "host-local",
+  turnFileOpenDiff: "host-local",
   exportExpr: "host-local",
   // Opens a native directory picker on the machine running the host. A remote
   // could neither see nor answer that dialog, so it would hang a phone on a
@@ -426,17 +463,18 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // the machine it is borrowing.
   removeProjectFolder: "host-local",
   openGlobalConfig: "host-local",
+  openProviderConfig: "host-local",
   openProjectConfig: "host-local",
   // Read-only inventory query through the live Grok ACP session. Same class as
-  // refreshContextDetails: no turn, no mutation, no desk-local picker. Connect
-  // and disconnect stay host-local. Mirroring the last fetch is not enough if
+  // refreshContextDetails: no turn, no mutation, no desk-local picker.
+  // Mirroring the last fetch is not enough if
   // the desk never opened Settings, so a remote may ask when it opens the page.
   listMcpServers: "view",
   // Reading the page is a view op. Everything that WRITES is "full": a routine
   // schedules unattended agent runs, which is the same class as the other host
   // state a remote may change (pins, archives), not turn control.
   //
-  // Unlike connectors, these are NOT host-local. A phone is exactly where
+  // A phone is exactly where
   // someone thinks "I should get a morning brief", and a remote can already
   // send arbitrary prompts — a routine adds persistence, not reach. Reach is
   // bounded separately, by `cwd` being checked against the authorized set at
@@ -446,12 +484,10 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   deleteRoutine: "full",
   setRoutinePaused: "full",
   runRoutineNow: "full",
-  // OAuth opens a browser on the desk and writes ~/.mcp-auth there. Key-auth
-  // pastes a secret into HostSecrets. A phone cannot complete either flow,
-  // must never set/read/clear a key, and must not change which tools every
-  // agent receives on the next session/new.
-  connectMcpConnector: "host-local",
-  disconnectMcpConnector: "host-local",
+  // Machine-wide configuration, like routines. Keys are write-only; remote
+  // OAuth is completed manually against the host's own callback listener.
+  connectMcpConnector: "full",
+  disconnectMcpConnector: "full",
   showLogs: "host-local",
   toggleDevTools: "host-local",
   openSettings: "host-local",
@@ -470,6 +506,8 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   setShowThinking: "host-local",
   setExpandCommandOutputs: "host-local",
   setSteerByDefault: "host-local",
+  setPromptNav: "host-local",
+  setExpandDiffCard: "host-local",
   setSoundNotifications: "host-local",
   setProcessingSound: "host-local",
   // Sandbox profiles are resolved from host/workspace files and changing one
@@ -483,6 +521,8 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // (like setAppPurpose), not a desk-only account or file action.
   setVoiceSendPhrase: "propose",
   setVoiceKeyterms: "propose",
+  setVoiceBackend: "propose",
+  configureOpenAiVoice: "host-local",
   // Remote surface is read-only for telemetry; the desk owns the switch.
   setTelemetryEnabled: "host-local",
   // Same class as the other General host prefs: the desk owns the switch,
@@ -498,6 +538,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // for a picture it already sent this tab, so it grants no reach the remote did
   // not already have. Path-based would be a different question entirely.
   requestImageFull: "propose",
+  requestImageOriginal: "propose",
   composerFocus: "host-local",
   // relay account actions (link/unlink/portal) manage THIS machine's device
   // token — only the local webview may drive them
@@ -531,6 +572,7 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   toggleRepoPin: false,
   setRepoArchived: false,
   setRepoColor: false,
+  setRepoIcon: false,
   toggleSessionPin: false,
   dismissWelcomeTip: false,
   welcomeTipShown: false,
@@ -545,6 +587,17 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   mentionQuery: true,
   listProjectDir: false,
   readProjectFile: false,
+  readProviderConfig: false,
+  writeProviderConfig: false,
+  restartProviderSession: true,
+  // The Changes view asks about the REPOSITORY, not the conversation. A tab
+  // whose session mapping went away can still legitimately show what changed
+  // on disk, and refusing here would blank the view for the exact person who
+  // came back to check on it.
+  gitStatus: false,
+  gitFileDiff: false,
+  turnFileDiff: false,
+  gitRun: false,
   send: true,
   newSession: false,
   cancel: true,
@@ -569,6 +622,7 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   uiConfirmAnswer: true,
   workflowControl: true,
   refreshContextDetails: true,
+  refreshSubscriptionUsage: true,
   pasteImage: true,
   uploadFile: true,
   writeProjectFile: false,
@@ -588,6 +642,8 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   cancelDeviceLogin: false,
   submitDeviceLoginCode: false,
   updateGrok: false,
+  updateCodex: false,
+  updateClaude: false,
   checkGrokUpdate: false,
   pickModel: true,
   openFile: false,
@@ -595,10 +651,12 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   openUrl: false,
   openText: false,
   openDiff: false,
+  turnFileOpenDiff: false,
   exportExpr: false,
   addProjectFolder: false,
   removeProjectFolder: false,
   openGlobalConfig: false,
+  openProviderConfig: false,
   openProjectConfig: false,
   listMcpServers: false,
   listRoutines: false,
@@ -630,6 +688,8 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   setShowThinking: false,
   setExpandCommandOutputs: false,
   setSteerByDefault: false,
+  setPromptNav: false,
+  setExpandDiffCard: false,
   setSoundNotifications: false,
   setProcessingSound: false,
   // Host-local (see REMOTE_MSG_TIER above) — never reaches this check from a
@@ -639,11 +699,14 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   setSummarizeRepliesAloud: false,
   setVoiceSendPhrase: false,
   setVoiceKeyterms: false,
+  setVoiceBackend: false,
+  configureOpenAiVoice: false,
   setTelemetryEnabled: false,
   setThumbsFeedback: false,
   setAppPurpose: false,
   summarizeSpeech: true,
   requestImageFull: true,
+  requestImageOriginal: true,
   composerFocus: false,
   remoteSignIn: false,
   remoteSignOut: false,
@@ -724,6 +787,7 @@ export function allowRemoteRepoTarget(msg: WebviewMsg, isKnownCwd: (cwd: string)
     case "toggleRepoPin":
     case "setRepoArchived":
     case "setRepoColor":
+    case "setRepoIcon":
     case "clearAllSessions":
     case "listRepoSessions":
     // File browse names a cwd. Without this case the default branch returns
@@ -734,6 +798,14 @@ export function allowRemoteRepoTarget(msg: WebviewMsg, isKnownCwd: (cwd: string)
     // Write names a cwd too. Without this case the default branch returns true
     // and a remote could claim an arbitrary path — same trap as list/read.
     case "writeProjectFile":
+    // The Changes view names a cwd on all three. Without these cases the
+    // default branch returns TRUE and a remote could claim an arbitrary path —
+    // the same trap the browse rows above exist for, and the one that matters
+    // most here because gitRun writes.
+    case "gitStatus":
+    case "gitFileDiff":
+    case "turnFileDiff":
+    case "gitRun":
       return isKnownCwd(msg.cwd);
     case "resumeSession":
     // Same shape as resume: the cwd is optional (the host falls back to its own
@@ -831,16 +903,7 @@ export function repoScopeFor(
  */
 export const DESK_ONLY_CAPABILITIES = [
   "servesMediaRanges",
-  // Hiding a project is desk-only, and 4.1.2 briefly made it a cloud
-  // capability before an independent review showed what that costs: on a
-  // cloud machine Add project is Create and Clone only — importing an
-  // existing folder needs the native picker, which no remote has — and
-  // Create refuses a destination that already exists. So Hide there was
-  // one-way, from the only surface that person has, under a confirmation
-  // that promised Add project would bring it back. Withholding the
-  // capability is what stops the control being drawn at all; reversible
-  // put-away belongs to the archive model, which is a feature and not an
-  // override (see the backlog entry).
+  // Closing folders stays at the desk; archive is available on every surface.
   "removeProjectFolder",
   "showInFolder",
   "previewInApp",
@@ -867,6 +930,14 @@ export type OutboundDisposition =
   | "host-local";
 
 export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> = {
+  // The RELAY's page shell sends this to its own webview; it never travels the
+  // other way. A desk host has no socket to lose and so has nothing to report,
+  // and mirroring one out would be a machine that never went away announcing
+  // that it came back — which the browser would answer by re-reading every
+  // view on screen, for nothing.
+  hostReachable: "host-local",
+  // Same shell, same reason: a desk host has no socket and no link to report.
+  hostLink: "host-local",
   media: "media",
   voiceState: "mirror",
   voiceConfigured: "mirror",
@@ -877,10 +948,12 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   initialState: "mirror",
   providerState: "mirror",
   // Page fields only (`projectMcpServerForRemote`). Launch recipes stay on
-  // the desk. Same machine-global observation as mcpConnectors; remotes may
-  // look, they cannot Connect/Disconnect (inbound host-local above).
+  // the desk. Same machine-global observation as mcpConnectors.
   mcpServers: "allowlist",
   mcpConnectors: "mirror",
+  // Consent belongs to the workspace: broadcast and replay it on initial state
+  // so the same user's reloaded tab can complete the current id + attemptId.
+  mcpConnectorAuthorization: "mirror",
   // Mirrored, but the project-auth pass above trims both cwd-bearing lists
   // first, so a tab sees only routines and projects it may already reach.
   routines: "mirror",
@@ -932,6 +1005,13 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   projectDirListing: "mirror",
   projectFileContent: "mirror",
   projectFileWriteResult: "mirror",
+  providerConfigContent: "mirror",
+  providerConfigWriteResult: "mirror",
+  gitStatusResult: "mirror",
+  gitFileDiffResult: "mirror",
+  turnFileDiffResult: "mirror",
+  turnDiffBaseline: "mirror",
+  gitRunResult: "mirror",
   userMessage: "mirror",
   agentStart: "mirror",
   thoughtChunk: "mirror",
@@ -946,6 +1026,8 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   permissionRequest: "mirror",
   permissionOptions: "mirror",
   permissionResolved: "mirror",
+  questionResolved: "mirror",
+  subscriptionUsage: "mirror",
   exitPlanRequest: "mirror",
   planResolved: "mirror",
   questionRequest: "mirror",
@@ -972,6 +1054,11 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   commandOutput: "mirror",
   expandCommandOutputs: "mirror",
   steerByDefault: "mirror",
+  // Not mirrored: a remote holds its OWN Previous-prompt preference in its
+  // own storage, so the desk's value would silently overwrite the phone's.
+  promptNav: "host-local",
+  // The phone owns its diff-card default too; never overwrite it from desk.
+  expandDiffCard: "host-local",
   soundNotifications: "mirror",
   processingSound: "host-local",
   readRepliesAloud: "host-local",
@@ -981,6 +1068,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   // Like speechSummary: sidebar targets it at the requesting tab only, so one
   // phone's enlarged picture never lands in another tab's overlay.
   imageFull: "mirror",
+  imageOriginal: "mirror",
   moveComposerCaret: "host-local",
   remoteStatus: "host-local",
   setAllToolDetails: "mirror",
@@ -991,6 +1079,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   restoreComposer: "mirror",
   truncateMessages: "mirror",
   uiConfirmRequest: "mirror",
+  uiConfirmResolved: "mirror",
   sessions: "mirror",
   repoSessions: "mirror",
   pinnedSessions: "mirror",
@@ -1031,6 +1120,11 @@ export type OutboundProjectAuth =
 
 export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth> = {
   // Device-global / host chrome — not project data.
+  // `hostReachable` and `hostLink` name no project and carry no project data
+  // at all; both are suppressed outbound anyway, and this says so a second
+  // time on purpose, because these two tables are read independently.
+  hostReachable: "none",
+  hostLink: "none",
   moveViewHint: "none",
   welcomeTips: "none",
   projectSetup: "none",
@@ -1049,10 +1143,13 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   providerState: "none",
   mcpServers: "none",
   mcpConnectors: "none",
+  mcpConnectorAuthorization: "none",
   routines: "entries",
   codexInstallProgress: "none",
   expandCommandOutputs: "none",
   steerByDefault: "none",
+  promptNav: "none",
+  expandDiffCard: "none",
   soundNotifications: "none",
   processingSound: "none",
   readRepliesAloud: "none",
@@ -1108,6 +1205,14 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   projectDirListing: "message-cwd",
   projectFileContent: "message-cwd",
   projectFileWriteResult: "message-cwd",
+  // Machine config, sent only to the requester; no repository scope to widen.
+  providerConfigContent: "none",
+  providerConfigWriteResult: "none",
+  gitStatusResult: "message-cwd",
+  gitFileDiffResult: "message-cwd",
+  turnFileDiffResult: "message-cwd",
+  turnDiffBaseline: "scope",
+  gitRunResult: "message-cwd",
   userMessage: "scope",
   agentStart: "scope",
   thoughtChunk: "scope",
@@ -1115,6 +1220,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   userMessageChunk: "scope",
   media: "scope",
   imageFull: "scope",
+  imageOriginal: "scope",
   speechSummary: "scope",
   historyReplay: "scope",
   historyBatch: "scope",
@@ -1125,6 +1231,8 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   permissionRequest: "scope",
   permissionOptions: "scope",
   permissionResolved: "scope",
+  questionResolved: "scope",
+  subscriptionUsage: "scope",
   exitPlanRequest: "scope",
   planResolved: "scope",
   questionRequest: "scope",
@@ -1149,6 +1257,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   restoreComposer: "scope",
   truncateMessages: "scope",
   uiConfirmRequest: "scope",
+  uiConfirmResolved: "scope",
   queuedSends: "scope",
   submitQueuedSend: "scope",
   steerUnavailable: "scope",
@@ -1269,7 +1378,11 @@ export function mayDeliverRemoteHostMsg(
       if (
         msg.type === "projectDirListing" ||
         msg.type === "projectFileContent" ||
-        msg.type === "projectFileWriteResult"
+        msg.type === "projectFileWriteResult" ||
+        msg.type === "gitStatusResult" ||
+        msg.type === "gitFileDiffResult" ||
+        msg.type === "turnFileDiffResult" ||
+        msg.type === "gitRunResult"
       ) {
         return cwdIsAuthorized(msg.cwd, authorizedCwds, sameCwd);
       }
@@ -1483,22 +1596,7 @@ export function transformHostMsgForRemote(msg: HostMsg, deps: MediaInlineDeps): 
   }
 }
 
-/**
- * Trim a `routines` frame to what one connection may reach.
- *
- * Both lists carry cwds and both must be filtered, but for different reasons.
- * The ROWS are the routines themselves. The PROJECTS are the form's picker, and
- * the desk deliberately offers archived projects there — archiving hides a
- * project from the rail, and a routine is not the rail. Remotes are the other
- * way round: `remoteAuthorizedCwds` excludes archived projects on purpose, so
- * archiving revokes remote access to them.
- *
- * Those two correct rules compose into a bug if the frame is merely CHECKED:
- * one archived project anywhere makes `mayDeliverRemoteHostMsg` refuse the
- * whole page, and a phone then sees nothing at all — including routines in
- * projects it may perfectly well reach. Filtering first is what keeps the
- * authorization check a backstop rather than an outage.
- */
+/** Omit absent projects and redact retained runs from removed projects. */
 export function routinesMessageForRemote(
   msg: Extract<HostMsg, { type: "routines" }>,
   authorizedCwds: readonly string[],
@@ -1538,10 +1636,9 @@ export function repoSessionsMessageForRemote(
  *
  * A routine's project can be edited, so its retained runs can name a DIFFERENT
  * project from the one it points at now — and that older project may since have
- * been archived, which is how a remote loses access to it. Filtering the
- * routine's current cwd is then not enough: the entry passes under its new
- * project while a retained run still carries the old path, its session id, and
- * a `detail` string that may quote either.
+ * been removed. Filtering the routine's current cwd is then not enough: the
+ * entry passes under its new project while a retained run still carries the old
+ * path, its session id, and a `detail` string that may quote either.
  *
  * Redacted rather than dropped, because the run DID happen and the health count
  * beside it is computed host-side from the full list. Removing the row would

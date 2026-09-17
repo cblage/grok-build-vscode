@@ -126,6 +126,7 @@ export const DESKTOP_THEME_CSS = `
   --vscode-button-hoverBackground: #1177bb;
   --vscode-button-secondaryBackground: #3a3d41;
   --vscode-button-secondaryForeground: #e6e6e6;
+  --vscode-button-secondaryHoverBackground: #45494e;
   --vscode-input-background: #313131;
   --vscode-input-foreground: #e6e6e6;
   --vscode-input-border: #3c3c3c;
@@ -146,6 +147,10 @@ export const DESKTOP_THEME_CSS = `
   --vscode-charts-blue: #3794ff;
   --vscode-charts-yellow: #d7ba7d;
   --vscode-charts-red: #f48771;
+  --e1: #4ec9b0;
+  --e2: #3794ff;
+  --e3: #a978f5;
+  --e4: #f48771;
   --vscode-scrollbarSlider-background: rgba(121,121,121,0.4);
   --vscode-scrollbarSlider-hoverBackground: rgba(100,100,100,0.7);
   --vscode-scrollbarSlider-activeBackground: rgba(191,191,191,0.5);
@@ -182,6 +187,7 @@ export const DESKTOP_THEME_CSS = `
   --vscode-button-hoverBackground: #0258a8;
   --vscode-button-secondaryBackground: #e5e5e5;
   --vscode-button-secondaryForeground: #3b3b3b;
+  --vscode-button-secondaryHoverBackground: #cccccc;
   --vscode-input-background: #ffffff;
   --vscode-input-foreground: #3b3b3b;
   --vscode-input-border: #cecece;
@@ -200,6 +206,10 @@ export const DESKTOP_THEME_CSS = `
   --vscode-charts-blue: #1a85ff;
   --vscode-charts-yellow: #bf8803;
   --vscode-charts-red: #cd3131;
+  --e1: #1a8f7d;
+  --e2: #1a85ff;
+  --e3: #8250df;
+  --e4: #cd3131;
   --vscode-scrollbarSlider-background: rgba(100,100,100,0.35);
   --vscode-scrollbarSlider-hoverBackground: rgba(100,100,100,0.55);
   --vscode-scrollbarSlider-activeBackground: rgba(0,0,0,0.6);

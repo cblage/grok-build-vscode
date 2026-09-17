@@ -16,13 +16,15 @@ const startControl = {
   loadFailuresRemaining: 0,
   loadFailWith: "Internal error",
   exitDuringNewSessionRemaining: 0,
+  efforts: [] as Array<string | undefined>,
 };
 
 vi.mock("../src/acp", async (importOriginal) => {
   const { EventEmitter } = await import("node:events");
   const actual = await importOriginal<typeof import("../src/acp")>();
   class FakeAcpClient extends EventEmitter {
-    provider = "grok" as const;
+    setHumanWaitActive = vi.fn();
+    provider: "grok" | "codex" | "claude";
     usesClientPlanGate = false;
     sessionId: string | undefined;
     availableModels: { modelId: string; name: string }[] = [];
@@ -30,8 +32,10 @@ vi.mock("../src/acp", async (importOriginal) => {
     fsRead?: unknown;
     fsWrite?: unknown;
     terminal?: unknown;
-    constructor(_opts: { log: (msg: string) => void }) {
+    constructor(opts: { log: (msg: string) => void; effort?: string; backend?: { provider: "grok" | "codex" | "claude" } }) {
       super();
+      this.provider = opts.backend?.provider ?? "grok";
+      startControl.efforts.push(opts.effort);
     }
     async start(): Promise<void> {
       startControl.starts += 1;
@@ -66,6 +70,7 @@ vi.mock("../src/acp", async (importOriginal) => {
       startControl.disposes += 1;
     }
     async setMode(): Promise<void> {}
+    supportsInterject(): boolean { return this.provider === "grok"; }
     isCredentialError(): boolean {
       return /auth|unauthor|401|api[_\s-]?key|credential|sign.?in/i.test(startControl.failWith);
     }
@@ -77,6 +82,7 @@ import { GrokSidebar } from "../src/sidebar";
 
 function makeSidebar(cwd: string): any {
   const sidebar = Object.create(GrokSidebar.prototype) as any;
+  sidebar.pendingTurnDiffCaptures = new WeakSet();
   const memento: Record<string, unknown> = {};
   sidebar.providerConnectionState = { grok: true, codex: false };
   sidebar.providerConnections = vi.fn(() => sidebar.providerConnectionState);
@@ -183,6 +189,90 @@ function onboardings(sidebar: any): HostMsg[] {
 }
 
 describe("startSession bounded spawn retry", () => {
+  it.each(["completed", "failed"])("the live tool update handler closes a question on %s", async (status) => {
+    const sidebar = makeSidebar("/repo");
+    const session = sidebar.focused;
+    const client = await sidebar.startSession(undefined, session);
+    session.turnToken = {};
+    client.emit("questionRequest", { id: 0, toolCallId: "call-colour", questions: [{ question: "Which colour?" }] });
+    expect(session.pendingQuestions.get(0)).toBe("call-colour");
+    expect(session.status).toBe("needs-you");
+    client.emit("toolCallUpdate", { toolCallId: "call-colour", status });
+    expect(session.pendingQuestions.size).toBe(0);
+    expect(client.setHumanWaitActive).toHaveBeenLastCalledWith(false);
+    expect(session.status).toBe("working");
+    expect(sidebar.posted.filter((m: HostMsg) => m.type === "questionResolved"))
+      .toEqual([{ type: "questionResolved", requestId: 0, outcome: "closed" }]);
+    session.turnToken = undefined;
+  });
+
+  it("ignores a replaced client's terminal update even when tool and request ids are reused", async () => {
+    const sidebar = makeSidebar("/repo");
+    const session = sidebar.focused;
+    const first = await sidebar.startSession(undefined, session);
+    first.emit("questionRequest", { id: 0, toolCallId: "reused", questions: [] });
+    const replacement = await sidebar.startSession(undefined, session);
+    replacement.emit("questionRequest", { id: 0, toolCallId: "reused", questions: [] });
+    sidebar.posted.length = 0;
+    first.emit("toolCallUpdate", { toolCallId: "reused", status: "completed" });
+    expect(session.pendingQuestions.get(0)).toBe("reused");
+    expect(sidebar.posted).toEqual([]);
+    replacement.emit("toolCallUpdate", { toolCallId: "reused", status: "completed" });
+    expect(session.pendingQuestions.size).toBe(0);
+    expect(sidebar.posted).toContainEqual({ type: "questionResolved", requestId: 0, outcome: "closed" });
+  });
+
+  it("tracks arriving human requests and closes them and confirmations before replacing the client", async () => {
+    const sidebar = makeSidebar("/repo");
+    const session = sidebar.focused;
+    const first = await sidebar.startSession(undefined, session);
+    session.planModeAvailable = true;
+    vi.spyOn(sidebar, "createPlanReviewSnapshot").mockResolvedValue({ path: "/plan", name: "Plan" });
+    first.emit("questionRequest", { id: "question", questions: [{ question: "Q?" }] });
+    expect(first.setHumanWaitActive).toHaveBeenLastCalledWith(true);
+    first.emit("permissionRequest", {
+      id: "permission", toolCall: { title: "Read?", kind: "read" },
+      options: [{ optionId: "yes", kind: "allow_once", name: "Allow" }],
+    });
+    first.emit("exitPlanRequest", { id: "plan", plan: "Plan" });
+    await vi.waitFor(() => expect(session.pendingExitPlans.size).toBe(1));
+    expect(session.pendingPermissions.size).toBe(1);
+    const confirm = sidebar.confirmInChat(session, { title: "Revert?", confirmLabel: "Rewind" });
+    const replacement = await sidebar.startSession(undefined, session);
+    await expect(confirm).resolves.toBe(false);
+    expect(replacement).not.toBe(first);
+    expect(first.setHumanWaitActive).toHaveBeenLastCalledWith(false);
+    expect(replacement.setHumanWaitActive).toHaveBeenLastCalledWith(false);
+    expect(session.pendingQuestions.size + session.pendingPermissions.size + session.pendingExitPlans.size).toBe(0);
+    expect(sidebar.posted).toContainEqual({ type: "questionResolved", requestId: "question", outcome: "closed" });
+    expect(sidebar.posted.some((m: HostMsg) => m.type === "uiConfirmResolved")).toBe(true);
+  });
+
+  it.each([
+    ["grok", undefined, "high"],
+    ["claude", "low", "low"],
+    ["codex", "medium", "medium"],
+    ["claude", undefined, undefined],
+    ["codex", undefined, undefined],
+  ] as const)("starts %s with its own remembered effort (%s)", async (provider, remembered, expected) => {
+    const sidebar = makeSidebar(process.cwd());
+    sidebar.focused.provider = provider;
+    sidebar.connectedProviders = () => [provider];
+    sidebar.usableProviders = () => [provider];
+    sidebar.createProviderBackend = () => ({ provider });
+    await sidebar.state.update("grok.defaultEffortByProvider", { [provider]: remembered });
+    sidebar.host.getConfiguration.mockReturnValue({
+      get: (key: string, fallback: unknown) => key === "defaultEffort" ? "high" : fallback,
+    });
+    startControl.efforts = [];
+    await sidebar.startSession(undefined, sidebar.focused);
+    expect(sidebar.focused.provider).toBe(provider);
+    expect(startControl.efforts).toEqual([expected]);
+    expect(sidebar.posted.find((message: HostMsg) => message.type === "initialized")).toMatchObject({
+      info: { provider, steeringSupported: provider === "grok" },
+    });
+  });
+
   beforeEach(() => {
     startControl.failuresRemaining = 0;
     startControl.failWith = "Internal error";
@@ -195,6 +285,15 @@ describe("startSession bounded spawn retry", () => {
     startControl.failWith = "Internal error";
     startControl.starts = 0;
     startControl.disposes = 0;
+  });
+
+  it.each([undefined, "saved-session"])("a new/load start (%s) clears grants even when reusing a Session object", async (resumeId) => {
+    const sidebar = makeSidebar("/repo");
+    const session = sidebar.focused;
+    session.allowedCommandPrograms.add("npm");
+    const client = await sidebar.startSession(resumeId, session);
+    expect(client).toBeDefined();
+    expect(session.allowedCommandPrograms.size).toBe(0);
   });
 
   it("retries two transient spawn failures then comes up with no error", async () => {
@@ -316,6 +415,54 @@ describe("startSession bounded spawn retry", () => {
     expect(sidebar.rememberProjectProvider).toHaveBeenCalled();
     expect(client).toBeUndefined();
     expect(startControl.starts).toBe(0);
+  });
+
+  it.each([false, true])("drops Codex startup events without transcript side effects (child: %s)", async (child) => {
+    const sidebar = makeSidebar("/repo");
+    const session = sidebar.focused as Session;
+    session.provider = "codex";
+    sidebar.providerConnectionState = { grok: false, codex: true };
+    sidebar.connectedProviders = vi.fn(() => ["codex"]);
+    const client = await sidebar.startSession(undefined, session);
+    expect(client).toBeDefined();
+    expect(startErrors(sidebar)).toEqual([]);
+    session.replaying = true;
+    session.inUserMessage = true;
+    const countBefore = session.historyEventCount;
+    const bufferBefore = [...session.buffer];
+    const postedBefore = [...sidebar.posted];
+    sidebar.host.appendLine.mockClear();
+    const compactSignal = vi.spyOn(sidebar, "noteAdapterCompactSignal");
+    const send = (event: "toolCall" | "toolCallUpdate", call: unknown) => {
+      if (child) client.emit("childStream", { childSessionId: "child-1", route: { event, payload: call } });
+      else client.emit(event, call);
+    };
+    send("toolCall", {
+      toolCallId: "startup-1", title: "mcp__canva__startup", status: "in_progress",
+      rawInput: { command: "connect canva" },
+    });
+    expect(sidebar.host.appendLine).not.toHaveBeenCalled();
+    const forwarded = "[codex-acp forwarded startup error] MCP server `canva` startup was cancelled.";
+    send("toolCallUpdate", {
+      toolCallId: "startup-1", status: "failed",
+      rawOutput: forwarded,
+      content: [{ type: "content", content: { type: "text", text: forwarded } }],
+    });
+    expect(sidebar.host.appendLine).toHaveBeenCalledTimes(1);
+    expect(sidebar.host.appendLine).toHaveBeenCalledWith(`[mcp] canva startup failed: ${forwarded}`);
+    expect(session.historyEventCount).toBe(countBefore);
+    expect(session.inUserMessage).toBe(true);
+    expect(session.buffer).toEqual(bufferBefore);
+    expect(sidebar.posted).toEqual(postedBefore);
+    expect(compactSignal).not.toHaveBeenCalled();
+
+    send("toolCall", {
+      toolCallId: "real-1", title: "mcp__canva__list_designs", status: "in_progress", rawInput: {},
+    });
+    expect(session.historyEventCount).toBe(countBefore + (child ? 0 : 1));
+    expect(sidebar.posted.at(-1)).toMatchObject({
+      type: child ? "childStream" : "toolCall", call: { toolCallId: "real-1" },
+    });
   });
 
   it("emits onboarding on the first credential failure and does not retry", async () => {

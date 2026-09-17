@@ -2,7 +2,7 @@
 
 This is the current-state contract for Grok Build Desktop updates. Phase 1
 (notice-only) shipped first. Phase 2 adds a real `electron-updater` download
-on macOS and Windows under the same rail affordance. Rules from phase 1 carry
+on macOS, Windows and Linux under the same rail affordance. Rules from phase 1 carry
 unless a later section overrides them.
 
 The feed is **not** GitHub Releases. A vsix-only tag becomes GitHub's
@@ -19,7 +19,7 @@ The check lists GitHub Releases (`DESKTOP_RELEASES_API_URL`) and
 `noticeIfUpdateAvailable` picks the newest non-draft release that carries a
 desktop installer (`isDesktopInstallerAsset`: anchored
 `-mac-arm64.dmg` / `-mac-x64.dmg` / `-mac-arm64.zip` / `-mac-x64.zip` /
-`-win-x64.exe`; `.blockmap` and `.vsix` do not count). Pre-releases count.
+`-win-x64.exe` / `-linux-x86_64.AppImage`; `.blockmap` and `.vsix` do not count). Pre-releases count.
 The running version is compared with `isNewerVersion` (numeric semver, not
 string order).
 
@@ -34,7 +34,7 @@ document reload. VS Code never sends the frame.
 
 ## Phase 2 — in-app download
 
-Packaged Windows and macOS builds download in the background through
+Packaged Windows, macOS and Linux builds download in the background through
 `electron-updater` and install on quit or when the user clicks the same
 rail button, now labelled **Restart to update**.
 
@@ -46,17 +46,30 @@ Do **not** use the GitHub provider. Point `electron-updater` at:
 |---|---|---|
 | Windows (`win32`) | `https://afkpilot.com/update/win/` | `https://afkpilot.com/update/win/latest.yml` |
 | macOS (`darwin`) | `https://afkpilot.com/update/mac/` | `https://afkpilot.com/update/mac/latest-mac.yml` |
+| Linux (`linux`) | `https://afkpilot.com/update/linux/` | `https://afkpilot.com/update/linux/latest-linux.yml` |
 
 Those paths are `desktopUpdateFeedBase` / `desktopUpdateFeedConfig` in
-`src/desktop/app-update.ts`. Linux has no feed; the client stays on the
-phase-1 notice.
+`src/desktop/app-update.ts`.
+
+**Linux shares the cloud host's artifact, and that is safe without a check.**
+One AppImage is attached per release; cloud machines extract it and exec
+`squashfs-root`, desks run the file. `AppImageUpdater.isUpdaterActive()`
+returns false when `process.env.APPIMAGE` is unset, which is exactly the
+extracted case — so a cloud machine's `checkForUpdates()` resolves null with a
+log line, emits no error and posts no notice, and cannot self-update out from
+under the relay's `refresh-sprite-hosts.mjs`. Only a desk run reaches the feed.
+
+Before the Linux channel existed the client fell back to the phase-1 notice,
+which fired anyway — `pickLatestDesktopRelease` matches the mac and Windows
+assets on the same release — and sent people to a download page that did not
+recognise their OS. That is what this channel replaced.
 
 `allowPrerelease` is irrelevant: the relay chooses which release's yml to
 serve. The client does not filter channels.
 
 ### Relay contract
 
-The relay (separate repo) must serve the two GETs above as
+The relay (separate repo) must serve the three GETs above as
 `application/x-yaml` (or `text/yaml` / `text/plain`). Each response is the
 `electron-builder` `latest.yml` / `latest-mac.yml` of the **newest GitHub
 Release that has desktop installer assets**, rewritten as follows.
@@ -87,7 +100,10 @@ Windows `latest.yml` must list the NSIS installer
 (`Grok-Build-Desktop-<version>-win-x64.exe`). macOS `latest-mac.yml` must
 list **both** zip archives (`…-mac-arm64.zip` and `…-mac-x64.zip`).
 Squirrel.Mac updates from the zip, not the dmg. A yml that only has one
-arch is a failed build, not a feed the relay should publish.
+arch is a failed build, not a feed the relay should publish. Linux
+`latest-linux.yml` must list `Grok-Build-Desktop-<version>-linux-x86_64.AppImage`
+— note `x86_64`, not the `x64` every other target uses. An AppImage embeds its
+own block map, so there is no sibling `.blockmap` to require or exclude.
 
 A vsix-only release is not a desktop latest. Keep serving the previous
 installer-bearing yml until a new desktop build is attached.
@@ -123,7 +139,8 @@ release account are the trust boundary for what gets installed on quit.
 `electron-builder.yml` has a generic `publish` block **only so the yml
 files are generated**. Every `dist*` script still passes `--publish never`.
 GitHub upload stays in `.github/workflows/desktop-release.yml`, which
-attaches `dist-desktop/latest.yml` and `dist-desktop/latest-mac.yml`
+attaches `dist-desktop/latest.yml`, `dist-desktop/latest-mac.yml` and
+`dist-desktop/latest-linux.yml`
 alongside the installers.
 
 macOS builds both arches in **one** `electron-builder --mac` invocation
@@ -133,7 +150,7 @@ drop the first arch (electron-builder issue #5592).
 
 ### Client behaviour
 
-1. Packaged win32/darwin: configure the generic feed, `autoDownload = true`,
+1. Packaged win32/darwin/linux: configure the generic feed, `autoDownload = true`,
    `autoInstallOnAppQuit = true`. Check after first paint and every 12 h.
 2. Update found: download in the background. **No dialog. No button yet.**
    The agent may be mid-turn.
@@ -144,8 +161,16 @@ drop the first arch (electron-builder issue #5592).
 4. Check or download fails (offline, 404, malformed yml, hash mismatch,
    network drop): log only, then run the phase-1 GitHub notice. The rail
    shows **Update available** and opens the download page.
-5. Unpackaged `npm run desktop`, Linux, or a missing feed: phase-1 notice
-   only.
+5. Unpackaged `npm run desktop`, a missing feed, or an updater that declines
+   to act: phase-1 notice only. The third case is Linux-specific and is NOT an
+   error — `checkForUpdates()` resolves null without throwing when
+   `process.env.APPIMAGE` is unset, so the check path treats a null result the
+   same as a thrown one. That covers a desk user who ran
+   `--appimage-extract` instead of the file (the usual workaround where
+   `libfuse2` is missing), who would otherwise be told nothing at all, having
+   been told before the Linux channel existed. It also covers a cloud machine,
+   harmlessly: `updateAvailable` is host-local outbound and every client there
+   is a remote, so the notice reaches nobody.
 6. No new persistent state beyond what electron-updater writes itself
    (its cache under userData).
 

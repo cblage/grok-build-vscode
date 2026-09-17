@@ -53,7 +53,9 @@ describe("native plan verdict orchestration", () => {
     expect(consume).toBeGreaterThan(respond);
     expect(persist).toBeGreaterThan(consume);
     expect(postExitPlanRequest).toContain("session.pendingExitPlans.set(req.id, { planText: plan })");
-    expect(startSessionSetup).toContain("session.pendingExitPlans.clear()");
+    expect(startSessionSetup).toContain("this.clearPendingHumanRequests(session)");
+    expect(sidebar.slice(sidebar.indexOf("  private clearPendingHumanRequests"), sidebar.indexOf("  noteAnswered")))
+      .toContain("session.pendingExitPlans.clear()");
   });
 
   it("settles approval state and interjects feedback before releasing native exit_plan_mode outcomes", () => {

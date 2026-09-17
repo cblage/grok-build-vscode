@@ -1,7 +1,7 @@
-import { existsSync, statSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
+import { findCliOnPath, isCliFile } from "./cli-path";
 
 const IS_WIN = process.platform === "win32";
 
@@ -9,30 +9,31 @@ function candidateNames(): string[] {
   return IS_WIN ? ["grok.cmd", "grok.exe", "grok.bat", "grok"] : ["grok"];
 }
 
-function effectiveHome(): string {
+function effectiveHome(env: NodeJS.ProcessEnv): string {
   // Respect env overrides first so tests + users can redirect the home lookup.
-  const fromEnv = IS_WIN ? process.env.USERPROFILE : process.env.HOME;
+  const fromEnv = IS_WIN ? env.USERPROFILE : env.HOME;
   return fromEnv || homedir();
 }
 
-export function locateGrokCli(configuredPath: string): string | undefined {
+/** `env` is injectable for the same reason locateCodexCli and locateClaudeCli
+ *  take one. A test that redirects the home or PATH lookup by assigning
+ *  `process.env` is mutating state shared with every other test FILE in the
+ *  process, because vitest runs those as threads - and the shell fallback below
+ *  then runs a real `where grok`, which on any machine with the CLI installed
+ *  returns the very binary the test asserts is absent. */
+export function locateGrokCli(
+  configuredPath: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
   if (configuredPath) {
-    return existsSync(configuredPath) ? configuredPath : undefined;
+    return isCliFile(configuredPath) ? configuredPath : undefined;
   }
-  const homeBin = path.join(effectiveHome(), ".grok", "bin");
+  const homeBin = path.join(effectiveHome(env), ".grok", "bin");
   for (const name of candidateNames()) {
     const candidate = path.join(homeBin, name);
-    if (existsSync(candidate)) return candidate;
+    if (isCliFile(candidate)) return candidate;
   }
-  try {
-    const cmd = IS_WIN ? "where grok" : "command -v grok";
-    const out = execSync(cmd, { encoding: "utf8" }).trim();
-    const first = out.split(/\r?\n/)[0]?.trim();
-    if (first && existsSync(first)) return first;
-  } catch {
-    // ignore — not on PATH
-  }
-  return undefined;
+  return findCliOnPath("grok", env, process.platform);
 }
 
 /** Whether this activation follows a previously-recorded extension version. */

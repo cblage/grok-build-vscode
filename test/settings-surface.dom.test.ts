@@ -1,11 +1,12 @@
 // Shared settings surface: overlay in chat.js + the catalog in media/settings.js.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Window } from "happy-dom";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { TIER1_CONNECTORS } from "../src/mcp-connectors";
-import { bootWebview, click, dispatch } from "./webview-harness";
+import { connectorViews, CONNECTOR_UNAVAILABLE_MESSAGE, TIER1_CONNECTORS } from "../src/mcp-connectors";
+import { parseWebviewMsg } from "../src/desktop/webview-msg-validate";
+import { openAppSettings, bootWebview, click, dispatch } from "./webview-harness";
 
 const settingsSrc = readFileSync(
   fileURLToPath(new URL("../media/settings.js", import.meta.url)),
@@ -100,12 +101,7 @@ function seedChat(h: ReturnType<typeof bootWebview>, extra: Record<string, unkno
 }
 
 function openSettings(h: ReturnType<typeof bootWebview>) {
-  const gear = h.doc.getElementById("rail-gear-btn") || h.doc.getElementById("gear-btn");
-  click(h.window, gear!);
-  const item = [...h.doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
-    .find((el) => /(^|\s)Settings$/.test((el.textContent || "").replace(/\s+/g, " ").trim()));
-  expect(item).toBeTruthy();
-  click(h.window, item!);
+  openAppSettings(h.window, h.doc);
 }
 
 function settingsNav(h: ReturnType<typeof bootWebview>) {
@@ -183,6 +179,7 @@ describe("settings catalog", () => {
     expect(rows.find((row) => row.id === "mcpCatalog")?.category).toBe("connectors");
     expect(api.GROK_CONNECTORS_URL).toBe("https://grok.com/connectors");
     expect(api.CONNECTOR_SECTION_HERE).toBe("On this computer");
+    expect(api.CONNECTOR_SECTION_HERE_REMOTE).toBe("On the workspace machine");
     expect(api.CONNECTOR_SECTION_GROK).toBe("Grok.com connectors");
     expect(api.CONNECTOR_SECTION_LOCAL).toBe("Local Grok connectors");
     expect(api.CONNECTOR_BLURB_HERE).toMatch(/Grok, Codex, and Claude/);
@@ -273,6 +270,273 @@ describe("settings catalog", () => {
     }
     const onDisk = readdirSync(dir).filter((f) => f.endsWith(".webp")).map((f) => f.replace(/\.webp$/, "")).sort();
     expect(onDisk).toEqual(logoIds);
+  });
+});
+
+describe("page-local settings layers", () => {
+  it.each(["Back to app", "Escape", "closeOnAction"])("reports opening and closing through %s", async (close) => {
+    const h = bootWebview();
+    seedChat(h);
+    const layers = (h.window as any).afkpilotLayers;
+    const depths: number[] = [];
+    h.window.addEventListener("afkpilot-layers", (event) => {
+      expect(event).toBeInstanceOf(h.window.CustomEvent);
+      expect((event as any).detail).toBeNull();
+      depths.push(layers.depth);
+    });
+    expect(layers.depth).toBe(0);
+    expect(layers.dismissTop()).toBe(false);
+    expect(depths).toEqual([]);
+    openSettings(h);
+    expect(layers.depth).toBe(1);
+    expect(depths).toEqual([1]);
+    if (close === "Escape") keydown(h.window, { key: "Escape" });
+    else if (close === "Back to app") click(h.window, h.doc.querySelector(".settings-back")!);
+    else {
+      clickSettingsNav(h, "Advanced");
+      expect(depths).toEqual([1]);
+      click(h.window, h.doc.querySelector('[data-id="showLogs"] .settings-action')!);
+      expect(h.posted).toContainEqual({ type: "showLogs" });
+    }
+    expect(h.doc.getElementById("settings-overlay")).toBeNull();
+    expect(layers.depth).toBe(0);
+    expect(depths).toEqual([1, 0]);
+    expect(layers.dismissTop()).toBe(false);
+    expect(depths).toEqual([1, 0]);
+    await h.window.happyDOM.abort();
+  });
+
+  it.each(["remote", "desktop", "vscode"])("dismisses once, locally, without accessing history on %s", async (surface) => {
+    const historyAccess = vi.fn();
+    const h = bootWebview({
+      remote: surface === "remote",
+      vscode: surface === "vscode",
+      beforeScripts: (window) => {
+        const original = window.history;
+        Object.defineProperty(window, "history", {
+          configurable: true,
+          get: () => { historyAccess("read"); return original; },
+          set: () => { historyAccess("write"); },
+        });
+      },
+    });
+    seedChat(h, { capabilities: surface === "desktop" ? { relocateView: false, showOutput: false } : {} });
+    const layers = (h.window as any).afkpilotLayers;
+    const depths: number[] = [];
+    h.window.addEventListener("afkpilot-layers", () => depths.push(layers.depth));
+    openSettings(h);
+    h.posted.length = 0;
+    expect(layers.depth).toBe(1);
+    expect(layers.dismissTop()).toBe(true);
+    expect(layers.depth).toBe(0);
+    expect(layers.dismissTop()).toBe(false);
+    expect(depths).toEqual([1, 0]);
+    expect(h.posted).toEqual([]);
+    expect(historyAccess).not.toHaveBeenCalled();
+    await h.window.happyDOM.abort();
+  });
+
+  it("does not count the host's Settings editor as a renderer layer", async () => {
+    const h = bootWebview({ vscode: true });
+    seedChat(h, { capabilities: { settingsEditor: true } });
+    const changed = vi.fn();
+    h.window.addEventListener("afkpilot-layers", changed);
+    openSettings(h);
+    expect(h.posted).toContainEqual({ type: "openSettingsSurface" });
+    expect((h.window as any).afkpilotLayers.depth).toBe(0);
+    expect((h.window as any).afkpilotLayers.dismissTop()).toBe(false);
+    expect(changed).not.toHaveBeenCalled();
+    await h.window.happyDOM.abort();
+  });
+});
+
+describe("dialogs above renderer layers", () => {
+  function bootLayers(kind = "settings", remote = true) {
+    const h = bootWebview({ remote });
+    seedChat(h, { capabilities: { browseProjectFiles: true, remoteAgentSignIn: true,
+      createProject: true, cloneProject: true, addProjectFolder: true } });
+    if (kind !== "settings") click(h.window, h.doc.getElementById("files-browse-btn")!);
+    if (kind !== "files") openSettings(h);
+    const layers = (h.window as any).afkpilotLayers;
+    const depth = layers.depth;
+    const changes: number[] = [];
+    h.window.addEventListener("afkpilot-layers", () => changes.push(layers.depth));
+    return { ...h, layers, depth, changes };
+  }
+  type H = ReturnType<typeof bootLayers>;
+  const blocked = (h: H) => {
+    expect(h.doc.body.dataset.modalAbove).toBeTruthy();
+    expect(h.layers.depth).toBe(0);
+    expect(h.layers.dismissTop()).toBe(false);
+  };
+  const restored = (h: H) => {
+    expect(h.doc.body.dataset.modalAbove).toBeUndefined();
+    expect(h.layers.depth).toBe(h.depth);
+    expect(h.changes).toEqual([0, h.depth]);
+  };
+  const choice = (h: H) => (h.window as any).__grokFilePanelConfirm({ title: "Keep this?" });
+  const wizardFrame = (h: H, device: unknown = { status: "waiting", code: "ABCD", url: "https://example.test/login" }) =>
+    dispatch(h.window, { type: "onboarding", state: "auth-required", platform: "linux", provider: "codex", device });
+  const openAdd = (h: H) => {
+    const opener = h.doc.createElement("button");
+    opener.className = "onb-action";
+    opener.dataset.act = "addProjectFolder";
+    h.doc.body.appendChild(opener);
+    click(h.window, opener);
+    click(h.window, [...h.doc.querySelectorAll(".rail-menu-item")].find((el) => el.textContent?.includes("Clone from GitHub"))!);
+  };
+  const closeAdd = (h: H) => click(h.window, h.doc.querySelector(".add-project-btn:not(.add-project-primary)")!);
+  const closeWizard = (h: H) => click(h.window, h.doc.querySelector(".connect-wizard-panel > .confirm-actions button")!);
+
+  it.each(["settings", "files", "both"])("reads the marker immediately with %s open", (kind) => {
+    const h = bootLayers(kind);
+    h.doc.body.dataset.modalAbove = "test-dialog";
+    blocked(h);
+    delete h.doc.body.dataset.modalAbove;
+    expect(h.layers.depth).toBe(h.depth);
+  });
+
+  it.each(["Escape", "Cancel", "backdrop", "confirm"])("restores both layers after a confirm exits through %s", async (exit) => {
+    const h = bootLayers("both");
+    const result = choice(h);
+    blocked(h);
+    expect(h.changes).toEqual([0]);
+    expect(keydown(h.window, { key: "Tab" }).defaultPrevented).toBe(false);
+    if (exit === "Escape") keydown(h.window, { key: "Escape" });
+    else click(h.window, h.doc.querySelector(exit === "backdrop" ? ".confirm-overlay"
+      : exit === "confirm" ? ".confirm-primary" : ".confirm-btn:not(.confirm-primary)")!);
+    expect(await result).toBe(exit === "confirm" ? "confirm" : "cancel");
+    expect(h.doc.querySelector(".confirm-overlay")).toBeNull();
+    restored(h);
+  });
+
+  it.each(["Escape", "Cancel", "scrim", "done"])("restores the layer after Add project exits through %s", (exit) => {
+    const h = bootLayers();
+    openAdd(h);
+    const input = h.doc.querySelector(".add-project-input") as HTMLInputElement;
+    input.value = "https://example.test/repo.git";
+    dispatch(h.window, { type: "projectSetup", error: "Try again" });
+    expect(input.value).toBe("https://example.test/repo.git");
+    blocked(h);
+    if (exit === "Escape") keydown(h.window, { key: "Escape" });
+    else if (exit === "Cancel") closeAdd(h);
+    else if (exit === "scrim") h.doc.querySelector(".add-project-scrim")!.dispatchEvent(new h.window.MouseEvent("mousedown", { bubbles: true }));
+    else dispatch(h.window, { type: "projectSetup", done: true });
+    expect(h.doc.querySelector(".add-project-scrim")).toBeNull();
+    restored(h);
+  });
+
+  it.each(["Escape", "Close", "backdrop", "cancel flow", "flow gone", "success"])("restores Settings after the wizard exits through %s", async (exit) => {
+    const h = bootLayers();
+    wizardFrame(h);
+    wizardFrame(h); // Live repaints must not acquire another marker.
+    blocked(h);
+    expect(h.changes).toEqual([0]);
+    if (exit === "Escape") keydown(h.window, { key: "Escape" });
+    else if (exit === "Close") closeWizard(h);
+    else if (exit === "backdrop") click(h.window, h.doc.querySelector(".connect-wizard-overlay")!);
+    else if (exit === "cancel flow") click(h.window, h.doc.querySelector('.connect-wizard-overlay [data-act="cancelDeviceLogin"]')!);
+    else if (exit === "flow gone") wizardFrame(h, null);
+    else {
+      wizardFrame(h, { status: "done" });
+      blocked(h);
+      await vi.waitFor(() => expect(h.doc.querySelector(".connect-wizard-overlay")).toBeNull(), { timeout: 2500 });
+    }
+    expect(h.doc.querySelector(".connect-wizard-overlay")).toBeNull();
+    restored(h);
+  });
+
+  it.each(["Escape", "Close", "backdrop", "FAQ"])("clears the explainer marker through %s", (exit) => {
+    const h = bootLayers("settings", false);
+    dispatch(h.window, { type: "remoteStatus", linked: false });
+    click(h.window, h.doc.getElementById("add-btn")!);
+    click(h.window, [...h.doc.querySelectorAll("#add-popover .toolbar-popover-item")].find((el) => el.textContent?.includes("How it works"))!);
+    blocked(h);
+    if (exit === "Escape") keydown(h.window, { key: "Escape" });
+    else click(h.window, h.doc.querySelector(exit === "Close" ? ".remote-explainer-close"
+      : exit === "backdrop" ? ".remote-explainer-overlay" : ".remote-explainer-panel .confirm-primary")!);
+    expect(h.doc.querySelector(".remote-explainer-overlay")).toBeNull();
+    restored(h);
+  });
+
+  it.each(["Escape", "Close", "backdrop", "session reset", "Back"])("dismisses the image lightbox as a LAYER through %s", (exit) => {
+    // It used to be a dialog ABOVE the layers, which suppressed all of them --
+    // so on a phone Back skipped every one and left the page. Enlarging an
+    // image and pressing Back to put it away is the commonest Back there is
+    // (owner, on his phone). It is a layer now, and Back closes it.
+    const h = bootLayers();
+    dispatch(h.window, { type: "chips", chips: [{ id: "image-1", path: "/image.png", relPath: "Image #1",
+      imageIndex: 1, hidden: false, previewSrc: "data:image/png;base64,AAAA" }] });
+    for (let i = 0; i < 2; i++) click(h.window, h.doc.querySelector(".attachment button")!);
+    expect(h.doc.body.dataset.modalAbove).toBeUndefined();
+    expect(h.layers.depth).toBe(h.depth + 1);
+    expect(h.changes).toEqual([h.depth + 1]);
+    if (exit === "Back") {
+      expect(h.layers.dismissTop()).toBe(true);
+      // Ahead of Settings, which it opened over and covers completely.
+      expect(h.doc.getElementById("settings-overlay")).not.toBeNull();
+    } else if (exit === "Escape") keydown(h.window, { key: "Escape" });
+    else if (exit === "session reset") dispatch(h.window, { type: "clearMessages" });
+    else click(h.window, h.doc.querySelector(exit === "Close" ? ".image-preview-close" : ".image-preview-overlay")!);
+    expect((h.doc.querySelector(".image-preview-overlay") as HTMLElement).hidden).toBe(true);
+    expect(h.layers.depth).toBe(h.depth);
+    expect(h.changes).toEqual([h.depth + 1, h.depth]);
+    // The node is retained and reused, so a second close must not report a
+    // change that never happened -- the shell spends a history entry per one.
+    click(h.window, h.doc.querySelector(".image-preview-close")!);
+    expect(h.layers.depth).toBe(h.depth);
+    expect(h.changes).toEqual([h.depth + 1, h.depth]);
+  });
+
+  it.each([false, true])("keeps the marker when nested Add project / wizard dialogs close (outer first=%s)", (outerFirst) => {
+    const h = bootLayers();
+    openAdd(h);
+    wizardFrame(h);
+    if (outerFirst) {
+      // Host completion can retire the outer form while the wizard is up.
+      dispatch(h.window, { type: "projectSetup", done: true });
+      dispatch(h.window, { type: "projectSetup", done: true });
+    } else closeWizard(h);
+    blocked(h);
+    expect(h.changes).toEqual([0]);
+    if (outerFirst) closeWizard(h);
+    else closeAdd(h);
+    restored(h);
+  });
+
+  it("releases replaced forms and wizard instances without orphaning their markers", () => {
+    const h = bootLayers();
+    openAdd(h);
+    const firstForm = h.doc.querySelector(".add-project-scrim");
+    openAdd(h);
+    expect(h.doc.querySelectorAll(".add-project-scrim")).toHaveLength(1);
+    expect(h.doc.querySelector(".add-project-scrim")).not.toBe(firstForm);
+    wizardFrame(h);
+    const firstWizard = h.doc.querySelector(".connect-wizard-overlay");
+    dispatch(h.window, { type: "onboarding", state: "auth-required", provider: "grok", device: { status: "starting" } });
+    expect(h.doc.querySelectorAll(".connect-wizard-overlay")).toHaveLength(1);
+    expect(h.doc.querySelector(".connect-wizard-overlay")).not.toBe(firstWizard);
+    closeWizard(h);
+    blocked(h);
+    closeAdd(h);
+    expect(h.doc.body.dataset.modalAbove).toBeUndefined();
+    expect(h.layers.depth).toBe(h.depth);
+    expect(h.changes).toEqual([0, h.depth, 0, h.depth]);
+  });
+
+  it("keeps same-kind confirms independent and tolerates a repeated close", async () => {
+    const h = bootLayers();
+    const first = choice(h);
+    const firstButton = h.doc.querySelector(".confirm-primary")!;
+    const second = choice(h);
+    click(h.window, firstButton);
+    click(h.window, firstButton);
+    blocked(h);
+    expect(h.changes).toEqual([0]);
+    click(h.window, h.doc.querySelector(".confirm-primary")!);
+    expect(await first).toBe("confirm");
+    expect(await second).toBe("confirm");
+    restored(h);
   });
 });
 
@@ -398,8 +662,8 @@ describe("settings overlay (chat.js)", () => {
   it("replaces the legacy gear panels with a single Settings entry", () => {
     const h = bootWebview();
     seedChat(h);
-    click(h.window, h.doc.getElementById("gear-btn")!);
-    const labels = gearLabels(h);
+    click(h.window, h.doc.getElementById("add-btn")!);
+    const labels = [...h.doc.querySelectorAll("#add-popover .toolbar-popover-item")].map((el) => el.textContent || "");
     expect(labels.some((l) => l === "Settings" || l.endsWith("Settings"))).toBe(true);
     expect(labels.some((l) => l === "All settings")).toBe(false);
     expect(labels.some((l) => /Config & debug/.test(l))).toBe(false);
@@ -425,10 +689,10 @@ describe("settings overlay (chat.js)", () => {
     });
     const ids = api.visibleRows(snapshot, vscodeEnv).map((row: { id: string }) => row.id);
     expect(ids).toEqual(expect.arrayContaining([
-      "showThinking", "expandCommandOutputs", "steerByDefault",
+      "showThinking", "expandCommandOutputs", "expandDiffCard", "steerByDefault",
       "soundNotifications", "processingSound",
       "readRepliesAloud", "summarizeRepliesAloud",
-      "openGlobalConfig", "openProjectConfig", "showLogs",
+      "openProjectConfig", "showLogs",
       "openVsCodeSettings", "moveView",
     ]));
   });
@@ -831,7 +1095,7 @@ describe("settings overlay (chat.js)", () => {
     expect((overlay.querySelector(".settings-connector-key-input") as HTMLInputElement).value).toBe("");
   });
 
-  it("a remote cannot paste, replace, or clear a GitHub key", () => {
+  it("an older host without the capability offers no remote key controls", () => {
     const h = bootWebview({ remote: true });
     seedChat(h, { capabilities: { mcpSettings: true } });
     dispatch(h.window, {
@@ -859,6 +1123,140 @@ describe("settings overlay (chat.js)", () => {
     expect(overlay.textContent).toContain("Connected");
     expect(h.posted).not.toContainEqual(expect.objectContaining({ type: "connectMcpConnector" }));
     expect(h.posted).not.toContainEqual(expect.objectContaining({ type: "disconnectMcpConnector" }));
+  });
+
+  it.each([false, true])("an unavailable key connector can retry with an empty token field (remote=%s)", (remote) => {
+    const h = bootWebview({ remote });
+    seedChat(h, { capabilities: { mcpSettings: true } });
+    const connectors = connectorViews({ github: { endpoint: "https://key.example/mcp", readOnly: true } }, {
+      unavailable: new Set(["github"]), keySet: new Set(["github"]),
+    }).filter((c) => c.id === "github");
+    dispatch(h.window, { type: "mcpConnectors", remoteConnect: true, connectors });
+    openSettings(h);
+    clickSettingsNav(h, "Connectors");
+    const overlay = h.doc.getElementById("settings-overlay")!;
+    expect(overlay.textContent).toContain(CONNECTOR_UNAVAILABLE_MESSAGE);
+    expect(overlay.textContent).toContain("Leave the token field empty");
+    expect(overlay.querySelector(".settings-mcp-status.is-ready")).toBeNull();
+    click(h.window, overlay.querySelector(".settings-connector-action")!);
+    expect((overlay.querySelector(".settings-connector-key-input") as HTMLInputElement).value).toBe("");
+    click(h.window, overlay.querySelector(".settings-connector-key-submit")!);
+    expect(h.posted).toContainEqual({ type: "connectMcpConnector", id: "github", key: "", readOnly: true });
+  });
+
+  it("a remote saved-OAuth retry closes the unused sign-in placeholder", () => {
+    const h = bootWebview({ remote: true });
+    seedChat(h, { capabilities: { mcpSettings: true } });
+    const store = { notion: { endpoint: "https://mcp.example/mcp" } };
+    const rows = (opts = {}) => connectorViews(store, opts).filter((c) => c.id === "notion");
+    const message = { type: "mcpConnectors", remoteConnect: true, connectors: rows({ unavailable: new Set(["notion"]) }) };
+    dispatch(h.window, message);
+    openSettings(h);
+    clickSettingsNav(h, "Connectors");
+    const overlay = h.doc.getElementById("settings-overlay")!;
+    const tab = { opener: {}, document: { title: "", body: { textContent: "" } }, location: { replace: vi.fn() }, close: vi.fn() };
+    h.window.open = vi.fn().mockReturnValue(tab);
+    click(h.window, overlay.querySelector(".settings-connector-action")!);
+    expect(h.posted).toContainEqual({ type: "connectMcpConnector", id: "notion" });
+    // The host first sends the still-unavailable row, then starts the probe.
+    dispatch(h.window, message);
+    dispatch(h.window, { ...message, connectors: rows({ unavailable: new Set(["notion"]), connectingId: "notion" }) });
+    dispatch(h.window, { ...message, connectors: rows() });
+    expect(tab.close).toHaveBeenCalledOnce();
+    expect(tab.location.replace).not.toHaveBeenCalled();
+    expect(overlay.querySelector(".settings-connector-action")?.textContent).toBe("Disconnect");
+  });
+
+  it("a capable remote writes and replaces a key without ever reading one back", () => {
+    const h = bootWebview({ remote: true });
+    seedChat(h, { capabilities: { mcpSettings: true } });
+    const row = { id: "github", name: "GitHub", description: "Repos.", auth: "key", status: "idle", connected: false };
+    dispatch(h.window, { type: "mcpConnectors", remoteConnect: true, connectors: [row] });
+    openSettings(h);
+    clickSettingsNav(h, "Connectors");
+    const overlay = h.doc.getElementById("settings-overlay")!;
+    click(h.window, overlay.querySelector(".settings-connector-action")!);
+    const input = overlay.querySelector(".settings-connector-key-input") as HTMLInputElement;
+    expect(input.type).toBe("password");
+    expect(input.value).toBe("");
+    input.value = "ghp_remote_write_only";
+    click(h.window, overlay.querySelector(".settings-connector-key-submit")!);
+    expect(h.posted).toContainEqual({ type: "connectMcpConnector", id: "github", key: "ghp_remote_write_only", readOnly: false });
+    expect(input.value).toBe("");
+    dispatch(h.window, { type: "mcpConnectors", remoteConnect: true, connectors: [{ ...row, connected: true, keySet: true }] });
+    expect((overlay.querySelector(".settings-connector-action") as HTMLElement).title)
+      .toContain("Tools in already running sessions remain available");
+    click(h.window, overlay.querySelector(".settings-connector-key-open")!);
+    expect((overlay.querySelector(".settings-connector-key-input") as HTMLInputElement).value).toBe("");
+    click(h.window, overlay.querySelector(".settings-connector-key-cancel")!);
+    click(h.window, overlay.querySelector(".settings-connector-action")!);
+    expect(h.posted).toContainEqual({ type: "disconnectMcpConnector", id: "github" });
+    expect(overlay.innerHTML).not.toContain("ghp_remote_write_only");
+  });
+
+  it.each([false, true])("a remote Connect tap opens consent automatically with a link fallback (popup blocked=%s)", (blocked) => {
+    const h = bootWebview({ remote: true });
+    seedChat(h, { capabilities: { mcpSettings: true } });
+    const row = { id: "notion", name: "Notion", description: "Pages.", auth: "oauth", status: "idle", connected: false };
+    dispatch(h.window, { type: "mcpConnectors", remoteConnect: true, connectors: [row] });
+    openSettings(h);
+    clickSettingsNav(h, "Connectors");
+    const overlay = h.doc.getElementById("settings-overlay")!;
+    const tab = { opener: {}, document: { title: "", body: { textContent: "" } }, location: { replace: vi.fn() }, close: vi.fn() };
+    const open = vi.fn().mockReturnValue(blocked ? null : tab);
+    h.window.open = open;
+    click(h.window, overlay.querySelector(".settings-connector-action")!);
+    expect(h.posted).toContainEqual({ type: "connectMcpConnector", id: "notion" });
+    expect(open).toHaveBeenCalledOnce();
+    expect(open).toHaveBeenCalledWith("", "_blank");
+    const consent = { type: "mcpConnectorAuthorization", id: "notion", attemptId: "attempt-1", status: "waiting", url: "https://vendor.example/authorize?state=test" };
+    dispatch(h.window, consent);
+    if (!blocked) {
+      expect(tab.opener).toBeNull();
+      expect(tab.location.replace).toHaveBeenCalledOnce();
+      expect(tab.location.replace).toHaveBeenCalledWith(consent.url);
+    }
+    dispatch(h.window, consent);
+    expect(open).toHaveBeenCalledOnce();
+    const link = overlay.querySelector(".settings-connector-oauth-link") as HTMLAnchorElement;
+    expect(link.href).toBe(consent.url);
+    expect(link.target).toBe("_blank");
+    expect(link.rel).toContain("noopener");
+    expect(link.className).toContain("is-primary");
+    expect(overlay.textContent).toContain("Connection completes automatically");
+    expect(overlay.querySelector(".settings-connector-oauth-input")).toBeNull();
+    expect(overlay.querySelector(".settings-connector-oauth-submit")).toBeNull();
+    expect(overlay.querySelector(".settings-connector-oauth-step")).toBeNull();
+    dispatch(h.window, { ...consent, status: "finished", url: undefined });
+    expect(overlay.querySelector(".settings-connector-oauth")).toBeNull();
+    // Switching back to a host that lacks the field must drop the capability.
+    dispatch(h.window, { type: "mcpConnectors", connectors: [row] });
+    expect(overlay.querySelector(".settings-connector-action")).toBeNull();
+  });
+
+  it.each([false, true])("a fresh remote restores consent without starting it and can replace it (connected=%s)", (connected) => {
+    const h = bootWebview({ remote: true });
+    seedChat(h, { capabilities: { mcpSettings: true } });
+    const row = { id: "notion", name: "Notion", description: "Pages.", auth: "oauth", status: "connecting", connected };
+    const consent = { type: "mcpConnectorAuthorization", id: "notion", attemptId: "live-attempt", status: "waiting", url: "https://vendor.example/authorize?state=live" };
+    dispatch(h.window, { type: "mcpConnectors", remoteConnect: true, connectors: [row] });
+    dispatch(h.window, consent);
+    openSettings(h);
+    clickSettingsNav(h, "Connectors");
+    const overlay = h.doc.getElementById("settings-overlay")!;
+    expect(h.posted).not.toContainEqual({ type: "connectMcpConnector", id: "notion" });
+    expect(overlay.querySelector(".settings-connector-oauth-step")).toBeNull();
+    expect((overlay.querySelector(".settings-connector-oauth-link") as HTMLAnchorElement).href).toBe(consent.url);
+    const restart = overlay.querySelector(".settings-connector-action") as HTMLButtonElement;
+    expect(restart.textContent).toBe("Connecting…");
+    expect(restart.disabled).toBe(true);
+    click(h.window, restart);
+    expect(h.posted).not.toContainEqual({ type: "connectMcpConnector", id: "notion" });
+    expect(h.posted).not.toContainEqual({ type: "disconnectMcpConnector", id: "notion" });
+    dispatch(h.window, { ...consent, attemptId: "new-attempt", url: "https://vendor.example/authorize?state=new" });
+    dispatch(h.window, { ...consent, status: "finished", error: "This sign-in expired or was replaced." });
+    expect((overlay.querySelector(".settings-connector-oauth-link") as HTMLAnchorElement).href).toContain("state=new");
+    expect(overlay.textContent).not.toContain("expired or was replaced");
   });
 
   it("a remote sees a connected GitHub row without a desk key as connected, with no paste", () => {
@@ -922,7 +1320,7 @@ describe("settings overlay (chat.js)", () => {
     expect(overlay.textContent).toMatch(/machine running this workspace/);
     expect(overlay.querySelector(".settings-connector-action")).toBeNull();
     expect(overlay.textContent).toContain("Connected");
-    expect(overlay.textContent).toContain("On this computer");
+    expect(overlay.textContent).toContain("On the workspace machine");
     expect(overlay.textContent).toContain("Grok.com connectors");
     expect(overlay.textContent).toContain("Local Grok connectors");
     expect(overlay.textContent).toMatch(/managed on the host machine only/);
@@ -1104,9 +1502,14 @@ describe("settings overlay (chat.js)", () => {
   });
 
   it("hides healthy provider rows in the gear and shows them when attention is needed", () => {
-    const h = bootWebview();
+    const h = bootWebview({ beforeScripts: (w) => {
+      const rail = w.document.createElement("aside"); rail.id = "projects-rail";
+      rail.innerHTML = '<div id="rail-scroll"></div><div class="rail-foot"></div>';
+      w.document.body.appendChild(rail);
+    } });
+    dispatch(h.window, { type: "repos", entries: [], selectedCwd: "/w", activeCwd: "/w" });
     seedChat(h);
-    click(h.window, h.doc.getElementById("gear-btn")!);
+    click(h.window, h.doc.getElementById("rail-gear-btn")!);
     expect(gearLabels(h).some((l) => /Grok/.test(l) && /Sign out/.test(l))).toBe(false);
 
     dispatch(h.window, {
@@ -1116,8 +1519,8 @@ describe("settings overlay (chat.js)", () => {
         { id: "codex", connected: false },
       ],
     });
-    click(h.window, h.doc.getElementById("gear-btn")!);
-    click(h.window, h.doc.getElementById("gear-btn")!);
+    click(h.window, h.doc.getElementById("rail-gear-btn")!);
+    click(h.window, h.doc.getElementById("rail-gear-btn")!);
     expect(gearLabels(h).join(" ")).toMatch(/Grok/);
     expect(gearLabels(h).join(" ")).toMatch(/Connect/);
 
@@ -1128,8 +1531,8 @@ describe("settings overlay (chat.js)", () => {
         { id: "codex", connected: true },
       ],
     });
-    click(h.window, h.doc.getElementById("gear-btn")!);
-    click(h.window, h.doc.getElementById("gear-btn")!);
+    click(h.window, h.doc.getElementById("rail-gear-btn")!);
+    click(h.window, h.doc.getElementById("rail-gear-btn")!);
     // Codex is healthy here, so SOMETHING can answer and the gear stops
     // carrying accounts entirely — Settings → Providers owns them (owner,
     // 2026-08-17). Previously a single lapsed account kept a half-broken
@@ -1144,8 +1547,8 @@ describe("settings overlay (chat.js)", () => {
         { id: "codex", connected: true },
       ],
     });
-    click(h.window, h.doc.getElementById("gear-btn")!);
-    click(h.window, h.doc.getElementById("gear-btn")!);
+    click(h.window, h.doc.getElementById("rail-gear-btn")!);
+    click(h.window, h.doc.getElementById("rail-gear-btn")!);
     expect(gearLabels(h).some((l) => /Sign out/.test(l))).toBe(false);
   });
 
@@ -1188,7 +1591,7 @@ describe("settings overlay (chat.js)", () => {
     expect(api.TELEMETRY_COPY).toContain("The IP address is discarded, never stored.");
   });
 
-  it("orders General rows as purpose, text size, coding display, steer, stats, thumbs on every surface", () => {
+  it("orders General rows as purpose, text size, coding display, steer, stats, previous prompt, thumbs on every surface", () => {
     const api = loadSettings();
     const coding = api.defaultSnapshot({ appPurpose: "coding" });
     const generalIds = (env: Record<string, unknown>) =>
@@ -1196,16 +1599,16 @@ describe("settings overlay (chat.js)", () => {
         .filter((row) => row.category === "general")
         .map((row) => row.id);
     expect(generalIds(fullEnv({ isDesktop: true, isRemote: false }))).toEqual([
-      "appPurpose", "chatFontScale", "showThinking", "expandCommandOutputs", "steerByDefault",
-      "telemetryDesktop", "thumbsFeedback",
+      "appPurpose", "chatFontScale", "showThinking", "expandCommandOutputs", "expandDiffCard", "steerByDefault",
+      "telemetryDesktop", "promptNav", "thumbsFeedback",
     ]);
     expect(generalIds(fullEnv({ isDesktop: false, isRemote: false, clientOwnsFontScale: false }))).toEqual([
-      "appPurpose", "openChatFontScale", "showThinking", "expandCommandOutputs", "steerByDefault",
-      "telemetryVsCode", "thumbsFeedback",
+      "appPurpose", "openChatFontScale", "showThinking", "expandCommandOutputs", "expandDiffCard", "steerByDefault",
+      "telemetryVsCode", "promptNav", "thumbsFeedback",
     ]);
     expect(generalIds(fullEnv({ isDesktop: true, isRemote: true }))).toEqual([
-      "appPurpose", "chatFontScale", "showThinking", "expandCommandOutputs", "steerByDefault",
-      "telemetryRemote", "thumbsFeedbackRemote",
+      "appPurpose", "chatFontScale", "showThinking", "expandCommandOutputs", "expandDiffCard", "steerByDefault",
+      "telemetryRemote", "promptNav", "thumbsFeedbackRemote",
     ]);
   });
 
@@ -1337,7 +1740,7 @@ describe("settings overlay keyboard containment", () => {
     expect(h.doc.getElementById("settings-overlay")).toBeTruthy();
     keydown(h.window, { key: "Escape" });
     expect(h.doc.getElementById("settings-overlay")).toBeNull();
-    expect(h.doc.activeElement).toBe(h.doc.getElementById("gear-btn"));
+    expect(h.doc.activeElement).toBe(h.doc.getElementById("add-btn"));
     expect(h.doc.querySelector("header")?.hasAttribute("inert")).toBe(false);
     expect(h.doc.querySelector("footer")?.getAttribute("data-settings-cover")).toBeNull();
   });
@@ -1361,7 +1764,7 @@ describe("settings overlay keyboard containment", () => {
     expect(header?.hasAttribute("inert") || header?.getAttribute("aria-hidden") === "true").toBe(true);
     click(h.window, back);
     expect(h.doc.getElementById("settings-overlay")).toBeNull();
-    expect(h.doc.activeElement).toBe(h.doc.getElementById("gear-btn"));
+    expect(h.doc.activeElement).toBe(h.doc.getElementById("add-btn"));
     expect(h.doc.querySelector("header")?.hasAttribute("inert")).toBe(false);
   });
 
@@ -1649,7 +2052,7 @@ describe("review lows (settings / telemetry / voice write scope)", () => {
       "utf8",
     );
     const start = src.indexOf('case "setVoiceSendPhrase"');
-    const end = src.indexOf('case "setTelemetryEnabled"');
+    const end = src.indexOf('case "setVoiceBackend"');
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
     const body = src.slice(start, end);
@@ -1750,6 +2153,106 @@ function mountAt(category: string, opts: {
   const types = () => posted.map((msg) => msg.type);
   return { window, root, posted, types, surface };
 }
+
+describe("CLI update actions", () => {
+  const providers = [
+    { id: "codex", connected: true, cliVersion: "0.149.0", latestCliVersion: "0.153.4",
+      updateAvailable: true, cliUpdate: { status: "idle" } },
+    { id: "claude", connected: true, cliVersion: "2.1.0", latestCliVersion: "2.1.263",
+      updateAvailable: true, cliUpdate: { status: "idle" } },
+  ];
+
+  it.each([false, true])("renders actions and their live outcomes (remote=%s)", (isRemote) => {
+    const h = mountAt("providers", { env: { isRemote }, snapshot: { providers } });
+    for (const suffix of ["Codex", "Claude"]) {
+      const action = h.root.querySelector(`[data-id="aboutUpdate${suffix}"] button`) as HTMLButtonElement;
+      expect(action).toBeTruthy();
+      action.click();
+      expect(h.types()).toContain("update" + suffix);
+    }
+    h.surface.update({ providers: providers.map((p) => ({ ...p, cliUpdate: { status: "running", message: "Updating on the host…" } })) });
+    expect(h.root.textContent).toContain("Updating on the host…");
+    expect((h.root.querySelector('[data-id="aboutUpdateCodex"] button') as HTMLButtonElement).disabled).toBe(true);
+    h.surface.update({ providers: providers.map((p) => ({ ...p, cliVersion: "9.0.0", cliUpdate: { status: "failed", message: "Update failed: permission denied" } })) });
+    expect(h.root.textContent).toContain("Update failed: permission denied");
+    expect(h.root.querySelector('[data-id="aboutUpdateCodex"]')?.textContent).toContain("v9.0.0");
+    expect((h.root.querySelector('[data-id="aboutUpdateCodex"] button') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("says which version is installed and which is available, on Providers", () => {
+    // It used to live in About, titled "Update Codex CLI" with no version
+    // anywhere near it, while Providers -- the page a person opens to think
+    // about Codex, and the page the release notes name -- said nothing about
+    // the CLI at all.
+    const h = mountAt("providers", { snapshot: { providers: [
+      { id: "codex", connected: true, cliVersion: "0.152.1", latestCliVersion: "0.153.4",
+        updateAvailable: true, cliUpdate: { status: "idle" } },
+      { id: "claude", connected: true, cliVersion: "2.1.0", latestCliVersion: "2.1.263",
+        updateAvailable: true, cliUpdate: { status: "idle" } },
+    ] } });
+    const codex = h.root.querySelector('[data-id="aboutUpdateCodex"]')?.textContent || "";
+    expect(codex).toContain("v0.152.1");
+    expect(codex).toContain("v0.153.4 is available");
+    const claude = h.root.querySelector('[data-id="aboutUpdateClaude"]')?.textContent || "";
+    expect(claude).toContain("v2.1.0");
+    expect(claude).toContain("v2.1.263 is available");
+  });
+
+  it("does not offer to update a Codex that is already current", () => {
+    // Reported from a phone: the page offered "Update Codex CLI" next to a
+    // Codex that had just been updated to the pinned version. The operation
+    // it offers stops your sessions for minutes, so an offer with nothing
+    // behind it is worse than silence.
+    const current = { id: "codex", connected: true, cliVersion: "0.153.4",
+      latestCliVersion: "0.153.4", updateAvailable: false, cliUpdate: { status: "idle" } };
+    const h = mountAt("providers", { snapshot: { providers: [current] } });
+    expect(h.root.querySelector('[data-id="aboutUpdateCodex"]')).toBeNull();
+
+    // The outcome of the update that made it current still shows, on its own
+    // row -- what goes away is the offer, not the answer.
+    h.surface.update({ providers: [{ ...current,
+      cliUpdate: { status: "succeeded", message: "Update completed · Codex CLI v0.153.4" } }] });
+    expect(h.root.querySelector('[data-id="aboutUpdateCodex"]')).toBeNull();
+    expect(h.root.textContent).toContain("Update completed · Codex CLI v0.153.4");
+
+    // A failure keeps the retry where the failure is.
+    h.surface.update({ providers: [{ ...current,
+      cliUpdate: { status: "failed", message: "Update failed: permission denied" } }] });
+    expect(h.root.querySelector('[data-id="aboutUpdateCodex"] button')).toBeTruthy();
+  });
+
+  it("holds Claude to the same rule as Codex", () => {
+    // Claude was briefly the exception -- always offered, because nothing told
+    // us what its current version was. The owner caught it offering to update
+    // a CLI whose own "Update completed - Claude Code CLI v2.1.263" line sat
+    // directly underneath. The host pins a Claude version now, so there is no
+    // exception left to get wrong.
+    const current = { id: "claude", connected: true, cliVersion: "2.1.263",
+      latestCliVersion: "2.1.263", updateAvailable: false, cliUpdate: { status: "idle" } };
+    const h = mountAt("providers", { snapshot: { providers: [current] } });
+    expect(h.root.querySelector('[data-id="aboutUpdateClaude"]')).toBeNull();
+
+    // Exactly the shape the report showed: updated a moment ago, outcome on
+    // screen, and no second offer beside it.
+    h.surface.update({ providers: [{ ...current,
+      cliUpdate: { status: "succeeded", message: "Update completed · Claude Code CLI v2.1.263" } }] });
+    expect(h.root.querySelector('[data-id="aboutUpdateClaude"]')).toBeNull();
+    expect(h.root.textContent).toContain("Update completed · Claude Code CLI v2.1.263");
+
+    // Behind the pin, it is offered again.
+    h.surface.update({ providers: [{ ...current, cliVersion: "2.1.0", updateAvailable: true,
+      cliUpdate: { status: "idle" } }] });
+    expect(h.root.querySelector('[data-id="aboutUpdateClaude"] button')).toBeTruthy();
+  });
+
+  it.each([false, true])("hides absent providers and unsupported old hosts (remote=%s)", (isRemote) => {
+    const h = mountAt("providers", { env: { isRemote }, snapshot: { providers: [
+      { ...providers[0], connected: false }, { id: "claude", connected: true },
+    ] } });
+    expect(h.root.querySelector('[data-id="aboutUpdateCodex"]')).toBeNull();
+    expect(h.root.querySelector('[data-id="aboutUpdateClaude"]')).toBeNull();
+  });
+});
 
 describe("Providers refresh", () => {
 
@@ -2269,5 +2772,239 @@ describe("settings: the GitHub token path matches what the host will accept", ()
     (root.querySelector(".settings-github-connect") as HTMLButtonElement).click();
     expect(root.querySelector(".settings-github-flow-recheck")).toBeNull();
     expect(root.querySelector(".settings-github-flow-cancel")).toBeTruthy();
+  });
+});
+
+describe("the connectors header speaks to the surface it is standing on", () => {
+  // Rendered on a phone, this section put "On this computer" directly above
+  // "on the machine running this workspace" -- two different machines named
+  // in two adjacent lines -- and then spent three of the paragraph's seven
+  // sentences on what Disconnect does, to a reader who had not pressed it and
+  // who on the read-only remote cannot press it at all. Seven lines of
+  // callout before the first connector.
+  const MCP_CAPS = { hostCaps: { mcpSettings: true, relocateView: false, showOutput: false, toggleDevTools: true } };
+  const CONNECTORS = [
+    { id: "linear", name: "Linear", auth: "oauth", connected: true, description: "Issues and projects." },
+  ];
+
+  function header(env: Record<string, unknown>, snapshot: Record<string, unknown> = {}) {
+    const { root } = mountAt("connectors", {
+      env: { ...MCP_CAPS, ...env },
+      snapshot: { appPurpose: "coding", mcpConnectors: CONNECTORS, ...snapshot },
+    });
+    const catalog = root.querySelector('[data-id="connectorsCatalog"]') as HTMLElement;
+    return {
+      heading: (root.querySelector(".settings-group")?.textContent || "").trim(),
+      blurb: (catalog?.querySelector(".settings-mcp-warning")?.textContent || "").trim(),
+      disconnectTitle: (catalog?.querySelector(".settings-connector-action") as HTMLElement)?.title || "",
+    };
+  }
+
+  it("names the machine the connectors are actually on", () => {
+    expect(header({}).heading).toBe("On this computer");
+    // A phone is not that computer, and the blurb underneath always knew it.
+    expect(header({ isRemote: true, isDesktop: false }, { mcpRemoteConnect: true }).heading)
+      .toBe("On the workspace machine");
+    expect(header({ isRemote: true, isDesktop: false }, { mcpRemoteConnect: false }).heading)
+      .toBe("On the workspace machine");
+  });
+
+  it("says where the sign-in happens and where the credential lands", () => {
+    expect(header({}).blurb).toMatch(/Credentials stay on this machine\.$/);
+    // The remote copy this replaces put three referents in two sentences --
+    // "the machine running this workspace", "this device", "here" -- so
+    // "approve access on this device" read as the host when it means the
+    // phone. window.open runs in the browser you are holding; only the
+    // credential travels.
+    const remote = header({ isRemote: true, isDesktop: false }, { mcpRemoteConnect: true }).blurb;
+    expect(remote).toMatch(/Sign-in opens in this browser/);
+    expect(remote).toMatch(/saved on that machine, not on this one\.$/);
+    expect(remote).not.toMatch(/this device/);
+  });
+
+  it("does not explain Disconnect to someone who has not pressed it", () => {
+    for (const surface of [
+      header({}),
+      header({ isRemote: true, isDesktop: false }, { mcpRemoteConnect: true }),
+      // And least of all here, where there is no Disconnect button at all.
+      header({ isRemote: true, isDesktop: false }, { mcpRemoteConnect: false }),
+    ]) {
+      expect(surface.blurb).not.toMatch(/Disconnect/);
+      expect(surface.blurb.split(/(?<=\.)\s+/).length).toBeLessThanOrEqual(3);
+    }
+    // It moved to the button, which is where it is read at the moment it
+    // applies. The other half of it -- "applies to new conversations and when
+    // you reopen one" -- is already in every row's own description.
+    expect(header({}).disconnectTitle).toMatch(/already running sessions remain available/);
+  });
+});
+
+describe("the Previous-prompt row (#150)", () => {
+  it("carries a host message off-remote, because the VS Code settings tab has no apply", () => {
+    const api = loadSettings() as any;
+    const row = api.ROWS.find((r: { id: string }) => r.id === "promptNav");
+    expect(row).toBeTruthy();
+    // On a remote the chat page IS the settings page, so `commit` calls
+    // chat.js's apply directly and the change never needs to become a message.
+    expect(row.localOnly(undefined, api.defaultEnv({ isRemote: true }))).toBe(true);
+    // On a desk it must NOT be local-only. VS Code opens Settings as its own
+    // webview, where `commit` has no `apply` to call - so a local-only row with
+    // no message dispatches to nothing at all, and the switch flips On while
+    // the button never appears and the value is forgotten on reopen.
+    expect(row.localOnly(undefined, api.defaultEnv({ isRemote: false }))).toBe(false);
+    expect(row.message(true)).toEqual({ type: "setPromptNav", value: true });
+    // And it stays reachable everywhere. Hiding it off-remote is the other way
+    // to make this consistent, and the wrong one: the IDEs are where it is
+    // actually tested.
+    expect(row.visible).toBeUndefined();
+  });
+
+  it("sits in General, immediately above the SpaceXAI feedback rows", () => {
+    // It started under Advanced while it was experimental. It is on by
+    // default now, so the place it is looked for is the same list as every
+    // other everyday toggle -- and Advanced is where a person goes to change
+    // something they already know exists.
+    const api = loadSettings() as any;
+    const general = api.ROWS
+      .filter((r: { category: string }) => r.category === "general")
+      .map((r: { id: string }) => r.id);
+    const at = general.indexOf("promptNav");
+    expect(at).toBeGreaterThan(-1);
+    // The neighbour is named rather than the index, so inserting a row
+    // above this pair does not fail a test about something else.
+    expect(general[at + 1]).toBe("thumbsFeedback");
+  });
+
+  it("is on by default in all four places a default lives, and no longer says Experimental", () => {
+    const api = loadSettings() as any;
+    const row = api.ROWS.find((r: { id: string }) => r.id === "promptNav");
+    expect(row.defaultValue).toBe(true);
+    expect(api.defaultSnapshot().promptNav).toBe(true);
+    // Four separate defaults, and flipping only the visible ones is how a
+    // feature ends up on in VS Code and off in the desktop app. The renderer's
+    // own remote fallback lives in prompt-navigation.dom.test.ts, which is
+    // where the storage semantics can actually be exercised.
+    const pkg = JSON.parse(readFileSync(
+      fileURLToPath(new URL("../package.json", import.meta.url)), "utf8",
+    ));
+    const contributed = pkg.contributes.configuration.properties["grok.promptNav"];
+    expect(contributed.default).toBe(true);
+    const desktopDefaults = readFileSync(
+      fileURLToPath(new URL("../src/desktop/config-store.ts", import.meta.url)), "utf8",
+    );
+    expect(desktopDefaults).toMatch(/"grok\.promptNav":\s*true,/);
+    const sidebarSrc = readFileSync(
+      fileURLToPath(new URL("../src/sidebar.ts", import.meta.url)), "utf8",
+    );
+    expect(sidebarSrc).not.toMatch(/promptNav",\s*false\)/);
+
+    // The word is gone from both places a person reads it.
+    expect(row.title).toBe("Previous prompt button");
+    expect(contributed.markdownDescription).not.toMatch(/Experimental/i);
+    expect(contributed.markdownDescription).not.toMatch(/Off by default/i);
+  });
+});
+
+
+describe("every desktop toggle reaches the desktop host", () => {
+  it.each(["grok", "codex", "claude"])("accepts the %s config open, read, save and restart messages", (provider) => {
+    const api = loadSettings();
+    const window = new Window();
+    const container = window.document.createElement("div");
+    const posted: unknown[] = [];
+    const mounted = api.mount(container as unknown as Element, {
+      standalone: true, category: "providers",
+      env: { hostCaps: { editProviderConfigFiles: true, editProjectFiles: true } },
+      post: (msg: unknown) => posted.push(msg),
+    });
+    (container.querySelector(`[data-provider="${provider}"]`) as any).click();
+    expect(posted).toContainEqual({ type: "openProviderConfig", provider });
+    for (const message of [
+      posted.at(-1),
+      { type: "readProviderConfig", provider, requestId: "read" },
+      { type: "writeProviderConfig", provider, requestId: "create", text: "{}", stamp: { mtimeMs: 0, size: -1 }, expectedAbsPath: "/home/user/config" },
+      { type: "restartProviderSession", provider, sessionId: "current" },
+    ]) expect(parseWebviewMsg(message)).not.toBeNull();
+    mounted.dispose();
+    window.happyDOM.abort();
+  });
+
+  it("rejects malformed provider config messages at the desktop boundary", () => {
+    for (const type of ["openProviderConfig", "readProviderConfig", "writeProviderConfig", "restartProviderSession"]) {
+      for (const provider of [undefined, "__proto__", "../auth.json", "other"]) expect(parseWebviewMsg({ type, provider })).toBeNull();
+    }
+    expect(parseWebviewMsg({ type: "writeProviderConfig", provider: "grok", text: "", expectedAbsPath: "/tmp/config" })).toBeNull();
+    expect(parseWebviewMsg({ type: "restartProviderSession", provider: "grok" })).toBeNull();
+  });
+
+  // The desktop app drops any webview message its validator does not list,
+  // silently. VS Code has no such gate and a phone applies local-only rows
+  // without posting, so a toggle can work on three surfaces and be dead on
+  // the fourth — setExpandDiffCard was, for one commit. This walks the rows
+  // the desktop actually shows and posts each one through that gate.
+  it("accepts the message of every visible toggle row", () => {
+    const api = loadSettings() as any;
+    const snapshot = { ...api.defaultSnapshot(), appPurpose: "coding" };
+    const env = { isRemote: false, isDesktop: true };
+    const toggles = api.visibleRows(snapshot, env)
+      .filter((r: any) => r.kind === "toggle" && typeof r.message === "function"
+        && !(typeof r.localOnly === "function" && r.localOnly(snapshot, env)));
+    expect(toggles.length).toBeGreaterThan(5);
+    for (const row of toggles) {
+      expect(parseWebviewMsg(row.message(true)), row.id).not.toBeNull();
+    }
+  });
+});
+
+describe("Expand diff card across settings surfaces", () => {
+  it("is a coding-only General row directly after tool details on every surface", () => {
+    const api = loadSettings() as any;
+    const row = api.ROWS.find((r: { id: string }) => r.id === "expandDiffCard");
+    expect(row).toMatchObject({ category: "general", title: "Expand diff card", defaultValue: false });
+    expect(api.defaultSnapshot().expandDiffCard).toBe(false);
+    for (const env of [
+      { isRemote: true }, { isRemote: false, isDesktop: true },
+      ...["VS Code", "Cursor", "Antigravity"].map((hostName) => ({ isRemote: false, isDesktop: false, hostName })),
+    ]) {
+      const surface = api.defaultEnv(env);
+      expect(row.localOnly(undefined, surface)).toBe(env.isRemote);
+      const ids = api.visibleRows(api.defaultSnapshot({ appPurpose: "coding" }), surface).map((r: any) => r.id);
+      expect(ids.indexOf("expandDiffCard")).toBe(ids.indexOf("expandCommandOutputs") + 1);
+      expect(api.visibleRows(api.defaultSnapshot(), surface).map((r: any) => r.id)).not.toContain("expandDiffCard");
+    }
+    expect(row.message(true)).toEqual({ type: "setExpandDiffCard", value: true });
+  });
+
+  it("posts from a standalone IDE settings page with no chat apply callback", () => {
+    const api = loadSettings();
+    const w = new Window({ url: "https://localhost/" });
+    const sent: unknown[] = [];
+    const surface = api.mount(w.document.body as unknown as Element, {
+      snapshot: api.defaultSnapshot({ appPurpose: "coding" }),
+      env: api.defaultEnv({ isRemote: false, isDesktop: false }),
+      post: (m: unknown) => sent.push(m),
+    });
+    (w.document.querySelector('[data-id="expandDiffCard"] .settings-switch') as any)?.click();
+    expect(sent).toContainEqual({ type: "setExpandDiffCard", value: true });
+    surface.dispose();
+  });
+
+  it("applies locally on a remote and keeps the preference when the host reconnects", () => {
+    const h = bootWebview({ remote: true });
+    seedChat(h);
+    dispatch(h.window, { type: "agentStart" });
+    dispatch(h.window, { type: "toolCall", call: { toolCallId: "diff-pref", kind: "edit", title: "Edit a.ts", content: [
+      { type: "diff", path: "a.ts", oldText: "a", newText: "b" },
+    ] } });
+    dispatch(h.window, { type: "agentEnd" });
+    openSettings(h);
+    const row = h.doc.querySelector('[data-id="expandDiffCard"]')!;
+    click(h.window, row.querySelector('.settings-switch')!);
+    expect(h.posted.some((m) => m.type === "setExpandDiffCard")).toBe(false);
+    expect(h.window.localStorage.getItem("grok.remote.expandDiffCard")).toBe("true");
+    expect(h.doc.querySelector('.turn-diff-summary-header')?.getAttribute('aria-expanded')).toBe('true');
+    seedChat(h, { expandDiffCard: false });
+    dispatch(h.window, { type: "expandDiffCard", value: false });
+    expect(h.doc.querySelector('.turn-diff-summary-header')?.getAttribute('aria-expanded')).toBe('true');
   });
 });

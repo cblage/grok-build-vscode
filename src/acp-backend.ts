@@ -1,4 +1,4 @@
-import type { EffortLevel } from "./acp";
+import type { EffortLevel, PromptContentBlock } from "./acp";
 
 export const ACP_PROVIDERS = ["grok", "codex", "claude"] as const;
 export type AcpProvider = (typeof ACP_PROVIDERS)[number];
@@ -63,6 +63,16 @@ export interface BackendSessionListResult {
   nextCursor?: string | null;
 }
 
+export interface BackendSteeringCapabilities {
+  supported: boolean;
+  acceptsContent: boolean;
+}
+
+export interface BackendSteeringOptions {
+  grokVersion?: string;
+  grokVersionVerified?: boolean;
+}
+
 export interface AcpBackend {
   readonly provider: AcpProvider;
   readonly processName: string;
@@ -75,6 +85,13 @@ export interface AcpBackend {
   setModel(sessionId: string, modelId: string, reasoningEffort?: string): { method: string; params: any };
   setReasoningEffort(sessionId: string, modelId: string | undefined, level: string): { method: string; params: any } | null;
   setMode(sessionId: string, modeId: string): { method: string; params: any };
+  steeringCapabilities(initializeResult: any, options: BackendSteeringOptions): BackendSteeringCapabilities;
+  interject(sessionId: string, text: string, content?: readonly PromptContentBlock[]): { method: string; params: any } | null;
+  /**
+   * Whether a steering RPC that RESOLVED actually delivered the text. Some
+   * adapters report a steering failure in-band, as a successful response.
+   */
+  steerDelivered(result: any): boolean;
   configState(response: any, fallback: BackendConfigState): BackendConfigState;
   modelSetSucceeded(response: any): boolean;
   listSessions(

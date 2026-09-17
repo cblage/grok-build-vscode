@@ -37,6 +37,7 @@ function makeSidebar(options: {
   const cwd = options.cwd ?? "/repo";
   const memento: Memento = options.memento ?? {};
   const sidebar = Object.create(GrokSidebar.prototype) as any;
+  sidebar.pendingConfirms = new Map();
   const connected = options.connected ?? ["grok"];
   sidebar.providerConnectionState = { grok: true, codex: false };
   sidebar.providerConnections = vi.fn(() => sidebar.providerConnectionState);
@@ -94,7 +95,6 @@ function makeSidebar(options: {
   sidebar.stopVoiceInput = vi.fn();
   sidebar.workspaceRoot = vi.fn(() => cwd);
   sidebar.authorizedSessionCwds = vi.fn(() => [cwd]);
-  sidebar.remoteAuthorizedSessionCwds = vi.fn(() => [cwd]);
   sidebar.sessionCwd = vi.fn((session: Session) => session.cwd || cwd);
   sidebar.setSessionCwd = vi.fn((session: Session, target: string) => { session.cwd = target; });
   sidebar.persistWorktreeBinding = vi.fn(async () => {});
@@ -132,7 +132,7 @@ describe("a background conversation's draft when its provider signs out", () => 
     background.cwd = "/repo";
     background.activeSessionId = "background-grok";
     background.hasHistory = true;
-    background.client = { dispose: vi.fn() } as any;
+    background.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     background.queuedSends = [{ text: "the secret draft", chips: [] }];
     sidebar.pool.add(background);
     sidebar.sessionDisplayName = vi.fn((session: Session) =>
@@ -163,7 +163,7 @@ describe("a background conversation's draft when its provider signs out", () => 
     background.provider = "grok";
     background.cwd = "/repo";
     background.queuedSends = [{ text: "draft typed during startup", chips: [] }];
-    background.client = { dispose: vi.fn() } as any;
+    background.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     sidebar.pool.add(background);
     sidebar.sessionDisplayName = vi.fn(() => "Starting conversation");
     const local: HostMsg[] = [];
@@ -186,7 +186,7 @@ describe("a background conversation's draft when its provider signs out", () => 
     background.provider = "grok";
     background.cwd = "/repo";
     background.activeSessionId = "background-grok";
-    background.client = { dispose: vi.fn() } as any;
+    background.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     background.queuedSends = [{ text: "draft text", chips: [] }];
     sidebar.pool.add(background);
     sidebar.sessionDisplayName = vi.fn(() => "Background investigation");
@@ -363,11 +363,11 @@ describe("signing back in after the last provider signed out", () => {
     sidebar.defaultProviderForProject = vi.fn(() => "grok");
     const desk = sidebar.focused as Session;
     desk.provider = "grok";
-    desk.client = { dispose: vi.fn() } as any;
+    desk.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     const phone = new Session();
     phone.provider = "grok";
     phone.cwd = "/repo";
-    phone.client = { dispose: vi.fn() } as any;
+    phone.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     phone.queuedSends = [{ text: "ask about the migration", chips: [] }];
     sidebar.remoteClients.identify("phone", "stable-phone-tab-after-logout");
     sidebar.remoteClients.ready("phone");
@@ -406,14 +406,14 @@ describe("signing back in after the last provider signed out", () => {
     const empty = sidebar.focused as Session;
     empty.provider = "grok";
     empty.activeSessionId = "empty-shell";
-    empty.client = { dispose: vi.fn() } as any;
+    empty.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
 
     const real = new Session();
     real.provider = "grok";
     real.cwd = "/repo";
     real.activeSessionId = "has-history";
     real.hasHistory = true;
-    real.client = { dispose: vi.fn() } as any;
+    real.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     sidebar.pool = new Set([empty, real]);
 
     await logout(sidebar);
@@ -434,7 +434,7 @@ describe("signing back in after the last provider signed out", () => {
     drafting.provider = "grok";
     drafting.activeSessionId = "empty-with-draft";
     drafting.queuedSends = [{ text: "the thing I was about to ask", chips: [] }] as any;
-    drafting.client = { dispose: vi.fn() } as any;
+    drafting.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     sidebar.pool = new Set([drafting]);
 
     await logout(sidebar);
@@ -450,7 +450,7 @@ describe("signing back in after the last provider signed out", () => {
     old.provider = "grok";
     old.activeSessionId = "park-origin";
     old.queuedSends = [{ text: "park me", chips: [] }];
-    old.client = { dispose: vi.fn() } as any;
+    old.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     await logout(sidebar);
     const stranded = sidebar.focused as Session;
     sidebar.resolveLocalRepoTarget = vi.fn(() => undefined);
@@ -470,18 +470,18 @@ describe("signing back in after the last provider signed out", () => {
     sidebar.defaultProviderForProject = vi.fn(() => "grok");
     const desk = sidebar.focused as Session;
     desk.provider = "grok";
-    desk.client = { dispose: vi.fn() } as any;
+    desk.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     const phone = new Session();
     phone.provider = "grok";
     phone.cwd = "/repo";
-    phone.client = { dispose: vi.fn() } as any;
+    phone.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     phone.queuedSends = [{ text: "ask about the migration", chips: [] }];
     const detached = new Session();
     detached.provider = "grok";
     detached.cwd = "/repo";
     detached.activeSessionId = "detached-grok";
     detached.hasHistory = true;
-    detached.client = { dispose: vi.fn() } as any;
+    detached.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     detached.queuedSends = [{ text: "draft from the disconnected phone", chips: [] }];
     sidebar.remoteClients.ready("phone");
     sidebar.remoteClients.setActive("phone", phone);
@@ -510,7 +510,7 @@ describe("signing back in after the last provider signed out", () => {
     sidebar.startSession = vi.fn(async (_resumeId: undefined, session: Session) => {
       session.needsProvider = false;
       session.activeSessionId = "fresh-grok";
-      session.client = { dispose: vi.fn() } as any;
+      session.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
       return session.client;
     });
 
@@ -558,7 +558,7 @@ describe("signing back in after the last provider signed out", () => {
     old.provider = "grok";
     old.activeSessionId = "draft-origin";
     old.queuedSends = [{ text: "survive failed retry", chips: [] }];
-    old.client = { dispose: vi.fn() } as any;
+    old.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     await logout(sidebar);
 
     sidebar.connectedProviders = vi.fn(() => ["grok"]);
@@ -593,7 +593,7 @@ describe("signing back in after the last provider signed out", () => {
     old.provider = "grok";
     old.activeSessionId = "cross-provider-origin";
     old.queuedSends = [{ text: "survive the Codex replacement refusal", chips: [] }];
-    old.client = { dispose: vi.fn() } as any;
+    old.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     sidebar.startSession = vi.fn(async () => undefined);
     const restored: HostMsg[] = [];
     sidebar.emit = vi.fn((_session: Session, message: HostMsg) => restored.push(message));

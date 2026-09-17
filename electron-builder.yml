@@ -201,6 +201,15 @@ nsis:
   artifactName: Grok-Build-Desktop-${version}-${os}-${arch}.${ext}
 
 linux:
+  # Same AppImage serves two audiences: the cloud machines, which extract it and
+  # exec the payload, and Linux desks, which run the file itself. Only the
+  # second ever reaches the feed below — electron-updater's AppImageUpdater
+  # refuses to run unless `process.env.APPIMAGE` is set, which an extracted run
+  # never has. That is what keeps a sprite from self-updating out from under
+  # refresh-sprite-hosts.mjs without a cloud check anywhere in the app.
+  publish:
+    provider: generic
+    url: https://afkpilot.com/update/linux
   icon: resources/grok-icon-round-512.png
   category: Development
   target:

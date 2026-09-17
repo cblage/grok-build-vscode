@@ -8,18 +8,16 @@
 //      buttons stopPropagation so they don't also resume
 //   3. Reasoning traces "no longer expandable" -> header click toggles the body
 import { describe, it, expect, vi } from "vitest";
-import { bootWebview, dispatch, click, Posted } from "./webview-harness";
+import { openAppSettings, bootWebview, dispatch, click, Posted } from "./webview-harness";
 import { countsAsUserBubble } from "../src/plan-restore";
 import { bracketRemoteSnapshot } from "../src/remote-policy";
 import type { HostMsg } from "../src/protocol";
 
 const $ = (doc: Document, id: string) => doc.getElementById(id) as HTMLElement;
 function openSettingsOverlay(window: Window, doc: Document) {
-  click(window, $(doc, "gear-btn"));
-  const item = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
-    .find((el) => /(^|\s)Settings$/.test((el.textContent || "").replace(/\s+/g, " ").trim()));
-  click(window, item!);
+  openAppSettings(window, doc);
 }
+
 function clickSettingsNav(window: Window, doc: Document, title: string) {
   const item = [...doc.querySelectorAll("#settings-overlay .settings-nav-item")]
     .find((el) => (el.textContent || "").trim() === title);
@@ -1330,7 +1328,7 @@ describe("gear settings lock (model + effort disabled while busy / priming)", ()
     h.posted.length = 0;
     return h;
   }
-  const modelBtn = (doc: Document) => doc.querySelector(".model-name-btn") as HTMLButtonElement;
+  const modelBtn = (doc: Document) => doc.querySelector(".model-picker-row") as HTMLButtonElement;
 
   it("shows the user-facing model name on the gear button, not the raw id", () => {
     const { window, doc } = bootWithModels();
@@ -1339,17 +1337,79 @@ describe("gear settings lock (model + effort disabled while busy / priming)", ()
     expect(modelBtn(doc).textContent).not.toContain("grok-build");
   });
 
-  it("when idle, the model button opens the picker and a pick posts setModel", () => {
+  it("when idle, a pick previews in place and posts setModel when the picker closes", () => {
     const { window, posted, doc } = bootWithModels();
     click(window, $(doc, "gear-btn"));
     expect(modelBtn(doc).disabled).toBe(false);
 
-    click(window, modelBtn(doc)); // opens the picker sub-view
     const composer = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
       .find((el) => el.textContent!.includes("Composer 2.5 Fast")) as HTMLElement;
     click(window, composer);
 
+    // The next step may be the effort strip, so the picker stays up — and the
+    // chip already reads the new name, applied or not (owner, 2026-09-13).
+    expect($(doc, "gear-popover").hidden).toBe(false);
+    expect($(doc, "gear-btn").textContent).toContain("Composer 2.5 Fast");
+    expect(types(posted)).not.toContain("setModel");
+
+    click(window, $(doc, "gear-btn"));
     expect(posted).toContainEqual({ type: "setModel", modelId: "grok-composer-2.5-fast" });
+  });
+
+  it("sends ONE message when a close changed the model and the effort", () => {
+    const { window, posted, doc } = bootWithModels();
+    click(window, $(doc, "gear-btn"));
+    const composer = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
+      .find((el) => el.textContent!.includes("Composer 2.5 Fast")) as HTMLElement;
+    click(window, composer);
+    click(window, doc.querySelectorAll(".effort-strip-stop")[3] as HTMLElement);
+    click(window, $(doc, "gear-btn"));
+
+    // Two posts would race the host's own handlers, so the level rides on the
+    // switch — see flushPicker, and sidebar's setModel case.
+    expect(posted).toContainEqual({
+      type: "setModel", modelId: "grok-composer-2.5-fast", effort: "medium",
+    });
+    expect(types(posted)).not.toContain("setEffort");
+  });
+
+  it("commits the picker BEFORE the send, so the prompt runs on the model just picked", () => {
+    const { window, posted, doc } = bootWithModels();
+    (doc.getElementById("input") as HTMLTextAreaElement).value = "hello";
+    click(window, $(doc, "gear-btn"));
+    const composer = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
+      .find((el) => el.textContent!.includes("Composer 2.5 Fast")) as HTMLElement;
+    click(window, composer);
+
+    // Send WITHOUT closing the picker first -- which keeping it open makes the
+    // natural gesture. The document's own close listener is on the bubble
+    // phase, so it runs AFTER this button's handler: without a flush of its
+    // own, `send` would reach the host first and the turn would run on the
+    // model that was just replaced.
+    click(window, doc.getElementById("send-btn") as HTMLButtonElement);
+
+    const order = types(posted);
+    expect(order).toContain("setModel");
+    expect(order).toContain("send");
+    expect(order.indexOf("setModel")).toBeLessThan(order.indexOf("send"));
+    // And the close that follows the click has nothing left to post.
+    expect(order.filter((t) => t === "setModel")).toHaveLength(1);
+  });
+
+  it("commits the picker before a SPOKEN send too, which no click precedes", () => {
+    const { window, posted, doc } = bootWithModels();
+    click(window, $(doc, "gear-btn"));
+    const composer = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
+      .find((el) => el.textContent!.includes("Composer 2.5 Fast")) as HTMLElement;
+    click(window, composer);
+
+    // "grok send" during a dictation the picker was opened over: the send is a
+    // host message, so nothing bubbles into closePopovers on its way in.
+    dispatch(window, { type: "voiceSubmit", text: "hello" });
+
+    const order = types(posted);
+    expect(order).toContain("setModel");
+    expect(order.indexOf("setModel")).toBeLessThan(order.indexOf("send"));
   });
 
   it("groups remote empty-session models deterministically and switches providers additively", () => {
@@ -1372,13 +1432,13 @@ describe("gear settings lock (model + effort disabled while busy / priming)", ()
       ],
     });
     click(h.window, $(h.doc, "gear-btn"));
-    click(h.window, modelBtn(h.doc));
 
     expect([...h.doc.querySelectorAll(".model-provider-heading")].map((el) => el.textContent))
       .toEqual(["Grok", "Codex"]);
     const codexModel = [...h.doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
       .find((el) => el.textContent?.includes("GPT-5.6 Sol")) as HTMLElement;
     click(h.window, codexModel);
+    click(h.window, $(h.doc, "gear-btn"));
     expect(h.posted).toContainEqual({ type: "setModel", modelId: "gpt-5.6-sol", provider: "codex" });
   });
 
@@ -1404,7 +1464,6 @@ describe("gear settings lock (model + effort disabled while busy / priming)", ()
     });
     dispatch(h.window, { type: "userMessage", text: "continue this conversation", chips: [] });
     click(h.window, $(h.doc, "gear-btn"));
-    click(h.window, modelBtn(h.doc));
 
     const text = h.doc.getElementById("gear-popover")!.textContent || "";
     expect(text).toContain("GPT-5.6 Sol");
@@ -1413,34 +1472,14 @@ describe("gear settings lock (model + effort disabled while busy / priming)", ()
     expect(h.doc.querySelectorAll(".model-provider-heading")).toHaveLength(0);
   });
 
-  it("renders the Accounts cluster only after the provider capability frame", () => {
+  it("keeps provider recovery reachable while all model selections are locked", () => {
     const h = bootWithModels();
+    dispatch(h.window, { type: "providerState", providers: [{ id: "grok", connected: false }] });
     click(h.window, $(h.doc, "gear-btn"));
-    expect(h.doc.querySelector("#gear-popover")!.textContent).not.toContain("Accounts");
-
-    dispatch(h.window, {
-      type: "providerState",
-      providers: [
-        { id: "grok", connected: true },
-        { id: "codex", connected: false },
-      ],
-    });
-    expect(h.doc.querySelector("#gear-popover")!.textContent).not.toContain("Accounts");
-
-    dispatch(h.window, {
-      type: "providerState",
-      providers: [
-        { id: "grok", connected: false },
-        { id: "codex", connected: false },
-      ],
-    });
-    expect(h.doc.querySelector("#gear-popover")!.textContent).toContain("Accounts");
-    const sections = [...h.doc.querySelectorAll("#gear-popover .popover-section")];
-    expect(sections.at(-1)?.textContent).toBe("Accounts");
-    const codex = [...h.doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
-      .find((el) => el.textContent?.includes("Codex")) as HTMLElement;
-    click(h.window, codex);
-    expect(h.posted).toContainEqual({ type: "runGrokLogin", provider: "codex" });
+    expect((h.doc.getElementById("gear-btn") as HTMLButtonElement).disabled).toBe(false);
+    expect((h.doc.querySelector(".model-picker-row") as HTMLButtonElement | null)?.disabled ?? true).toBe(true);
+    click(h.window, h.doc.querySelector(".model-manage-providers")!);
+    expect(h.doc.querySelector('[data-category="providers"].active')).toBeTruthy();
   });
 
   it("never renders provider management or posts account actions remotely", () => {
@@ -1461,25 +1500,27 @@ describe("gear settings lock (model + effort disabled while busy / priming)", ()
     expect(types(h.posted)).not.toContain("runGrokLogin");
   });
 
-  it("while priming, the model button is disabled and clicking it neither opens the picker nor posts", () => {
+  it("while priming, model rows are disabled and clicking one posts nothing — but the chip still opens", () => {
     const { window, posted, doc } = bootWithModels({ value: true, locked: true });
     click(window, $(doc, "gear-btn"));
 
-    expect(modelBtn(doc).disabled).toBe(true);
-    expect(modelBtn(doc).className).toContain("disabled");
+    // Locking the SELECTION is not locking the control: the picker is what
+    // carries Manage providers, the recovery route out of this state.
+    expect($(doc, "gear-popover").hidden).toBe(false);
+    expect((doc.getElementById("gear-btn") as HTMLButtonElement).disabled).toBe(false);
+    expect(doc.querySelector(".model-manage-providers")).toBeTruthy();
 
+    expect(modelBtn(doc).disabled).toBe(true);
     click(window, modelBtn(doc));
-    // still on the main gear view (the picker's "← Model" back row never rendered)
-    expect(doc.querySelector("#gear-popover .popover-back")).toBeNull();
     expect(types(posted)).not.toContain("setModel");
   });
 
   it("while busy, clicking an effort dot does not post setEffort", () => {
     const { window, posted, doc } = bootWithModels({ value: true });
     click(window, $(doc, "gear-btn"));
-    const dot = doc.querySelector(".effort-dot") as HTMLElement;
+    const dot = doc.querySelector(".effort-strip-stop") as HTMLElement;
 
-    expect(dot.className).toContain("disabled");
+    expect((dot as HTMLButtonElement).disabled).toBe(true);
     click(window, dot);
     expect(types(posted)).not.toContain("setEffort");
   });
@@ -1677,7 +1718,7 @@ describe("provider onboarding", () => {
 
 describe("gear menu — AFK Pilot onboarding", () => {
   const gearItem = (doc: Document, label: string) =>
-    [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")].find(
+    [...doc.querySelectorAll("#add-popover .toolbar-popover-item")].find(
       (el) => el.textContent?.includes(label),
     ) as HTMLElement | undefined;
   const button = (doc: Document, label: string) =>
@@ -1688,7 +1729,7 @@ describe("gear menu — AFK Pilot onboarding", () => {
   it("offers linked devices an immediate hinted Continue remotely action with a phone icon", () => {
     const { window, posted, doc } = bootWebview();
     dispatch(window, { type: "remoteStatus", linked: true });
-    click(window, $(doc, "gear-btn"));
+    click(window, $(doc, "add-btn"));
 
     const item = gearItem(doc, "Continue remotely");
     expect(item).toBeTruthy();
@@ -1707,9 +1748,9 @@ describe("gear menu — AFK Pilot onboarding", () => {
     // show nothing, and the section must appear when the answer lands, even
     // while the popover is open.
     const { window, doc } = bootWebview();
-    click(window, $(doc, "gear-btn"));
+    click(window, $(doc, "add-btn"));
 
-    const labels = () => [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
+    const labels = () => [...doc.querySelectorAll("#add-popover .toolbar-popover-item")]
       .map((el) => el.textContent || "");
     expect(labels().some((l) => /link this device|Your account|Continue remotely/i.test(l))).toBe(false);
 
@@ -1722,9 +1763,9 @@ describe("gear menu — AFK Pilot onboarding", () => {
     // next to "Continue remotely" was removed (owner, 2026-07-30).
     const { window, posted, doc } = bootWebview();
     dispatch(window, { type: "remoteStatus", linked: true });
-    click(window, $(doc, "gear-btn"));
+    click(window, $(doc, "add-btn"));
 
-    const labels = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
+    const labels = [...doc.querySelectorAll("#add-popover .toolbar-popover-item")]
       .map((el) => el.textContent || "");
     expect(labels.some((l) => /unlink this device/i.test(l))).toBe(false);
 
@@ -1743,7 +1784,7 @@ describe("gear menu — AFK Pilot onboarding", () => {
       capabilities: { relocateView: false, showOutput: false },
     });
     dispatch(window, { type: "remoteStatus", linked: true });
-    click(window, $(doc, "gear-btn"));
+    click(window, $(doc, "add-btn"));
     expect(gearItem(doc, "Unlink this device…")).toBeUndefined();
     openSettingsOverlay(window, doc);
     clickSettingsNav(window, doc, "Remote control");
@@ -1761,7 +1802,7 @@ describe("gear menu — AFK Pilot onboarding", () => {
       capabilities: { relocateView: false, showOutput: false },
     });
     dispatch(window, { type: "remoteStatus", linked: true });
-    click(window, $(doc, "gear-btn"));
+    click(window, $(doc, "add-btn"));
     expect(gearItem(doc, "Unlink this device…")).toBeUndefined();
   });
 
@@ -1785,7 +1826,7 @@ describe("gear menu — AFK Pilot onboarding", () => {
   it("opens the How it works explainer locally without navigating", () => {
     const { window, posted, doc } = bootWebview();
     dispatch(window, { type: "remoteStatus", linked: false });
-    click(window, $(doc, "gear-btn"));
+    click(window, $(doc, "add-btn"));
     click(window, gearItem(doc, "How it works")!);
 
     expect(posted.filter((msg) => msg.type === "openRemotePortal")).toEqual([]);
@@ -1808,7 +1849,7 @@ describe("gear menu — AFK Pilot onboarding", () => {
       capabilities: { relocateView: false, showOutput: false },
     });
     dispatch(window, { type: "remoteStatus", linked: false });
-    click(window, $(doc, "gear-btn"));
+    click(window, $(doc, "add-btn"));
     click(window, gearItem(doc, "How it works")!);
     const panel = doc.querySelector(".remote-explainer-panel");
     expect(panel!.textContent).toContain("Keep this app open.");
@@ -1826,7 +1867,7 @@ describe("gear menu — AFK Pilot onboarding", () => {
       },
     });
     dispatch(window, { type: "remoteStatus", linked: false }); // an unlinked machine, stated not assumed
-    click(window, $(doc, "gear-btn"));
+    click(window, $(doc, "add-btn"));
     click(window, gearItem(doc, "How it works")!);
 
     click(window, doc.querySelector(".remote-url-copy")!);
@@ -1842,7 +1883,7 @@ describe("gear menu — AFK Pilot onboarding", () => {
   it("closes the explainer without navigating", () => {
     const { window, posted, doc } = bootWebview();
     dispatch(window, { type: "remoteStatus", linked: false }); // an unlinked machine, stated not assumed
-    click(window, $(doc, "gear-btn"));
+    click(window, $(doc, "add-btn"));
     click(window, gearItem(doc, "How it works")!);
     click(window, doc.querySelector(".remote-explainer-close")!);
 
@@ -1854,7 +1895,7 @@ describe("gear menu — AFK Pilot onboarding", () => {
 describe("effort picker uses the model's advertised levels (not a hardcoded set)", () => {
   const openEffortDots = (h: any) => {
     click(h.window, $(h.doc, "gear-btn"));
-    return [...h.doc.querySelectorAll(".effort-dot")] as HTMLElement[];
+    return [...h.doc.querySelectorAll(".effort-strip-stop")] as HTMLElement[];
   };
 
   it("shows exactly the current model's advertised efforts, ordered low→high", () => {
@@ -1872,7 +1913,7 @@ describe("effort picker uses the model's advertised levels (not a hardcoded set)
     ]);
   });
 
-  it("uses the session's effective effort instead of the global spawn preference", () => {
+  it.each([undefined, "medium"])("uses the session's effective effort over the spawn preference and catalog effort %s", (catalogEffort) => {
     const h = bootWebview();
     dispatch(h.window, {
       type: "initialState", effort: "medium", cwd: "/w", useCtrlEnter: false,
@@ -1885,12 +1926,15 @@ describe("effort picker uses the model's advertised levels (not a hardcoded set)
       models: [{
         modelId: "grok-4.6", name: "Grok 4.6",
         reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        reasoningEffort: catalogEffort,
       }],
     });
 
     const dots = openEffortDots(h);
     expect(dots).toHaveLength(4);
-    expect(dots.every((dot) => dot.classList.contains("active"))).toBe(true);
+    expect(dots.map((dot) => dot.getAttribute("aria-checked")))
+      .toEqual(["false", "false", "false", "true"]);
+    expect(h.doc.querySelector(".model-chip-effort")?.textContent).toBe("Extra high");
   });
 
   it("falls back to the full ladder when the model advertises no efforts", () => {
@@ -1902,14 +1946,11 @@ describe("effort picker uses the model's advertised levels (not a hardcoded set)
     expect(openEffortDots(h)).toHaveLength(6);
   });
 
-  it("shows a Loading… model + 5 neutral placeholder dots before the session's model info arrives", () => {
+  it("shows Loading without inventing effort stops before model metadata arrives", () => {
     const h = bootWebview();
-    // no `session` message yet → no model / effort menu known
-    const dots = openEffortDots(h);
-    const nameBtn = h.doc.querySelector("#gear-popover .model-name-btn") as HTMLElement;
-    expect(nameBtn.textContent).toContain("Loading");
-    expect(dots).toHaveLength(5);
-    expect(dots.every((d) => d.classList.contains("loading"))).toBe(true);
+    expect(openEffortDots(h)).toHaveLength(0);
+    expect(h.doc.querySelector(".model-chip-name")?.textContent).toContain("Loading");
+    expect(h.doc.querySelector(".model-manage-providers")).toBeTruthy();
   });
 });
 
@@ -2347,16 +2388,16 @@ describe("gear menu — Other group + About / Settings", () => {
     h.posted.length = 0;
     return h;
   }
-  const items = (doc: Document) => [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")] as HTMLElement[];
+  const items = (doc: Document) => [...doc.querySelectorAll("#add-popover .toolbar-popover-item")] as HTMLElement[];
 
   it("replaces the flat Config/Account/Debug sections with an Other group", () => {
     const h = boot();
-    click(h.window, $(h.doc, "gear-btn"));
+    click(h.window, $(h.doc, "add-btn"));
     const labels = items(h.doc).map((el) => el.textContent || "");
     expect(labels.some((l) => l.includes("Version & about"))).toBe(false);
     expect(labels.some((l) => /(^|\s)Settings$/.test(l.replace(/\s+/g, " ").trim()))).toBe(true);
     expect(labels.some((l) => l.includes("Config & debug"))).toBe(false);
-    expect(labels.some((l) => l.includes("Log out"))).toBe(true);
+    expect(labels.some((l) => l.includes("Log out"))).toBe(false); // Legacy recovery stays in the chip footer.
     // the old standalone items no longer live on the main view
     expect(labels.some((l) => l.trim() === "Sign out")).toBe(false);
     expect(labels.some((l) => l.includes("Show extension logs"))).toBe(false);
@@ -2555,7 +2596,7 @@ describe("gear menu — Other group + About / Settings", () => {
 
   it("the gear no longer has a Version & about entry", () => {
     const h = boot();
-    click(h.window, $(h.doc, "gear-btn"));
+    click(h.window, $(h.doc, "add-btn"));
     expect(items(h.doc).some((el) => (el.textContent || "").includes("Version & about"))).toBe(false);
     expect(items(h.doc).some((el) => (el.textContent || "").includes("Settings"))).toBe(true);
   });
@@ -2566,7 +2607,7 @@ describe("gear menu — Other group + About / Settings", () => {
     clickSettingsNav(h.window, h.doc, "Advanced");
 
     const overlay = h.doc.getElementById("settings-overlay")!;
-    expect(overlay.querySelector('[data-id="openGlobalConfig"]')).toBeTruthy();
+    expect(overlay.querySelector('[data-id="openGlobalConfig"]')).toBeNull();
     expect(overlay.querySelector('[data-id="openProjectConfig"]')).toBeTruthy();
     expect(overlay.querySelector('[data-id="showLogs"]')).toBeTruthy();
 
@@ -3468,8 +3509,9 @@ describe("gear entry: Move view (Settings → Advanced)", () => {
     openAdvancedSettings(window, doc);
     expect(itemByLabel(doc, "Move view")).toBeUndefined();
     expect(itemByLabel(doc, "Show extension logs")).toBeUndefined();
-    // Config paths still work on desktop.
-    expect(itemByLabel(doc, "Open global config")).toBeTruthy();
+    // The project config stays in Advanced; global config lives in Providers.
+    expect(itemByLabel(doc, "Open project config")).toBeTruthy();
+    expect(itemByLabel(doc, "Open global config")).toBeUndefined();
   });
 });
 
@@ -3525,7 +3567,7 @@ describe("context popover (donut click, #39)", () => {
     expect(text).toContain("Skills");
     expect(text).toContain("MCP (2 servers)");
     // 16,017 used − 1,039 system − 12,166 messages = 2,812 overhead.
-    expect(text).toMatch(/Reasoning\/overhead\s*2,812/);
+    expect(text).toContain("Reasoning/overhead2.81K");
     const windowAt = text.indexOf("In this window");
     const countedAt = text.indexOf("Already counted above");
     expect(text.indexOf("System")).toBeGreaterThan(windowAt);
@@ -3562,7 +3604,7 @@ describe("context popover (donut click, #39)", () => {
     expect(first).toMatch(/System\s*10/);
     expect(first).toMatch(/Messages\s*80/);
     expect(first).toMatch(/Reasoning\/overhead\s*10/);
-    expect(first).toMatch(/Free\s*199,890/);
+    expect(first).toContain("Free200K");
     expect(first).toContain("Already counted above");
     expect(first).toContain("Tool definitions");
     expect(first).toContain("Skills");
@@ -3600,7 +3642,7 @@ describe("context popover (donut click, #39)", () => {
     const text = $(doc, "context-popover").textContent!;
     expect(text).toContain("In this window");
     expect(text).toMatch(/Reasoning\/overhead\s*10/);
-    expect(text).toMatch(/Free\s*199,890/);
+    expect(text).toContain("Free200K");
   });
 
   it("keeps the snapshot after promptComplete moves used and re-fetches session/info", () => {
@@ -3648,7 +3690,7 @@ describe("context popover (donut click, #39)", () => {
     });
     click(window, $(doc, "donut"));
     const text = $(doc, "context-popover").textContent!;
-    expect(text).toMatch(/Reasoning\/overhead\s*3,000/);
+    expect(text).toContain("Reasoning/overhead3K");
     const windowAt = text.indexOf("In this window");
     const countedAt = text.indexOf("Already counted above");
     expect(text.indexOf("Reasoning/overhead")).toBeGreaterThan(windowAt);
@@ -3720,11 +3762,11 @@ describe("context popover (donut click, #39)", () => {
     // on the surface showing the number that motivates it — and directly under
     // the context line, not stranded below the billing sections.
     expect(act).not.toBeNull();
-    expect(act.classList.contains("disabled")).toBe(true); // 0 tokens — nothing to compact
+    expect((act as HTMLButtonElement).disabled).toBe(true); // 0 tokens — nothing to compact
     const rows = [...pop.children];
-    expect(rows.indexOf(act)).toBe(rows.findIndex((e) => e.textContent!.includes("Context used")) + 1);
+    expect(rows.indexOf(act)).toBe(rows.findIndex((e) => e.textContent!.includes("Context used")) + 2);
     // A <button> would drag native chrome into the popover; every row is a div.
-    expect(act.tagName).toBe("DIV");
+    expect(act.tagName).toBe("BUTTON");
   });
 
   it("Compact sends /compact bare once there is context", () => {
@@ -3737,7 +3779,7 @@ describe("context popover (donut click, #39)", () => {
     dispatch(window, { type: "promptComplete", meta: { totalTokens: 44123 } });
     click(window, $(doc, "donut"));
     const act = $(doc, "context-popover").querySelector(".context-compact") as HTMLElement;
-    expect(act.classList.contains("disabled")).toBe(false);
+    expect((act as HTMLButtonElement).disabled).toBe(false);
     click(window, act);
     expect(posted).toContainEqual({ type: "send", text: "/compact", bare: true });
   });
@@ -3778,7 +3820,9 @@ describe("context popover — usage breakdown (#53)", () => {
     // Session total is the number you act on, so it leads; Last turn is detail.
     expect(txt.indexOf("Session total")).toBeGreaterThan(-1);
     expect(txt.indexOf("Session total")).toBeLessThan(txt.indexOf("Last turn"));
-    expect(txt.replace(/[,\s\u00a0\u202f]/g, "")).toContain("32722");
+    // Thousands read as thousands here too: the ledger is one column of
+    // figures, and 32,722 beside 32.26K would be two different scales.
+    expect(txt.replace(/[,\s\u00a0\u202f]/g, "")).toContain("32.72K");
     expect(txt).toContain("cache read");
     expect(txt).not.toContain("Cost"); // no reported cost => no fake $0 row
     // No cache-CREATION field exists anywhere in the CLI — it must not be faked.
@@ -3798,7 +3842,7 @@ describe("context popover — usage breakdown (#53)", () => {
       session: { inputTokens: 32722, outputTokens: 202 },
     });
     click(window, $(doc, "donut"));
-    const hdr = $(doc, "context-popover").querySelector(".popover-section-toggle") as HTMLElement;
+    const hdr = $(doc, "context-popover").querySelector('[data-fold="lastTurn"]') as HTMLElement;
     expect(hdr).not.toBeNull();
     const body = hdr.nextElementSibling as HTMLElement;
     expect(body.hidden).toBe(true); // diagnostics stay out of the way by default
@@ -3808,6 +3852,69 @@ describe("context popover — usage breakdown (#53)", () => {
     // "Model calls" is what makes billed input (which dwarfs context) make sense.
     expect(body.textContent).toContain("Model calls");
     expect(body.textContent).toContain("3");
+  });
+
+  it("folds Session total too, closed by default and remembered independently", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "initialState", appPurpose: "coding", capabilities: {} } as never);
+    dispatch(window, {
+      type: "usage",
+      turn: { inputTokens: 16394, outputTokens: 160, modelCalls: 3 },
+      session: { inputTokens: 32722, outputTokens: 202 },
+    });
+    click(window, $(doc, "donut"));
+    const pop = $(doc, "context-popover");
+    const sess = pop.querySelector('[data-fold="session"]') as HTMLElement;
+    const turn = pop.querySelector('[data-fold="lastTurn"]') as HTMLElement;
+    expect(sess).not.toBeNull();
+    // The donut is opened to read a CONTEXT figure. Neither ledger unrolls over
+    // it uninvited.
+    expect((sess.nextElementSibling as HTMLElement).hidden).toBe(true);
+    expect((turn.nextElementSibling as HTMLElement).hidden).toBe(true);
+
+    // Opening one leaves the other alone — separate keys, separate memory.
+    click(window, sess);
+    expect((sess.nextElementSibling as HTMLElement).hidden).toBe(false);
+    expect((turn.nextElementSibling as HTMLElement).hidden).toBe(true);
+    expect((sess.nextElementSibling as HTMLElement).textContent).toContain("Input");
+
+    // The marker is SWAPPED, not rotated, so a closed section is a real "›" and
+    // an open one a real "⌄" rather than the same glyph on its side.
+    expect(sess.querySelector(".popover-twisty")!.innerHTML)
+      .not.toBe(turn.querySelector(".popover-twisty")!.innerHTML);
+  });
+
+  it("folds Already counted above, closed by default and independent of the ledgers", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "initialState", appPurpose: "coding", capabilities: {} } as never);
+    dispatch(window, {
+      type: "contextUsage",
+      used: 16017,
+      window: 512000,
+      systemPromptTokens: 1039,
+      toolDefinitionsTokens: 812,
+      messageTokens: 12166,
+      categories: [{ label: "Skills", tokens: 1200 }],
+    });
+    dispatch(window, { type: "usage", session: { inputTokens: 32722, outputTokens: 202 } });
+    click(window, $(doc, "donut"));
+    const pop = $(doc, "context-popover");
+    const counted = pop.querySelector('[data-fold="counted"]') as HTMLElement;
+    expect(counted).not.toBeNull();
+    const body = counted.nextElementSibling as HTMLElement;
+    // Every row under it restates a number already shown in "In this window",
+    // so it is the last thing worth unrolling uninvited.
+    expect(body.hidden).toBe(true);
+    expect(body.textContent).toContain("Tool definitions");
+
+    // "In this window" is NOT a fold. The figures the donut is opened to read
+    // stay on screen; only the restatements and the ledgers collapse.
+    expect(pop.querySelector('[data-fold="window"]')).toBeNull();
+
+    click(window, counted);
+    expect(body.hidden).toBe(false);
+    const sess = pop.querySelector('[data-fold="session"]') as HTMLElement;
+    expect((sess.nextElementSibling as HTMLElement).hidden).toBe(true);
   });
 
   it("a restore-only session total (no turn yet) shows the session section alone", () => {
@@ -3841,7 +3948,7 @@ describe("context popover — usage breakdown (#53)", () => {
     const pop = $(doc, "context-popover");
     expect(pop.textContent).toContain("$0.018038");
 
-    const hdr = pop.querySelector(".popover-section-toggle") as HTMLElement;
+    const hdr = pop.querySelector('[data-fold="lastTurn"]') as HTMLElement;
     click(window, hdr);
     expect((hdr.nextElementSibling as HTMLElement).textContent).toContain("$0.008");
   });
@@ -3860,11 +3967,11 @@ describe("context popover — usage breakdown (#53)", () => {
     });
     click(window, $(doc, "donut"));
     const pop = $(doc, "context-popover");
-    const sessionSection = pop.querySelector(".popover-section") as HTMLElement;
+    const sessionSection = pop.querySelector('[data-fold="session"]') as HTMLElement;
     expect(sessionSection.textContent).toBe("Session total");
     expect(sessionSection.nextElementSibling?.textContent).toContain("Input");
 
-    const hdr = pop.querySelector(".popover-section-toggle") as HTMLElement;
+    const hdr = pop.querySelector('[data-fold="lastTurn"]') as HTMLElement;
     const sessionText: string[] = [];
     for (let el = sessionSection.nextElementSibling; el && el !== hdr; el = el.nextElementSibling) {
       sessionText.push(el.textContent ?? "");

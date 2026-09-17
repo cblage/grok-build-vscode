@@ -30,17 +30,17 @@ function openGear(h: Harness) {
 }
 
 function gearText(h: Harness): string {
-  return h.doc.getElementById("gear-popover")!.textContent || "";
+  return (h.doc.getElementById("add-popover")!.hidden ? h.doc.getElementById("gear-popover") : h.doc.getElementById("add-popover"))!.textContent || "";
 }
 
 function gearItems(h: Harness): string[] {
-  return [...h.doc.querySelectorAll("#gear-popover .toolbar-popover-item")].map(
+  return [...h.doc.querySelectorAll("#gear-popover .toolbar-popover-item, #add-popover .toolbar-popover-item")].map(
     (el) => (el.textContent || "").replace(/\s+/g, " ").trim(),
   );
 }
 
 function findGearItem(h: Harness, re: RegExp): HTMLElement | undefined {
-  return [...h.doc.querySelectorAll("#gear-popover .toolbar-popover-item")].find((el) =>
+  return [...h.doc.querySelectorAll("#gear-popover .toolbar-popover-item, #add-popover .toolbar-popover-item")].find((el) =>
     re.test(el.textContent || ""),
   ) as HTMLElement | undefined;
 }
@@ -82,7 +82,7 @@ describe("app purpose + session menu (DOM)", () => {
     });
     // Knowledge work forces thinking-hidden even when showThinking is true.
     expect(h.doc.body.classList.contains("thinking-hidden")).toBe(true);
-    openGear(h);
+    click(h.window, h.doc.getElementById("add-btn"));
     expect(gearText(h)).toContain("Use this app for");
     expect(gearText(h)).toContain("Knowledge work");
     expect(gearText(h)).not.toContain("Continue in a new chat");
@@ -356,7 +356,7 @@ describe("app purpose + session menu (DOM)", () => {
       appPurpose: "knowledge",
       capabilities: { relocateView: true, showOutput: true },
     });
-    openGear(h);
+    click(h.window, h.doc.getElementById("add-btn"));
     click(h.window, findGearItem(h, /Coding/)!);
     await Promise.resolve();
     expect(h.posted.find((m) => m.type === "setAppPurpose")).toEqual({
@@ -387,7 +387,7 @@ describe("app purpose + session menu (DOM)", () => {
       appPurpose: "knowledge",
       capabilities: { relocateView: true, showOutput: true },
     });
-    openGear(h);
+    click(h.window, h.doc.getElementById("add-btn"));
     click(h.window, findGearItem(h, /^Settings$|Settings$/)!);
     await Promise.resolve();
     const overlay = h.doc.getElementById("settings-overlay")!;
@@ -422,11 +422,12 @@ describe("app purpose + session menu (DOM)", () => {
       steerByDefault: false,
       soundNotifications: false,
       processingSound: false,
-      readRepliesAloud: false,
-      appPurpose: "coding",
-      capabilities: {},
-    });
-    click(h.window, h.doc.getElementById("rail-gear-btn") || h.doc.getElementById("gear-btn"));
+        readRepliesAloud: false,
+        appPurpose: "coding",
+        capabilities: { remoteSteering: true },
+      });
+      dispatch(h.window, { type: "initialized", info: { provider: "grok", steeringSupported: true, init: {} } });
+      click(h.window, h.doc.getElementById("rail-gear-btn") || h.doc.getElementById("gear-btn"));
     expect(gearText(h)).toMatch(/Settings/);
     expect(gearText(h)).not.toContain("Advanced settings");
     click(h.window, findGearItem(h, /Settings/)!);
@@ -484,9 +485,9 @@ describe("rail gear placement (DOM)", () => {
     // frequency control and must stay next to the composer.
     expect(composerGear.hidden).toBe(false);
     expect(railGear.hidden).toBe(false);
-    // ...but it must not be a SECOND gear: sliders (lucide settings-2) vs gear.
-    // circle+circle is settings-2's signature; the gear has exactly one.
-    expect((composerGear.innerHTML.match(/<circle/g) || []).length).toBe(2);
+    // ...but it must not be a SECOND gear. It names the model instead, and the
+    // gear's own path (M12.22 2h-.44) never appears in it.
+    expect(composerGear.querySelector(".model-chip-name")?.textContent).toBeTruthy();
     expect(composerGear.innerHTML).not.toContain("M12.22 2h-.44");
   });
 
@@ -494,7 +495,7 @@ describe("rail gear placement (DOM)", () => {
     const h = liveRail();
     click(h.window, h.doc.getElementById("gear-btn"));
     const composerMenu = gearText(h);
-    expect(composerMenu).toContain("Model and Effort");
+    expect(composerMenu).toContain("Effort");
     // Session actions moved to the header's ⋯ menu, so this popover is model
     // and effort ALONE — how the agent answers, nothing about which
     // conversation you are in.
@@ -512,7 +513,7 @@ describe("rail gear placement (DOM)", () => {
     expect(railMenu).not.toContain("Basic settings");
     expect(railMenu).not.toContain("Advanced settings");
     expect(railMenu).not.toContain("Version & about");
-    expect(railMenu).not.toContain("Model and Effort");
+    expect(railMenu).not.toContain("Effort");
     expect(railMenu).not.toContain("Continue in a new chat");
   });
 
@@ -572,7 +573,7 @@ describe("rail gear placement (DOM)", () => {
     // dismiss this one and make you click again.
     click(h.window, composer);
     expect(pop.hidden).toBe(false);
-    expect(gearText(h)).toContain("Model and Effort");
+    expect(gearText(h)).toContain("Effort");
     click(h.window, rail);
     expect(pop.hidden).toBe(false);
     expect(gearText(h)).toContain("Use this app for");
@@ -594,7 +595,7 @@ describe("rail gear placement (DOM)", () => {
     expect(cap).toBeLessThanOrEqual(240);
   });
 
-  it("VS Code's single button keeps a gear icon and the whole menu", () => {
+  it("VS Code keeps the chip and relocates the app rows into +", () => {
     const h = bootWebview({ ready: true });
     dispatch(h.window, {
       type: "initialState",
@@ -612,14 +613,16 @@ describe("rail gear placement (DOM)", () => {
     });
     dispatch(h.window, { type: "sessionName", sessionId: "active", name: "Active", cwd: "/w" });
     const composerGear = h.doc.getElementById("gear-btn")!;
-    expect(composerGear.innerHTML).toContain("M12.22 2h-.44");
+    expect(composerGear.querySelector(".model-chip-name")?.textContent).toBeTruthy();
     openGear(h);
-    // Nothing is split without a rail to split into.
-    expect(gearText(h)).toContain("Model and Effort");
+    // The chip keeps the conversation controls; + takes the app rows.
+    expect(gearText(h)).toContain("Effort");
     expect(gearText(h)).not.toContain("Continue in a new chat");
+    expect(gearText(h)).not.toContain("Use this app for");
+    click(h.window, h.doc.getElementById("add-btn"));
     expect(gearText(h)).toContain("Use this app for");
     expect(gearText(h)).not.toContain("Version & about");
-    click(h.window, composerGear);
+    click(h.window, h.doc.getElementById("add-btn"));
     expect(openSessionMenu(h).some((el) => (el.textContent || "").includes("Continue in a new chat"))).toBe(true);
   });
 
@@ -725,11 +728,15 @@ describe("context popover respects the app purpose", () => {
       messageTokens: 12166,
       freeTokens: 495983,
     } as never);
+    // What a host that knows `subscriptionUsage` does at session start, empty
+    // or not. The section is gated on that frame having arrived, so omitting it
+    // would make this a test about an OLD host instead of about the purpose.
+    dispatch(h.window, { type: "subscriptionUsage", windows: [] } as never);
     click(h.window, h.doc.getElementById("donut")!);
     return h.doc.getElementById("context-popover")!;
   };
 
-  it("shows the number and Compact, and nothing else, in knowledge work", () => {
+  it("shows context, Compact and subscription availability in knowledge work", () => {
     const h = bootWebview();
     dispatch(h.window, { type: "initialState", appPurpose: "knowledge", capabilities: {} } as never);
 
@@ -744,6 +751,7 @@ describe("context popover respects the app purpose", () => {
     // What a person writing a document actually asked the donut.
     expect(text).toContain("Context used");
     expect(text).toContain("Compact conversation");
+    expect(text).toContain("No subscription usage reported yet.");
     // The technical account, all of it, absent.
     expect(text).not.toContain("In this window");
     expect(text).not.toContain("System");

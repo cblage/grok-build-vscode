@@ -1,31 +1,14 @@
-/**
- * One-shot `mcp-remote` spawn that drives the vendor OAuth flow. Credentials
- * land in `~/.mcp-auth`. We used to say "we never read that directory", and
- * {@link connectorsLackingOAuthToken} at the bottom of this file deliberately
- * reverses that: it is the only way to know a connector will open a browser
- * before the CLI spawns one. It reads presence, never contents. Injected spawn keeps
- * this testable without npx or a browser. A connector with `oauthScope`
- * writes that JSON to a temp `@file` (`writeOAuthClientMetadataFile`) because
- * Windows Connect uses `shell: true` and inline `{...}` is mangled; dispose
- * after the child exits. `session/new` gets the same flag from
- * `persistConnectorOAuthClientMetadata` so grok's later spawn agrees.
- *
- * A live Grok session already running the same endpoint holds the OAuth
- * callback port pinned in mcp-remote's client registration, and Windows skips
- * mcp-remote's lockfile so a second instance cannot learn the first exists.
- * That collision is REPORTED, never worked around — see
- * {@link authorizeMcpRemote} for why retrying on another port re-authorised
- * every host on the machine. `quoteSpawnArgs` wraps whitespace-bearing argv
- * entries only for this shell spawn — never in `mcpRemoteArgs`.
- */
+/** One-shot MCP initialization probe, legacy authorization, and measured token-store paths. */
 import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { writeMcpRemoteHeadlessPreload } from "./mcp-remote-headless";
 import {
   MCP_INITIALIZE_REQUEST,
+  MCP_REMOTE_AUTHORIZATION_TIMEOUT_MS,
   MCP_REMOTE_CONNECT_TIMEOUT_MS,
   TIER1_CONNECTORS,
   classifyConnectFailure,
@@ -65,11 +48,15 @@ export interface AuthorizeMcpRemoteOpts {
   shell?: boolean;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  /** Replaces `timeoutMs` once the authorization link exists. */
+  authorizationTimeoutMs?: number;
   /**
    * Key-auth connectors: a DCR-incompatibility failure means the pasted
    * token was rejected, not that the app can never work.
    */
   auth?: ConnectorAuth;
+  /** Guard against unexpected browser launches after host-owned authorization. */
+  headless?: boolean;
 }
 
 export type AuthorizeMcpRemoteResult =
@@ -170,28 +157,45 @@ function runAuthorizeMcpRemote(
   opts: AuthorizeMcpRemoteOpts,
 ): Promise<AuthorizeMcpRemoteResult> {
   const timeoutMs = opts.timeoutMs ?? MCP_REMOTE_CONNECT_TIMEOUT_MS;
+  const authorizationTimeoutMs = opts.authorizationTimeoutMs ?? MCP_REMOTE_AUTHORIZATION_TIMEOUT_MS;
   const chunks: string[] = [];
   let settled = false;
   let timedOut = false;
   let spawnError: { code?: string; message?: string } | undefined;
   let proc: ReturnType<McpRemoteSpawn> | undefined;
+  let headless: ReturnType<typeof writeMcpRemoteHeadlessPreload> | undefined;
 
   const finish = (result: AuthorizeMcpRemoteResult): AuthorizeMcpRemoteResult => {
     if (settled) return result;
     settled = true;
     try { proc?.kill(); } catch { /* already gone */ }
+    headless?.dispose();
     return result;
   };
 
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
+    const expire = () => {
       timedOut = true;
       resolve(finish({
         ok: false,
         kind: "timeout",
         message: connectFailureMessage("timeout"),
       }));
-    }, timeoutMs);
+    };
+    let timer = setTimeout(expire, timeoutMs);
+
+    /**
+     * The proxy has printed a link, so the remaining wait is a person's, not
+     * ours. Re-arm on the human budget instead of spending what is left of the
+     * startup ceiling on a consent screen.
+     */
+    let handedOver = false;
+    const handOverToHuman = () => {
+      if (handedOver || settled) return;
+      handedOver = true;
+      clearTimeout(timer);
+      timer = setTimeout(expire, authorizationTimeoutMs);
+    };
 
     const succeed = () => {
       clearTimeout(timer);
@@ -207,7 +211,7 @@ function runAuthorizeMcpRemote(
           kind,
           kind === "port-conflict" || kind === "oauth-incompatible" || kind === "key-rejected"
             ? undefined
-            : detail,
+            : opts.headless || opts.auth === "key" ? undefined : detail,
         ),
       }));
     };
@@ -230,9 +234,16 @@ function runAuthorizeMcpRemote(
     };
 
     try {
+      if (opts.headless) headless = writeMcpRemoteHeadlessPreload();
       proc = opts.spawn(opts.command, quoteSpawnArgs(opts.args, opts.shell), {
         stdio: ["pipe", "pipe", "pipe"],
-        env: opts.env,
+        env: opts.headless ? {
+          ...(opts.env ?? process.env),
+          NODE_OPTIONS: [
+            (opts.env ?? process.env).NODE_OPTIONS,
+            `--require ${JSON.stringify(headless!.path.replace(/\\/g, "/"))}`,
+          ].filter(Boolean).join(" "),
+        } : opts.env,
         shell: opts.shell,
         windowsHide: true,
       });
@@ -282,6 +293,11 @@ function runAuthorizeMcpRemote(
     const onLine = (line: string) => {
       considerOutput(line);
       if (settled) return;
+      // Legacy authorization retains its human budget; a seeded probe must not authorize.
+      if (line.includes("Please authorize this client by visiting:")) {
+        if (opts.headless) { fail("failed"); return; }
+        handOverToHuman();
+      }
       const initialized = parseInitializeResult(line);
       if (initialized === true) succeed();
       if (initialized === false) {
@@ -422,4 +438,59 @@ export function connectorsLackingOAuthToken(opts: {
   } catch {
     return empty;
   }
+}
+
+const availabilityFs = { readFileSync, writeFileSync, unlinkSync };
+interface McpAvailabilityStoreOpts {
+  home?: string;
+  env?: NodeJS.ProcessEnv;
+  fs?: typeof availabilityFs;
+}
+
+function unavailableMarker(endpoint: string, opts: McpAvailabilityStoreOpts): string {
+  return join(mcpAuthRoot(opts.env ?? process.env, opts.home ?? homedir()),
+    `mcp-remote-${MCP_REMOTE_STORE_VERSION}`, `${mcpServerUrlHash(endpoint)}_grok-unavailable.json`);
+}
+
+/**
+ * Our own marker, never a token or registration. Only the latest definite
+ * failure withholds; success, port conflict, or an ambiguous retry clears it.
+ * No directory creation: absent/unwritable storage fails open.
+ */
+export function recordMcpRemoteOutcome(
+  endpoint: string,
+  result: AuthorizeMcpRemoteResult | undefined,
+  opts: McpAvailabilityStoreOpts = {},
+): void {
+  try {
+    const fs = opts.fs ?? availabilityFs;
+    const file = unavailableMarker(endpoint, opts);
+    if (result?.ok === false && result.kind === "server-unavailable") {
+      fs.writeFileSync(file, JSON.stringify("server-unavailable"), "utf8");
+    } else {
+      fs.unlinkSync(file);
+    }
+  } catch { /* Cannot establish availability; do not affect saved authorization. */ }
+}
+
+/**
+ * Read fresh for both session/new and Settings. Missing directories/files,
+ * unreadable or malformed state, unknown outcomes and unavailable md5 all
+ * withhold nothing. Markers are scoped to the exact endpoint and proxy store
+ * version, so changing either cannot inherit an old failure.
+ */
+export function connectorsWithUnavailableServer(opts: McpAvailabilityStoreOpts & {
+  store: ConnectedConnectorStore;
+}): ReadonlySet<string> {
+  const unavailable = new Set<string>();
+  for (const connector of TIER1_CONNECTORS) {
+    const record = opts.store[connector.id];
+    if (!record) continue;
+    try {
+      const raw = (opts.fs ?? availabilityFs).readFileSync(
+        unavailableMarker(record.endpoint || connector.endpoint, opts), "utf8");
+      if (JSON.parse(raw) === "server-unavailable") unavailable.add(connector.id);
+    } catch { /* Ambiguity must never remove a working connector. */ }
+  }
+  return unavailable;
 }

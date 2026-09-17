@@ -6,6 +6,7 @@
   const MIN_CHAT_WIDTH = 280;
   const MOBILE_BREAKPOINT = 640;
   const EDITABLE_KINDS = new Set(["markdown", "json", "text"]);
+  const PULL_AGENT_MESSAGE = "Pull the latest changes for this branch from the remote, resolve any conflicts, and tell me what changed.";
   // Shared Seti lookup data. Hosts provide only a URL rooted in their own
   // scheme; the component chooses the asset and the browser lazily loads icons
   // that actually appear on screen. This keeps Node work and SVG/data-URL
@@ -144,6 +145,36 @@
       // switched to.
       refreshing: false,
       filter: "",
+      // The Changes view, per scope for the same reason the tree is: the panel
+      // element is shared, and a commit message typed against one project must
+      // not appear over another.
+      changes: {
+        snapshot: null,
+        loading: false,
+        loadSeq: 0,
+        error: "",
+        /** "no-git" and "not-a-repo" hide the view; "failed" shows the reason. */
+        errorKind: "",
+        message: "",
+        /** null when not naming a branch; a string while the field is open. */
+        branchDraft: null,
+        /** The path whose diff is open, or null for the list. */
+        diffPath: null,
+        diffPatch: "",
+        diffTruncated: false,
+        diffLoading: false,
+        diffError: "",
+        /**
+         * Fences a superseded diff read, exactly as `loadSeq` does for the
+         * list. A reconnect re-asks for the open diff while the previous
+         * connection's request is still unresolved; without this the older
+         * one's late answer lands on top of the newer one's.
+         */
+        diffSeq: 0,
+        /** Outcome of the last run, shown until the next one starts. */
+        notice: null,
+        running: false,
+      },
     };
   }
 
@@ -163,7 +194,8 @@
       // its version stamp, but never adopts a different absolute target.
       expectedAbsPath: result.absPath,
       mode: result.kind === "markdown" ? "preview" : "read",
-      editing: false,
+      missing: !!result.missing,
+      editing: !!result.missing,
       dirty: false,
       saving: false,
       sentText: null,
@@ -175,32 +207,32 @@
     };
   }
 
-  /**
-   * A tab for a file that could not be opened.
-   *
-   * The error used to be painted over the tree instead: no tab, so nothing
-   * named the file that had failed, and the tree's filter box stayed on screen
-   * above a message about a file you could no longer see. Giving the failure a
-   * tab makes it behave like every other open file — it says which file, it can
-   * be left open while you look at something else, and it closes the same way.
-   */
-  function makeErrorTab(scopeId, relPath, reason) {
-    return {
-      ...makeTab(scopeId, { relPath, kind: "error", text: "" }),
-      error: reason || "Could not open file.",
-    };
-  }
-
   function applyDraft(tab, text) {
     tab.draftText = String(text);
     tab.dirty = tab.draftText !== tab.baselineText;
     return tab;
   }
 
+  /**
+   * Is there anything for Save to do?
+   *
+   * `dirty` answers "has this been EDITED", and everything that asks the person
+   * a question reads it: the close prompt, the tab dot, the page's own unload
+   * guard. A file that does not exist yet has been edited by nobody, so it must
+   * not claim so — open one on a phone and an untouched buffer would otherwise
+   * make a reload say "changes you made may not be saved". But it still has
+   * something to save: the buffer IS the file, and saving is what creates it.
+   * Those are two different questions, so they get two different functions.
+   */
+  function savable(tab) {
+    return !!(tab.dirty || tab.missing);
+  }
+
   function applySaveSuccess(tab, sentText, result) {
     // The remote editor learned this the hard way: the textarea remains live
     // while Save is in flight. Only the captured payload reached the host.
     tab.baselineText = sentText;
+    tab.missing = false;
     tab.stamp = result.stamp;
     tab.sentText = null;
     tab.saving = false;
@@ -268,10 +300,17 @@
   /**
    * Pure layout planner for the file-panel tab strip.
    *
-   * State A (fits): folder+name title, every tab is icon+name, X only on active.
+   * State A (fits): folder+name title, every tab is icon+name and its own X.
    * State B (tight): inactive tabs demote to icon-only (dirty dot kept) BEFORE
    *   any tab is hidden; active keeps icon+name+X; title may drop to icon-only.
    * State C (minimal): folder icon + the active tab + one "…" chip of the rest.
+   *
+   * `preferChip` SKIPS B. On a touch screen an icon-only tab is an anonymous
+   * square — three open files became three identical glyphs, and the strip
+   * grew a second ✕ a thumb's width from the one that closes the whole panel.
+   * A phone gets the named tab it is on and a menu for the rest, which is also
+   * the only place the other files can be closed from. On a desk B still earns
+   * its keep: a mouse has hover titles and the row has room for real names.
    *
    * No layout: stripWidth<=0 (happy-dom) always returns A so DOM tests see every
    * tab. The renderer measures real widths and applies this plan in at most two
@@ -289,6 +328,7 @@
     const tabIconWidths = Array.isArray(src.tabIconWidths) ? src.tabIconWidths : [];
     const chipWidth = Math.max(0, Number(src.chipWidth) || STRIP_CHIP_WIDTH);
     const slack = Math.max(0, Number(src.slack) || 0);
+    const preferChip = !!src.preferChip;
     const all = stripRange(tabCount);
     const fullModes = all.map(() => "full");
 
@@ -326,17 +366,291 @@
       }
       return out;
     };
-    if (titleWidth + bTabs <= avail) {
-      return result("b", "full", all, [], promoteIdles(bModes, avail - titleWidth - bTabs));
-    }
-    if (titleIconWidth + bTabs <= avail) {
-      return result("b", "icon", all, [], promoteIdles(bModes, avail - titleIconWidth - bTabs));
+    // B has nothing to say when NOTHING is selected. Its whole idea is "keep
+    // the current file named, demote the rest to icons" — with no current file
+    // (the Changes list or the tree is what you are looking at) every tab
+    // demotes, and the strip becomes a row of anonymous glyphs: no name to
+    // read, and no X either, since an icon-only tab hides its close. Three
+    // files open and no way to shut any of them, which is exactly the strip
+    // the owner photographed. C answers the same width honestly — one … chip
+    // that lists every file by name with its own close beside it.
+    if (!preferChip && activeIndex >= 0) {
+      if (titleWidth + bTabs <= avail) {
+        return result("b", "full", all, [], promoteIdles(bModes, avail - titleWidth - bTabs));
+      }
+      if (titleIconWidth + bTabs <= avail) {
+        return result("b", "icon", all, [], promoteIdles(bModes, avail - titleIconWidth - bTabs));
+      }
     }
 
     const visible = activeIndex >= 0 && activeIndex < tabCount ? [activeIndex] : [];
     const overflow = all.filter((i) => i !== activeIndex);
     const cModes = all.map((i) => (i === activeIndex ? "full" : "icon"));
-    return result("c", "icon", visible, overflow, cModes);
+    // C used to give up the project name unconditionally, which was right when
+    // C only ever happened under real pressure. `preferChip` reaches it with
+    // room to spare — one tab and a chip on a phone — and dropping the name
+    // there left a folder glyph beside an empty strip. Ask instead.
+    const cTabs = (visible.length ? fullAt(activeIndex) : 0) + (overflow.length ? chipWidth : 0);
+    const cTitle = titleWidth + cTabs <= avail ? "full" : "icon";
+    return result("c", cTitle, visible, overflow, cModes);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * The Changes view — pure helpers
+   *
+   * Everything here answers ONE question: is it safe to walk away? The
+   * wording rules follow from that. Say the answer, not the inputs to it;
+   * say each fact once; and never make somebody add two numbers together to
+   * find out whether their work is somewhere safe.
+   * ------------------------------------------------------------------ */
+
+  /** How one row reads. Short, because the row also carries the path. */
+  const CHANGE_WORD = { M: "Modified", A: "Added", D: "Deleted", R: "Renamed", U: "Conflict", "?": "Added" };
+
+  function changeWord(status) {
+    return CHANGE_WORD[status] || "Changed";
+  }
+
+  /**
+   * The one line at the top of the view.
+   *
+   * Ordered by what would hurt: a conflict blocks everything, uncommitted work
+   * is the thing that gets lost, unpushed work is safe on this machine but not
+   * anywhere else, and only when none of those apply is there good news.
+   *
+   * "on this machine" is deliberate on the unpushed line. On a cloud machine
+   * the person may never see that disk again, and "committed" alone reads as
+   * finished when it is not.
+   */
+  function changesHeadline(snapshot) {
+    const snap = snapshot || {};
+    const files = Array.isArray(snap.files) ? snap.files : [];
+    const conflicts = files.filter((file) => file && file.status === "U").length;
+    if (conflicts) {
+      return { tone: "warn", text: conflicts === 1 ? "1 file has conflicts" : conflicts + " files have conflicts" };
+    }
+    if (files.length) {
+      // Deliberately NOT the warning tone — see the note on .gfp-changes-warn.
+      return { tone: "note", text: files.length === 1 ? "1 file not committed" : files.length + " files not committed" };
+    }
+    const ahead = Number(snap.ahead) || 0;
+    if (ahead > 0) {
+      const noun = ahead === 1 ? "1 commit" : ahead + " commits";
+      return { tone: "note", text: noun + " saved here but not pushed" };
+    }
+    if (snap.unborn) return { tone: "ok", text: "Nothing committed yet" };
+    return { tone: "ok", text: "Everything is committed and pushed" };
+  }
+
+  /**
+   * The branch chip's text, and whether to say anything about the remote.
+   *
+   * `behind` is only ever as fresh as the last fetch, and the view does not
+   * fetch — so it is phrased as a fact about what was last seen rather than as
+   * a live count, and it is dropped entirely when it is zero.
+   */
+  function changesBranchLine(snapshot) {
+    const snap = snapshot || {};
+    if (snap.detached) return { branch: "Detached HEAD", note: "Not on a branch" };
+    const branch = snap.branch || "";
+    if (!branch) return { branch: "No branch", note: "" };
+    if (!snap.hasRemote) return { branch: branch, note: "No remote" };
+    if (!snap.hasUpstream) return { branch: branch, note: "Not on the remote yet" };
+    const behind = Number(snap.behind) || 0;
+    if (behind > 0) {
+      return { branch: branch, note: (behind === 1 ? "1 commit" : behind + " commits") + " on the remote you do not have" };
+    }
+    return { branch: branch, note: "" };
+  }
+
+  /**
+   * Whether this file's diff offers "Discard these changes".
+   *
+   * The host's `canRevertFile` in `src/git-status.ts` is the authority and
+   * refuses the same set; a webview cannot import it, so the predicate is
+   * carried twice and `test/changes-view.dom.test.ts` pins them together. Only
+   * `M` and `D` are in HEAD under this path, and only for those can
+   * `git checkout HEAD -- <path>` keep the promise the confirmation makes.
+   */
+  function canDiscard(file) {
+    if (!file) return false;
+    return file.status === "M" || file.status === "D";
+  }
+
+  /**
+   * What the primary button does and says.
+   *
+   * Its label is the whole promise — which is why there is no confirmation
+   * dialog repeating it back. The cases that DO get a dialog are the ones the
+   * label cannot make safe: discarding a file, and pushing the branch everyone
+   * else builds on.
+   */
+  function changesPrimaryAction(snapshot, opts) {
+    const snap = snapshot || {};
+    const message = String((opts && opts.message) || "").trim();
+    const files = Array.isArray(snap.files) ? snap.files : [];
+    const conflicted = files.some((file) => file && file.status === "U");
+    const canPush = !!snap.hasRemote && !snap.detached && !!snap.branch;
+    if (files.length) {
+      if (conflicted) {
+        return { op: null, label: "Commit", disabled: true, hint: "Resolve the conflicts first." };
+      }
+      return {
+        op: "commit",
+        push: canPush,
+        label: canPush ? "Commit and push" : "Commit",
+        disabled: !message,
+        hint: !snap.hasRemote ? "This project has no remote. Commit saves your work here."
+          : message ? "" : "Describe what changed, then commit.",
+      };
+    }
+    const ahead = Number(snap.ahead) || 0;
+    if (ahead > 0 && canPush) {
+      return { op: "push", label: ahead === 1 ? "Push 1 commit" : "Push " + ahead + " commits", disabled: false, hint: "" };
+    }
+    if (ahead > 0) {
+      const hint = !snap.hasRemote
+        ? "This project has no remote to push to."
+        : "You are not on a branch, so there is nothing to push to.";
+      return { op: null, label: "Push", disabled: true, hint: hint };
+    }
+    return { op: null, label: "Commit", disabled: true, hint: "" };
+  }
+
+  /**
+   * The second commit button.
+   *
+   * The primary promises the safe thing — recorded AND somewhere other than
+   * this machine — and on a cloud box that is the right default nearly every
+   * time. But "write this down, I am not ready to publish it" is a real
+   * intention, and until now the only way to express it was to press nothing.
+   *
+   * It appears ONLY when the primary would also push. Where there is no remote
+   * or no branch the primary already says just "Commit", and a second button
+   * saying the same thing is a choice with one outcome.
+   *
+   * Side by side, "Commit" and "Commit and push" name the two outcomes
+   * directly. The short caption keeps both choices readable on a phone.
+   */
+  function changesCommitOnlyAction(snapshot, opts) {
+    const primary = changesPrimaryAction(snapshot, opts);
+    if (primary.op !== "commit" || !primary.push) {
+      return { show: false, label: "Commit", disabled: true };
+    }
+    return { show: true, label: "Commit", disabled: primary.disabled };
+  }
+
+  /**
+   * Split a unified patch into rows to paint.
+   *
+   * Only the parts a reader uses: the hunk headers as separators, and the
+   * added/removed/context lines with their real line numbers. `diff --git`,
+   * index lines and mode bits are dropped — they are true and nobody reads
+   * them, which is the definition of the noise this view is trying not to be.
+   */
+  function parseUnifiedDiff(patch) {
+    const rows = [];
+    const text = typeof patch === "string" ? patch : "";
+    if (!text) return rows;
+    let oldNo = 0;
+    let newNo = 0;
+    let inHunk = false;
+    const lines = text.split(/\r?\n/);
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
+    for (const raw of lines) {
+      if (raw.slice(0, 2) === "@@") {
+        const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/.exec(raw);
+        if (match) {
+          oldNo = Number(match[1]) || 0;
+          newNo = Number(match[2]) || 0;
+          inHunk = true;
+          rows.push({ kind: "hunk", text: String(match[3] || "").trim(), oldNo: null, newNo: null });
+          continue;
+        }
+      }
+      if (!inHunk) continue;
+      const marker = raw.charAt(0);
+      if (marker === "+") {
+        rows.push({ kind: "add", text: raw.slice(1), oldNo: null, newNo: newNo });
+        newNo += 1;
+      } else if (marker === "-") {
+        rows.push({ kind: "del", text: raw.slice(1), oldNo: oldNo, newNo: null });
+        oldNo += 1;
+      } else if (marker === "\\") {
+        // "\ No newline at end of file" — real, and not a line of anybody's file.
+        rows.push({ kind: "meta", text: raw.slice(2), oldNo: null, newNo: null });
+      } else if (marker === " " || raw === "") {
+        rows.push({ kind: "ctx", text: raw.slice(1), oldNo: oldNo, newNo: newNo });
+        oldNo += 1;
+        newNo += 1;
+      }
+    }
+    return rows;
+  }
+
+  /** Adapt parsed patch rows to chat.js's shared inline diff renderer. */
+  function patchRowsToDiffHunks(rows) {
+    const hunks = [];
+    let hunk = null;
+    for (const row of rows) {
+      if (row.kind === "hunk") { hunk = null; continue; }
+      if (row.kind !== "add" && row.kind !== "del" && row.kind !== "ctx") continue;
+      if (!hunk) {
+        hunk = { site: {}, result: { lines: [] } };
+        hunks.push(hunk);
+      }
+      if (hunk.site.oldLine == null && row.oldNo != null) hunk.site.oldLine = row.oldNo;
+      if (hunk.site.newLine == null && row.newNo != null) hunk.site.newLine = row.newNo;
+      hunk.result.lines.push({ type: row.kind, text: row.text });
+    }
+    return hunks;
+  }
+
+  /**
+   * The +N −M pair as DOM, in the product's diff palette.
+   *
+   * Three places print this pair now — the file row, the total on the headline
+   * and the open file's own diff header — and a fourth (the turn card) prints
+   * it in chat.js. Colour is not decoration on these two numbers: green and
+   * red are what say WHICH is which without reading the sign, and a grey pair
+   * reads as a measurement of something else entirely.
+   */
+  function appendCountLabel(host, label, doc) {
+    if (!label) return host;
+    for (const part of label.split(" ")) {
+      const span = doc.createElement("span");
+      span.className = part.charAt(0) === "+" ? "gfp-change-add" : "gfp-change-del";
+      span.textContent = part;
+      host.appendChild(span);
+    }
+    return host;
+  }
+
+  /** "+12 −3" summed over every file, or "" when no file carries counts. */
+  function changeTotalLabel(files) {
+    const list = Array.isArray(files) ? files : [];
+    let added = 0;
+    let deleted = 0;
+    let known = false;
+    for (const file of list) {
+      if (!file) continue;
+      if (typeof file.added === "number") { added += file.added; known = true; }
+      if (typeof file.deleted === "number") { deleted += file.deleted; known = true; }
+    }
+    if (!known) return "";
+    return changeCountLabel({ added: added, deleted: deleted });
+  }
+
+  /** "+12 −3", or "" when there is nothing knowable to say. */
+  function changeCountLabel(file) {
+    const entry = file || {};
+    const added = typeof entry.added === "number" ? entry.added : null;
+    const deleted = typeof entry.deleted === "number" ? entry.deleted : null;
+    if (added === null && deleted === null) return "";
+    const parts = [];
+    if (added) parts.push("+" + added);
+    if (deleted) parts.push("\u2212" + deleted);
+    return parts.join(" ");
   }
 
   const ICON = {
@@ -345,6 +659,9 @@
     chevronDown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>',
     file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>',
     folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>',
+    // lucide `folder-open` — the current project. Outline like its
+    // closed twin; the open state is the shape, never a fill.
+    folderOpen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>',
     // lucide maximize-2 / minimize-2 — expand the panel over chat, then restore.
     // lucide `maximize` / `minimize` (corner brackets) — the owner's explicit
     // pick over the -2 diagonal-arrow variants.
@@ -362,8 +679,78 @@
     // file gets.
     preview: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 7v14"/><path d="M16 12h2"/><path d="M16 8h2"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/><path d="M6 12h2"/><path d="M6 8h2"/></svg>',
     code: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg>',
+    // lucide `git-branch` — the Changes view. A branch, not a diff glyph:
+    // the question the view answers is "where is my work", and a branch is the
+    // shape people already read that way.
+    branch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>',
+    // lucide `undo-2` — restore a file to the last commit.
+    undo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"/></svg>',
+    // lucide `arrow-up-from-line` — push. Up and away from here.
+    push: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 9-6-6-6 6"/><path d="M12 3v14"/><path d="M5 21h14"/></svg>',
     pencil: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></svg>',
   };
+
+  /**
+   * Every panel this module has made, so it can answer what is on screen.
+   *
+   * The page's Back handling has to know which overlays are open, and it used to
+   * know by NAMING the panels that existed when it was written. A panel added
+   * afterwards is then invisible to it: the provider-config editor shipped in the
+   * same release as that API, was never added, and Back therefore walked off the
+   * page with an unsaved config file on screen. Answering the question here --
+   * where panels are made -- is the only version of it that cannot go stale.
+   */
+  const livePanels = new Set();
+
+  /**
+   * Told whenever the answer to {@link openOverlayPanels} may have changed.
+   *
+   * ONE listener for every panel, present and future, because the alternative
+   * is per-panel wiring -- and per-panel wiring is exactly what let the
+   * provider-config editor open with nobody being told. Counting it correctly
+   * would not have been enough on its own: the page holds a history entry per
+   * open layer and takes one when it HEARS about the layer, so a panel that
+   * opens silently has no entry and Back walks off the page regardless.
+   */
+  const overlayListeners = new Set();
+
+  function onOverlaysChanged(fn) {
+    if (typeof fn === "function") overlayListeners.add(fn);
+  }
+
+  function notifyOverlays() {
+    for (const fn of [...overlayListeners]) {
+      try { fn(); } catch (_) { /* one bad listener must not strand the rest */ }
+    }
+  }
+
+  /**
+   * The overlay panels currently on screen, TOPMOST FIRST.
+   *
+   * Docked panels are deliberately absent: they sit beside the conversation
+   * rather than over it, so nothing is covered and there is nothing for Back to
+   * close. A panel can move between the two while it is open -- narrowing to
+   * phone width raises a docked panel to an overlay -- so this reads the class
+   * every time rather than remembering what it was.
+   */
+  function openOverlayPanels() {
+    const open = [];
+    for (const panel of [...livePanels]) {
+      // A panel whose element has left the document is gone for good; drop it
+      // rather than let the set grow for the life of the page.
+      if (!panel.element.isConnected) { livePanels.delete(panel); continue; }
+      if (!panel.isOpen() || !panel.isOverlay() || panel.element.hidden) continue;
+      open.push(panel);
+    }
+    return open.sort((a, b) => {
+      const za = Number(getComputedStyle(a.element).zIndex) || 0;
+      const zb = Number(getComputedStyle(b.element).zIndex) || 0;
+      if (za !== zb) return zb - za;
+      // Same layer: whichever is later in the document paints over the other.
+      return (a.element.compareDocumentPosition(b.element)
+        & Node.DOCUMENT_POSITION_FOLLOWING) ? 1 : -1;
+    });
+  }
 
   function createFilePanel(options) {
     if (!options || !options.access) throw new Error("file panel requires an access adapter");
@@ -375,6 +762,26 @@
       : (source) => "<pre>" + escapeHtml(source) + "</pre>";
     const doc = options.document || root.document;
     const win = options.window || root;
+    const waiting = win.GrokHostWait && win.GrokHostWait.get();
+    const operations = new Set();
+    const pathLabel = (path) => typeof ui.pathLabel === "function" ? ui.pathLabel(path) : path;
+    function beginOperation(label, success, failure) {
+      if (!waiting || !waiting.snapshot()) return null;
+      for (const old of operations) if (old.cancelled || (old.until && old.until < Date.now())) operations.delete(old);
+      const op = waiting.begin({ label, success, failure });
+      operations.add(op);
+      return op;
+    }
+    function finishOperation(op, result, retry) {
+      if (!op) return;
+      if (result && result.cancelled) op.cancel();
+      else if (result && result.ok) op.succeed();
+      else op.fail(result && result.reason, retry);
+    }
+    function cancelOperations() {
+      for (const op of operations) op.cancel();
+      operations.clear();
+    }
     const mount = options.mount || {};
     const elementIds = mount.elementIds || {};
     const panelHost = mount.panelHost || doc.body;
@@ -386,6 +793,18 @@
     let destroyed = false;
     let open = false;
     let treeMode = true;
+    /**
+     * The Changes view is a third body mode alongside tree and viewer.
+     *
+     * Kept as its own flag rather than folded into `treeMode` because
+     * `treeMode` already means something specific to the tab strip — "no file
+     * is open" — and overloading it would have quietly changed which tab looks
+     * active while the Changes list is on screen.
+     */
+    let changesMode = false;
+    let changesPollTimer = null;
+    let gitWritesInFlight = 0;
+    let renderedChangesState = null;
     /** Which tab the live textarea belongs to, so a repaint only restores a
      *  caret into the same file it came from. */
     let editingTabKey = null;
@@ -405,7 +824,7 @@
     const rootEl = doc.createElement("aside");
     rootEl.id = mount.id || "grok-file-panel";
     rootEl.className = "gfp-panel desk-ft-panel";
-    rootEl.setAttribute("aria-label", "Workspace files");
+    rootEl.setAttribute("aria-label", mount.label || "Workspace files");
     rootEl.hidden = true;
 
     const resizer = doc.createElement("div");
@@ -421,6 +840,39 @@
     title.type = "button";
     title.className = "gfp-title desk-ft-title";
     title.title = "Show file tree";
+    /**
+     * The Changes button.
+     *
+     * Beside the project title because it is the same KIND of thing — a mode
+     * for the whole project, not an action on the open file. It is hidden
+     * unless three things are true at once: the mount can answer git at all,
+     * the person is in Coding mode, and the directory really is a repository.
+     * A button that opens an empty explanation is worse than no button.
+     */
+    const canGit = typeof access.gitStatus === "function";
+    const changesBtn = doc.createElement("button");
+    changesBtn.type = "button";
+    changesBtn.className = "gfp-icon-button gfp-changes-btn";
+    changesBtn.title = "Changes";
+    changesBtn.setAttribute("aria-label", "Changes");
+    changesBtn.hidden = true;
+    const changesCount = doc.createElement("span");
+    changesCount.className = "gfp-changes-count";
+    changesCount.hidden = true;
+    changesBtn.innerHTML = ICON.branch;
+    // "Changes", not just a glyph, whenever the strip has room for it. The
+    // prototype made this a named tab beside the folder and the open file, and
+    // the strip reads better for it: a row of anonymous glyphs asks you to
+    // remember what each one was. The word hides under .gfp-strip-compact,
+    // which is the same ladder the project title already climbs down — and
+    // collectStripMeasurements reads this button as trailing width, so the
+    // A/B/C planner absorbs the extra automatically.
+    const changesLabel = doc.createElement("span");
+    changesLabel.className = "gfp-changes-label";
+    changesLabel.textContent = "Changes";
+    changesBtn.appendChild(changesLabel);
+    changesBtn.appendChild(changesCount);
+
     const tabsEl = doc.createElement("div");
     tabsEl.className = "gfp-tabs desk-ft-tabs";
     tabsEl.setAttribute("role", "tablist");
@@ -434,15 +886,16 @@
 
     // Re-list the tree. Present on every mount — the phone needs it most, since
     // it is the surface watching an agent write files it did not open itself.
-    // It is also the control that pins the trailing group to the right edge
-    // when no tabs are open; see .gfp-refresh in file-panel.css.
+    // The control lives beside the tree filter for its entire lifetime.
     const refreshBtn = doc.createElement("button");
     refreshBtn.type = "button";
     refreshBtn.className = "gfp-icon-button gfp-refresh desk-ft-refresh";
     refreshBtn.innerHTML = ICON.refresh;
     refreshBtn.title = "Refresh";
     refreshBtn.setAttribute("aria-label", "Refresh file tree");
-    refreshBtn.addEventListener("click", () => void refreshTree());
+    refreshBtn.addEventListener("click", () => {
+      void refreshTree(true);
+    });
 
     // Content-area maximize. The mount opts in (desktop and the wide browser);
     // the phone overlay already goes full-viewport at the 899 dock breakpoint,
@@ -456,9 +909,9 @@
       maximizeBtn.type = "button";
       maximizeBtn.className = "gfp-icon-button gfp-maximize desk-ft-maximize";
       maximizeBtn.setAttribute("aria-pressed", "false");
-      header.append(title, tabsEl, refreshBtn, maximizeBtn, closePanel);
+      header.append(title, changesBtn, tabsEl, maximizeBtn, closePanel);
     } else {
-      header.append(title, tabsEl, refreshBtn, closePanel);
+      header.append(title, changesBtn, tabsEl, closePanel);
     }
 
     const filter = doc.createElement("input");
@@ -467,12 +920,18 @@
     filter.placeholder = "Filter…";
     filter.autocomplete = "off";
     filter.spellcheck = false;
+    const filterRow = doc.createElement("div");
+    filterRow.className = "gfp-filter-row";
+    filterRow.append(filter, refreshBtn);
 
     const tree = doc.createElement("div");
     tree.className = "gfp-tree desk-ft-body files-browse-body";
     const viewer = doc.createElement("div");
     viewer.className = "gfp-viewer desk-ft-viewer files-browse-viewer";
     viewer.hidden = true;
+    const changesEl = doc.createElement("div");
+    changesEl.className = "gfp-changes";
+    changesEl.hidden = true;
 
     if (elementIds.resizer) resizer.id = elementIds.resizer;
     if (elementIds.title) title.id = elementIds.title;
@@ -481,7 +940,7 @@
     if (elementIds.viewer) viewer.id = elementIds.viewer;
     if (maximizeBtn && elementIds.maximize) maximizeBtn.id = elementIds.maximize;
 
-    rootEl.append(header, filter, tree, viewer);
+    rootEl.append(header, filterRow, tree, changesEl, viewer);
     panelHost.appendChild(resizer);
     panelHost.appendChild(rootEl);
 
@@ -490,9 +949,21 @@
     toggle.className = "gfp-toggle desk-ft-top-toggle";
     toggle.setAttribute("aria-label", "Toggle file panel");
     toggle.innerHTML = panelIcon("right");
+    // The uncommitted count, on the button that opens the panel. The Changes
+    // button carries the same number, but that one is inside the panel and
+    // this is the only copy readable while the panel is closed.
+    const toggleCount = doc.createElement("span");
+    toggleCount.className = "gfp-toggle-count";
+    toggleCount.hidden = true;
+    toggleCount.setAttribute("aria-hidden", "true");
+    toggle.appendChild(toggleCount);
     toggle.addEventListener("click", () => setOpen(!open));
     closePanel.addEventListener("click", () => setOpen(false));
     title.addEventListener("click", showTree);
+    changesBtn.addEventListener("click", () => {
+      if (changesMode) showTree();
+      else showChanges();
+    });
     if (maximizeBtn) maximizeBtn.addEventListener("click", () => setMaximized(!maximized));
     filter.addEventListener("input", () => {
       if (!currentState) return;
@@ -521,6 +992,7 @@
     }
 
     function applyPresentation() {
+      const wasOverlay = rootEl.classList.contains("gfp-overlay");
       const overlay = isOverlay();
       rootEl.classList.toggle("gfp-overlay", overlay);
       rootEl.classList.toggle("gfp-docked", !overlay);
@@ -566,17 +1038,26 @@
         panelHost.appendChild(rootEl);
       }
       applyStripShrink();
+      if (overlay !== wasOverlay) {
+        if (typeof options.onPresentationChanged === "function") options.onPresentationChanged(overlay);
+        notifyOverlays();
+      }
     }
 
     function setOpen(next) {
+      const wasOpen = open;
       open = !!next;
       rootEl.hidden = !open;
       toggle.setAttribute("aria-expanded", String(open));
       toggle.title = open ? "Hide file panel" : "Show file panel";
       if (!open) setMaximized(false);
+      if (!open && wasOpen) { cancelOperations(); abortPending(); }
       applyPresentation();
       if (open && currentState && !currentState.tree) void loadRootTree();
+      syncChangesPolling();
+      if (open && !wasOpen && changesMode) void loadChanges({});
       if (typeof options.onOpenChanged === "function") options.onOpenChanged(open);
+      if (open !== wasOpen) notifyOverlays();
     }
 
     function paintMaximize() {
@@ -593,15 +1074,12 @@
      * viewer's own Reload already covers the open file — a second button there
      * would either do nothing visible or reload something you cannot see.
      *
-     * Hiding it is safe for the strip layout because it is only ever hidden
-     * while a file is open, and an open file means a tab, and `.gfp-tabs` grows
-     * to hold the trailing controls against the right edge.
+     * Its home is inside the body it refreshes; the strip budgets only its
+     * own controls, regardless of which body is showing.
      */
     function paintRefresh() {
-      const wasHidden = refreshBtn.hidden;
       refreshBtn.hidden = !treeMode;
-      // In flight covers both loads: pressing refresh during the first listing
-      // would ask for the same thing twice.
+      // A first listing and a refresh both own the tree until they finish.
       refreshBtn.disabled = !currentState || !!currentState.rootLoad;
       refreshBtn.classList.toggle("gfp-busy", !!(currentState && currentState.rootLoad));
       // Read from the scope on screen, never left behind by the one that
@@ -611,7 +1089,6 @@
       // the abort signal, so that wait is 30s on a remote and open-ended on
       // the desk.
       rootEl.classList.toggle("gfp-refreshing", !!(currentState && currentState.refreshing));
-      if (refreshBtn.hidden !== wasHidden) applyStripShrink();
     }
 
     function applyMaximizedBodyClass() {
@@ -645,7 +1122,21 @@
       title.textContent = "";
       const icon = doc.createElement("span");
       icon.className = "gfp-title-icon";
-      renderFileIcon(icon, label, "dir");
+      // The project's own mark when the mount can name one, so the folder above
+      // the files and the project's row in the rail are the same glyph in the
+      // same colour. A mount that supplies no hook — the provider-config panel,
+      // whose scope is a config directory rather than a project — keeps the
+      // folder, and so does a project with no mark of its own.
+      const cwd = scopeCwd(currentScope);
+      const mark = typeof ui.projectMark === "function" && cwd ? ui.projectMark(cwd) : "";
+      if (mark) {
+        icon.innerHTML = mark;
+        icon.classList.add("gfp-title-icon-mark");
+        const tint = typeof ui.projectMarkColor === "function" ? ui.projectMarkColor(cwd) : "";
+        if (tint) icon.dataset.repoColor = tint;
+      } else {
+        renderFileIcon(icon, label, "dir");
+      }
       const name = doc.createElement("span");
       name.className = "gfp-title-label";
       name.textContent = label;
@@ -684,7 +1175,7 @@
         trailingWidth += box.width
           + (cs ? (parseFloat(cs.marginLeft) || 0) + (parseFloat(cs.marginRight) || 0) : 0);
       }
-      addTrailing(refreshBtn);
+      addTrailing(changesBtn);
       addTrailing(maximizeBtn);
       addTrailing(closePanel);
       // Gap floor on the tab row (padding-right on .gfp-tabs) is measured
@@ -713,28 +1204,50 @@
         const iconEl = el.querySelector(".gfp-tab-icon");
         const dirtyEl = el.querySelector(".gfp-tab-dirty");
         const iconW = iconEl ? iconEl.getBoundingClientRect().width : 16;
-        // Two dirty numbers: the SLOT is always rendered on a full tab
-        // (flex-basis 10px, empty or not) — counting it only when dirty
-        // under-budgeted clean tabs by slot+gap and the shortfall came out of
-        // the name. Icon-only mode display:nones the EMPTY slot, so there the
-        // dot counts only when actually dirty.
+        // The dot costs width only when there IS a dot. It used to be a slot
+        // held open on every tab, empty or not, and the planner had to budget
+        // it that way to match; both are gone, because a permanent 10px
+        // between a filename and the X that closes it is 10px of the wrong
+        // message. Two names remain only because the icon-only branch below
+        // reads the same number under its own rule.
         const dirtyOn = dirtyEl && dirtyEl.textContent;
-        const dirtySlotW = dirtyEl ? Math.max(dirtyEl.getBoundingClientRect().width, 10) : 0;
         const dirtyDotW = dirtyOn ? Math.max(dirtyEl.getBoundingClientRect().width, 10) : 0;
+        const dirtySlotW = dirtyDotW;
         // Floor so an unloaded img (0×0) cannot convince the planner that
         // icon-only tabs are free. 28px is pad+icon in the icon-only rule.
         const iconOnly = Math.max(28, pad + Math.max(iconW, 16) + (dirtyDotW ? gap + dirtyDotW : 0));
         const wasIconOnly = el.classList.contains("gfp-tab-icon-only");
         const box = el.getBoundingClientRect().width || 0;
-        // A tab's own scrollWidth cannot see through the NAME's ellipsis (the
-        // span hides its own overflow), so a tab that ever rendered squeezed
-        // would measure its squeezed width as "full" and the plan would
-        // believe it forever. Sum the parts with the name's scrollWidth — the
-        // one number that still knows the untruncated text.
+        // Measure the TEXT, not the box that holds it.
+        //
+        // Both of the box's numbers are the previous pass's answer coming
+        // back: the name is a flex item that fills whatever the tab's basis
+        // gave it, and the basis is the number computed here. Feeding either
+        // one in latched the first pass's figure forever — measured at 148px
+        // for a run of glyphs 109px wide, and the surplus is dead space inside
+        // the name, which is what pushed the close button a thumb's width away
+        // from the filename it closes (owner: "closing file closer to the
+        // filename"). Same ratchet the note below this one describes for the
+        // tab box, one element down, and it survived because scrollWidth
+        // sounds like a content measurement.
+        //
+        // A Range over the text nodes reports the laid-out glyph run and
+        // nothing else, so it cannot ratchet. It also still sees through the
+        // ellipsis, which is why scrollWidth was reached for in the first
+        // place: text-overflow clips at paint, so the run is laid out at full
+        // width even when the box shows three dots. scrollWidth remains the
+        // fallback for engines with no Range (happy-dom's tests measure zero
+        // either way, and take the A-plan short-circuit above).
         const nameEl = el.querySelector(".gfp-tab-name");
-        const nameW = nameEl
-          ? Math.max(nameEl.scrollWidth || 0, nameEl.getBoundingClientRect().width || 0)
-          : 0;
+        let nameW = 0;
+        if (nameEl) {
+          if (typeof doc.createRange === "function") {
+            const range = doc.createRange();
+            range.selectNodeContents(nameEl);
+            nameW = range.getBoundingClientRect().width || 0;
+          }
+          if (!nameW) nameW = nameEl.scrollWidth || 0;
+        }
         const closeEl = el.querySelector(".gfp-tab-close");
         const closeW = closeEl && !closeEl.hidden ? Math.max(closeEl.getBoundingClientRect().width, 22) : 0;
         // +2 on the name: integer scrollWidth under-reports fractional text
@@ -783,7 +1296,7 @@
       rootEl.classList.toggle("gfp-strip-b", plan.state === "b");
       rootEl.classList.toggle("gfp-strip-c", plan.state === "c");
       title.classList.toggle("gfp-title-icon-only", plan.title === "icon");
-      title.classList.toggle("gfp-title-selected", !!treeMode);
+      title.classList.toggle("gfp-title-selected", !!treeMode && !changesMode);
 
       const tabs = [...tabsEl.querySelectorAll(".gfp-tab")];
       overflowRelPaths = [];
@@ -816,7 +1329,18 @@
           chip.addEventListener("click", () => openOverflowMenu(chip));
           tabsEl.appendChild(chip);
         }
-        chip.title = overflowRelPaths.map((rel) => fileName(rel)).join(", ");
+        // On a phone the chip IS the rest of the strip, so anything unsaved in
+        // there has no other way to say so — the dot lives on the menu ROW,
+        // which is one tap past the point of noticing. Nothing is lost either
+        // way (a dirty close still asks), but "you have unsaved work" is not a
+        // thing to make somebody go looking for.
+        const dirtyBehind = !!currentState && overflowRelPaths.some((rel) => {
+          const t = currentState.tabs.get(rel);
+          return !!(t && t.dirty);
+        });
+        chip.classList.toggle("gfp-overflow-chip-dirty", dirtyBehind);
+        const names = overflowRelPaths.map((rel) => fileName(rel)).join(", ");
+        chip.title = dirtyBehind ? names + " — unsaved changes" : names;
         chip.setAttribute("aria-expanded", menu && menu.classList.contains("gfp-overflow-menu") ? "true" : "false");
         chip.hidden = false;
       } else if (chip) {
@@ -857,6 +1381,16 @@
       };
     }
 
+    /** A finger, not a mouse. Asked at plan time, not cached: a tablet with a
+     *  keyboard attached can change its answer, and the query is free. */
+    function coarsePointer() {
+      try {
+        return !!(win.matchMedia && win.matchMedia("(pointer: coarse)").matches);
+      } catch {
+        return false;
+      }
+    }
+
     function forceTighterPlan(plan) {
       const tabs = [...tabsEl.querySelectorAll(".gfp-tab")];
       const n = tabs.length;
@@ -890,6 +1424,7 @@
         let plan = forcedStripPlan || planStrip({
           ...collectStripMeasurements(),
           slack: 12,
+          preferChip: coarsePointer(),
         });
         applyPlanToDom(plan);
         // Promotions are speculative: verify against the RENDERED truth and
@@ -990,8 +1525,9 @@
       pendingControllers.clear();
     }
 
-    async function callAccess(method, scopeId, value) {
+    async function callAccess(method, scopeId, value, owner) {
       const controller = typeof AbortController === "function" ? new AbortController() : null;
+      if (owner) owner.readController = controller;
       if (controller) pendingControllers.add(controller);
       try {
         return await access[method](scopeId, value, controller ? { signal: controller.signal } : undefined);
@@ -1013,16 +1549,50 @@
       return state;
     }
 
+    /**
+     * Point the panel at a project — or hear the SAME project asserted again.
+     *
+     * The second case is not a lesser version of the first, and treating it as
+     * one is what this function got wrong. A host re-asserts its scope whenever
+     * it hands over a fresh snapshot, which on a remote means every reconnect:
+     * a cloud machine that suspended and woke sends `initialState` carrying the
+     * cwd it already had. Nothing about the person's project changed. Only the
+     * socket did.
+     *
+     * So `switched` gates everything that belongs to a project SWITCH — the
+     * abort, leaving Changes, and resetting which of tree or viewer is showing.
+     * A re-assert keeps all of it and re-reads in place, which is the whole
+     * promise the Changes view makes when it says it fills in on reconnect.
+     *
+     * What this function no longer does is decide that a re-assert means the
+     * connection died. It cannot know that — only something watching a socket
+     * can — and the caller that used to tell it was itself guessing, from the
+     * arrival of a second snapshot. `refreshDisplayed` below is that job, asked
+     * for explicitly by whoever actually knows.
+     */
     async function setScope(scope) {
       if (destroyed) return;
       const nextState = scope ? scopeState(scope) : null;
-      if (currentState !== nextState) abortPending();
+      const switched = currentState !== nextState;
+      if (switched) { cancelOperations(); abortPending(); }
       currentState = nextState;
       currentScope = nextState ? nextState.scope : null;
       title.title = scope && (scope.title || scope.label) || "Show file tree";
       paintTitle();
       filter.value = currentState ? currentState.filter : "";
-      treeMode = !(currentState && currentState.activeRelPath);
+      // A project switch always lands on that project's own tree. Staying in
+      // Changes would show one project's branch under another's title for as
+      // long as the read takes, which is exactly the kind of cross-project
+      // confusion the per-scope state exists to prevent.
+      if (switched) leaveChanges();
+      paintChangesButton();
+      // Never forced from here. Hosts reassert one scope from adjacent state
+      // and catalog events too, and forcing on those would turn each into a
+      // duplicate `git status` — the same waste `rootLoad` sharing exists to
+      // avoid one function below. The one case that must force is a connection
+      // that ended, and that arrives at `refreshDisplayed`.
+      if (canGit && currentState && gitEnabledNow()) void loadChanges();
+      if (switched) treeMode = !(currentState && currentState.activeRelPath);
       renderTabs();
       if (!currentState) {
         renderedTreeState = null;
@@ -1033,12 +1603,62 @@
         tree.hidden = false;
         return;
       }
+      // A re-assert that kept Changes stops here: showTree and renderViewer
+      // both belong to the other two views, and renderViewer would undo the
+      // line above by leaving Changes itself.
+      if (changesMode) return;
       if (treeMode) {
         showTree();
         if (open && !currentState.tree) await loadRootTree();
       } else {
         renderViewer();
       }
+    }
+
+    /**
+     * The connection these reads were riding is gone and a new one is up. Ask
+     * again for what is ON SCREEN — and for nothing that somebody is part way
+     * through writing.
+     *
+     * The view owns what it wants to display, which is why this recreates a
+     * handful of reads rather than replaying the requests that were in flight.
+     * Those belonged to clicks made minutes ago against a socket that no longer
+     * exists; re-sending them would answer a question nobody is still asking
+     * and, in the tree's case, would answer it about a folder that has since
+     * been collapsed.
+     *
+     * `force` is what gets past the in-flight guard, and it is safe for exactly
+     * the reason the guard exists: the request being guarded went down with the
+     * previous connection and no answer to it is ever coming. `loadSeq` and
+     * `diffSeq` fence the late answer if one somehow does.
+     *
+     * What is deliberately NOT re-read: a dirty tab, a tab mid-save, and the
+     * commit message and branch draft, which `loadChanges` never touches. A
+     * reload replaces a tab wholesale, so doing it to a file somebody has typed
+     * into would take their words away to fix a connection problem they did not
+     * cause.
+     */
+    async function refreshDisplayed(opts) {
+      if (destroyed || !currentScope || !currentState) return;
+      if (opts && opts.preservePending && !open) return;
+      const state = currentState;
+      if (canGit && gitEnabledNow()) {
+        // The list re-reads itself here; the OPEN DIFF has to be asked for
+        // separately or it keeps whatever the dead connection left on it.
+        // That is what the owner hit: a diff subview pinned to "The connection
+        // dropped before that finished." with nothing that would ever replace
+        // it, because only the list was ever refreshed. Asked for even when the
+        // tree is showing, because leaving Changes keeps the open diff and
+        // going back lands straight on it. Status and diff are different
+        // request keys, so this does not queue behind the read above.
+        const openDiff = state.changes.diffPath;
+        void loadChanges({ force: !(opts && opts.preservePending) });
+        if (openDiff && !(opts && opts.preservePending && state.changes.diffLoading)) void openChangeDiff(openDiff, false);
+      }
+      if (changesMode) return;
+      if (treeMode) { void refreshTree(); return; }
+      const tab = state.activeRelPath ? state.tabs.get(state.activeRelPath) : null;
+      if (tab && !tab.dirty && !tab.saving && !tab.reloading && !tab.loading) void reloadTab(tab, false);
     }
 
     async function loadRootTree() {
@@ -1055,13 +1675,14 @@
       state.rootLoad = (async () => {
         const result = await callAccess("list", scopeId, "");
         if (result && result.ok) state.tree = result;
-        if (destroyed || currentState !== state) return;
+        if (destroyed || currentState !== state) return { ok: false, cancelled: true };
         tree.textContent = "";
         if (!result || !result.ok) {
           appendStatus(tree, result && result.reason || "Could not list folder.", true);
-          return;
+          return result;
         }
         renderRootTree(state);
+        return result;
       })();
       paintRefresh();
       try {
@@ -1084,12 +1705,17 @@
      * Everything else is deliberately untouched — open tabs, the filter text,
      * scroll position. A refresh that cost you your place is not worth pressing.
      */
-    async function refreshTree() {
+    async function refreshTree(intent) {
       if (destroyed || !currentScope || !currentState) return;
       const state = currentState;
+      const operation = intent ? beginOperation("Reading project files", "Project files refreshed.", "Couldn't read project files.") : null;
       // A first listing already in flight is as fresh as anything we would ask
       // for, so join it rather than racing a second request against it.
-      if (state.rootLoad) return state.rootLoad;
+      if (state.rootLoad) {
+        const result = await state.rootLoad;
+        finishOperation(operation, result, () => refreshTree(true));
+        return;
+      }
       const scopeId = state.scope.id;
       const remembered = expandedPaths();
       const scrollTop = tree.scrollTop;
@@ -1099,6 +1725,7 @@
           callAccess("list", scopeId, ""),
           ...remembered.map((relPath) => callAccess("list", scopeId, relPath)),
         ]);
+        finishOperation(operation, rootResult && rootResult.ok ? folderResults.find((r) => !r || !r.ok) || rootResult : rootResult, () => refreshTree(true));
         if (destroyed || currentState !== state) return;
         if (!rootResult || !rootResult.ok) {
           // Keep the tree you had. A refresh that failed is a failed refresh,
@@ -1110,7 +1737,7 @@
           const status = statusLine(rootResult && rootResult.reason || "Could not list folder.", true);
           status.classList.add("gfp-refresh-error");
           tree.appendChild(status);
-          return;
+          return rootResult;
         }
         const listings = new Map();
         remembered.forEach((relPath, index) => {
@@ -1120,6 +1747,7 @@
         state.tree = rootResult;
         renderRootTree(state, listings);
         tree.scrollTop = scrollTop;
+        return rootResult;
       })();
       paintRefresh();
       try {
@@ -1207,6 +1835,36 @@
       // Below the rows, not instead of them: appendStatus clears its host, so
       // this used to throw away every entry of a folder big enough to be cut.
       if (result.truncated) container.appendChild(statusLine("Folder truncated — more entries exist."));
+      paintTreeDirty();
+    }
+
+    /**
+     * The dot on a tree row: this file, or something under this folder, is
+     * not committed. Read off the same snapshot the Changes badge counts, so
+     * the tree and the badge cannot disagree about what is dirty. Painted
+     * over the rendered rows rather than by rebuilding them — a snapshot
+     * arrives after every turn, and the tree must not flicker for it.
+     *
+     * Every folder above a changed file is marked too; a closed folder that
+     * hides a change would otherwise look exactly like one that does not.
+     */
+    function paintTreeDirty() {
+      const snapshot = currentState && currentState.changes.snapshot;
+      const files = snapshot && Array.isArray(snapshot.files) ? snapshot.files : [];
+      const changed = new Set();
+      for (const file of files) {
+        const path = file && typeof file.path === "string" ? file.path : "";
+        if (!path) continue;
+        changed.add(path);
+        let cut = path.lastIndexOf("/");
+        while (cut > 0) {
+          changed.add(path.slice(0, cut));
+          cut = path.lastIndexOf("/", cut - 1);
+        }
+      }
+      for (const node of tree.querySelectorAll(".gfp-node")) {
+        node.classList.toggle("gfp-node-changed", changed.has(node.dataset.rel));
+      }
     }
 
     function makeTreeNode(entry, parentRelPath, listings) {
@@ -1224,6 +1882,7 @@
       row.style.setProperty("--gfp-depth", String(depth));
       const lead = doc.createElement("span");
       lead.className = "gfp-lead desk-ft-lead files-browse-row-icon";
+      // Directory rows use a chevron; the folder mark belongs to the project.
       if (entry.kind === "dir") {
         lead.classList.add("desk-ft-twist");
         lead.innerHTML = ICON.chevronRight;
@@ -1232,6 +1891,10 @@
       const name = doc.createElement("span");
       name.className = "gfp-name desk-ft-name files-browse-row-name";
       name.textContent = entry.name;
+      // The uncommitted mark; paintTreeDirty decides whether it shows.
+      const dot = doc.createElement("span");
+      dot.className = "gfp-node-dot";
+      dot.setAttribute("aria-hidden", "true");
       const actions = doc.createElement("div");
       actions.className = "gfp-row-actions desk-ft-row-actions";
       // Copy path is host-free, so every row has a menu — including remote,
@@ -1249,7 +1912,7 @@
         openRowMenu(more, entry);
       });
       actions.appendChild(more);
-      row.append(lead, name, actions);
+      row.append(lead, name, dot, actions);
       node.appendChild(row);
       if (entry.kind === "dir") {
         const children = doc.createElement("div");
@@ -1291,18 +1954,30 @@
       node.classList.toggle("gfp-expanded", opening);
       node.classList.toggle("desk-ft-open", opening);
       lead.innerHTML = opening ? ICON.chevronDown : ICON.chevronRight;
-      if (!opening) return;
+      if (!opening) {
+        if (node.readController) node.readController.abort();
+        if (node.operation) node.operation.cancel();
+        return;
+      }
       if (children.dataset.loaded === "1") return;
       appendStatus(children, "Loading…");
       const state = currentState;
       const scopeId = state.scope.id;
       const seq = (directorySeq.get(scopeKey(scopeId, entry.relPath)) || 0) + 1;
       directorySeq.set(scopeKey(scopeId, entry.relPath), seq);
-      const result = await callAccess("list", scopeId, entry.relPath);
+      node.operation = beginOperation("Reading " + entry.relPath, "Loaded " + entry.relPath + ".", "Couldn't read " + entry.relPath + ".");
+      const result = await callAccess("list", scopeId, entry.relPath, node);
       if (
         destroyed || currentState !== state
+        || !node.classList.contains("gfp-expanded")
         || directorySeq.get(scopeKey(scopeId, entry.relPath)) !== seq
       ) return;
+      finishOperation(node.operation, result, () => {
+        if (open && currentState === state && node.isConnected) {
+          node.classList.remove("gfp-expanded");
+          void toggleDirectory(node, entry, lead);
+        }
+      });
       children.textContent = "";
       if (!result || !result.ok) {
         appendStatus(children, result && result.reason || "Could not list folder.", true);
@@ -1314,9 +1989,14 @@
     }
 
     function renderFileIcon(host, name, kind) {
+      // The current project uses the open outline folder across icon themes.
+      if (kind === "dir") {
+        host.innerHTML = ICON.folderOpen;
+        return;
+      }
       const icons = ui.fileIcons;
       if (!icons || !icons.baseUrl) {
-        host.innerHTML = kind === "dir" ? ICON.folder : ICON.file;
+        host.innerHTML = ICON.file;
         return;
       }
       const id = typeof icons.idFor === "function"
@@ -1365,44 +2045,59 @@
       if (!currentScope || !currentState || !relPath) return { ok: false, reason: "no repository scope" };
       const state = currentState;
       const scopeId = state.scope.id;
-      if (!force && state.tabs.has(relPath)) {
+      let tab = state.tabs.get(relPath);
+      if (!force && tab && tab.kind !== "pending" && tab.kind !== "error") {
         activateTab(relPath);
         return { ok: true };
       }
-      const existing = state.tabs.get(relPath);
-      const readSeq = existing ? ++existing.readSeq : 1;
-      const result = await callAccess("read", scopeId, relPath);
-      if (destroyed || currentState !== state) return { ok: false, reason: "scope changed" };
-      if (existing && existing.readSeq !== readSeq) return { ok: false, reason: "superseded" };
-      if (!result || !result.ok) {
-        // Open it as a tab rather than painting the message over the tree, so
-        // the failure names its own file. Same path as a success from here on.
-        //
-        // This used to hand a non-previewable file straight to the OS on the
-        // desktop (`result.openExternal`), which meant the same click did two
-        // different things depending on which client you were sitting at — a
-        // tab with a message in the browser, a silently launched external app
-        // on the desktop. The tab is now the answer everywhere, and the OS
-        // route is offered INSIDE it rather than taken on your behalf.
-        const failed = makeErrorTab(scopeId, relPath, result && result.reason);
-        failed.canOpenExternally = !!(result && result.openExternal && access.openExternal);
-        state.tabs.set(relPath, failed);
-        if (!state.order.includes(relPath)) state.order.push(relPath);
-        state.activeRelPath = relPath;
-        treeMode = false;
-        renderTabs();
-        renderViewer();
-        setOpen(true);
-        return result || { ok: false, reason: "read failed" };
-      }
-      const tab = makeTab(scopeId, result);
+      if (tab && (tab.dirty || tab.saving)) { activateTab(relPath); return { ok: false, reason: "File has edits." }; }
+      if (tab && tab.loading && !force) { activateTab(relPath); return { ok: false, reason: "Opening file." }; }
+      if (tab && tab.readController) tab.readController.abort();
+      if (tab && tab.operation) tab.operation.cancel();
+      tab = makeTab(scopeId, { relPath, kind: "pending" });
+      tab.loading = true;
+      tab.operation = beginOperation("Opening " + pathLabel(relPath), "Opened " + pathLabel(relPath) + ".", "Couldn't open " + pathLabel(relPath) + ".");
       state.tabs.set(relPath, tab);
       if (!state.order.includes(relPath)) state.order.push(relPath);
       state.activeRelPath = relPath;
       treeMode = false;
+      leaveChanges();
       renderTabs();
       renderViewer();
       setOpen(true);
+      const result = await callAccess("read", scopeId, relPath, tab);
+      tab.loading = false;
+      if (destroyed || currentState !== state || state.tabs.get(relPath) !== tab || tab.dirty) {
+        if (tab.operation) tab.operation.cancel();
+        return { ok: false, reason: "superseded" };
+      }
+      finishOperation(tab.operation, result, () => {
+        if (open && currentState === state && state.tabs.get(relPath) === tab && !tab.dirty) void openFile(relPath, true);
+      });
+      if (!result || !result.ok) {
+        // The failure stays in the tab it was opened in.
+        //
+        // It used to be painted over the tree instead: no tab, so nothing named
+        // the file that had failed, and the tree's filter box stayed on screen
+        // above a message about a file you could no longer see. A tab makes the
+        // failure behave like every other open file — it says which file, it
+        // can be left open while you look at something else, it closes the same
+        // way, and now it is the same tab that was already on screen saying
+        // "Opening…", so nothing about the view jumps when the answer lands.
+        tab.error = result && result.reason || "Could not open file.";
+        tab.canOpenExternally = !!(result && result.openExternal && access.openExternal);
+        if (open) {
+          renderTabs();
+          if (state.activeRelPath === relPath && !treeMode && !changesMode) renderViewer();
+        }
+        return result || { ok: false, reason: "read failed" };
+      }
+      const fresh = makeTab(scopeId, result);
+      state.tabs.set(relPath, fresh);
+      // Another tab may have been selected while this one was opening.
+      if (state.activeRelPath === relPath && !treeMode && !changesMode && open) {
+        renderTabs(); renderViewer();
+      }
       return { ok: true, kind: result.kind };
     }
 
@@ -1410,6 +2105,10 @@
       if (!currentState || !currentState.tabs.has(relPath)) return;
       currentState.activeRelPath = relPath;
       treeMode = false;
+      // Before renderTabs, not after: the strip asks whether the Changes list
+      // is showing when it decides which tab is selected, and renderViewer's
+      // own call comes too late to answer it.
+      leaveChanges();
       renderTabs();
       renderViewer();
     }
@@ -1432,6 +2131,12 @@
         });
         if (answer !== "discard") return false;
       }
+      // Was the tab being CLOSED the one on screen? Only that answer decides
+      // whether the body needs a new subject, and it has to be read before the
+      // bookkeeping below moves activeRelPath onto a survivor.
+      const wasOnScreen = !treeMode && !changesMode && state.activeRelPath === relPath;
+      if (tab.readController) tab.readController.abort();
+      if (tab.operation) tab.operation.cancel();
       state.tabs.delete(relPath);
       state.order = state.order.filter((item) => item !== relPath);
       if (state.activeRelPath === relPath) {
@@ -1443,6 +2148,13 @@
       // took effect in its own scope either way.
       if (state !== currentState) return true;
       renderTabs();
+      // Closing a file is tidying, not navigation. Every named tab now carries
+      // an X and so does every row of the … menu, so a close can be pressed
+      // while the tree or the Changes list is what you are looking at — and
+      // this used to open an editor over it, leaving the folder or the Changes
+      // button still underlined above somebody else's file. Stay put; the
+      // strip repaint is the whole of the change you asked for.
+      if (!wasOnScreen) return true;
       if (state.activeRelPath) renderViewer();
       else showTree();
       return true;
@@ -1458,7 +2170,12 @@
       for (const relPath of currentState.order) {
         const tab = currentState.tabs.get(relPath);
         if (!tab) continue;
-        const isActive = !treeMode && currentState.activeRelPath === relPath;
+        // `changesMode` counts as "no file is being viewed". Leaving it out
+        // drew TWO selected tabs at once — the Changes button underlined and
+        // the last-opened file still wearing the active treatment and its X.
+        // The flag was kept separate from `treeMode` for exactly this reason
+        // (see its declaration) and then never consulted here.
+        const isActive = !treeMode && !changesMode && currentState.activeRelPath === relPath;
         const item = doc.createElement("div");
         item.className = "gfp-tab desk-ft-tab" + (isActive ? " gfp-tab-active desk-ft-tab-active" : "");
         item.setAttribute("role", "tab");
@@ -1474,26 +2191,897 @@
         const dirty = doc.createElement("span");
         dirty.className = "gfp-tab-dirty desk-ft-tab-dirty";
         dirty.textContent = tab.dirty ? "•" : "";
-        item.append(icon, name, dirty);
-        // Inactive tabs never render an X. The active tab's close is structural
-        // (not CSS-hidden) so it cannot be clipped away by a shrink rule.
-        if (isActive) {
-          const close = doc.createElement("button");
-          close.type = "button";
-          close.className = "gfp-tab-close desk-ft-tab-close";
-          close.innerHTML = ICON.close;
-          close.title = "Close";
-          close.setAttribute("aria-label", "Close " + fileName(relPath));
-          close.addEventListener("click", (event) => {
-            event.stopPropagation();
-            void closeTab(relPath);
-          });
-          item.appendChild(close);
-        }
+        // icon · dot · name · X — the prototype's order, and it is better than
+        // the one we shipped for a reason worth naming: with the dot AFTER the
+        // name it is the one thing entitled to sit between a filename and the
+        // X that closes it, so a dirty tab pushes its own close away exactly
+        // when you are most likely to reach for it. In front of the name the
+        // dot costs the same width and never separates the pair.
+        item.append(icon, dirty, name);
+        // Every tab that shows a name carries its own X, active or not.
+        // Closing used to require opening the file first, which is worst
+        // exactly where tabs are scarcest: in State C a phone shows one tab,
+        // so shutting five files meant activating five files.
+        // Icon-only tabs hide the X along with the name in CSS, and the
+        // planner budgets that mode from icon + dirty dot alone, so a hidden
+        // X costs no width. The active tab is never icon-only, so its close
+        // is still effectively structural.
+        const close = doc.createElement("button");
+        close.type = "button";
+        close.className = "gfp-tab-close desk-ft-tab-close";
+        close.innerHTML = ICON.close;
+        close.title = "Close";
+        close.setAttribute("aria-label", "Close " + fileName(relPath));
+        close.addEventListener("click", (event) => {
+          event.stopPropagation();
+          void closeTab(relPath);
+        });
+        item.appendChild(close);
         item.addEventListener("click", () => activateTab(relPath));
         tabsEl.appendChild(item);
       }
       applyStripPlan();
+    }
+
+    /* ---------------------------------------------------------------- *
+     * The Changes view
+     * ---------------------------------------------------------------- */
+
+    /**
+     * Whether to offer the view at all.
+     *
+     * Three conditions, and each removes a different bad outcome. No adapter
+     * call means an older host that would drop the message in silence. A
+     * false `gitEnabled` is an embedder saying this mount has no business
+     * showing git at all. Not a repository means a button whose only content
+     * would be an explanation of why it is empty.
+     */
+    function gitEnabledNow() {
+      if (typeof options.gitEnabled !== "function") return true;
+      return !!options.gitEnabled();
+    }
+
+    function changesAvailable() {
+      if (destroyed || !canGit || !currentState) return false;
+      if (!gitEnabledNow()) return false;
+      const state = currentState.changes;
+      return state.errorKind !== "no-git" && state.errorKind !== "not-a-repo";
+    }
+
+    function paintChangesButton() {
+      const available = changesAvailable();
+      const wasHidden = changesBtn.hidden;
+      changesBtn.hidden = !available;
+      // Turn cards are painted before the first status read can finish. One
+      // live hook retires every existing link when that read says no git,
+      // and restores them when a different project does offer Changes.
+      doc.body.classList.toggle("changes-unavailable", !available);
+      changesBtn.classList.toggle("gfp-changes-selected", !!changesMode);
+      changesBtn.setAttribute("aria-pressed", String(!!changesMode));
+      const snapshot = currentState && currentState.changes.snapshot;
+      const count = snapshot && Array.isArray(snapshot.files) ? snapshot.files.length : 0;
+      // The badge counts UNCOMMITTED files only. Unpushed commits are named in
+      // words inside the view; a badge that silently added two different things
+      // together would be a number nobody could act on.
+      changesCount.hidden = !count;
+      changesCount.textContent = count > 99 ? "99+" : String(count);
+      changesBtn.title = count
+        ? (count === 1 ? "Changes — 1 file not committed" : "Changes — " + count + " files not committed")
+        : "Changes";
+      // Same number, same rule, on the panel toggle — and gone with the
+      // Changes button when there is no repository to count.
+      toggleCount.hidden = !available || !count;
+      toggleCount.textContent = changesCount.textContent;
+      paintTreeDirty();
+      if (changesBtn.hidden !== wasHidden) applyStripShrink();
+      syncChangesPolling();
+    }
+
+    function canPollChanges() {
+      return !destroyed && open && changesMode && doc.visibilityState === "visible"
+        && changesAvailable() && !gitWritesInFlight
+        && typeof options.pollChanges === "function" && options.pollChanges();
+    }
+
+    /**
+     * Remote status replies are already host frames, which keep a Sprite awake.
+     * Thirty seconds stays inside the relay's 90s silence window without a new
+     * keepalive protocol. Visibility is a billing boundary: a forgotten tab or
+     * a closed view must stop holding the machine, even if a timer was queued.
+     * Desktop mounts do not opt in; their host already announces file writes.
+     */
+    function syncChangesPolling() {
+      if (!canPollChanges()) {
+        if (changesPollTimer !== null) win.clearInterval(changesPollTimer);
+        changesPollTimer = null;
+      } else if (changesPollTimer === null) {
+        changesPollTimer = win.setInterval(() => {
+          if (!canPollChanges()) { syncChangesPolling(); return; }
+          void loadChanges({ quiet: true });
+        }, 30000);
+      }
+    }
+
+    function changesVisibilityChanged() {
+      syncChangesPolling();
+      if (canPollChanges()) void loadChanges({ quiet: true });
+    }
+
+    function showChanges() {
+      if (!canGit || !currentState) return;
+      if (currentState.changes.operation) currentState.changes.operation.cancel();
+      currentState.changes.operation = beginOperation("Reading what changed", "Changes loaded.", "Couldn't read what changed.");
+      changesMode = true;
+      treeMode = false;
+      rootEl.classList.remove("gfp-viewing");
+      if (mount.viewingBodyClass) doc.body.classList.remove(mount.viewingBodyClass);
+      tree.hidden = true;
+      viewer.hidden = true;
+      changesEl.hidden = false;
+      rootEl.classList.add("gfp-changes-mode");
+      renderTabs();
+      paintChangesButton();
+      paintRefresh();
+      renderChanges();
+      // A snapshot older than this visit is a snapshot of somebody else's
+      // moment — the agent has very likely written files since. Always re-read
+      // on entry; it is two cheap commands and the whole point of the view is
+      // that the number is true.
+      void loadChanges({});
+    }
+
+    async function loadChanges(opts) {
+      if (destroyed || !canGit || !currentScope || !currentState || gitWritesInFlight) return;
+      const state = currentState;
+      const scopeId = currentScope.id;
+      const quiet = !!(opts && opts.quiet);
+      if (state.changes.loading && !(opts && opts.force)) return;
+      const seq = ++state.changes.loadSeq;
+      state.changes.loading = true;
+      if (changesMode && !quiet) {
+        paintRefresh();
+        renderChanges();
+      }
+      let result;
+      try {
+        result = await callAccess("gitStatus", scopeId);
+      } catch (err) {
+        result = { ok: false, kind: "failed", reason: String((err && err.message) || err || "Could not read git status.") };
+      }
+      if (seq !== state.changes.loadSeq) return;
+      state.changes.loading = false;
+      if (destroyed || currentState !== state) return;
+      // A background failure cannot replace good data, hide a working tab, or
+      // erase a notice. The next tick may succeed; explicit reads still explain
+      // failures to the person who asked for them.
+      finishOperation(state.changes.operation, result, () => showChanges());
+      state.changes.operation = null;
+      if (quiet && (!result || !result.ok)) return;
+      if (result && result.ok) {
+        state.changes.snapshot = result.snapshot;
+        state.changes.error = "";
+        state.changes.errorKind = "";
+        // A path that stopped being changed cannot still have its diff on
+        // screen — the host would refuse it, and a stale patch is worse than
+        // none because it looks current.
+        if (state.changes.diffPath && !(result.snapshot.files || []).some((f) => f.path === state.changes.diffPath)) {
+          state.changes.diffPath = null;
+          state.changes.diffPatch = "";
+        }
+      } else {
+        state.changes.snapshot = null;
+        state.changes.errorKind = (result && result.kind) || "failed";
+        state.changes.error = (result && result.reason) || "Could not read git status.";
+        // The two "there is no git here" answers retire the button entirely
+        // rather than parking an explanation behind it.
+        if (state.changes.errorKind === "no-git" || state.changes.errorKind === "not-a-repo") {
+          if (changesMode) showTree();
+        }
+      }
+      paintChangesButton();
+      if (changesMode) {
+        paintRefresh();
+        renderChanges();
+      }
+    }
+
+    async function openChangeDiff(path, intent = true) {
+      if (!currentScope || !currentState) return;
+      const state = currentState;
+      const scopeId = currentScope.id;
+      if (state.changes.readController) state.changes.readController.abort();
+      if (state.changes.diffOperation) state.changes.diffOperation.cancel();
+      const operation = state.changes.diffOperation = intent ? beginOperation("Reading changes in " + path, "Changes loaded for " + path + ".", "Couldn't read changes in " + path + ".") : null;
+      const seq = ++state.changes.diffSeq;
+      state.changes.diffPath = path;
+      state.changes.diffPatch = "";
+      state.changes.diffTruncated = false;
+      state.changes.diffError = "";
+      state.changes.diffLoading = true;
+      renderChanges();
+      let result;
+      try {
+        result = await callAccess("gitDiff", scopeId, path, state.changes);
+      } catch (err) {
+        result = { ok: false, reason: String((err && err.message) || err || "Could not read the diff.") };
+      }
+      if (destroyed || seq !== state.changes.diffSeq || currentState !== state || state.changes.diffPath !== path) return;
+      state.changes.diffLoading = false;
+      finishOperation(operation, result, () => openChangeDiff(path));
+      if (result && result.ok) {
+        state.changes.diffPatch = result.patch || "";
+        state.changes.diffTruncated = !!result.truncated;
+      } else {
+        state.changes.diffError = (result && result.reason) || "Could not read the diff.";
+      }
+      renderChanges();
+    }
+
+    function closeChangeDiff() {
+      if (!currentState) return;
+      if (currentState.changes.readController) currentState.changes.readController.abort();
+      if (currentState.changes.diffOperation) currentState.changes.diffOperation.cancel();
+      currentState.changes.diffPath = null;
+      currentState.changes.diffPatch = "";
+      currentState.changes.diffError = "";
+      renderChanges();
+    }
+
+    async function runChangesOp(request) {
+      if (!currentScope || !currentState || typeof access.gitRun !== "function") return;
+      const state = currentState;
+      const scopeId = currentScope.id;
+      if (state.changes.running) return;
+      const operation = beginOperation("Running Git " + request.op, "Git " + request.op + " finished.", "Couldn't finish Git " + request.op + ".");
+      const before = state.changes.snapshot;
+      state.changes.running = true;
+      gitWritesInFlight += 1;
+      // A read started before this write may arrive after its newer snapshot.
+      // Invalidate it now, including its loading flag, so it cannot undo a
+      // successful commit or strand polling when it eventually returns.
+      state.changes.loadSeq += 1;
+      state.changes.loading = false;
+      syncChangesPolling();
+      state.changes.notice = null;
+      renderChanges();
+      let result;
+      try {
+        result = await access.gitRun(scopeId, request);
+      } catch (err) {
+        result = { ok: false, reason: String((err && err.message) || err || "That git command failed.") };
+      }
+      state.changes.running = false;
+      gitWritesInFlight -= 1;
+      syncChangesPolling();
+      if (destroyed || currentState !== state) return;
+      if (result && result.snapshot) state.changes.snapshot = result.snapshot;
+      // A failed compound command may have committed before its push failed.
+      // Return to the updated Changes controls so retry is replanned from that
+      // outcome, rather than replaying the old command and its message.
+      finishOperation(operation, result, () => { if (open && currentState === state) showChanges(); });
+      // A push can fail after its commit succeeded. An advanced local history
+      // with no remaining files proves the message was spent in that case too.
+      if (request.op === "commit" && result && (result.ok || (request.push && result.snapshot
+        && result.snapshot.ahead > ((before && before.ahead) || 0)
+        && Array.isArray(result.snapshot.files) && !result.snapshot.files.length))) {
+        state.changes.message = "";
+      }
+      if (result && result.ok) {
+        state.changes.notice = { tone: "ok", text: successLine(request, result.snapshot) };
+        state.changes.diffPath = null;
+        state.changes.diffPatch = "";
+      } else {
+        state.changes.notice = {
+          tone: "warn",
+          text: (result && result.reason) || "That git command failed.",
+          detail: (result && result.detail) || "",
+        };
+        if (state.changes.notice.text === "The remote has commits you do not have. Pull before pushing."
+          && typeof ui.askAgent === "function") {
+          state.changes.notice.action = { label: "Ask the agent to pull", run: askAgentToPull };
+        } else if (state.changes.notice.text === "Push needs GitHub. Connect it in Settings."
+          && typeof ui.openSettings === "function") {
+          state.changes.notice.action = { label: "Connect GitHub", run: () => leavePanelFor(ui.openSettings) };
+        }
+      }
+      paintChangesButton();
+      renderChanges();
+    }
+
+    function leavePanelFor(run) {
+      // Reveal the destination before it takes focus. Docked panels stay open.
+      if (isOverlay()) setOpen(false);
+      run();
+    }
+
+    function askAgentToPull() {
+      leavePanelFor(() => ui.askAgent(PULL_AGENT_MESSAGE));
+    }
+
+    /** What happened, in the person's terms rather than git's. */
+    function successLine(request, snapshot) {
+      const ahead = snapshot ? Number(snapshot.ahead) || 0 : 0;
+      if (request.op === "commit") {
+        if (request.push) return "Committed and pushed.";
+        return ahead > 0
+          ? "Committed. " + (ahead === 1 ? "1 commit is" : ahead + " commits are") + " still only on this machine."
+          : "Committed.";
+      }
+      if (request.op === "push") return "Pushed.";
+      if (request.op === "newBranch") return "Now on " + request.branch + ".";
+      if (request.op === "revertFile") return "Restored " + request.path + " to the last commit.";
+      return "Done.";
+    }
+
+    function renderChanges() {
+      if (!changesMode) return;
+      // Like renderViewer, this rebuilds textareas. Keep the caret, selection
+      // direction and scroll for this scope only; input listeners already keep
+      // the draft text in state. A poll must not interrupt a half-written commit
+      // message (or the branch name being entered beside it).
+      const live = changesEl.querySelector(".gfp-changes-message, .gfp-changes-branch-input");
+      const focused = changesEl.contains(doc.activeElement) ? doc.activeElement : null;
+      const editor = focused && focused.matches("textarea, input") ? focused : live;
+      const carry = editor && currentState && renderedChangesState === currentState.changes
+        ? { selector: editor.classList.contains("gfp-changes-message") ? ".gfp-changes-message" : ".gfp-changes-branch-input",
+            start: editor.selectionStart, end: editor.selectionEnd, direction: editor.selectionDirection,
+            scrollTop: editor.scrollTop, scrollLeft: editor.scrollLeft, focused: doc.activeElement === editor }
+        : null;
+      const scrollTop = changesEl.scrollTop;
+      renderedChangesState = currentState && currentState.changes;
+      changesEl.textContent = "";
+      if (!currentState) {
+        changesEl.appendChild(changesEmpty("No repository selected."));
+        return;
+      }
+      const state = currentState.changes;
+      if (state.diffPath) {
+        renderChangeDiff(state);
+        return;
+      }
+      if (state.error) {
+        changesEl.appendChild(changesEmpty(state.error));
+        return;
+      }
+      if (!state.snapshot) {
+        changesEl.appendChild(changesEmpty(state.loading ? "Reading git status\u2026" : "No status yet."));
+        return;
+      }
+      renderChangesList(state);
+      const next = carry && changesEl.querySelector(carry.selector);
+      if (next) {
+        if (carry.focused && open && doc.visibilityState === "visible") next.focus({ preventScroll: true });
+        next.setSelectionRange(carry.start, carry.end, carry.direction);
+        next.scrollTop = carry.scrollTop;
+        next.scrollLeft = carry.scrollLeft;
+      }
+      changesEl.scrollTop = scrollTop;
+    }
+
+    /**
+     * The diff, in the product's one diff style.
+     *
+     * Same markup as chat.js's `buildInlineDiffRegion`: a sign column, a
+     * right-aligned line-number gutter sized to the widest number actually
+     * shown, and the code. A hunk boundary becomes the same dashed rule that
+     * separates two non-contiguous edits in a tool call, because it means the
+     * same thing — the file jumps here.
+     */
+    function diffRegion(rows) {
+      const wrap = doc.createElement("div");
+      wrap.className = "tool-diff-region gfp-diff-region";
+      let widest = 0;
+      for (const row of rows) {
+        const shown = row.kind === "del" ? row.oldNo : row.newNo;
+        if (shown && shown > widest) widest = shown;
+      }
+      // Floored at 4ch so everything up to 999 looks exactly like the inline
+      // diff; only a four-digit file widens the track.
+      const digits = String(widest || 0).length;
+      wrap.style.setProperty("--tdl-num-w", Math.max(4, digits + 1) + "ch");
+      for (const row of rows) {
+        if (row.kind === "hunk") {
+          const sep = doc.createElement("div");
+          sep.className = "tdl-sep";
+          wrap.appendChild(sep);
+          continue;
+        }
+        const line = doc.createElement("div");
+        line.className = "tdl" + (row.kind === "add" ? " tdl-add" : row.kind === "del" ? " tdl-del" : "");
+        const sign = doc.createElement("span");
+        sign.className = "tdl-sign";
+        sign.textContent = row.kind === "add" ? "+" : row.kind === "del" ? "\u2212" : "";
+        sign.setAttribute("aria-hidden", "true");
+        const num = doc.createElement("span");
+        num.className = "tdl-num";
+        const shown = row.kind === "del" ? row.oldNo : row.newNo;
+        num.textContent = shown ? String(shown) : "";
+        const code = doc.createElement("span");
+        code.className = "tdl-code";
+        code.textContent = row.kind === "meta" ? "\u2026 " + row.text : row.text;
+        line.append(sign, num, code);
+        wrap.appendChild(line);
+      }
+      return wrap;
+    }
+
+    function changesEmpty(text) {
+      const el = doc.createElement("p");
+      el.className = "gfp-changes-empty";
+      el.textContent = text;
+      return el;
+    }
+
+    function renderChangesList(state) {
+      const snapshot = state.snapshot;
+      const files = Array.isArray(snapshot.files) ? snapshot.files : [];
+
+      // 1. Where the work is. One quiet line; the branch is context, not news.
+      const branchInfo = changesBranchLine(snapshot);
+      const branchRow = doc.createElement("div");
+      branchRow.className = "gfp-changes-branch";
+      const branchIcon = doc.createElement("span");
+      branchIcon.className = "gfp-changes-branch-icon";
+      branchIcon.innerHTML = ICON.branch;
+      const branchName = doc.createElement("span");
+      branchName.className = "gfp-changes-branch-name";
+      branchName.textContent = branchInfo.branch;
+      branchRow.append(branchIcon, branchName);
+      if (branchInfo.note) {
+        const note = doc.createElement("span");
+        note.className = "gfp-changes-branch-note";
+        note.textContent = branchInfo.note;
+        branchRow.appendChild(note);
+      }
+      if (typeof ui.askAgent === "function" && snapshot.hasRemote && !snapshot.detached && snapshot.branch) {
+        const pull = doc.createElement("button");
+        pull.type = "button";
+        pull.className = "gfp-changes-ask-pull";
+        pull.textContent = "Ask agent to pull";
+        pull.title = "Puts a pull request for this branch into the message box";
+        pull.addEventListener("click", askAgentToPull);
+        branchRow.appendChild(pull);
+      }
+      changesEl.appendChild(branchRow);
+
+      // 2. The answer to "is it safe to walk away", in one line.
+      const headline = changesHeadline(snapshot);
+      const headlineEl = doc.createElement("p");
+      headlineEl.className = "gfp-changes-headline gfp-changes-" + headline.tone;
+      headlineEl.textContent = headline.text;
+      // The size of it, beside the count of it. "8 files not committed" says
+      // how many places changed and nothing about how much — which is the
+      // difference between a rename sweep and a rewrite, and it is the number
+      // the turn card has been showing all along.
+      // snapshot.files, not the `files` binding below — that one is declared
+      // further down this function and reading it here is a dead-zone throw.
+      const total = changeTotalLabel(snapshot.files);
+      if (total) {
+        const totalEl = doc.createElement("span");
+        totalEl.className = "gfp-change-stat gfp-changes-total";
+        appendCountLabel(totalEl, total, doc);
+        headlineEl.appendChild(doc.createTextNode(" "));
+        headlineEl.appendChild(totalEl);
+      }
+      changesEl.appendChild(headlineEl);
+
+      // 3. The outcome of the last run, if there was one. Above the list,
+      //    because it is about to be contradicted by the list otherwise.
+      if (state.notice) {
+        const notice = doc.createElement("div");
+        notice.className = "gfp-changes-notice gfp-changes-" + state.notice.tone;
+        const line = doc.createElement("p");
+        line.className = "gfp-changes-notice-text";
+        line.textContent = state.notice.text;
+        notice.appendChild(line);
+        if (state.notice.detail) {
+          const detail = doc.createElement("pre");
+          detail.className = "gfp-changes-notice-detail";
+          detail.textContent = state.notice.detail.trim();
+          notice.appendChild(detail);
+        }
+        if (state.notice.action) {
+          const action = doc.createElement("button");
+          action.type = "button";
+          action.className = "gfp-changes-secondary gfp-changes-notice-action";
+          action.textContent = state.notice.action.label;
+          action.addEventListener("click", state.notice.action.run);
+          notice.appendChild(action);
+        }
+        changesEl.appendChild(notice);
+      }
+
+      // 4. The files. Each row is a link to its own diff and nothing else —
+      //    the destructive action lives one level in, behind having looked.
+      if (files.length) {
+        changesEl.appendChild(changesSectionHeader("Not committed"));
+        const list = doc.createElement("div");
+        list.className = "gfp-changes-list";
+        // A beginner's unignored node_modules can contain thousands of files.
+        // Cap DOM work only: the full snapshot drives counts, validation and
+        // commit scope, including files below this fold.
+        const rowLimit = 200;
+        for (const file of files.slice(0, rowLimit)) {
+          list.appendChild(changeRow(file));
+        }
+        if (files.length > rowLimit) {
+          const more = doc.createElement("p");
+          more.className = "gfp-changes-more";
+          more.textContent = "and " + (files.length - rowLimit) + " more";
+          list.appendChild(more);
+        }
+        changesEl.appendChild(list);
+      }
+
+      // 5. Unpushed commits, only when there are some and nothing uncommitted
+      //    is shouting louder. Two lists at once is the noise the owner
+      //    specifically asked not to have.
+      const unpushed = Array.isArray(snapshot.unpushed) ? snapshot.unpushed : [];
+      if (unpushed.length && !files.length) {
+        changesEl.appendChild(changesSectionHeader("Not pushed"));
+        const list = doc.createElement("div");
+        list.className = "gfp-changes-commits";
+        for (const commit of unpushed.slice(0, 8)) {
+          const row = doc.createElement("div");
+          row.className = "gfp-changes-commit";
+          const sha = doc.createElement("code");
+          sha.className = "gfp-changes-sha";
+          sha.textContent = commit.sha;
+          const subject = doc.createElement("span");
+          subject.className = "gfp-changes-subject";
+          subject.textContent = commit.subject;
+          row.append(sha, subject);
+          list.appendChild(row);
+        }
+        if (unpushed.length > 8) {
+          const more = doc.createElement("p");
+          more.className = "gfp-changes-more";
+          more.textContent = snapshot.unpushedTruncated
+            ? "and more"
+            : "and " + (unpushed.length - 8) + " more";
+          list.appendChild(more);
+        }
+        changesEl.appendChild(list);
+      }
+
+      changesEl.appendChild(changesActions(state, snapshot, files));
+    }
+
+    function changesSectionHeader(label) {
+      const heading = doc.createElement("div");
+      heading.className = "gfp-changes-section";
+      heading.textContent = label;
+      return heading;
+    }
+
+    function changeRow(file) {
+      const row = doc.createElement("button");
+      row.type = "button";
+      row.className = "gfp-change-row gfp-change-" + (file.status === "?" ? "new" : file.status.toLowerCase());
+      row.dataset.path = file.path;
+      row.title = changeWord(file.status) + " \u2014 " + file.path;
+
+      const badge = doc.createElement("span");
+      badge.className = "gfp-change-badge";
+      // An untracked file is an ADDED file, and it says so with the same
+      // letter the turn card prints. The panel used to say "+" here and the
+      // word "new" at the other end of the row -- two vocabularies for one
+      // fact, on the two surfaces a person compares side by side.
+      badge.textContent = file.status === "?" ? "A" : file.status;
+      badge.setAttribute("aria-hidden", "true");
+
+      const name = doc.createElement("span");
+      name.className = "gfp-change-name";
+      const base = fileName(file.path);
+      const dir = file.path.slice(0, Math.max(0, file.path.length - base.length - 1));
+      const baseEl = doc.createElement("span");
+      baseEl.className = "gfp-change-base";
+      baseEl.textContent = base;
+      name.appendChild(baseEl);
+      if (dir) {
+        const dirEl = doc.createElement("span");
+        dirEl.className = "gfp-change-dir";
+        dirEl.textContent = dir;
+        name.appendChild(dirEl);
+      }
+
+      row.append(badge, name);
+
+      const counts = changeCountLabel(file);
+      if (counts) {
+        const stat = doc.createElement("span");
+        stat.className = "gfp-change-stat";
+        appendCountLabel(stat, counts, doc);
+        row.appendChild(stat);
+      }
+      // Nothing takes the stat column's place for an untracked file. Counting
+      // its lines needs a host-side read per file (no `git diff` entry exists),
+      // and the turn card already summarises what changed in the round.
+
+      row.addEventListener("click", () => void openChangeDiff(file.path));
+      return row;
+    }
+
+    /**
+     * The commit box and its buttons.
+     *
+     * The common case — "put this somewhere I will not lose it" — stays one
+     * press on the primary, and everything else is deliberately quieter than
+     * it: a second commit that does not push, and the branch escape hatch.
+     * The hint precedes the message; both commit choices share the row below it.
+     */
+    function changesActions(state, snapshot, files) {
+      const wrap = doc.createElement("div");
+      wrap.className = "gfp-changes-actions";
+      const primary = changesPrimaryAction(snapshot, { message: state.message });
+      // Declared up here because the message box's listener, built below,
+      // has to keep it in step and closes over the binding.
+      let onlyBtn = null;
+
+      const hint = doc.createElement("p");
+      hint.className = "gfp-changes-hint";
+      hint.textContent = primary.hint;
+      wrap.appendChild(hint);
+
+      if (files.length) {
+        const box = doc.createElement("textarea");
+        box.className = "gfp-changes-message";
+        box.rows = 2;
+        box.placeholder = "What changed?";
+        box.value = state.message;
+        box.setAttribute("aria-label", "Commit message");
+        box.addEventListener("input", () => {
+          state.message = box.value;
+          const next = changesPrimaryAction(snapshot, { message: state.message });
+          runBtn.disabled = next.disabled || state.running || typeof state.branchDraft === "string";
+          hint.textContent = next.hint;
+          if (onlyBtn) {
+            onlyBtn.disabled = changesCommitOnlyAction(snapshot, { message: state.message }).disabled
+              || state.running || typeof state.branchDraft === "string";
+          }
+        });
+        wrap.appendChild(box);
+      }
+
+      const runBtn = doc.createElement("button");
+      runBtn.type = "button";
+      runBtn.className = "gfp-changes-primary";
+      runBtn.textContent = state.running ? "Working\u2026" : primary.label;
+      // Naming a branch takes over: one enabled primary at a time is the whole
+      // design of this block.
+      runBtn.disabled = primary.disabled || state.running || typeof state.branchDraft === "string";
+      runBtn.addEventListener("click", () => {
+        if (!primary.op) return;
+        if (primary.op === "commit") {
+          void runChangesOp({ op: "commit", message: state.message, push: !!primary.push });
+          return;
+        }
+        void confirmedPush(snapshot);
+      });
+      const actionRow = doc.createElement("div");
+      actionRow.className = "gfp-changes-action-row";
+      actionRow.appendChild(runBtn);
+      wrap.appendChild(actionRow);
+
+      // The rule, said under the buttons rather than in the README. The owner
+      // asked "all files or nothing? is that correct?" — which is the question
+      // a person has at exactly this moment, and the answer was nowhere on the
+      // screen where they have it. Lifted from the prototype, whose footer
+      // does the same job.
+      if (files.length) {
+        const rule = doc.createElement("p");
+        rule.className = "gfp-changes-rule";
+        rule.textContent = "Every not-committed file goes in. To leave one out, discard it from its ⋯ menu first.";
+        wrap.appendChild(rule);
+      }
+
+      const commitOnly = changesCommitOnlyAction(snapshot, { message: state.message });
+      if (commitOnly.show) {
+        onlyBtn = doc.createElement("button");
+        onlyBtn.type = "button";
+        onlyBtn.className = "gfp-changes-secondary gfp-changes-commit-only";
+        onlyBtn.textContent = commitOnly.label;
+        onlyBtn.disabled = commitOnly.disabled || state.running || typeof state.branchDraft === "string";
+        onlyBtn.addEventListener("click", () => {
+          void runChangesOp({ op: "commit", message: state.message, push: false });
+        });
+        actionRow.classList.add("has-commit-only");
+        actionRow.prepend(onlyBtn);
+      }
+
+      // The escape hatch, and the reason the primary button can stay a single
+      // promise: anybody who does not want to commit onto this branch can move
+      // the work first, and that is one line rather than a second mode.
+      if (files.length && snapshot.isDefaultBranch && !snapshot.detached) {
+        if (typeof state.branchDraft === "string") {
+          wrap.appendChild(branchNameRow(state));
+        } else {
+          const move = doc.createElement("button");
+          move.type = "button";
+          move.className = "gfp-changes-secondary gfp-changes-move-branch";
+          move.textContent = "Move to a new branch\u2026";
+          move.disabled = state.running;
+          move.addEventListener("click", () => {
+            state.branchDraft = "";
+            renderChanges();
+            const input = changesEl.querySelector(".gfp-changes-branch-input");
+            if (input) input.focus();
+          });
+          wrap.appendChild(move);
+        }
+      }
+      return wrap;
+    }
+
+    /**
+     * Naming the branch, in the panel rather than in a dialog.
+     *
+     * The host is the authority on what git will accept — it re-plans every
+     * operation from its own snapshot and refuses names git would reject — so
+     * this checks only enough to keep the button from being pressable while it
+     * obviously cannot work. A second copy of the real rule here would be one
+     * more thing to keep in step with isValidBranchName.
+     */
+    function branchNameRow(state) {
+      const row = doc.createElement("div");
+      row.className = "gfp-changes-branch-row";
+
+      const input = doc.createElement("input");
+      input.type = "text";
+      input.className = "gfp-changes-branch-input";
+      input.placeholder = "new-branch-name";
+      input.value = state.branchDraft;
+      input.setAttribute("aria-label", "Name for the new branch");
+      input.autocomplete = "off";
+      input.spellcheck = false;
+
+      const create = doc.createElement("button");
+      create.type = "button";
+      create.className = "gfp-changes-primary gfp-changes-branch-create";
+      create.textContent = "Create branch";
+
+      const cancel = doc.createElement("button");
+      cancel.type = "button";
+      cancel.className = "gfp-changes-secondary gfp-changes-branch-cancel";
+      cancel.textContent = "Cancel";
+
+      const usable = () => {
+        const name = input.value.trim();
+        return !!name && !/\s/.test(name) && !state.running;
+      };
+      const sync = () => { create.disabled = !usable(); };
+      const submit = () => {
+        if (!usable()) return;
+        const name = input.value.trim();
+        state.branchDraft = null;
+        void runChangesOp({ op: "newBranch", branch: name });
+      };
+
+      input.addEventListener("input", () => { state.branchDraft = input.value; sync(); });
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") { event.preventDefault(); submit(); }
+        // Escape leaves the naming state without touching the repository. It
+        // stops there rather than bubbling, because the panel's own Escape
+        // closes the whole thing and losing the view is not what "never mind
+        // about the branch name" should mean.
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          state.branchDraft = null;
+          renderChanges();
+        }
+      });
+      create.addEventListener("click", submit);
+      cancel.addEventListener("click", () => { state.branchDraft = null; renderChanges(); });
+      sync();
+
+      row.append(input, create, cancel);
+      return row;
+    }
+
+    /**
+     * Pushing the default branch is the one push worth interrupting.
+     *
+     * Not because it is destructive — it is not — but because on `main` it is
+     * the one that other people see immediately, and a phone in a pocket is an
+     * easy place to press a button by accident.
+     */
+    async function confirmedPush(snapshot) {
+      if (snapshot.isDefaultBranch) {
+        const answer = await confirmChoice({
+          title: "Push to " + snapshot.branch + "?",
+          body: "This is the default branch, so anyone working from it will see these commits.",
+          actions: [{ id: "push", label: "Push" }],
+        });
+        if (answer !== "push") return;
+      }
+      await runChangesOp({ op: "push" });
+    }
+
+    function renderChangeDiff(state) {
+      const path = state.diffPath;
+      const file = (state.snapshot && (state.snapshot.files || []).find((f) => f.path === path)) || null;
+
+      const head = doc.createElement("div");
+      head.className = "gfp-changes-diff-head";
+      const back = doc.createElement("button");
+      back.type = "button";
+      back.className = "gfp-changes-back";
+      back.title = "Back to changes";
+      back.setAttribute("aria-label", "Back to changes");
+      back.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>';
+      back.addEventListener("click", closeChangeDiff);
+      const name = doc.createElement("span");
+      name.className = "gfp-changes-diff-name";
+      name.textContent = path;
+      name.title = path;
+      head.append(back, name);
+      if (file) {
+        const word = doc.createElement("span");
+        word.className = "gfp-changes-diff-word";
+        word.textContent = changeWord(file.status);
+        head.appendChild(word);
+        // The row you pressed to get here showed these two numbers; the header
+        // that replaced it did not, so the size of what you are reading
+        // disappeared at the moment you started reading it.
+        const counts = changeCountLabel(file);
+        if (counts) {
+          const stat = doc.createElement("span");
+          stat.className = "gfp-change-stat";
+          appendCountLabel(stat, counts, doc);
+          head.appendChild(stat);
+        }
+      }
+      changesEl.appendChild(head);
+
+      if (state.diffLoading) {
+        changesEl.appendChild(changesEmpty("Reading the diff\u2026"));
+        return;
+      }
+      if (state.diffError) {
+        changesEl.appendChild(changesEmpty(state.diffError));
+        return;
+      }
+
+      const rows = parseUnifiedDiff(state.diffPatch);
+      if (!rows.length) {
+        // A real and confusing case: a file git reports as changed whose
+        // content is identical, which is what a mode change or a line-ending
+        // rewrite looks like. Saying so beats an empty box.
+        changesEl.appendChild(changesEmpty("No line changes to show \u2014 the file's permissions or line endings changed."));
+      } else {
+        changesEl.appendChild(diffRegion(rows));
+        if (state.diffTruncated) {
+          changesEl.appendChild(changesEmpty("This diff is too large to show in full."));
+        }
+      }
+
+      // Revert lives HERE and nowhere else: after the person has seen exactly
+      // what they would be throwing away. A discard button in the file list
+      // would be one mis-tap from losing work with no undo.
+      if (canDiscard(file) && typeof access.gitRun === "function") {
+        const foot = doc.createElement("div");
+        foot.className = "gfp-changes-diff-foot";
+        const discard = doc.createElement("button");
+        discard.type = "button";
+        discard.className = "gfp-changes-discard";
+        discard.innerHTML = ICON.undo;
+        const label = doc.createElement("span");
+        label.textContent = "Discard these changes";
+        discard.appendChild(label);
+        discard.disabled = !!state.running;
+        discard.addEventListener("click", async () => {
+          const answer = await confirmChoice({
+            title: "Discard changes to " + fileName(path) + "?",
+            body: "This restores the file to the last commit. It cannot be undone.",
+            actions: [{ id: "discard", label: "Discard", danger: true }],
+          });
+          if (answer !== "discard") return;
+          await runChangesOp({ op: "revertFile", path: path });
+        });
+        foot.appendChild(discard);
+        changesEl.appendChild(foot);
+      }
     }
 
     function currentTab() {
@@ -1504,6 +3092,10 @@
 
     function showTree() {
       treeMode = true;
+      changesMode = false;
+      changesEl.hidden = true;
+      rootEl.classList.remove("gfp-changes-mode");
+      paintChangesButton();
       rootEl.classList.remove("gfp-viewing");
       if (mount.viewingBodyClass) doc.body.classList.remove(mount.viewingBodyClass);
       tree.hidden = false;
@@ -1650,7 +3242,30 @@
       return wrap;
     }
 
+    function leaveChanges() {
+      if (!changesMode) return;
+      changesMode = false;
+      changesEl.hidden = true;
+      rootEl.classList.remove("gfp-changes-mode");
+      paintChangesButton();
+      paintRefresh();
+    }
+
+    /**
+     * Re-read the status because something outside the panel changed the tree.
+     *
+     * The whole value of the count on the button is that it is true without
+     * anybody asking, and the agent writing files is precisely when it stops
+     * being true. Cheap enough to call freely: two git commands with
+     * GIT_OPTIONAL_LOCKS=0, and it no-ops when the view was never available.
+     */
+    function refreshChangesQuietly() {
+      if (!canGit || !currentState || !gitEnabledNow()) return;
+      void loadChanges({});
+    }
+
     function renderViewer() {
+      leaveChanges();
       const tab = currentTab();
       if (!tab) return showTree();
       // Where the caret was, so a repaint does not throw it away.
@@ -1680,6 +3295,12 @@
       const head = viewerHead();
       renderViewerActions(head, tab);
       viewer.appendChild(head);
+      if (typeof ui.fileNotice === "function") {
+        const slot = doc.createElement("div");
+        slot.className = "gfp-file-notice";
+        viewer.appendChild(slot);
+        refreshFileNotice();
+      }
       if (tab.notice) {
         const notice = doc.createElement("div");
         notice.className = "gfp-notice desk-ft-notice files-browse-notice" + (tab.conflict ? " gfp-notice-warning files-browse-notice-warn" : "");
@@ -1690,7 +3311,10 @@
       const body = doc.createElement("div");
       body.className = "gfp-viewer-body desk-ft-viewer-body files-browse-viewer-body";
       if (elementIds.viewerBody) body.id = elementIds.viewerBody;
-      if (tab.error) {
+      if (tab.loading) {
+        body.setAttribute("aria-busy", "true");
+        appendStatus(body, "Opening " + pathLabel(tab.relPath) + "…", false);
+      } else if (tab.error) {
         // Inside the tab's own body, under its own tab. The message is the
         // content of this file as far as the panel is concerned.
         //
@@ -1700,6 +3324,7 @@
         // client with nothing at all in the menu still drops it.
         if (!head.childNodes.length) head.remove();
         appendStatus(body, tab.error, true);
+        body.appendChild(actionButton("Try again", "", () => void openFile(tab.relPath, true)));
         // The desktop can still hand it to the OS — offered here, not done for
         // you, so the same click means the same thing on every client.
         if (tab.canOpenExternally && access.openExternal) {
@@ -1823,7 +3448,7 @@
           cancel.disabled = tab.saving;
           const save = actionButton(tab.saving ? "Saving…" : "Save", "primary", () => void saveTab(tab));
           save.classList.add("gfp-save", "files-browse-action", "files-browse-action-primary");
-          save.disabled = tab.saving || !tab.dirty;
+          save.disabled = tab.saving || !savable(tab);
           end.append(cancel, save);
         }
       }
@@ -1838,8 +3463,9 @@
     }
 
     function patchDirtyUi(tab) {
+      refreshFileNotice();
       const save = viewer.querySelector(".gfp-save");
-      if (save) save.disabled = tab.saving || !tab.dirty;
+      if (save) save.disabled = tab.saving || !savable(tab);
       const item = tabsEl.querySelector('[data-rel="' + cssEscape(tab.relPath) + '"] .gfp-tab-dirty');
       if (item) item.textContent = tab.dirty ? "•" : "";
       applyStripPlan();
@@ -1853,6 +3479,10 @@
           actions: [{ id: "discard", label: "Discard", danger: true }],
         });
         if (answer !== "discard") return false;
+      }
+      if (tab.missing) {
+        tab.dirty = false;
+        return closeTab(tab.relPath);
       }
       tab.draftText = tab.baselineText;
       tab.dirty = false;
@@ -1888,9 +3518,19 @@
       if (isOnScreen(tab)) renderViewer();
     }
 
+    function refreshFileNotice() {
+      const slot = viewer.querySelector(".gfp-file-notice");
+      const tab = currentTab();
+      if (!slot || !tab || typeof ui.fileNotice !== "function") return;
+      slot.textContent = "";
+      const content = ui.fileNotice(tab);
+      if (content) slot.appendChild(content);
+    }
+
     async function saveTab(tab) {
-      if (!access.write || !tab.dirty || tab.saving || !tab.stamp || !tab.expectedAbsPath) return false;
+      if (!access.write || !savable(tab) || tab.saving || !tab.stamp || !tab.expectedAbsPath) return false;
       const sentText = tab.draftText;
+      const operation = beginOperation("Saving " + pathLabel(tab.relPath), "Saved " + pathLabel(tab.relPath) + ".", "Couldn't save " + pathLabel(tab.relPath) + ".");
       const seq = ++tab.saveSeq;
       tab.saving = true;
       tab.sentText = sentText;
@@ -1903,8 +3543,14 @@
         expectedAbsPath: tab.expectedAbsPath,
       });
       if (destroyed || tab.saveSeq !== seq) return false;
+      finishOperation(operation, result, () => {
+        if (open && currentScope && currentScope.id === tab.scopeId) void saveTab(tab);
+      });
       if (result && result.ok) {
         applySaveSuccess(tab, sentText, result);
+        // Editor writes bypass agentEnd and git operations. Keep the current
+        // project's badge and next Changes list in step with this save too.
+        if (currentScope && currentScope.id === tab.scopeId) refreshChangesQuietly();
         repaintFor(tab);
         return true;
       }
@@ -1941,7 +3587,7 @@
       viewer.appendChild(actions);
     }
 
-    async function reloadTab(tab) {
+    async function reloadTab(tab, intent = true) {
       const state = scopes.get(tab.scopeId);
       if (!state || state.tabs.get(tab.relPath) !== tab || tab.reloading) return false;
       // Reload replaces the whole tab with the host's version, so anything typed
@@ -1951,11 +3597,15 @@
       // the honest way to say that is to stop accepting edits, not to accept
       // them and then drop them.
       tab.reloading = true;
+      const operation = intent ? beginOperation("Opening " + pathLabel(tab.relPath), "Opened " + pathLabel(tab.relPath) + ".", "Couldn't open " + pathLabel(tab.relPath) + ".") : tab.operation;
+      tab.operation = operation;
+      if (operation) operation.resume();
       tab.notice = "Reloading…";
       repaintFor(tab);
-      const result = await access.read(tab.scopeId, tab.relPath);
+      const result = await callAccess("read", tab.scopeId, tab.relPath, tab);
       tab.reloading = false;
       if (destroyed || state.tabs.get(tab.relPath) !== tab) return false;
+      finishOperation(operation, result, () => { if (open && !tab.dirty) void reloadTab(tab); });
       if (!result || !result.ok) {
         tab.conflict = false;
         tab.notice = result && result.reason || "Could not reload the current file version.";
@@ -1991,6 +3641,7 @@
         return renderViewer();
       }
       tab.stamp = fresh.stamp;
+      tab.missing = !!fresh.missing;
       tab.saving = false;
       // Dirty against what is ON DISK NOW, not against the version this tab was
       // opened at. Overwrite exists precisely because the file moved underneath
@@ -2001,7 +3652,7 @@
       // the newer bytes — and closing it would not have warned.
       if (typeof fresh.text === "string") tab.baselineText = fresh.text;
       tab.dirty = tab.draftText !== tab.baselineText;
-      if (!tab.dirty) {
+      if (!savable(tab)) {
         // The refresh proved the file already holds exactly this text, so there
         // is nothing to overwrite. `saveTab` refuses a clean tab and returns
         // silently, which left "Refreshing version…" on screen forever — an
@@ -2192,6 +3843,13 @@
     }
 
     function overflowMenuItem(relPath, tab) {
+      // A row rather than a bare button, because the X is its own control and
+      // interactive content cannot nest inside a <button>. This menu IS the
+      // tab strip on a phone (State C lists every file but the active one
+      // here), so a close that exists only on tabs is a close a phone cannot
+      // reach.
+      const row = doc.createElement("div");
+      row.className = "gfp-overflow-row";
       const button = doc.createElement("button");
       button.type = "button";
       button.className = "gfp-menu-item gfp-overflow-item desk-ft-overflow-item";
@@ -2213,7 +3871,24 @@
         closeMenu();
         activateTab(relPath);
       });
-      return button;
+
+      const close = doc.createElement("button");
+      close.type = "button";
+      close.className = "gfp-tab-close gfp-overflow-close";
+      close.innerHTML = ICON.close;
+      close.title = "Close";
+      close.setAttribute("aria-label", "Close " + fileName(relPath));
+      close.addEventListener("click", (event) => {
+        event.stopPropagation();
+        // Await, then dismiss: a dirty file asks before it closes, and the
+        // menu lists tabs, so it is stale the moment one goes. Cancelling
+        // leaves the menu as it was.
+        void closeTab(relPath).then((closed) => {
+          if (closed) closeMenu();
+        });
+      });
+      row.append(button, close);
+      return row;
     }
 
     function menuItem(label, listener) {
@@ -2266,6 +3941,7 @@
       currentState = currentScope ? scopeState(currentScope) : null;
       renderedTreeState = null;
       treeMode = true;
+      changesMode = false;
       renderTabs();
       showTree();
       if (open && currentState) void loadRootTree();
@@ -2273,6 +3949,9 @@
 
     function destroy() {
       destroyed = true;
+      cancelOperations();
+      syncChangesPolling();
+      doc.body.classList.add("changes-unavailable");
       abortPending();
       closeMenu();
       if (copyFlashTimer) {
@@ -2291,6 +3970,7 @@
       // The `true` must match the registration, or this removes nothing and the
       // listener outlives the panel.
       doc.removeEventListener("click", closeMenuFromOutside, true);
+      doc.removeEventListener("visibilitychange", changesVisibilityChanged);
       toggle.remove();
       resizer.remove();
       rootEl.remove();
@@ -2314,6 +3994,7 @@
     // null on the opening click (so it cannot close what has not opened), and
     // on a second click of the same button it skips so `beginMenu` can toggle.
     doc.addEventListener("click", closeMenuFromOutside, true);
+    doc.addEventListener("visibilitychange", changesVisibilityChanged);
     win.addEventListener("resize", applyPresentation);
     function onChromeKey(event) {
       if (event.key !== "Escape" || event.defaultPrevented) return;
@@ -2365,18 +4046,56 @@
       if (typeof options.onOpenChanged === "function") options.onOpenChanged(false);
     }
 
-    return {
+    const panel = {
       element: rootEl,
       resizer,
       toggleElement: toggle,
       setOpen,
       isOpen: () => open,
+      isOverlay: () => rootEl.classList.contains("gfp-overlay"),
       setScope,
+      /** Redraw the title. The host calls this when the project's mark or tint
+       *  changed underneath us — the scope did not, so setScope would be a
+       *  full reload for a one-glyph change. */
+      repaintTitle() {
+        if (destroyed) return;
+        paintTitle();
+        applyStripShrink();
+      },
+      /**
+       * A connection ended and a new one is up. The caller is the only thing
+       * that can know that, which is the whole reason this is a call and not
+       * an inference drawn in here.
+       */
+      refreshDisplayed,
+      refreshFileNotice,
       setWidth: setPanelWidth,
       setMaximized,
       isMaximized: () => maximized,
       openPath: openFile,
       hasDirty: () => anyDirty(scopes),
+      /**
+       * Re-read git status. The host calls this when a turn ends, because that
+       * is exactly when the count on the button stopped being true.
+       */
+      refreshChanges: refreshChangesQuietly,
+      /** Repaint the button — the Coding/Knowledge toggle changes its answer. */
+      refreshChangesAvailability: paintChangesButton,
+      /**
+       * Is the Changes view offered at all right now? Anything outside the
+       * panel that wants to link INTO it has to ask, rather than assume: a
+       * knowledge-work session, a folder that is not a repository and a host
+       * too old to answer git at all each make the link a dead control, and
+       * they are all ordinary situations rather than edge cases.
+       */
+      canShowChanges: () => changesAvailable(),
+      /** Open the panel, on the Changes list. The link from the turn card. */
+      showChanges: () => {
+        if (!changesAvailable()) return false;
+        setOpen(true);
+        showChanges();
+        return true;
+      },
       confirmClose,
       clearMemory,
       destroy,
@@ -2388,6 +4107,8 @@
       },
       _lastStripPlan: () => lastStripPlan,
     };
+    livePanels.add(panel);
+    return panel;
   }
 
   function iconIdFromTable(name, table, fallback) {
@@ -2459,6 +4180,8 @@
 
   const api = {
     createFilePanel,
+    openOverlayPanels,
+    onOverlaysChanged,
     resolveMarkdownLink,
     fileName,
     relativeCopyPath,
@@ -2476,6 +4199,15 @@
     applySaveSuccess,
     anyDirty,
     panelIcon,
+    changeWord,
+    changesHeadline,
+    changesBranchLine,
+    changesPrimaryAction,
+    changesCommitOnlyAction,
+    changeCountLabel,
+    changeTotalLabel,
+    parseUnifiedDiff,
+    patchRowsToDiffHunks,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = api;

@@ -23,6 +23,14 @@ refresh after substantive work. §4 gained three findings and had its method swe
 vary by machine (§9), so §14's two enforcement claims are scoped to that host until a second one
 confirms them. Everything not named here is still 0.2.117 evidence.
 
+**A narrow 1.0.30 pass ran on 2026-09-13/14** (grok CLI **1.0.30**, one Windows 11 host), driving
+`grok agent stdio` directly rather than through the extension. It added **§16** and **§17** and
+touched nothing else. §16: two controlled runs of `ask_user_question`, one answered and one left to
+expire, logging every frame stamped from the moment of the ask. §17: five prompts through a
+throwaway project, granting `allow_always` once and watching which later commands re-asked, plus
+the same directory driven under two path spellings. No other section was re-run, so everything else
+keeps the build it is labelled with.
+
 **§2's finding first changed shape on 1.0.4 (2026-08-15)**, after a user report: the image-aware
 `read_file` had shipped, but delegating clients could not reach it. That remains true on 1.0.5,
 where it was re-run in full.
@@ -304,11 +312,14 @@ or rename it `process/usage`.
 
 Related quota gap, **last LIVE-VERIFIED 0.2.103, SOURCE-VERIFIED 2026-07-29, not re-checked on
 0.2.117** (we cannot force a rate-limit without abusing the account): HTTP 429 maps to `-32003`
-without the available retry delay. There is also still no queryable quota surface — eight plausible
-method names (`_x.ai/usage`, `_x.ai/quota`, `_x.ai/limits`, `_x.ai/rate_limits`,
-`_x.ai/account/usage`, `_x.ai/user/usage`, `_x.ai/billing/usage`, `_x.ai/usage/get`) all returned
-`-32601` on 0.2.117. A client can only say "try again later". Please preserve `retry_after_secs` in
-error data and expose account quota independently of per-process token accounting.
+without the available retry delay. Please preserve `retry_after_secs` in error data.
+The account-quota gap is now partly covered: the owner's 2026-09-13 probe verified
+`_x.ai/billing` through our client. It exposes one weekly window through
+`config.creditUsagePercent` and `config.currentPeriod`; plain `x.ai/billing` is
+method-not-found. We consume only that capacity window, using `currentPeriod.end`
+as reset time, and omit financial account detail. See
+[subscription usage](../../research/subscription-usage.md) for the provider
+differences and the event-driven cache that avoids masking prompt idle timeouts.
 
 ## 6. Edit diff delivery is inconsistent, and `old_line` is a post-edit coordinate (archive §2.10)
 
@@ -645,6 +656,122 @@ Everything needed for a good UI is in that payload (`displayName`, `source`,
 on `_x.ai/mcp/servers_updated`; document `_x.ai/mcp/list` or fold it into those
 rails; and make `initialize._meta.mcpApps` mean something a client can gate on,
 or remove it. Full evidence and reproduction: `ACP-MCP-ask.md`.
+
+## 16. An abandoned `ask_user_question` closes exactly like an answered one (new)
+
+**LIVE-VERIFIED 1.0.30 (2026-09-13)**, two controlled runs on one Windows 11 host, driving
+`grok agent stdio` directly and logging every frame stamped from the moment of the ask.
+
+`ask_user_question` has its own documented timeout — `[toolset.ask_user_question]`,
+`timeout_enabled = true`, `timeout_secs = 1800`, overridable by `GROK_ASK_USER_QUESTION_TIMEOUT_*`,
+user config and requirements. On expiry the CLI stops waiting and continues the turn. That part is
+documented and reasonable.
+
+**The CLI does tell the client the interaction closed.** The request carries a `toolCallId`, and at
+expiry two frames arrive naming it:
+
+    interaction_resolved { tool_call_id: "call-…-0" }
+    tool_call_update     { toolCallId: "call-…-0", status: "completed",
+                           content: [{ text: "User declined to answer the questions.
+                                              Continue with the task" }] }
+
+**The problem is that an answered question closes with the identical shape.** Same two frames, same
+`status: "completed"`, differing only in an English sentence inside `content`:
+
+    tool_call_update     { toolCallId: "call-…-0", status: "completed",
+                           content: [{ text: "User has answered your questions:
+                                              \"Which colour?\"=\"Red\". You can now
+                                              continue with the user's answers in mind." }] }
+
+So a client can reliably learn *that* the interaction is over — which is enough to retire a card —
+but cannot learn *why* without pattern-matching prose. `interaction_resolved` carries no reason
+code, and `status` is `completed` in both cases even though one of them is an abandonment.
+
+Note also `pending_interaction` does carry a `kind` (`"question"` / `"permission"`) when the
+interaction opens, so the vocabulary for discriminating already exists on the way in — it is only
+the way out that is undifferentiated.
+
+**Client cost/workaround:** we correlate by `toolCallId` and treat any terminal `tool_call_update`
+as closure, which is correct and is what we ship. What we cannot do is tell the user *why* their
+card went inert — "the agent moved on without your answer" and "your answer was accepted" are the
+same event on the wire. We deliberately do **not** match the prose: a client keying off an English
+sentence breaks silently the day it is reworded, and that is not a dependency worth taking.
+
+This is the direct cause of [#160](https://github.com/phuryn/grok-build-vscode/issues/160), where a
+user answered after the CLI had already given up and reasonably reported "clicking Submit seems to
+do nothing".
+
+**Ask:** put a reason on the way out. Either a field on `interaction_resolved`
+(`reason: "answered" | "timed_out" | "cancelled"`), or a non-`completed` status on the
+`tool_call_update` for an abandonment — `completed` for a tool that never got its input is
+misleading on its own terms. Either one is a small addition and it is the difference between a
+client that can explain itself to the user and one that can only guess.
+
+## 17. "Don't ask again" can only ever grant one exact command string (new)
+
+**LIVE-VERIFIED 1.0.30 (2026-09-14)**, driving `grok agent stdio` directly against a
+throwaway project and logging every `session/request_permission`.
+
+`session/request_permission` for a terminal command offers four options:
+
+    allow_always, allow_once, reject_once, reject_always
+
+Answering `allow_always` persists, and it persists well — the grant lands in
+`~/.grok/sessions/<url-encoded-cwd>/permission.toml` and survives into a **new session**:
+
+    allowed_bash_commands = [
+        "echo probe-one > out-one.txt",
+    ]
+
+| Step | Command | Permission request? |
+|---|---|---|
+| 1 | `echo probe-one > out-one.txt` | yes — answered `allow_always` |
+| 2 | the same command | **no** |
+| 3 | `echo probe-two > out-two.txt` | **yes** |
+| 4 | step 1's command, later in the session | **no** |
+| 5 | step 1's command, **brand new session** | **no** |
+
+**The problem is step 3.** `allowed_bash_commands` is a list of literal strings matched
+exactly, so a grant covers one command and nothing adjacent to it. In an agentic session
+almost every command differs — a different test file, a different path, a different flag —
+so almost every command is a fresh grant. A user who answers "Yes, and don't ask again" a
+hundred times ends with a hundred single-command grants and a hundred-and-first prompt,
+and reasonably concludes the setting does not work.
+
+**The CLI already has the concept we need, and ACP cannot reach it.** The same file carries
+
+    allowed_bash_globs = []
+
+which would express "any `npm` command" in one grant. Nothing in the four permission option
+kinds populates it. We also measured that hand-writing a glob into that file has no effect
+on the ACP path, and neither does `allow_bash_execute = true` — both edits survive in the
+file unrewritten and are simply not consulted here. So the field is real, it is not
+reachable from a client, and it is not reachable by the user either.
+
+**Client cost/workaround:** the host replaces execute `allow_always` with a
+session-scoped program grant and answers the CLI's real `allow_once`. Every
+shell segment must name an explicitly granted program; the existing Plan
+tokenizer fails closed on syntax it cannot safely decompose. The grant lives
+only on `Session`, is never persisted or inherited on load, and cannot approve
+anything while planning. Automatic answers stay visible as collapsed,
+persisted transcript cards. This addresses
+[#123](https://github.com/phuryn/grok-build-vscode/issues/123) and
+[#61](https://github.com/phuryn/grok-build-vscode/issues/61) without using the
+CLI's exact-string store. Cards also omit `reject_always` (#154); edits keep
+the CLI's useful path-keyed `allow_always`. Persistent allow/ask/deny policy
+remains the CLI's `.grok/config.toml` route. Relabelling the original CLI
+option alone could not fix its matching semantics; owning the session grant can.
+
+**Ask:** a fifth option kind that grants a family rather than a string — enough to populate
+`allowed_bash_globs`. The pattern could be the CLI's to choose (it already classifies the
+command, so it knows the program and the shape) with the option's own `name` stating it, so
+the client renders whatever the CLI decided to offer and nothing has to be inferred
+client-side.
+
+A secondary note, measured in passing and worth a line: the grant store is keyed on the
+**literal** cwd string, URL-encoded. `C:/Project` and `c:\Project` are two separate stores
+for one directory, confirmed by running the same folder both ways — a user whose terminal
+and whose editor spell the path differently silently keeps two sets of grants.
 
 ## Closed since the archive
 

@@ -100,7 +100,7 @@ function sessionHandle(sessionId) {
         name: "Fake",
         _meta: {
           supportsReasoningEffort: true,
-          reasoningEffort: "high",
+          reasoningEffort: process.env.FAKE_CONFIG_EFFORT || "high",
           reasoningEfforts: [{ value: "high" }, { value: "medium" }, { value: "low" }],
         },
       }],

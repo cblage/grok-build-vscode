@@ -3,6 +3,8 @@ import type { HostMsg } from "./protocol";
 import type { FileChip } from "./chips";
 import { permissionOptionsForPlan } from "./plan-gate";
 import type { AcpProvider } from "./acp-backend";
+import type { SubscriptionUsageBinding } from "./subscription-usage";
+import type { TelemetrySessionOrigin } from "./telemetry";
 import {
   queuedSendsMessage,
   takeQueuedSendsPrefix,
@@ -25,8 +27,10 @@ export interface PendingPermission {
   toolKind?: string;
   /** Adapter plan-review text, when the permission carried one. */
   plan?: string;
-  /** Full option set offered by the CLI. */
+  /** Host-presented options, including a possible session command grant. */
   options: PendingPermissionOption[];
+  /** Host-only translation; the CLI must receive its one-time id, never ours. */
+  commandGrant?: { optionId: string; allowOnceId: string; programs: string[] };
   /** Subset safe to expose while the client-side Plan gate remains active. */
   planOptions: PendingPermissionOption[];
 }
@@ -65,7 +69,9 @@ export function preferredPermissionAllowOption(
   planActive: boolean,
 ): PendingPermissionOption | undefined {
   const options = pendingPermissionOptions(pending, planActive);
-  return options.find((option) => option.kind === "allow_always")
+  // Auto accept may answer pending cards, but only a deliberate card answer
+  // may create a program grant; the CLI also cannot interpret our option id.
+  return options.find((option) => option.kind === "allow_always" && option.optionId !== pending.commandGrant?.optionId)
     ?? options.find((option) => option.kind === "allow_once");
 }
 
@@ -87,9 +93,14 @@ export class Session {
   chips: FileChip[] = [];
   /** The live ACP client (one spawned `grok agent stdio` process), once started. */
   client?: AcpClient;
+  /** Latest account capacity, held outside conversation history. */
+  subscriptionUsage?: SubscriptionUsageBinding;
 
   /** YOLO: auto-approve every permission request for this session. */
   autoApprove = false;
+
+  /** Explicit card grants only. Never serialized or inherited by a loaded session. */
+  readonly allowedCommandPrograms = new Set<string>();
 
   /** Plan-mode gate is up for this session (client-side enforcement mirror). */
   planActive = false;
@@ -192,7 +203,9 @@ export class Session {
   pendingExitPlans = new Map<number | string, PendingExitPlan>();
 
   /**
-   * Live question requests awaiting an answer, by ACP request id.
+   * Live questions by ACP request id, with the toolCallId when the CLI supplies
+   * it. A matching terminal tool update closes the request even without a local
+   * answer. Older CLIs without that id retain the turn-end/stale-answer fallback.
    *
    * Tracked for the same reason as the two maps beside it: answering one card
    * does not resume a turn that another card is still blocking. Questions had
@@ -201,7 +214,7 @@ export class Session {
    * agent stayed blocked, and on a rented machine the heartbeat that follows
    * `working` kept it awake and billing indefinitely.
    */
-  pendingQuestions = new Set<number | string>();
+  pendingQuestions = new Map<number | string, string | undefined>();
 
   /** Submitted plan comments still awaiting `_x.ai/interject` acceptance. */
   inFlightPlanComments = new Map<number | string, InFlightPlanComment>();
@@ -227,6 +240,10 @@ export class Session {
    * can render plan cards inline with the conversation rather than at the end.
    */
   userMessageCount = 0;
+
+  /** Ephemeral accounting for this conversation; not reset by replay/rewind. */
+  telemetrySessionOrigin?: TelemetrySessionOrigin;
+  remoteMessageReported = false;
 
   /**
    * True while a sequence of user_message_chunk events is mid-flight, so we
@@ -628,6 +645,7 @@ export function sessionUiSnapshot(
   chips: FileChip[] = session.chips,
 ): HostMsg[] {
   const messages: HostMsg[] = [];
+  messages.push({ type: "subscriptionUsage", windows: session.subscriptionUsage?.snapshot() ?? [] });
   if (session.client?.currentModelId) {
     messages.push({ type: "modelChanged", modelId: session.client.currentModelId });
   }

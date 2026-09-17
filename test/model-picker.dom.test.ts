@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { bootWebview, click, dispatch } from "./webview-harness";
 
 const $ = (doc: Document, id: string) => doc.getElementById(id) as HTMLElement;
-const modelBtn = (doc: Document) => doc.querySelector(".model-name-btn") as HTMLButtonElement;
+const modelBtn = (doc: Document) => doc.querySelector(".model-picker-row") as HTMLButtonElement;
 const pickerItems = (doc: Document) => [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")];
 
 function openModelPicker(h: ReturnType<typeof bootWebview>, models: object[], extra: object = {}) {
@@ -21,7 +21,6 @@ function openModelPicker(h: ReturnType<typeof bootWebview>, models: object[], ex
     ...extra,
   });
   click(h.window, $(h.doc, "gear-btn"));
-  click(h.window, modelBtn(h.doc));
 }
 
 describe("model picker provider marks and manage-providers", () => {

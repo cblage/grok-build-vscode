@@ -15,6 +15,9 @@
 
 export const MCP_CONNECTORS_KEY = "grok.mcpConnectors";
 
+export const CONNECTOR_UNAVAILABLE_MESSAGE =
+  "The connector's server could not be reached. Check the server or network, then press Connect to retry.";
+
 /**
  * **Pinned on purpose — do not float this back to bare `mcp-remote`.**
  *
@@ -79,6 +82,7 @@ export const MCP_REMOTE_NAME = "mcp-remote";
 
 /** mcp-remote flag. Value is `@<absolute path>` to a JSON file we write (not inline JSON — Windows Connect uses `shell: true`). */
 export const STATIC_OAUTH_CLIENT_METADATA_FLAG = "--static-oauth-client-metadata";
+export const STATIC_OAUTH_CLIENT_INFO_FLAG = "--static-oauth-client-info";
 
 /** mcp-remote `--header`. Value is `Name:${ENV}` (no spaces) so the secret stays in env. */
 export const MCP_REMOTE_HEADER_FLAG = "--header";
@@ -107,8 +111,21 @@ export const MCP_CONNECTOR_SECRET_KEY_PREFIX = "grok.mcpConnector.";
 /** Paste field / SecretStorage cap. Fine-grained PATs are long; this is abuse-sized. */
 export const MAX_CONNECTOR_KEY_CHARS = 8192;
 
-/** Browser OAuth can sit on a consent page; this is a hard ceiling, not a spinner. */
+/**
+ * Ceiling on the part WE control: npx resolving the package, the proxy booting,
+ * and the authorization link appearing. Not a spinner.
+ */
 export const MCP_REMOTE_CONNECT_TIMEOUT_MS = 180_000;
+
+/**
+ * Ceiling once the link exists, replacing the one above. From that moment the
+ * clock belongs to a person reading a consent screen -- on a phone, on their
+ * own time, often signing in to the vendor first. Three minutes measured from
+ * `npx` is not that budget: Airtable's flow alone (sign in, choose a base,
+ * approve) routinely outruns it, and when it does we kill the proxy out from
+ * under a sign-in the user is still being told to finish.
+ */
+export const MCP_REMOTE_AUTHORIZATION_TIMEOUT_MS = 900_000;
 
 export type ConnectorAuth = "oauth" | "key";
 
@@ -201,6 +218,7 @@ export type ConnectFailureKind =
   | "timeout"
   | "port-conflict"
   | "endpoint-refused"
+  | "server-unavailable"
   | "oauth-incompatible"
   | "key-rejected"
   | "failed";
@@ -415,11 +433,13 @@ export function mcpRemoteArgs(
   callbackPort?: number,
   oauthClientMetadataPath?: string,
   headers?: McpRemoteHeaderOpts,
+  oauthClientInfoPath?: string,
 ): string[] {
   const args = ["-y", MCP_REMOTE_PACKAGE, endpoint];
   if (callbackPort != null && isUsableListenPort(callbackPort)) args.push(String(callbackPort));
   args.push(...mcpRemoteHeaderArgs(headers));
   if (oauthClientMetadataPath) args.push(...mcpRemoteOAuthClientMetadataArgs(oauthClientMetadataPath));
+  if (oauthClientInfoPath) args.push(STATIC_OAUTH_CLIENT_INFO_FLAG, `@${oauthClientInfoPath}`);
   return args;
 }
 
@@ -554,12 +574,14 @@ export function hostMcpServers(
    * CLI. See the skip below; an empty set (the default) keeps the old behaviour.
    */
   lapsed: ReadonlySet<string> = new Set(),
+  unavailable: ReadonlySet<string> = new Set(),
 ): AcpMcpStdioServer[] {
   const out: AcpMcpStdioServer[] = [];
   const seen = new Set<string>();
   for (const connector of TIER1_CONNECTORS) {
     const record = store[connector.id];
     if (!record) continue;
+    if (unavailable.has(connector.id)) continue;
     const endpoint = record.endpoint || connector.endpoint;
     if (reservedConflictsConnector(connector, endpoint, reserved)) continue;
     const name = normalizeMcpName(connector.id);
@@ -605,6 +627,8 @@ export function connectorViews(
     keySet?: ReadonlySet<string>;
     /** OAuth connectors being withheld from `mcpServers` — see hostMcpServers. */
     lapsed?: ReadonlySet<string>;
+    /** Definite proxy failures, independent of saved authorization. */
+    unavailable?: ReadonlySet<string>;
   } = {},
 ): ConnectorView[] {
   return TIER1_CONNECTORS.map((connector) => {
@@ -620,15 +644,21 @@ export function connectorViews(
     // is untouched, so reconnecting keeps any endpoint override.
     const lapsed = auth === "oauth" && connected && !connecting && !failed
       && !!opts.lapsed?.has(connector.id);
+    const unavailable = connected && !!opts.unavailable?.has(connector.id);
+    const unavailableMessage = CONNECTOR_UNAVAILABLE_MESSAGE + (keySet
+      ? " Leave the token field empty and press Connect again to use the saved token."
+      : auth === "oauth" ? " Your saved authorization will be reused." : "");
     return {
       id: connector.id,
       name: connector.name,
       description: connector.description,
       endpoint: store[connector.id]?.endpoint || connector.endpoint,
-      connected: lapsed ? false : connected,
-      status: connecting ? "connecting" : (failed || lapsed) ? "error" : "idle",
+      connected: lapsed || unavailable ? false : connected,
+      status: connecting ? "connecting" : (failed || lapsed || unavailable) ? "error" : "idle",
       auth,
-      ...(failed ? { error: opts.error } : lapsed ? { error: CONNECTOR_REAUTH_MESSAGE } : {}),
+      ...(lapsed ? { error: CONNECTOR_REAUTH_MESSAGE }
+        : unavailable && !connecting ? { error: unavailableMessage }
+        : failed ? { error: opts.error } : {}),
       ...(auth === "key" ? {
         keySet,
         ...(connector.keyHint ? { keyHint: connector.keyHint } : {}),
@@ -922,14 +952,20 @@ export function connectFailureMessage(kind: ConnectFailureKind, detail?: string)
     case "timeout":
       return "Sign-in timed out. Complete the browser prompt within three minutes, then try again.";
     case "port-conflict":
-      // Not a failure to fix — the login port is held by our own running proxy
-      // for this same connector, which means it is already signed in. Say that,
-      // rather than sending the user to close windows for no reason.
-      return "This connector is already signed in and running in another conversation on this computer, so there is nothing to do. If you want to sign in again, close the other conversations using it first.";
+      // All we actually observed is that this connector's deterministic sign-in
+      // port is taken. The usual holder is our own proxy for the same connector
+      // in another conversation, which does mean it is signed in — but saying
+      // so outright told the owner "already signed in, nothing to do" about a
+      // connector he had never connected, with no way forward from a red dot.
+      // So: report the observation, cover both readings, and always end on
+      // something the person can do.
+      return "This connector's sign-in port is already in use on this computer, usually by the same connector running in another conversation or editor window. If it is connected there, nothing needs doing. Otherwise close those windows and press Connect again.";
     case "endpoint-refused":
       return detail
         ? `The app refused the connection: ${detail}`
         : "The app refused the connection. Check the endpoint is reachable, then try again.";
+    case "server-unavailable":
+      return CONNECTOR_UNAVAILABLE_MESSAGE;
     case "oauth-incompatible":
       return "This app's sign-in is not compatible with this connector.";
     case "key-rejected":
@@ -980,6 +1016,12 @@ export function classifyConnectFailure(input: {
   if (connectOutputLooksLikeOAuthIncompatible(input.output || "") || connectOutputLooksLikeOAuthIncompatible(input.spawnError?.message || "")) {
     return input.auth === "key" ? "key-rejected" : "oauth-incompatible";
   }
+  // Only a failed process with a concrete proxy connection error is evidence.
+  // npm failures, HTTP/auth refusals and startup deadlines prove no outage.
+  if (!input.spawnError && typeof input.exitCode === "number" && input.exitCode > 0
+    && connectOutputLooksLikeUnavailableServer(input.output || "")) {
+    return "server-unavailable";
+  }
   if (
     /enotfound|econnrefused|eai_again|getaddrinfo|status code 4\d\d|http 4\d\d|404 not found|connection refused|unable to connect|certificate/.test(output)
   ) {
@@ -991,6 +1033,15 @@ export function classifyConnectFailure(input: {
 export function connectOutputLooksLikePortConflict(output: string): boolean {
   const text = output.toLowerCase();
   return /\beaddrinuse\b/.test(text) || /address already in use/.test(text);
+}
+
+/** Narrow on purpose: unknown output must never hide a working connector. */
+export function connectOutputLooksLikeUnavailableServer(output: string): boolean {
+  if (connectOutputLooksSuccessful(output) || connectOutputLooksLikePortConflict(output)
+    || /timeout|timed?\s*out|\babort|cancel|npm\s+(?:err|error)\b/i.test(output)
+    || output.split(/\r?\n/).some((line) => parseInitializeResult(line) === true)) return false;
+  const failure = output.match(/(?:^|\n)(?:\[\d+\]\s+)?Connection error:\s*([\s\S]*)$/i)?.[1];
+  return !!failure && /\b(?:connect (?:ECONNREFUSED|ENETUNREACH|EHOSTUNREACH)|getaddrinfo ENOTFOUND)\b/.test(failure);
 }
 
 /** Vendor DCR / client-metadata rejection. Not the user's fault and not fixed by retrying.

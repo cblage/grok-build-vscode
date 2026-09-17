@@ -854,3 +854,29 @@ describe("a replace_all renders one hunk per replaced site (_meta.details[])", (
     expect(item.querySelector(".diff-stat-del")!.textContent).toBe("−0"); // no phantom removal
   });
 });
+
+describe("the native diff link is a desk affordance, on every diff surface", () => {
+  it.each([false, true])("edit row offers `open diff →` only where it can work (remote=%s)", remote => {
+    // Measured before this was gated: a phone DID get the button, and clicking
+    // it posted `openDiff`, which is `host-local` — so allowFromRemote refuses
+    // it and nothing happens at all. Unlike the permission card there is no
+    // revealToolDiff fallback worth reaching for, because this button lives
+    // INSIDE the inline region it would reveal: the diff is already on screen
+    // above it. #160 is this complaint, and #167 made the turn-diff card take
+    // the same line, so the two surfaces now agree.
+    const { window, doc, posted } = bootWebview({ remote });
+    dispatch(window, { type: "toolCall", call: EDIT_CALL });
+    dispatch(window, { type: "toolCallUpdate", call: { toolCallId: "tc1", content: [DIFF] } });
+
+    const link = doc.querySelector(".tool-item-diff .preview-link");
+    expect(!!link).toBe(!remote);
+    // The diff itself is never withheld — only the control that cannot act.
+    expect(doc.querySelector(".tool-item-diff .tdl")).not.toBeNull();
+    if (link) {
+      click(window, link);
+      expect(posted.at(-1)).toMatchObject({ type: "openDiff", path: "src/foo.ts" });
+    } else {
+      expect(posted.some(m => m.type === "openDiff")).toBe(false);
+    }
+  });
+});

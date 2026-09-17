@@ -8,6 +8,16 @@
  *
  * Pure module: no Electron, no vscode. VS Code keeps its cast path (sandboxed
  * webview); ElectronWebview.dispatchMessage runs this gate first.
+ *
+ * THIS SWITCH IS A REGISTRATION SITE, and the least visible one. `TYPE_SET`
+ * lets a known type in, but a type with no `case` label then falls to
+ * `default: return null` and is dropped — silently, on the desktop app only,
+ * while VS Code (which never loads this file) works. Seven types had been
+ * missed that way by 2026-09-14: the git panel, Update Codex / Update Claude,
+ * and both popover refreshes were dead on desktop and nobody had noticed,
+ * because there is nothing to notice. `desktop-host-pure.test.ts` now asserts
+ * every `WebviewMsg["type"]` has a label here, so the next omission fails a
+ * test instead of one surface.
  */
 import {
   WEBVIEW_MESSAGE_TYPES,
@@ -63,6 +73,11 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
   if (!isString(type) || !TYPE_SET.has(type)) return null;
 
   switch (type as WebviewMsg["type"]) {
+    case "setVoiceBackend":
+      if (raw.value !== "auto" && raw.value !== "xai" && raw.value !== "openai") return null;
+      break;
+    case "configureOpenAiVoice":
+      break;
     case "ready":
       if (!opt(raw.tabToken, isString)) return null;
       break;
@@ -149,6 +164,10 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "cancelCodexInstall":
     case "checkGrokUpdate":
     case "updateGrok":
+    case "updateCodex":
+    case "updateClaude":
+    case "refreshContextDetails":
+    case "refreshSubscriptionUsage":
     case "refreshProviders":
     case "pickFile":
     case "voiceStart":
@@ -180,6 +199,9 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       if (raw.modeId !== "agent" && raw.modeId !== "plan" && raw.modeId !== "yolo") {
         return null;
       }
+      break;
+    case "setSandbox":
+      if (!isString(raw.profile)) return null;
       break;
     case "removeChip":
     case "toggleChip":
@@ -230,6 +252,8 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "setSummarizeRepliesAloud":
     case "setExpandCommandOutputs":
     case "setSteerByDefault":
+    case "setPromptNav":
+    case "setExpandDiffCard":
     case "setTelemetryEnabled":
     case "setThumbsFeedback":
     case "composerFocus":
@@ -253,6 +277,9 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       break;
     case "requestImageFull":
       if (!isString(raw.fullId)) return null;
+      break;
+    case "requestImageOriginal":
+      if (!isString(raw.fullId) || !/^[A-Za-z0-9_-]{20,128}$/.test(raw.fullId) || !Number.isSafeInteger(raw.requestId)) return null;
       break;
     case "permissionAnswer":
       if (!isStringOrNumber(raw.requestId) || !isString(raw.optionId)) return null;
@@ -294,6 +321,7 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       break;
     case "toggleSessionPin":
       if (!isString(raw.id) || !isBoolean(raw.pinned)) return null;
+      if (!opt(raw.requestId, isString) || (typeof raw.requestId === "string" && raw.requestId.length > 128)) return null;
       if (!opt(raw.cwd, isString)) return null;
       break;
     case "selectRepo":
@@ -307,6 +335,9 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       break;
     case "setRepoColor":
       if (!isString(raw.cwd) || !isString(raw.color)) return null;
+      break;
+    case "setRepoIcon":
+      if (!isString(raw.cwd) || !isString(raw.icon)) return null;
       break;
     case "resumeSession":
       if (!isString(raw.id)) return null;
@@ -333,6 +364,43 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "listProjectDir":
       if (!isString(raw.cwd)) return null;
       if (!opt(raw.relPath, isString)) return null;
+      break;
+    case "gitStatus":
+      if (!isString(raw.cwd)) return null;
+      if (!opt(raw.requestId, isString)) return null;
+      break;
+    case "gitFileDiff":
+      if (!isString(raw.cwd) || !isString(raw.path)) return null;
+      if (!opt(raw.requestId, isString)) return null;
+      break;
+    case "turnFileDiff":
+      if (!isString(raw.cwd) || !isString(raw.path)
+        || !isString(raw.turnId) || !isString(raw.requestId)) return null;
+      break;
+    case "turnFileOpenDiff":
+      if (!isString(raw.turnId) || !isString(raw.cwd) || !isString(raw.path)) return null;
+      break;
+    case "gitRun":
+      if (!isString(raw.cwd)) return null;
+      if (!["commit", "push", "newBranch", "revertFile"].includes(raw.op as string)) return null;
+      if (!opt(raw.requestId, isString) || !opt(raw.message, isString)
+        || !opt(raw.branch, isString) || !opt(raw.path, isString)
+        || !opt(raw.push, isBoolean)) return null;
+      if (raw.paths !== undefined
+        && (!Array.isArray(raw.paths) || raw.paths.some((item) => !isString(item)))) return null;
+      break;
+    case "openProviderConfig":
+    case "readProviderConfig":
+      if (!["grok", "codex", "claude"].includes(raw.provider as string)) return null;
+      if (!opt(raw.requestId, isString)) return null;
+      break;
+    case "restartProviderSession":
+      if (!["grok", "codex", "claude"].includes(raw.provider as string) || !isString(raw.sessionId) || !raw.sessionId) return null;
+      break;
+    case "writeProviderConfig":
+      if (!["grok", "codex", "claude"].includes(raw.provider as string)
+        || !opt(raw.requestId, isString) || !isString(raw.text) || !isString(raw.expectedAbsPath)
+        || !isObject(raw.stamp) || !isNumber(raw.stamp.mtimeMs) || !isNumber(raw.stamp.size)) return null;
       break;
     case "readProjectFile":
       if (!isString(raw.cwd) || !isString(raw.relPath)) return null;

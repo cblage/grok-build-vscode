@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import packageManifest from "../package.json";
 import { grokCliNeedsShell } from "./cli-process";
+import type { PromptContentBlock } from "./acp";
 import type {
   AcpBackend,
   BackendConfigState,
@@ -336,6 +337,37 @@ export class CodexBackend implements AcpBackend {
       return { method: "session/set_config_option", params: { sessionId, configId: "collaboration_mode", value: modeId } };
     }
     return { method: "session/set_config_option", params: { sessionId, configId: "mode", value: modeId } };
+  }
+
+  steeringCapabilities(initializeResult: any) {
+    const supported = initializeResult?._meta?.steering?.supported === true;
+    return { supported, acceptsContent: supported };
+  }
+
+  interject(sessionId: string, text: string, content?: readonly PromptContentBlock[]) {
+    return {
+      method: "_session/steering",
+      params: { sessionId, prompt: content?.length ? [...content] : [{ type: "text", text }] },
+    };
+  }
+
+  steerDelivered(result: any): boolean {
+    // The adapter documents exactly three outcomes -- the prompt "joined the
+    // active turn (injected), started a new one (startedNewTurn), or could not
+    // be applied (failed)" -- and only the last is a non-delivery.
+    //
+    // It matters because `executeOrQueueSteeringRequest` catches its own error
+    // and answers `{ outcome: "failed" }` as a SUCCESSFUL RPC. A client that
+    // reads the absence of a throw as delivery paints a steer bubble over text
+    // the agent never received, which is the one failure Steer must not have.
+    //
+    // `startedNewTurn` DID reach the agent, so it is not lost text and must
+    // never be re-queued -- that would send it twice. The idle guard in
+    // `steerSend` is what keeps it rare; the residue when it loses its race is
+    // a turn the host did not begin, which is a worse thing to duplicate than
+    // to leave. An absent outcome keeps today's behaviour, so an adapter that
+    // reports nothing is not newly treated as broken.
+    return result?.outcome !== "failed";
   }
 
   configState(response: any, fallback: BackendConfigState): BackendConfigState {

@@ -62,7 +62,7 @@ describe("sidebar connect wiring", () => {
     expect(body).toContain("env: npx.env");
     expect(body).not.toContain("env: process.env");
     expect(body).toContain("writeOAuthClientMetadataFile");
-    expect(body).toMatch(/mcpRemoteArgs\(endpoint,\s*undefined,\s*metadata\?\.path\)/);
+    expect(body).toContain("clientInfo?.path");
     expect(body).not.toContain("quoteSpawnArgs");
     expect(body).toContain("withAuthHeaderEnv(npx.env, token)");
     expect(body).toContain('auth: "key"');
@@ -195,6 +195,37 @@ describe("quoteSpawnArgs", () => {
   });
 });
 
+describe("headless OAuth guard", () => {
+  function begin() {
+    const proc = new FakeProc();
+    const spawn = vi.fn(() => proc as never);
+    const result = authorizeMcpRemote({ command: "npx", args: mcpRemoteArgs("https://vendor.example/mcp"),
+      spawn, timeoutMs: 1000, headless: true,
+      env: { PATH: "npx-path", NODE_OPTIONS: "--no-warnings" } });
+    return { proc, spawn, result };
+  }
+
+  it("fails an unexpected authorization attempt without exposing the link", async () => {
+    const h = begin();
+    h.proc.stderr.write("Please authorize this client by visiting:\nhttps://vendor.example/?state=private\n");
+    const result = await h.result;
+    expect(result).toMatchObject({ ok: false });
+    expect(JSON.stringify(result)).not.toContain("private");
+    expect(h.proc.killed).toBe(true);
+  });
+
+  it.each(["error", "close"])("cleans up the preload on asynchronous %s", async (event) => {
+    const h = begin();
+    const options = h.spawn.mock.calls[0][2].env.NODE_OPTIONS as string;
+    expect(options).toContain("--no-warnings --require ");
+    const preload = JSON.parse(options.slice(options.indexOf("--require ") + 10));
+    expect(existsSync(preload)).toBe(true);
+    h.proc.emit(event, event === "error" ? new Error("spawn failed") : 1);
+    await expect(h.result).resolves.toMatchObject({ ok: false });
+    expect(existsSync(preload)).toBe(false);
+  });
+});
+
 describe("npx spawn plan", () => {
   it("uses the Windows cmd shim with a shell", () => {
     const empty = { pathEnv: "", isFile: () => false };
@@ -271,9 +302,8 @@ describe("authorizeMcpRemote", () => {
   // mcp-remote pins the callback port from its OAuth registration; handing it a
   // different one means "delete client_info.json and re-register", which forces
   // a fresh consent screen AND invalidates the registration every other host on
-  // this machine shares through ~/.mcp-auth. A conflict means the connector is
-  // already signed in and running elsewhere, so exactly one spawn happens and
-  // the result says so.
+  // this machine shares through ~/.mcp-auth. So exactly one spawn happens and
+  // the result reports the conflict rather than trying to route around it.
   it("never respawns on a port conflict — one spawn, and it reports it", async () => {
     const proc = new FakeProc();
     const spawns: string[][] = [];

@@ -1,4 +1,31 @@
 (function (root) {
+  // Both the standalone VS Code Settings webview and the chat mount this
+  // catalog extension. Rows stay hidden until the host supplies availability.
+  root.GrokVoiceSettings = {
+    install(api) {
+      if (!api || api.ROWS.some(row => row.id === "voiceBackend")) return;
+      const known = s => !!(s && s.voiceBackendState);
+      api.ROWS.splice(api.ROWS.findIndex(row => row.id === "voiceSendPhrase"), 0, {
+        id: "voiceBackend", category: "voice", title: "Transcription backend", kind: "select",
+        description: "Auto prefers OpenAI for Codex and xAI for Grok or Claude, using the other when its credential is available. A change applies to the next recording.",
+        options: [{ value: "auto", label: "Auto" }, { value: "xai", label: "xAI" }, { value: "openai", label: "OpenAI" }],
+        defaultValue: "auto", visible: known,
+        get: s => s.voiceBackendState.preference,
+        message: value => ({ type: "setVoiceBackend", value }),
+      }, {
+        id: "voiceBackendAvailability", category: "voice", title: "Transcription credentials", kind: "status",
+        visible: known,
+        describe: s => "OpenAI: " + (s.voiceBackendState.hasOpenAi ? "key available" : "needs an API key")
+          + ". xAI: " + (s.voiceBackendState.hasXai ? "credential available" : "needs a key or Grok sign-in")
+          + ". Codex / ChatGPT sign-in does not include transcription API access. OpenAI API usage is billed separately.",
+      }, {
+        id: "configureOpenAiVoice", category: "voice", title: "OpenAI voice API key", kind: "action",
+        description: "Set the key on this host, or use OPENAI_API_KEY in its environment. The key is never sent to the chat or remote clients.",
+        actionLabel: "Set API key", hostLocal: true, visible: known,
+        message: () => ({ type: "configureOpenAiVoice" }),
+      });
+    },
+  };
   const FILE_EXTS = new Set([
     "ts","tsx","js","jsx","mjs","cjs","json","md","mdx","toml","yml","yaml",
     "css","scss","sass","less","html","htm","xml","svg",
@@ -24,19 +51,22 @@
   // copy and test/protocol.test.ts asserts the two are set-equal in both
   // directions (and that chat.js actually handles every host type).
   const HOST_MESSAGE_TYPES = [
-    "initialState", "moveViewHint", "welcomeTips", "projectSetup", "githubState", "githubRepos", "providerState", "mcpServers", "mcpConnectors", "routines", "codexInstallProgress", "planModeAvailability", "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "updateAvailable", "updateReady", "telemetryEnabled", "thumbsFeedback", "initialized",
+    "providerConfigContent", "providerConfigWriteResult",
+    "initialState", "moveViewHint", "welcomeTips", "projectSetup", "githubState", "githubRepos", "providerState", "mcpServers", "mcpConnectors", "mcpConnectorAuthorization", "routines", "codexInstallProgress", "planModeAvailability", "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "updateAvailable", "updateReady", "telemetryEnabled", "thumbsFeedback", "initialized",
     "cliUpdating", "session", "sessionName", "sessionRemoved", "modelChanged", "modeChanged", "modePolicy", "sandboxState", "openModePopover",
     "voiceState", "voiceConfigured", "voicePartial", "voiceSubmit", "voiceTranscript",
-    "voiceError", "chips", "commandsUpdate", "mentionResults", "projectDirListing", "projectFileContent", "projectFileWriteResult", "userMessage", "agentStart", "thoughtChunk",
+    "voiceError", "chips", "commandsUpdate", "mentionResults", "projectDirListing", "projectFileContent", "projectFileWriteResult", "gitStatusResult", "gitFileDiffResult", "turnFileDiffResult", "turnDiffBaseline", "gitRunResult", "userMessage", "agentStart", "thoughtChunk",
     "messageChunk", "media", "userMessageChunk", "historyReplay", "historyBatch", "permissionHistoryQueue",
     "planHistoryQueue", "toolCall", "toolCallUpdate", "permissionRequest", "permissionOptions",
-    "permissionResolved", "exitPlanRequest", "planResolved", "questionRequest", "planNotice", "autoCompactNotice", "planBlocked",
-    "promptComplete", "contextUsage", "commandOutput", "expandCommandOutputs", "setAllToolDetails", "focusInput", "findInSession", "restoreComposer", "truncateMessages", "uiConfirmRequest", "agentReset", "agentError", "agentEnd", "exit", "setBusy", "summarizing",
+    "permissionResolved", "exitPlanRequest", "planResolved", "questionRequest", "questionResolved", "planNotice", "autoCompactNotice", "planBlocked",
+    "subscriptionUsage",
+    "promptComplete", "contextUsage", "commandOutput", "expandCommandOutputs", "setAllToolDetails", "focusInput", "findInSession", "restoreComposer", "truncateMessages", "uiConfirmRequest", "uiConfirmResolved", "agentReset", "agentError", "agentEnd", "exit", "setBusy", "summarizing",
     "sessionContext", "clearMessages", "onboarding", "error", "hostNotice", "xaiNotification", "subagentUpdate", "childStream", "runProgress", "sessions", "repoSessions", "pinnedSessions", "repos",
-    "sessionDot", "queuedSends", "submitQueuedSend", "steerUnavailable", "feedbackAvailability", "turnFeedbackAck", "usage", "steerByDefault", "soundNotifications", "processingSound", "readRepliesAloud", "summarizeRepliesAloud", "speechSummary", "imageFull", "moveComposerCaret",
-    "remoteStatus",
+    "sessionDot", "queuedSends", "submitQueuedSend", "steerUnavailable", "feedbackAvailability", "turnFeedbackAck", "usage", "steerByDefault", "promptNav", "expandDiffCard", "soundNotifications", "processingSound", "readRepliesAloud", "summarizeRepliesAloud", "speechSummary", "imageFull", "imageOriginal", "moveComposerCaret",
+    "remoteStatus", "hostReachable", "hostLink",
   ];
   const WEBVIEW_MESSAGE_TYPES = [
+    "readProviderConfig", "writeProviderConfig", "restartProviderSession", "openProviderConfig",
     "ready", "remotePreferences", "send", "newSession", "cancel", "pickModel", "setMode", "setSandbox", "removeChip",
     "toggleChip", "openFile", "showInFolder", "openUrl", "openText", "openDiff", "exportExpr", "setEffort",
     "addProjectFolder", "removeProjectFolder", "createProject", "cloneProject", "setupGithubCli", "listGithubRepos", "githubSignOut", "githubLoginWithToken",
@@ -44,13 +74,14 @@
     "listRoutines", "saveRoutine", "deleteRoutine", "setRoutinePaused", "runRoutineNow",
     "setShowThinking", "setAppPurpose", "setExpandCommandOutputs",
     "dropFile", "permissionAnswer", "exitPlanAnswer", "questionAnswer", "questionCancel",
-    "setModel", "installCodex", "cancelCodexInstall", "runInstallCmd", "runGrokLogin", "cancelDeviceLogin", "submitDeviceLoginCode", "logout", "checkGrokUpdate", "updateGrok",
-    "recheckConnection", "refreshProviders", "retryProviderSession", "listSessions", "listRepoSessions", "selectRepo", "toggleRepoPin", "setRepoArchived", "setRepoColor", "toggleSessionPin", "resumeSession", "renameSession", "deleteSession",
-      "clearAllSessions", "pickFile", "mentionQuery", "addMentionFile", "listProjectDir", "readProjectFile", "writeProjectFile", "pasteImage", "uploadFile", "voiceStart", "voiceStop",
-      "remoteVoiceStart", "remoteVoiceChunk", "remoteVoiceStop",
-    "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "turnFeedback", "forkSession", "setSteerByDefault",
-    "setSoundNotifications", "setProcessingSound", "setReadRepliesAloud", "setSummarizeRepliesAloud", "setVoiceSendPhrase", "setVoiceKeyterms", "setTelemetryEnabled", "setThumbsFeedback", "summarizeSpeech", "requestImageFull", "composerFocus",
+    "setModel", "installCodex", "cancelCodexInstall", "runInstallCmd", "runGrokLogin", "cancelDeviceLogin", "submitDeviceLoginCode", "logout", "checkGrokUpdate", "updateGrok", "updateCodex", "updateClaude",
+    "recheckConnection", "refreshProviders", "retryProviderSession", "listSessions", "listRepoSessions", "selectRepo", "toggleRepoPin", "setRepoArchived", "setRepoColor", "setRepoIcon", "toggleSessionPin", "resumeSession", "renameSession", "deleteSession",
+      "clearAllSessions", "pickFile", "mentionQuery", "addMentionFile", "listProjectDir", "readProjectFile", "writeProjectFile", "gitStatus", "gitFileDiff", "turnFileDiff", "turnFileOpenDiff", "gitRun", "pasteImage", "uploadFile", "voiceStart", "voiceStop",
+      "remoteVoiceStart", "remoteVoiceChunk", "remoteVoiceStop", "setVoiceBackend", "configureOpenAiVoice",
+    "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "turnFeedback", "forkSession", "setSteerByDefault", "setPromptNav", "setExpandDiffCard",
+    "setSoundNotifications", "setProcessingSound", "setReadRepliesAloud", "setSummarizeRepliesAloud", "setVoiceSendPhrase", "setVoiceKeyterms", "setTelemetryEnabled", "setThumbsFeedback", "summarizeSpeech", "requestImageFull", "requestImageOriginal", "composerFocus",
     "newWorktreeSession", "applyWorktree", "removeWorktree", "rewindSession", "editLastMessage", "uiConfirmAnswer", "workflowControl", "refreshContextDetails",
+    "refreshSubscriptionUsage",
     "remoteSignIn", "remoteSignOut", "unlinkRemoteDevice", "openRemotePortal",
     "openUpdateRelease", "restartToUpdate",
   ];
@@ -1905,10 +1936,20 @@
    * chooses among those — which is why this needs no randomness and stays a
    * pure function.
    *
-   * `deskOnly` is the same rule that keeps the move-view hint off phones: a
-   * remote may not sign an agent in or link a connector (both `host-local`),
-   * so suggesting it there is advice the reader cannot take from where they
-   * are standing.
+   * TWO axes, because one boolean used to carry two different facts and the
+   * cost was two tips silently withheld from everyone on a cloud machine.
+   *
+   * `requiresLocalSurface` is a static property of the ADVICE: the action it
+   * points at is `host-local` in remote-policy.ts, so no remote can perform it
+   * from anywhere, ever. "Continue on your phone" read on a phone, a worktree
+   * create, an Explorer drag. It was called `deskOnly`, which read as "this
+   * needs the desk" — and on a cloud machine, where every reader is remote,
+   * that meant nobody saw it at all. Signing an agent in and linking a
+   * connector were both wrongly marked so, and both were found only when the
+   * owner noticed a tip missing (providers 2026-08-31, connectors 2026-09-06).
+   *
+   * `remoteNeeds*` is the dynamic half: does THIS host offer the capability.
+   * That is what those two became, and it is where a new gate belongs.
    *
    * Copy carries ONE `{braced}` span — the actionable phrase. The renderer
    * splits on it and builds text nodes plus a single control, so tip text
@@ -1919,10 +1960,10 @@
       id: "providers",
       copy: "Grok isn’t your only agent. {Connect Codex or Claude Code} and pick one per conversation.",
       target: "settings:providers",
-      // Was deskOnly, on the rule that a remote may not sign an agent in. It
-      // can since 3.19.x, and on a cloud machine this is the only surface
-      // there is (owner asked why it never appears, 2026-08-31).
-      deskOnly: false,
+      // Was requiresLocalSurface, on the rule that a remote may not sign an
+      // agent in. It can since 3.19.x, and on a cloud machine this is the
+      // only surface there is (owner asked why it never appears, 2026-08-31).
+      requiresLocalSurface: false,
       remoteNeedsSignIn: true,
       // Not "fewer than all three": the moment a SECOND agent exists the user
       // has discovered that agents are interchangeable here, which is the only
@@ -1933,21 +1974,31 @@
       id: "routines",
       copy: "Work that repeats can run itself. {Set up a routine} and it opens a session on schedule.",
       target: "settings:routines",
-      deskOnly: false,
+      requiresLocalSurface: false,
       eligible: (f) => f.routineCount === 0,
     },
     {
       id: "connectors",
       copy: "Give your agent your tools. {Connect Notion, Linear or GitHub} and it can read and write them.",
       target: "settings:connectors",
-      deskOnly: true,
+      // Was requiresLocalSurface, on the rule that connecting an app needed
+      // has not since 4.1.9 shipped connector sign-in from a phone, and on a
+      // cloud machine that flag means nobody ever sees this rather than
+      // "desk users see it" -- there is no desk user there. Exactly the
+      // correction the providers tip above records for itself.
+      requiresLocalSurface: false,
+      // Gated on the capability this tip's own destination is gated on: the
+      // Settings page hides its Connectors category unless the host advertises
+      // `mcpSettings`, so without this the link could land on a page that is
+      // not there.
+      remoteNeedsMcpSettings: true,
       eligible: (f) => f.connectorCount === 0,
     },
     {
       id: "remote",
       copy: "Leave the desk without leaving the work. {Continue on your phone.}",
       target: "settings:account",
-      deskOnly: true,
+      requiresLocalSurface: true,
       // Three states, not two (see state.remoteLinked): null means the host has
       // not read the token yet, and inviting an already-linked machine to link
       // again is the exact confusion that tri-state exists to prevent.
@@ -1957,14 +2008,14 @@
       id: "readAloud",
       copy: "Grok can read its replies out loud — turn it on in {Voice settings}.",
       target: "settings:voice",
-      deskOnly: false,
+      requiresLocalSurface: false,
       eligible: (f) => !f.readRepliesAloud,
     },
     {
       id: "voice",
       copy: "Talk instead of typing — set up {voice control} and dictate into the composer.",
       target: "settings:voice",
-      deskOnly: false,
+      requiresLocalSurface: false,
       eligible: (f) => !f.voiceConfigured,
     },
     {
@@ -1978,7 +2029,7 @@
       // does not have. Advising it there is advice that cannot be taken.
       copyWhen: (f) => (f.isRemote ? "{Mention a file with @} to bring it into the conversation." : undefined),
       target: "mention",
-      deskOnly: false,
+      requiresLocalSurface: false,
       eligible: () => true,
     },
     {
@@ -1990,11 +2041,41 @@
       // nobody remembers ("… > Continue in a new chat > Use a new worktree").
       copy: "Trying something risky? {Start it in a worktree} — your checkout stays untouched.",
       target: "worktree",
-      deskOnly: true,
+      requiresLocalSurface: true,
       // Every condition the destination list itself applies, so the link can
       // never fire something the host would refuse: coding mode, a CLI that
       // supports worktrees, and not already inside one (they do not nest).
       eligible: (f) => f.appPurpose === "coding" && f.worktreeSupported && !f.inWorktree,
+    },
+    {
+      id: "dragShift",
+      // Scoped to a VS Code-internal drag deliberately. A `dragstart` in the
+      // workbench makes the editor set pointer-events:none on every webview and
+      // re-check it on each dragover, so an Explorer drop cannot reach us at all
+      // without Shift held — the workbench demands the modifier, which is why we
+      // do not read it as ours (#136). An OS file-manager drag fires no
+      // dragstart, is never blocked, and there Shift IS ours ("inline the file's
+      // text"), so this advice would be actively wrong outside the Explorer.
+      // Order matters and the first draft had it backwards: Shift+click in the
+      // Explorer is a range-select, so the modifier cannot be held BEFORE the
+      // drag starts — it goes down once the drag is already moving.
+      copy: "Dragging from the Explorer? {Start the drag, then hold Shift} — the editor blocks the drop otherwise.",
+      target: null,
+      // `dropFile` is "host-local", so a remote's drop is refused outright and
+      // the advice would be a dead end there.
+      requiresLocalSurface: true,
+      // No Explorer in the desktop app, where `mentions` already covers dropping.
+      eligible: (f) => !f.desktopShell,
+    },
+    {
+      id: "pasteScreenshot",
+      // Pointer, not surface. A laptop browser on the relay pastes screenshots
+      // exactly like the desk does; a phone cannot get an image onto a textarea
+      // at all, so there the advice is simply untrue.
+      copy: "Copied a screenshot? {Paste it straight into the message box.}",
+      target: null,
+      requiresLocalSurface: false,
+      eligible: (f) => !f.coarsePointer,
     },
   ];
 
@@ -2047,18 +2128,21 @@
       // here would have hidden the tip on every host that never mentions it.
       worktreeSupported: f.worktreeSupported !== false,
       inWorktree: !!f.inWorktree,
-      cloudHost: !!f.cloudHost,
       remoteCanConnectAgents: !!f.remoteCanConnectAgents,
+      mcpSettings: !!f.mcpSettings,
       remoteLinked: f.remoteLinked === true ? true : f.remoteLinked === false ? false : null,
+      coarsePointer: !!f.coarsePointer,
+      desktopShell: !!f.desktopShell,
     };
     return WELCOME_TIPS.filter((tip) => {
       if (dismissed.has(tip.id)) return false;
       if (shownToday.has(tip.id)) return false;
-      if (known.isRemote && tip.deskOnly) return false;
+      if (known.isRemote && tip.requiresLocalSurface) return false;
       // A tip whose action needs a capability this remote does not have is the
-      // same dead end deskOnly was invented to prevent — just decided by what
+      // same dead end requiresLocalSurface prevents — but decided by what
       // the host advertises rather than by where the reader is standing.
       if (known.isRemote && tip.remoteNeedsSignIn && !known.remoteCanConnectAgents) return false;
+      if (known.isRemote && tip.remoteNeedsMcpSettings && !known.mcpSettings) return false;
       // -1 is "the host never told us" — see the doc comment.
       if (tip.id === "routines" && known.routineCount < 0) return false;
       if (tip.id === "connectors" && known.connectorCount < 0) return false;
@@ -2892,11 +2976,305 @@
     return `${hr}h ${min % 60}m`;
   }
 
-  const api = { WELCOME_TIPS, welcomeTipById, welcomeTipsFor, welcomeTipCopy, splitWelcomeTipCopy, addProjectMenuItems, addProjectFolderPreview, addProjectForm, parseCloneQuery, filterGithubRepos, githubRepoNameParts, formatWaitElapsed, FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, composerHasSendIntent, explicitVisibleChips, normalizeQueuedSends, queuedSendsText, queuedSendsChips, contextOverheadTokens, nextContextBreakdown, contextBreakdownIsCurrent, createPendingOverlay, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelPickerLabel, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, TOOL_LABEL_MAX, middleElide, isAdvertisedSkill, getSlashQuery, applySlashPick, filterCommands, highlightQueryParts, appendHighlightedText, commandProgramLabel, commandTextPreview, MAX_COMMAND_OUTPUT_CHARS, capCommandOutput, extractToolResultOutput, commandOutputWasCancelled, commandOutputTruncationNote, computeLineDiff, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents, flattenHistoryMessages, splitHistoryWindow, countHistoryReplayCounters, partitionHistoryCards, GITHUB_FINE_GRAINED_TOKEN_URL, fillFineGrainedTokenHint };
+  /**
+   * Merge key for turn-summary paths. Slash-normalized + lowercased so Windows
+   * (and typical macOS) path casing differences don't split one file into two
+   * rows (F1.txt vs f1.txt). Linux case collisions are vanishingly rare here.
+   */
+  function normalizeTurnEditPathKey(path) {
+    if (path == null || path === "") return "";
+    return String(path).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  }
+
+  /**
+   * Paths a shell command is deleting — best-effort parse of the delete verbs
+   * grok actually emits (PowerShell Remove-Item / ri / del, POSIX rm). Returns
+   * [] when the command isn't a delete (so Start-Sleep / git status stay out).
+   */
+  function parseShellDeletePaths(command) {
+    const s = String(command || "").trim();
+    if (!s) return [];
+    // First statement only — grok usually issues one delete per tool call.
+    const first = s.split(/(?:;|\n|&&|\|\|)/)[0].trim();
+    const head = first.match(/^(?:Remove-Item|ri|del|erase|rm(?:\.exe)?)\b/i);
+    if (!head) return [];
+    let rest = first.slice(head[0].length);
+
+    const paths = [];
+    const quoted = /"([^"]+)"|'([^']+)'|`([^`]+)`/g;
+    let m;
+    while ((m = quoted.exec(rest))) {
+      const p = m[1] || m[2] || m[3];
+      if (p) paths.push(p);
+    }
+    if (paths.length) return paths;
+
+    // Unquoted: drop flags (-Force, -ErrorAction X, /f, /q, -f, -rf, …) then
+    // keep remaining tokens as candidate paths. Do NOT treat Unix absolute
+    // paths (/tmp/x) as flags — only short DOS-style /f switches.
+    const tokens = rest.split(/\s+/).filter(Boolean);
+    const flagWithArg = /^(?:-ErrorAction|-ea|-Path|-LiteralPath|-Include|-Exclude|-Filter|-Name)$/i;
+    const isFlag = (t) => /^-/.test(t) || /^\/[A-Za-z]{1,3}$/.test(t);
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (flagWithArg.test(t)) { i++; continue; }
+      if (isFlag(t)) continue;
+      paths.push(t);
+    }
+    return paths;
+  }
+
+  /**
+   * Collapse per-tool-call file mutations into one row per path (turn-level
+   * chat diff summary).
+   *
+   * - Paths merge case-insensitively (see normalizeTurnEditPathKey).
+   * - Multiple edits on one path: **sum** every edit's +/− (each tool row's
+   *   change counts toward the turn — create in batch 1 + edit in batch 2 both
+   *   count). openDiff spans **first.oldText → last.newText** when both are on
+   *   the wire so "open diff" shows the whole turn, not only the last region.
+   * - kind:"delete" (or shell-parsed deletes) mark the path deleted; a later
+   *   edit on the same path recreates it.
+   *
+   * @param {Iterable<{ path?: string, kind?: string, added?: number, removed?: number, oldText?: string, newText?: string, openDiff?: object|null }>} entries
+   * @param {{ computeLineDiff?: Function }} [opts] — reserved; counts come from
+   *   the per-edit stats already computed by the row renderer.
+   */
+  function aggregateTurnEdits(entries, opts) {
+    void opts; // kept for call-site compat / future inject hooks
+    /** @type {Map<string, { path: string, events: any[] }>} */
+    const groups = new Map();
+    if (entries) {
+      for (const e of entries) {
+        if (!e) continue;
+        const path = typeof e.path === "string" ? e.path : "";
+        const key = normalizeTurnEditPathKey(path);
+        let g = groups.get(key);
+        if (!g) {
+          g = { path, events: [] };
+          groups.set(key, g);
+        } else if (path && (!g.path || path.length >= g.path.length)) {
+          // Prefer a longer/more specific display path; keep first-seen casing
+          // when lengths match (so we don't thrash on case-only variants).
+          if (path.length > g.path.length) g.path = path;
+        }
+        g.events.push(e);
+      }
+    }
+
+    const files = [];
+    for (const g of groups.values()) {
+      let deleted = false;
+      const edits = [];
+      for (const e of g.events) {
+        if (e.kind === "delete") {
+          deleted = true;
+          edits.length = 0;
+          continue;
+        }
+        deleted = false;
+        edits.push(e);
+      }
+      if (deleted) {
+        files.push({
+          path: g.path,
+          action: "deleted",
+          added: 0,
+          removed: 0,
+        });
+        continue;
+      }
+      if (!edits.length) continue;
+
+      let added = 0;
+      let removed = 0;
+      for (const e of edits) {
+        if (typeof e.added === "number" && Number.isFinite(e.added)) added += e.added;
+        if (typeof e.removed === "number" && Number.isFinite(e.removed)) removed += e.removed;
+      }
+
+      const first = edits[0];
+      // There is deliberately no turn-level openDiff here. oldText/newText on
+      // the wire are the REPLACED REGION of one edit, not snapshots of the
+      // file, so splicing the first edit's old onto the last edit's new
+      // describes a substitution that never happened — and the host expands it
+      // against disk into a confident whole-file diff of that fiction. The
+      // chat card requests the host-captured baseline instead; without one it
+      // reveals the last tool row. Neither path changes these summed counts.
+      const created = first.oldText === "" || (first.openDiff && first.openDiff.oldText === "");
+      files.push({
+        path: g.path,
+        action: created ? "created" : "edited",
+        added,
+        removed,
+      });
+    }
+
+    files.sort((a, b) => {
+      // Deletes last; then alpha by path (case-insensitive).
+      if (a.action === "deleted" && b.action !== "deleted") return 1;
+      if (b.action === "deleted" && a.action !== "deleted") return -1;
+      return (a.path || "").localeCompare(b.path || "", undefined, { sensitivity: "base" });
+    });
+
+    let totalAdded = 0;
+    let totalRemoved = 0;
+    for (const f of files) {
+      if (f.action === "deleted") continue;
+      totalAdded += f.added;
+      totalRemoved += f.removed;
+    }
+    return { files, totalAdded, totalRemoved };
+  }
+
+  /** Header label for the turn-level change list ("Changed 1 file" / "Changed 3 files"). */
+  function turnDiffSummaryTitle(agg) {
+    const n = agg && Array.isArray(agg.files) ? agg.files.length : 0;
+    if (n <= 0) return "";
+    return n === 1 ? "Changed 1 file" : `Changed ${n} files`;
+  }
+
+  const api = { WELCOME_TIPS, welcomeTipById, welcomeTipsFor, welcomeTipCopy, splitWelcomeTipCopy, addProjectMenuItems, addProjectFolderPreview, addProjectForm, parseCloneQuery, filterGithubRepos, githubRepoNameParts, formatWaitElapsed, FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, composerHasSendIntent, explicitVisibleChips, normalizeQueuedSends, queuedSendsText, queuedSendsChips, contextOverheadTokens, nextContextBreakdown, contextBreakdownIsCurrent, createPendingOverlay, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelPickerLabel, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, TOOL_LABEL_MAX, middleElide, isAdvertisedSkill, getSlashQuery, applySlashPick, filterCommands, highlightQueryParts, appendHighlightedText, commandProgramLabel, commandTextPreview, MAX_COMMAND_OUTPUT_CHARS, capCommandOutput, extractToolResultOutput, commandOutputWasCancelled, commandOutputTruncationNote, computeLineDiff, normalizeTurnEditPathKey, parseShellDeletePaths, aggregateTurnEdits, turnDiffSummaryTitle, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents, flattenHistoryMessages, splitHistoryWindow, countHistoryReplayCounters, partitionHistoryCards, GITHUB_FINE_GRAINED_TOKEN_URL, fillFineGrainedTokenHint };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;
   } else {
     root.GrokWebviewHelpers = api;
   }
+})(typeof globalThis !== "undefined" ? globalThis : this);
+
+// Page-local operation UI, shipped in the helper bundle on every surface.
+// A socket snapshot is a capability, never a host/protocol version check.
+(function (root) {
+  let shared;
+  function create(win) {
+    const operations = new Map();
+    let sequence = 0;
+    let timer;
+    let element;
+    const snapshot = () => win.afkpilotHostLink;
+    const available = () => !snapshot() || (snapshot().reachable && snapshot().restored);
+    function paint() {
+      if (timer) win.clearTimeout(timer);
+      const now = Date.now();
+      for (const [id, op] of operations) {
+        if (op.until && now >= op.until) operations.delete(id);
+      }
+      const visible = snapshot() ? [...operations.values()].filter((op) => !op.cancelled) : [];
+      if (!visible.length) {
+        if (element) element.hidden = true;
+        win.document.body.classList.remove("host-wait-visible");
+        return;
+      }
+      if (!element) {
+        element = win.document.createElement("aside");
+        element.id = "host-wait-strip";
+        element.className = "host-wait-strip";
+        element.setAttribute("aria-label", "Machine activity");
+        // A body sibling of the overlays, never a child of the transcript.
+        win.document.body.appendChild(element);
+        if (typeof win.ResizeObserver === "function") {
+          new win.ResizeObserver(() => {
+            win.document.body.style.setProperty("--host-wait-height", element.offsetHeight + "px");
+          }).observe(element);
+        }
+      }
+      element.hidden = false;
+      win.document.body.classList.add("host-wait-visible");
+      const pending = visible.filter((op) => op.status === "pending");
+      const op = pending[pending.length - 1] || visible[visible.length - 1];
+      const link = snapshot();
+      const waking = !link.reachable;
+      const since = waking ? (link.phase === "waking" ? link.since : op.started) : op.workingSince;
+      const elapsed = Math.max(0, Math.floor((now - since) / 1000));
+      const duration = Math.floor(elapsed / 60) + ":" + String(elapsed % 60).padStart(2, "0");
+      const copy = win.document.createElement("span");
+      copy.className = "host-wait-copy";
+      copy.setAttribute("role", "status");
+      let spinner;
+      if (op.status === "pending") {
+        spinner = win.document.createElement("span");
+        spinner.className = "host-wait-spinner";
+        spinner.setAttribute("aria-hidden", "true");
+        copy.textContent = waking
+          ? (elapsed >= 30 ? "Still starting… " + duration + " so far." : "Waking your machine.") + " " + op.label
+          : op.label + (elapsed >= 30 ? " — " + duration + " so far. Waiting for confirmation." : "…");
+        if (pending.length > 1) copy.textContent += " · " + pending.filter((item) => item !== op).map((item) => item.label).join(" · ");
+      } else {
+        copy.textContent = op.status === "success" ? op.success : op.failure + (op.reason ? " " + op.reason : "");
+      }
+      if (pending.length || visible.some((item) => item.until)) timer = win.setTimeout(paint, 1000);
+      const renderKey = op.id + ":" + op.status + ":" + copy.textContent;
+      if (element.dataset.renderKey === renderKey) return;
+      element.dataset.renderKey = renderKey;
+      element.replaceChildren();
+      if (spinner) element.appendChild(spinner);
+      element.dataset.state = op.status;
+      element.appendChild(copy);
+      if (op.status === "failure" && op.retry) {
+        const button = win.document.createElement("button");
+        button.type = "button";
+        button.textContent = "Try again";
+        button.onclick = () => { op.cancel(); op.retry(); };
+        element.appendChild(button);
+      }
+    }
+    function begin(spec) {
+      const op = {
+        ...spec, id: ++sequence, started: Date.now(), workingSince: Date.now(), status: "pending",
+        wasWaking: !!snapshot() && !snapshot().reachable,
+        // Sticky, unlike wasWaking above, which flips back on every event. The
+        // question this answers is "was this person ever made to wait", and an
+        // answer that a reconnection erases cannot answer it.
+        waited: !!snapshot() && !snapshot().reachable,
+        cancel() { operations.delete(op.id); op.cancelled = true; paint(); },
+        resume() { if (op.cancelled) return; op.status = "pending"; op.reason = ""; op.until = null; paint(); },
+        /*
+         * A success is only news if the person was made to wait for it.
+         *
+         * The file is on screen, the row has moved back to its value, the tab's
+         * dot has cleared -- saying so in words as well tells them what they are
+         * already looking at, holds the strip for three seconds, and on a phone
+         * takes that height off the full-screen panel underneath, which then
+         * springs back when the strip goes. Nothing is learned and the layout
+         * moves twice.
+         *
+         * What IS worth saying is the resolution of a wait this strip asked
+         * them to sit through: they were told the machine was starting, so they
+         * are owed the end of that sentence. Failures are news whatever the
+         * link did, and are not gated here.
+         */
+        succeed() {
+          if (op.cancelled) return;
+          if (!op.waited) { operations.delete(op.id); paint(); return; }
+          op.status = "success"; op.until = Date.now() + 3000; paint();
+        },
+        fail(reason, retry) {
+          if (op.cancelled) return;
+          op.status = "failure"; op.reason = reason || ""; op.retry = retry; paint();
+        },
+      };
+      operations.set(op.id, op);
+      paint();
+      return op;
+    }
+    // `hostLink`, not `hostReachable`. The strip wants every phase change --
+    // waking, offline, back-but-not-restored -- and `hostReachable` is a
+    // command the renderer answers by abandoning its in-flight reads and
+    // re-running `git status`, so a shell that fired it on each change would
+    // turn a flapping uplink into a storm of those. Two messages, because they
+    // are two different things: one says what the link IS, one says act on it.
+    win.addEventListener("message", (event) => {
+      if (event.data && event.data.type === "hostLink") {
+        for (const op of operations.values()) {
+          if (snapshot() && snapshot().reachable && op.wasWaking) op.workingSince = Date.now();
+          op.wasWaking = !!snapshot() && !snapshot().reachable;
+          if (op.wasWaking) op.waited = true;
+        }
+        paint();
+      }
+    });
+    return { begin, snapshot, available };
+  }
+  root.GrokHostWait = { get: () => shared || (shared = create(root)) };
 })(typeof globalThis !== "undefined" ? globalThis : this);

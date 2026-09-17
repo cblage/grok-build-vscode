@@ -28,7 +28,7 @@ export async function assertPinnedAfterZoomedExpandedTurn(page, opts = {}) {
   const log = opts.log || ((m) => console.log(`[stick] ${m}`));
 
   await page.waitForSelector("#messages", { timeout: 45000 });
-  await page.waitForSelector("#scroll-bottom-btn", { timeout: 15000 });
+  await page.waitForSelector("#scroll-bottom-btn", { state: "attached", timeout: 15000 });
 
   // VS Code sidebar geometry: hide desktop chrome that would steal the
   // column, then shrink to a zoomed-sidebar size. Cmd+= is CSS --chat-zoom

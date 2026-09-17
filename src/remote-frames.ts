@@ -193,6 +193,15 @@ function parseRemoteWebviewMsg(msg: unknown): WebviewMsg | null {
   const value = msg as Record<string, unknown>;
   if (typeof value.type !== "string" || !WEBVIEW_TYPE_SET.has(value.type)) return null;
   switch (value.type) {
+    case "connectMcpConnector":
+      if (typeof value.id !== "string" || (value.key !== undefined && typeof value.key !== "string")
+        || (value.readOnly !== undefined && typeof value.readOnly !== "boolean")) return null;
+      return { type: "connectMcpConnector", id: value.id,
+        ...(value.key !== undefined ? { key: value.key } : {}),
+        ...(value.readOnly !== undefined ? { readOnly: value.readOnly } : {}),
+      };
+    case "disconnectMcpConnector":
+      return typeof value.id === "string" ? { type: "disconnectMcpConnector", id: value.id } : null;
     case "ready":
       return value.tabToken === undefined
         ? { type: "ready" }
@@ -255,6 +264,11 @@ function parseRemoteWebviewMsg(msg: unknown): WebviewMsg | null {
       return typeof value.fullId === "string" && REMOTE_TAB_TOKEN_RE.test(value.fullId)
         ? { type: "requestImageFull", fullId: value.fullId }
         : null;
+    case "requestImageOriginal":
+      return typeof value.fullId === "string" && REMOTE_TAB_TOKEN_RE.test(value.fullId)
+        && Number.isSafeInteger(value.requestId)
+        ? { type: "requestImageOriginal", fullId: value.fullId, requestId: value.requestId as number }
+        : null;
     case "selectRepo":
     case "clearAllSessions":
       return isRemoteCwd(value.cwd) ? msg as WebviewMsg : null;
@@ -272,6 +286,13 @@ function parseRemoteWebviewMsg(msg: unknown): WebviewMsg | null {
       return isRemoteCwd(value.cwd) && typeof value.color === "string"
         ? msg as WebviewMsg
         : null;
+    case "setRepoIcon":
+      // Shape only, exactly as for the colour above: the host allowlists the
+      // mark id against REPO_ICON_IDS and re-checks the cwd against the live
+      // catalog. Empty string is a valid "default folder".
+      return isRemoteCwd(value.cwd) && typeof value.icon === "string"
+        ? msg as WebviewMsg
+        : null;
     // Shape-checked here like its repo-level sibling rather than riding the
     // `default` passthrough: the host validates too, but a malformed message
     // that reaches the host has already crossed the boundary this parser exists
@@ -279,6 +300,7 @@ function parseRemoteWebviewMsg(msg: unknown): WebviewMsg | null {
     case "toggleSessionPin":
       return isRemoteSessionId(value.id) &&
         typeof value.pinned === "boolean" &&
+        (value.requestId === undefined || (typeof value.requestId === "string" && value.requestId.length <= 128)) &&
         (value.cwd === undefined || isRemoteCwd(value.cwd))
         ? msg as WebviewMsg
         : null;
@@ -321,10 +343,18 @@ function parseRemoteWebviewMsg(msg: unknown): WebviewMsg | null {
       return isRemoteCwd(value.cwd) && isRemoteMentionPath(value.relPath)
         ? msg as WebviewMsg
         : null;
+    case "readProviderConfig":
+      return ["grok", "codex", "claude"].includes(value.provider as string) ? msg as WebviewMsg : null;
+    case "restartProviderSession":
+      return ["grok", "codex", "claude"].includes(value.provider as string) && isRemoteSessionId(value.sessionId)
+        ? msg as WebviewMsg : null;
+    case "writeProviderConfig":
     case "writeProjectFile": {
-      // Existing-file save only: stamp + expectedAbsPath are mandatory so the
-      // host can refuse a stale tab or a cross-project relPath collision.
-      if (!isRemoteCwd(value.cwd) || !isRemoteMentionPath(value.relPath)) return null;
+      // Stamp + expectedAbsPath are mandatory. Project saves require existing
+      // files; provider configs can carry the missing-file stamp from a read.
+      if (value.type === "writeProviderConfig") {
+        if (!["grok", "codex", "claude"].includes(value.provider as string)) return null;
+      } else if (!isRemoteCwd(value.cwd) || !isRemoteMentionPath(value.relPath)) return null;
       if (typeof value.text !== "string") return null;
       if (!isRemoteCwd(value.expectedAbsPath)) return null;
       const stamp = value.stamp;
@@ -718,6 +748,13 @@ export function buildLinkStartBody(input: {
   };
 }
 
+/** The relay refused this socket because it is already holding one for this
+ *  device. Mirrors CLOSE_DEVICE_BUSY in the relay's server.ts. */
+export const CLOSE_DEVICE_BUSY = 4002;
+/** The relay rejected the device credential itself: re-link, never retry.
+ *  Mirrors CLOSE_BAD_TOKEN in the relay's server.ts. */
+export const CLOSE_BAD_TOKEN = 4001;
+
 export const INITIAL_BACKOFF_MS = 1000;
 export const MAX_BACKOFF_MS = 30_000;
 
@@ -756,6 +793,50 @@ export function nextBackoffMs(prev: number): number {
  */
 export function connectionWasHealthy(connectedMs: number): boolean {
   return connectedMs >= MAX_BACKOFF_MS;
+}
+
+/**
+ * The relay closes 4002 when another socket is already holding this device.
+ *
+ * Almost always that other socket is THIS host's previous one, frozen open:
+ * the machine suspended, no FIN ever reached the relay, and the close event
+ * that would have detached it never fired. The relay now challenges such an
+ * incumbent with a ping the moment a second socket claims the device, so the
+ * corpse is retired within its probe deadline and the very next attempt gets
+ * in. Measured on a real machine, the wait used to be twenty-eight seconds.
+ *
+ * A refusal is therefore not a flap. `connectionWasHealthy` exists because a
+ * socket that OPENS and dies proves nothing, and doubling the delay is what
+ * stops it hammering the relay — but 4002 is a definite answer from a relay
+ * that is plainly up and plainly working, and it says the thing we are
+ * waiting for is measured in seconds. Growing the delay to thirty for that
+ * makes the host wait long after the obstacle has gone.
+ *
+ * It is not free either: every attempt costs the relay a device lookup, which
+ * is the exact query that once ran sixty-five million times in a week. So the
+ * short retry is BOUNDED, by the only number that means anything here — how
+ * long the relay needs to retire the incumbent. Past that the refusal is no
+ * longer transient (two windows on one desk genuinely share a device token,
+ * and one of them has to lose), and ordinary backoff takes over with whatever
+ * delay it had already earned. Nothing resets it.
+ *
+ * Jittered because every host refused by one relay is refused at once.
+ */
+export const REFUSAL_SHORT_RETRY_WINDOW_MS = 10_000;
+export const REFUSAL_SHORT_RETRY_MIN_MS = 1_000;
+export const REFUSAL_SHORT_RETRY_MAX_MS = 2_000;
+
+/**
+ * How long to wait after a 4002, given how long this run of refusals has been
+ * going. `undefined` means the short window is over: use ordinary backoff.
+ */
+export function refusalRetryMs(
+  refusedForMs: number,
+  random: () => number = Math.random,
+): number | undefined {
+  if (refusedForMs >= REFUSAL_SHORT_RETRY_WINDOW_MS) return undefined;
+  const spread = REFUSAL_SHORT_RETRY_MAX_MS - REFUSAL_SHORT_RETRY_MIN_MS;
+  return REFUSAL_SHORT_RETRY_MIN_MS + Math.floor(random() * (spread + 1));
 }
 
 /**

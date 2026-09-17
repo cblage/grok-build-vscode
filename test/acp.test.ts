@@ -1,6 +1,7 @@
 import { MCP_REMOTE_PACKAGE } from "../src/mcp-connectors";
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
+import { EventEmitter } from "node:events";
 import { describe, it, expect, vi } from "vitest";
 import {
   AcpClient,
@@ -21,6 +22,8 @@ import { CodexBackend } from "../src/codex-backend";
 function clientWithFakeProc(opts?: {
   backend?: AcpBackend;
   effort?: "high";
+  grokVersion?: string;
+  grokVersionVerified?: boolean;
   timeouts?: {
     promptIdleTimeoutMs?: number;
     promptAbsoluteTimeoutMs?: number;
@@ -31,6 +34,8 @@ function clientWithFakeProc(opts?: {
     cliPath: "x",
     cwd: "/",
     log: () => {},
+    grokVersion: opts?.grokVersion,
+    grokVersionVerified: opts?.grokVersionVerified,
     ...(opts?.backend ? { backend: opts.backend } : {}),
     ...(opts?.effort ? { effort: opts.effort } : {}),
     ...(opts?.timeouts ? { timeouts: opts.timeouts } : {}),
@@ -59,6 +64,33 @@ function replyToWrites(
 }
 
 describe("AcpClient notification metadata", () => {
+  it.each([new CodexBackend(), new ClaudeBackend()])("waits beyond disposal's grace period for actual exit before updating (%s)", async (backend) => {
+    const { client } = clientWithFakeProc({ backend });
+    const proc = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    (client as any).proc = proc;
+    vi.spyOn(client, "dispose").mockResolvedValue();
+    let settled = false;
+    const waiting = client.disposeForUpdate().then(() => { settled = true; });
+    await vi.waitFor(() => expect(proc.listenerCount("exit")).toBe(1));
+    expect(settled).toBe(false);
+    proc.emit("exit", 0);
+    await waiting;
+    expect(settled).toBe(true);
+  });
+
+  it("refuses a binary update when a process never exits", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client } = clientWithFakeProc({ backend: new CodexBackend() });
+      (client as any).proc = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+      vi.spyOn(client, "dispose").mockResolvedValue();
+      const waiting = expect(client.disposeForUpdate(100)).rejects.toThrow("did not exit");
+      await vi.runAllTimersAsync();
+      await waiting;
+      expect((client as any).proc.listenerCount("exit")).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("emits the live context count from the session/update envelope", () => {
     const { client } = clientWithFakeProc();
     const seen: number[] = [];
@@ -256,7 +288,106 @@ describe("AcpClient session/info", () => {
   });
 });
 
+describe("AcpClient subscription usage", () => {
+  it("returns a minimized weekly measurement directly from billing", async () => {
+    const { client } = clientWithFakeProc();
+    (client as any).request = vi.fn().mockResolvedValue({ config: {
+      creditUsagePercent: 3,
+      currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", start: "2026-09-12T00:00:00Z", end: "2026-09-19T00:00:00Z" },
+      prepaidBalance: { val: 4426 }, onDemandCap: { val: 0 }, onDemandUsed: { val: 0 },
+      isUnifiedBillingUser: true, billingPeriodStart: "2026-09-01T00:00:00Z", billingPeriodEnd: "2026-10-01T00:00:00Z",
+    }, subscription_tier: "SuperGrok Heavy" });
+    const result = await client.getSubscriptionUsage();
+    expect(result).toEqual([{
+      usedPercent: 3, label: "Weekly", periodType: "USAGE_PERIOD_TYPE_WEEKLY",
+      periodStart: "2026-09-12T00:00:00.000Z", periodEnd: "2026-09-19T00:00:00.000Z", observedAt: expect.any(String),
+    }]);
+    for (const field of ["prepaidBalance", "onDemandCap", "onDemandUsed", "isUnifiedBillingUser",
+      "billingPeriodStart", "billingPeriodEnd", "subscription_tier"]) {
+      expect(JSON.stringify(result)).not.toContain(field);
+    }
+  });
+
+  it("uses the optional underscore billing method and latches unsupported quietly", async () => {
+    const { client } = clientWithFakeProc();
+    const log = vi.fn();
+    (client as any).opts.log = log;
+    const request = vi.fn().mockRejectedValue({ code: -32601, message: "Method not found" });
+    (client as any).request = request;
+    await expect(client.getSubscriptionUsage()).resolves.toEqual([]);
+    await expect(client.getSubscriptionUsage()).resolves.toEqual([]);
+    expect(request).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledWith("_x.ai/billing", {});
+    expect(log).toHaveBeenCalledWith("[billing] CLI does not support _x.ai/billing");
+  });
+
+  it("returns no measurement for malformed billing without inventing zero", async () => {
+    const { client } = clientWithFakeProc();
+    (client as any).request = vi.fn().mockResolvedValue({ config: {} });
+    await expect(client.getSubscriptionUsage()).resolves.toEqual([]);
+    (client as any).request = vi.fn().mockRejectedValue({ code: -32602 });
+    await expect(client.getSubscriptionUsage()).rejects.toMatchObject({ code: -32602 });
+  });
+
+  it.each([new ClaudeBackend(), new CodexBackend()])("does not pull billing from %s", async (backend) => {
+    const { client } = clientWithFakeProc({ backend });
+    const request = vi.fn();
+    (client as any).request = request;
+    await expect(client.getSubscriptionUsage()).resolves.toEqual([]);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, new ClaudeBackend(), new CodexBackend()])("takes only Claude's own update meta, and only for the parent (%s)", (backend) => {
+    const { client } = clientWithFakeProc({ backend });
+    client.sessionId = "parent";
+    const observed = vi.fn();
+    client.on("subscriptionUsage", observed);
+    const rate = { status: "allowed_warning", utilization: 0.83, rateLimitType: "seven_day_opus", resetsAt: 1900000000 };
+    const update = { sessionUpdate: "usage_update", _meta: { "_claude/rateLimit": rate } };
+    (client as any).handleSessionUpdate({ sessionUpdate: "usage_update" }, update._meta, "parent");
+    (client as any).handleSessionUpdate(update, undefined, "child");
+    expect(observed).not.toHaveBeenCalled();
+    (client as any).handleSessionUpdate(update, undefined, "parent");
+    if (backend?.provider === "claude") {
+      expect(observed).toHaveBeenCalledOnce();
+      expect(observed.mock.calls[0][0]).toEqual([{
+        usedPercent: 83, label: "Weekly · Opus", periodType: "seven_day_opus",
+        periodEnd: new Date(rate.resetsAt * 1000).toISOString(), observedAt: expect.any(String),
+      }]);
+    } else expect(observed).not.toHaveBeenCalled();
+  });
+});
+
 describe("AcpClient session mcpServers", () => {
+  it.each([undefined, new CodexBackend(), new ClaudeBackend()])("retains private MCP files through session startup and disposes them with the CLI (%s)", async (backend) => {
+    const { client, written } = clientWithFakeProc({ backend });
+    const cleanup = vi.fn();
+    (client as any).opts.mcpServers = (onDispose) => { onDispose(cleanup); return []; };
+    replyToWrites(client, written, () => ({ sessionId: "s1" }));
+    await client.newSession();
+    await client.loadSession("s1");
+    expect(cleanup).not.toHaveBeenCalled();
+    await client.dispose();
+    await client.dispose();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("cleans files supplied by an async secret read that finishes after CLI disposal", async () => {
+    const { client } = clientWithFakeProc();
+    let finish!: () => void;
+    const cleanup = vi.fn();
+    (client as any).opts.mcpServers = async (onDispose) => {
+      await new Promise<void>((resolve) => { finish = resolve; });
+      onDispose(cleanup);
+      return [];
+    };
+    const servers = (client as any).mcpServersForSession();
+    await client.dispose();
+    finish();
+    await servers;
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
   it("sends the host-owned list on session/new and session/load", async () => {
     const servers = [{ name: "linear", command: "npx", args: ["-y", MCP_REMOTE_PACKAGE, "https://mcp.linear.app/mcp"] }];
     const { client, written } = clientWithFakeProc();
@@ -422,6 +553,28 @@ describe("AcpClient permission responses", () => {
   });
 });
 
+describe("question tool identity on the ACP request", () => {
+  it.each(["x.ai/ask_user_question", "_x.ai/ask_user_question"])("preserves toolCallId from %s", async (method) => {
+    const { client, written } = clientWithFakeProc();
+    const received = vi.fn();
+    client.on("questionRequest", received);
+    const params = { sessionId: "s", toolCallId: "call-colour", questions: [{ question: "Which colour?" }] };
+    await (client as any).handleServerRequest({ id: 0, method, params });
+    expect(received).toHaveBeenCalledWith({ id: 0, ...params });
+    expect(written).toEqual([]);
+  });
+
+  it.each([undefined, null, "", 42])("leaves missing or invalid tool identity uncorrelated (%s)", async (toolCallId) => {
+    const { client } = clientWithFakeProc();
+    const received = vi.fn();
+    client.on("questionRequest", received);
+    await (client as any).handleServerRequest({
+      id: 0, method: "_x.ai/ask_user_question", params: { sessionId: "s", toolCallId, questions: [] },
+    });
+    expect(received).toHaveBeenCalledWith({ id: 0, sessionId: "s", questions: [] });
+  });
+});
+
 describe("AcpClient Plan terminal environment", () => {
   it("strips agent-supplied environment overrides from allowed Plan commands", async () => {
     const { client, written } = clientWithFakeProc();
@@ -546,6 +699,66 @@ describe("AcpClient Plan terminal environment", () => {
 });
 
 describe("AcpClient.request timer lifecycle", () => {
+  it.each([0, 10_000])("immediately suspends and resumes with fresh idle time (absolute %s)", async (absoluteMs) => {
+    vi.useFakeTimers();
+    try {
+      const { client } = clientWithFakeProc({
+        timeouts: { promptIdleTimeoutMs: 1_000, promptAbsoluteTimeoutMs: absoluteMs },
+      });
+      let settled = false;
+      const p = (client as any).request("session/prompt", {});
+      void p.then(() => { settled = true; }, () => { settled = true; });
+      const timedOut = expect(p).rejects.toThrow("ACP request timed out: session/prompt");
+      await vi.advanceTimersByTimeAsync(900);
+      client.setHumanWaitActive(true);
+      expect(vi.getTimerCount()).toBe(absoluteMs ? 1 : 0);
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(settled).toBe(false);
+      client.setHumanWaitActive(false);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).toBe(false);
+      // Repeating the same state must not extend the interval.
+      client.setHumanWaitActive(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await timedOut;
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("enforces the original absolute deadline while waiting, even with ACP traffic", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client } = clientWithFakeProc({
+        timeouts: { promptIdleTimeoutMs: 1_000, promptAbsoluteTimeoutMs: 5_000 },
+      });
+      const p = (client as any).request("session/prompt", {});
+      const timedOut = expect(p).rejects.toThrow("ACP request timed out: session/prompt");
+      await vi.advanceTimersByTimeAsync(900);
+      client.setHumanWaitActive(true);
+      await vi.advanceTimersByTimeAsync(3_600);
+      (client as any).touchPendingPromptTimers();
+      await vi.advanceTimersByTimeAsync(500);
+      await timedOut;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("does not suspend ordinary requests, and clears the suspended timer on prompt completion", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client } = clientWithFakeProc({ timeouts: { requestTimeoutMs: 1_000 } });
+      client.setHumanWaitActive(true);
+      const p = (client as any).request("session/prompt", {});
+      const other = (client as any).request("session/set_mode", {});
+      const timedOut = expect(other).rejects.toThrow("ACP request timed out: session/set_mode");
+      await vi.advanceTimersByTimeAsync(1_000);
+      await timedOut;
+      (client as any).onLine(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }));
+      await p;
+      client.setHumanWaitActive(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("clears the per-request timeout when the response arrives (no leaked timer)", async () => {
     vi.useFakeTimers();
     try {
@@ -799,7 +1012,7 @@ describe("AcpClient.interject wire", () => {
   });
 
   it("sends additive content when image blocks are provided", async () => {
-    const { client, written } = clientWithFakeProc();
+    const { client, written } = clientWithFakeProc({ grokVersion: "1.0.5", grokVersionVerified: true });
     (client as any).sessionId = "s1";
     replyToWrites(client, written, () => ({ status: "queued" }));
     const content = [

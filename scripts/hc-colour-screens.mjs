@@ -1,4 +1,4 @@
-// Do the effort dots and the check mark actually READ in High Contrast?
+// Do the effort knob and the check mark actually READ in High Contrast?
 //
 // #139 was fixed by reading VS Code's own theme data — `button.background` is
 // literally black for hcDark — and that is strong evidence about the cause but
@@ -17,7 +17,9 @@ import * as path from "node:path";
 const root = process.cwd();
 const OUT = process.env.SCREENS_DIR || ".screens";
 fs.mkdirSync(OUT, { recursive: true });
-const css = fs.readFileSync(path.join(root, "media", "chat.css"), "utf8");
+// A stylesheet BOM is valid at byte zero, but becomes part of the :root
+// selector when embedded after other rules in a <style> element.
+const css = fs.readFileSync(path.join(root, "media", "chat.css"), "utf8").replace(/^\uFEFF/, "");
 const log = (m) => console.log(`[hc-colour] ${m}`);
 
 // Straight from vs/workbench/workbench.desktop.main.js (VS Code 1.131.0).
@@ -45,7 +47,7 @@ const page = async (browser, theme, token) => {
   const vars = Object.entries(THEMES[theme]).map(([k, v]) => `--vscode-${k}: ${v};`).join("\n");
   // The one line under test, applied as the old token or the new one.
   const override = token === "old"
-    ? `.effort-dot.active::before { background: var(--vscode-button-background); border-color: var(--vscode-button-background); }
+    ? `.effort-strip-stop.current i { background: var(--vscode-button-background); }
        .popover-check { color: var(--vscode-button-background); }`
     : "";
   const p = await browser.newPage({ viewport: { width: 320, height: 150 }, deviceScaleFactor: 2 });
@@ -58,11 +60,13 @@ const page = async (browser, theme, token) => {
     ${override}
   </style></head><body>
     <div class="gear-popover">
-      <div class="model-effort-row">
-        <span class="model-name-btn">grok-4-fast</span>
-        <span class="effort-dots">
-          <span class="effort-dot active"></span><span class="effort-dot active"></span><span class="effort-dot"></span>
-        </span>
+      <div class="model-effort-strip">
+        <div class="effort-strip-track" style="--n:3;--f:.5;--knob:var(--e3)">
+          <span class="effort-strip-rail"></span><span class="effort-strip-fill"></span>
+          <button class="effort-strip-stop past"><i></i></button>
+          <button class="effort-strip-stop current"><i></i></button>
+          <button class="effort-strip-stop"><i></i></button>
+        </div>
       </div>
       <div class="toolbar-popover-item"><span class="gear-lead"><span>Coding</span></span><span class="popover-check">&#10003;</span></div>
     </div>
@@ -83,14 +87,16 @@ const ratio = (a, b) => {
   return (x + 0.05) / (y + 0.05);
 };
 
-const browser = await chromium.launch();
+const browser = await chromium.launch({ executablePath: process.env.COMPOSER_CHROMIUM ||
+  (process.platform === "win32" && fs.existsSync("C:/Program Files/Google/Chrome/Application/chrome.exe")
+    ? "C:/Program Files/Google/Chrome/Application/chrome.exe" : undefined) });
 for (const theme of Object.keys(THEMES)) {
   for (const token of ["old", "new"]) {
     const p = await page(browser, theme, token);
     const file = path.join(OUT, `hc-${theme}-${token}.png`);
     await p.screenshot({ path: file });
-    const dot = await p.$eval(".effort-dot.active", (el) =>
-      getComputedStyle(el, "::before").backgroundColor);
+    const dot = await p.$eval(".effort-strip-stop.current i", (el) =>
+      getComputedStyle(el).backgroundColor);
     const check = await p.$eval(".popover-check", (el) => getComputedStyle(el).color);
     await p.close();
     const surface = THEMES[theme]["editorWidget-background"];

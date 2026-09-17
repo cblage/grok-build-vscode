@@ -4,7 +4,7 @@
 // agentError tones. AudioContext is stubbed only so the test can observe
 // create / resume / suspend without changing runtime behavior.
 import { describe, expect, it } from "vitest";
-import { bootWebview, dispatch, click, press } from "./webview-harness";
+import { openAppSettings, bootWebview, dispatch, click, press } from "./webview-harness";
 
 type FakeCtx = {
   state: string;
@@ -167,11 +167,7 @@ describe("AudioContext is not held open while silent (#107)", () => {
     const { window, doc } = bootWebview({
       beforeScripts: (w) => { created = installFakeAudio(w); },
     });
-    click(window, doc.getElementById("gear-btn")!);
-    const settings = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")].find(
-      (el) => /(^|\s)Settings$/.test((el.textContent || "").replace(/\s+/g, " ").trim()),
-    ) as HTMLElement;
-    click(window, settings);
+    openAppSettings(window, doc);
     const notifications = [...doc.querySelectorAll("#settings-overlay .settings-nav-item")].find(
       (el) => (el.textContent || "").trim() === "Notifications",
     ) as HTMLElement;

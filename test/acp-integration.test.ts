@@ -311,7 +311,7 @@ describe("ACP integration (real subprocess, fake CLI)", () => {
     expect(line).toContain('"reasoningEffort":"low"'); // switch re-sends the override
   });
 
-  it("startup: a valid default effort is forwarded as --reasoning-effort before stdio", async () => {
+  it.each(["low", "medium"])("startup: explicit effort overrides a %s Grok TOML default", async (configuredEffort) => {
     const logs: string[] = [];
     const effortClient = new AcpClient({
       cliPath: fixtureCli(),
@@ -321,14 +321,21 @@ describe("ACP integration (real subprocess, fake CLI)", () => {
         GROK_HOME: path.join(planHome, ".grok"),
         FAKE_WORKSPACE_ROOT: workspace,
         FAKE_PLAN_PATH: path.join(planHome, ".grok", "sessions", "cwd-x", "sess-effort", "plan.md"),
+        FAKE_CONFIG_EFFORT: configuredEffort,
       },
       effort: "high",
       log: (msg) => logs.push(msg),
     });
 
     try {
+      const advertised: (string | undefined)[] = [];
+      effortClient.on("session", () => advertised.push(effortClient.availableModels[0]?.reasoningEffort));
       await effortClient.start();
       await effortClient.newSession();
+      expect(effortClient.currentReasoningEffort).toBe("high");
+      expect(advertised).toEqual(["high"]);
+      await waitForStderr(logs, /SET_MODEL:/);
+      expect(logs.join("\n")).toContain('"reasoningEffort":"high"');
 
       // The fixture exits 2 on any argv it doesn't recognize, so a successful
       // session proves the forwarded shape (`agent --reasoning-effort high stdio`)

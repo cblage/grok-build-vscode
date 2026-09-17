@@ -11,7 +11,7 @@
  * or navigating to the tree keeps them; Cancel and closing a dirty tab ask;
  * page unload still warns while any scope owns dirty text.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { bootWebview, click, dispatch, type Harness, type Posted } from "./webview-harness";
 
 const CWD_A = "/work/app";
@@ -587,5 +587,289 @@ describe("remote discard and close semantics", () => {
 
     expect([...h.doc.querySelectorAll("button")].some((item) => item.textContent === "Edit")).toBe(false);
     expect(requests(h, "writeProjectFile")).toHaveLength(0);
+  });
+
+  /*
+   * A cloud machine suspends about a minute after the last frame, which is one
+   * paragraph of reading, so the Changes view meets a sleeping host constantly
+   * and its read simply gets no answer.
+   *
+   * Silence must not convict that host of being a released build too old to
+   * echo requestIds. The poison set exists to stop a late legacy answer landing
+   * in a different request's tab, and applying it on a timeout made every later
+   * read answer "Request state is stale. Refresh this page and try again." from
+   * memory, without ever reaching the wire — so the view stayed dead after the
+   * machine woke, and reloading the page was the only cure. The owner hit that
+   * repeatedly. A reply WITHOUT a requestId is what proves an old host, and
+   * that case is covered above.
+   */
+  it.each([false, true])("still reads after a silent host, so a woken machine fills the view in (cloud=%s)", async (cloud) => {
+    const caps = { browseProjectFiles: true, editProjectFiles: true, gitChanges: true };
+    const h = bootWebview({ remote: true, beforeScripts: (window) => Object.assign(window, { grokCloudHost: cloud }) });
+
+    // The harness window owns its own timers, so hold the request timeout here
+    // and fire it by hand rather than waiting thirty real seconds.
+    const expiries: Array<() => void> = [];
+    const realTimeout = h.window.setTimeout.bind(h.window);
+    (h.window as unknown as { setTimeout: unknown }).setTimeout = (fn: () => void, ms: number) => {
+      if (ms >= 20_000) {
+        expiries.push(fn);
+        return 0;
+      }
+      return realTimeout(fn, ms);
+    };
+    const boot = () => dispatch(h.window, {
+      type: "initialState", cwd: CWD_A, capabilities: caps, appPurpose: "coding",
+    });
+    boot();
+    dispatch(h.window, {
+      type: "repos",
+      entries: [{ cwd: CWD_A, label: "app", available: true, pinned: false, updatedAt: 2 }],
+      selectedCwd: CWD_A,
+    });
+    await settle();
+    click(h.window, h.doc.getElementById("files-browse-btn")!);
+    await settle();
+    const changesBtn = h.doc.querySelector(".gfp-changes-btn") as HTMLElement | null;
+    expect(changesBtn, "no Changes control").toBeTruthy();
+    click(h.window, changesBtn!);
+    await settle();
+
+    // Asleep: the read goes out and nothing at all comes back.
+    const asked = requests(h, "gitStatus").length;
+    expect(asked).toBeGreaterThan(0);
+    expect(expiries.length).toBeGreaterThan(0);
+    for (const expire of expiries.splice(0)) expire();
+    await settle();
+    // The SAME sentence on a cloud machine and a laptop, deliberately. This
+    // used to open with the relay page's own "Waking your cloud machine…" so
+    // that two guesses at one fact spoke with one voice; the page no longer
+    // guesses — the relay reports the phase — and a timed-out read has no
+    // standing to say anything about the machine at all.
+    expect(h.doc.querySelector(".gfp-changes-empty")?.textContent)
+      .toBe("No answer yet. This view fills in when the machine reconnects.");
+
+    // It wakes and dials back in. The next read must reach the WIRE — and land
+    // in a view the person is still looking at, which is why nothing clicks
+    // back into Changes here. A reconnect is not a project switch.
+    boot();
+    await settle();
+    expect(h.doc.querySelector(".gfp-changes-mode"), "the reconnect dropped the Changes view").toBeTruthy();
+    expect(requests(h, "gitStatus").length).toBeGreaterThan(asked);
+    await reply(h, requests(h, "gitStatus").at(-1)!, { type: "gitStatusResult", ok: true, snapshot: {
+      branch: "main", files: [{ path: "docs/loremipsum.md", status: "?", added: null, deleted: null }],
+    } });
+    await settle();
+    expect(h.doc.querySelector(".gfp-changes-headline")?.textContent).toBe("1 file not committed");
+    await h.window.happyDOM.abort();
+  });
+
+  /**
+   * A machine woken in ten seconds must not leave the view saying "waking" for
+   * another minute — nor drop the person back into the file tree.
+   *
+   * Every remote snapshot carries an `initialState`, so a cloud machine dialling
+   * back in re-asserts the scope it already had. Two things then went wrong at
+   * once, both of them exactly where the notice above promises the view fills
+   * itself in. `setScope` read the re-assert as a project switch and left
+   * Changes for the tree. And the read it started declined, because the scope
+   * was still `loading` from the request that vanished into the frozen socket —
+   * so even clicking back in waited out that request's own thirty seconds.
+   *
+   * This deliberately does NOT fire the expiries. The reconnect arriving while
+   * the first read is still in flight is the ordinary case now that the relay
+   * probes a frozen uplink on the next click instead of waiting for a heartbeat
+   * to find the corpse.
+   */
+  it("keeps the Changes view across a reconnect, and re-reads without waiting out the timeout", async () => {
+    const caps = { browseProjectFiles: true, editProjectFiles: true, gitChanges: true };
+    const h = bootWebview({ remote: true, beforeScripts: (window) => Object.assign(window, { grokCloudHost: true }) });
+
+    const expiries: Array<() => void> = [];
+    const realTimeout = h.window.setTimeout.bind(h.window);
+    (h.window as unknown as { setTimeout: unknown }).setTimeout = (fn: () => void, ms: number) => {
+      if (ms >= 20_000) {
+        expiries.push(fn);
+        return 0;
+      }
+      return realTimeout(fn, ms);
+    };
+    const boot = () => dispatch(h.window, {
+      type: "initialState", cwd: CWD_A, capabilities: caps, appPurpose: "coding",
+    });
+    boot();
+    dispatch(h.window, {
+      type: "repos",
+      entries: [{ cwd: CWD_A, label: "app", available: true, pinned: false, updatedAt: 2 }],
+      selectedCwd: CWD_A,
+    });
+    await settle();
+    click(h.window, h.doc.getElementById("files-browse-btn")!);
+    await settle();
+    const changesBtn = h.doc.querySelector(".gfp-changes-btn") as HTMLElement | null;
+    expect(changesBtn, "no Changes control").toBeTruthy();
+    click(h.window, changesBtn!);
+    await settle();
+    expect(h.doc.querySelector(".gfp-changes-mode"), "never entered Changes").toBeTruthy();
+
+    // The machine freezes: the read is on the wire and nothing comes back.
+    const asked = requests(h, "gitStatus").length;
+    expect(asked).toBeGreaterThan(0);
+    expect(expiries.length, "no request timeout was armed").toBeGreaterThan(0);
+
+    // It wakes and dials back in, still inside that first request's lifetime.
+    //
+    // The snapshot is NOT what says so. Reading a second `initialState` as
+    // proof the connection died was a guess this webview had no way to make,
+    // and it was wrong in both directions: a session swap produces one with
+    // nothing wrong, and a suspended machine can be gone a minute before one
+    // arrives.
+    boot();
+    await settle();
+    expect(requests(h, "gitStatus").length, "a snapshot on its own re-read").toBe(asked);
+
+    // The page's shell is the thing that can see a socket, and it says so.
+    dispatch(h.window, { type: "hostReachable" });
+    await settle();
+    expect(h.doc.querySelector(".gfp-changes-mode"), "the reconnect dropped the Changes view").toBeTruthy();
+    expect(requests(h, "gitStatus").length, "the reconnect did not re-read").toBeGreaterThan(asked);
+
+    await reply(h, requests(h, "gitStatus").at(-1)!, { type: "gitStatusResult", ok: true, snapshot: {
+      branch: "main", files: [{ path: "docs/loremipsum.md", status: "?", added: null, deleted: null }],
+    } });
+    await settle();
+    expect(h.doc.querySelector(".gfp-changes-headline")?.textContent).toBe("1 file not committed");
+    await h.window.happyDOM.abort();
+  });
+
+  it("re-reads the OPEN DIFF across a reconnect, not just the list", async () => {
+    // The owner hit this on a phone: the diff subview kept "The connection
+    // dropped before that finished." for ever, because the reconnect refreshed
+    // the Changes LIST and nothing ever re-asked for the diff on screen.
+    const caps = { browseProjectFiles: true, editProjectFiles: true, gitChanges: true };
+    const h = bootWebview({ remote: true, beforeScripts: (window) => Object.assign(window, { grokCloudHost: true }) });
+    const boot = () => dispatch(h.window, {
+      type: "initialState", cwd: CWD_A, capabilities: caps, appPurpose: "coding",
+    });
+    boot();
+    dispatch(h.window, {
+      type: "repos",
+      entries: [{ cwd: CWD_A, label: "app", available: true, pinned: false, updatedAt: 2 }],
+      selectedCwd: CWD_A,
+    });
+    await settle();
+    click(h.window, h.doc.getElementById("files-browse-btn")!);
+    await settle();
+    const changesBtn = h.doc.querySelector(".gfp-changes-btn") as HTMLElement | null;
+    expect(changesBtn, "no Changes control").toBeTruthy();
+    click(h.window, changesBtn!);
+    await settle();
+
+    await reply(h, requests(h, "gitStatus").at(-1)!, { type: "gitStatusResult", ok: true, snapshot: {
+      branch: "main", files: [{ path: "docs/loremipsum.md", status: "?", added: null, deleted: null }],
+    } });
+    const row = h.doc.querySelector(".gfp-change-row") as HTMLElement | null;
+    expect(row, "no change row to open").toBeTruthy();
+    click(h.window, row!);
+    await settle();
+    const askedDiff = requests(h, "gitFileDiff").length;
+    expect(askedDiff, "the row did not request a diff").toBeGreaterThan(0);
+
+    // The machine freezes with that diff request on the wire, then wakes and
+    // dials back in with a fresh snapshot — which, again, proves nothing about
+    // the socket on its own.
+    boot();
+    await settle();
+    expect(requests(h, "gitFileDiff").length, "a snapshot on its own re-read").toBe(askedDiff);
+
+    dispatch(h.window, { type: "hostReachable" });
+    await settle();
+    expect(
+      requests(h, "gitFileDiff").length,
+      "the reconnect re-read the list but left the open diff on the dead connection",
+    ).toBeGreaterThan(askedDiff);
+
+    // The answer to the NEW request lands, and the dropped-connection message
+    // from the abandoned one does not survive it.
+    const asked = requests(h, "gitFileDiff").at(-1)!;
+    dispatch(h.window, {
+      type: "gitFileDiffResult",
+      ok: true,
+      patch: "@@ -0,0 +1 @@\n+lorem\n",
+      cwd: asked.cwd,
+      path: "docs/loremipsum.md",
+      requestId: asked.requestId,
+    });
+    await settle();
+    const changesText = h.doc.querySelector(".gfp-changes")?.textContent || "";
+    expect(changesText, "the abandoned diff's error outlived the reconnect")
+      .not.toContain("The connection dropped");
+    await h.window.happyDOM.abort();
+  });
+
+  it.each([false, true])("keeps background polling from poisoning a later explicit read (legacy=%s)", async (legacy) => {
+    const h = bootWebview({ remote: true });
+    const intervals = new Map<number, () => void>();
+    const expiries = new Map<number, () => void>();
+    const originalTimeout = h.window.setTimeout.bind(h.window);
+    const originalClear = h.window.clearTimeout.bind(h.window);
+    let id = 100000;
+    Object.assign(h.window, {
+      setInterval: (fn: () => void, ms: number) => {
+        expect(ms).toBe(30000);
+        intervals.set(++id, fn);
+        return id;
+      },
+      clearInterval: (key: number) => intervals.delete(key),
+      setTimeout: (fn: () => void, ms: number) => {
+        if (ms < 20000) return originalTimeout(fn, ms);
+        expiries.set(++id, fn);
+        return id;
+      },
+      clearTimeout: (key: number) => { if (!expiries.delete(key)) originalClear(key); },
+    });
+    const snapshot = { branch: "main", hasRemote: false,
+      files: [{ path: "docs/loremipsum.md", status: "?", added: null, deleted: null }] };
+    dispatch(h.window, { type: "initialState", cwd: CWD_A, appPurpose: "coding",
+      capabilities: { browseProjectFiles: true, gitChanges: true } });
+    await settle();
+    await reply(h, requests(h, "gitStatus").at(-1)!, { type: "gitStatusResult", ok: true, snapshot }, { legacy });
+    click(h.window, h.doc.getElementById("files-browse-btn")!);
+    await settle();
+    await listRoot(h, [], undefined, legacy);
+    click(h.window, h.doc.querySelector(".gfp-changes-btn")!);
+    await settle();
+    await reply(h, requests(h, "gitStatus").at(-1)!, { type: "gitStatusResult", ok: true, snapshot }, { legacy });
+    const before = requests(h, "gitStatus").length;
+    expect(intervals.size).toBe(legacy ? 0 : 1);
+    for (const tick of [...intervals.values()]) tick();
+    await settle();
+    expect(requests(h, "gitStatus")).toHaveLength(before + (legacy ? 0 : 1));
+    if (!legacy) {
+      const poll = requests(h, "gitStatus").at(-1)!;
+      expect(Object.keys(poll).sort()).toEqual(["cwd", "requestId", "type"]);
+      expect(expiries.size).toBe(1);
+      const unchanged = h.doc.querySelector(".gfp-changes")!.innerHTML;
+      for (const expire of [...expiries.values()]) expire();
+      expiries.clear();
+      await settle();
+      expect(h.doc.querySelector(".gfp-changes")!.innerHTML).toBe(unchanged);
+      for (const tick of [...intervals.values()]) tick();
+      await settle();
+      expect(requests(h, "gitStatus")).toHaveLength(before + 2);
+      await reply(h, poll, { type: "gitStatusResult", ok: true, snapshot: { branch: "stale", files: [] } });
+      expect(h.doc.querySelector(".gfp-changes-branch-name")?.textContent).toBe("main");
+      await reply(h, requests(h, "gitStatus").at(-1)!, { type: "gitStatusResult", ok: true, snapshot });
+    }
+    // Even on a legacy host, the next deliberate visit still reaches the wire.
+    click(h.window, h.doc.querySelector(".gfp-title")!);
+    expect(intervals.size).toBe(0);
+    const explicitBefore = requests(h, "gitStatus").length;
+    click(h.window, h.doc.querySelector(".gfp-changes-btn")!);
+    await settle();
+    expect(requests(h, "gitStatus")).toHaveLength(explicitBefore + 1);
+    await reply(h, requests(h, "gitStatus").at(-1)!, { type: "gitStatusResult", ok: true, snapshot }, { legacy });
+    expect(h.doc.querySelector(".gfp-changes-headline")?.textContent).toBe("1 file not committed");
+    await h.window.happyDOM.abort();
   });
 });

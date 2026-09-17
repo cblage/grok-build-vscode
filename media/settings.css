@@ -557,6 +557,20 @@ body.settings-page .settings-surface {
   color: var(--vscode-textLink-foreground, #3794ff);
 }
 
+/* The consent link opens the provider authorization page, so it is a
+   button rather than link-coloured prose. `.settings-action.is-primary` carries
+   the colours; an anchor still needs the parts a <button> gets for free. */
+.settings-connector-oauth-link {
+  display: inline-flex;
+  align-items: center;
+  /* The form is a one-column grid, so a child stretches edge to edge unless
+     told otherwise. justify-self is the inline axis here; align-self would
+     silently do nothing. */
+  justify-self: start;
+  text-decoration: none;
+  padding: 6px 14px;
+}
+
 .settings-connector-key-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1435,4 +1449,22 @@ a.settings-github-flow-open {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+/* Config paths remain readable on narrow Settings pages. */
+.settings-provider-configs {
+  display: block;
+}
+.settings-provider-configs > summary {
+  cursor: pointer;
+}
+.settings-provider-config {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+}
+.settings-provider-config .settings-row-copy {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }

@@ -24,14 +24,18 @@ export class RemoteClientState<T, C = never> {
   }>();
 
   constructor(
-    private readonly defaultCwd: string,
+    private readonly defaultCwd: string | (() => string),
     private readonly normalize: (cwd: string) => string = (cwd) => cwd,
   ) {}
+
+  private currentDefaultCwd(): string {
+    return typeof this.defaultCwd === "function" ? this.defaultCwd() : this.defaultCwd;
+  }
 
   ready(clientId: string): string {
     const existing = this.cwdByClient.get(clientId);
     if (existing) return existing;
-    const cwd = this.defaultCwd;
+    const cwd = this.currentDefaultCwd();
     this.cwdByClient.set(clientId, cwd);
     return cwd;
   }
@@ -137,7 +141,7 @@ export class RemoteClientState<T, C = never> {
     if (!this.cwdByClient.has(clientId)) {
       throw new Error(`Remote client ${clientId} is not ready`);
     }
-    const selected = cwd || this.defaultCwd;
+    const selected = cwd || this.currentDefaultCwd();
     const previous = this.cwdByClient.get(clientId);
     this.cwdByClient.set(clientId, selected);
     if (previous && this.normalize(previous) !== this.normalize(selected)) {

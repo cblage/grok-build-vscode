@@ -4,9 +4,16 @@
 
 ## Telemetry — what is sent
 
-A single, anonymous **`session_start`** event ([Aptabase](https://aptabase.com)), fired on the **first real message** of a session — never for empty or abandoned sessions. Legacy primer turns replayed from sessions created by older extension builds do not count as real messages. Its only purpose is to gauge how many people use the extension, which models/modes are popular, and whether our default settings are the right ones.
+Anonymous events go to [Aptabase](https://aptabase.com). **`session_start`** fires on the **first real message** of a conversation — never for empty or abandoned conversations. Legacy primer turns replayed from sessions created by older extension builds do not count as real messages. It gauges how many people use the extension, which models/modes are popular, and whether our default settings are the right ones.
 
-The event carries:
+Two smaller events measure remote intent and use:
+
+- **`remote_portal_opened`** fires when someone opens the AFK Pilot portal from the local host. Its only custom props are the anonymous install id, `hostKind`, and `withHint` (whether the portal was opened with connection guidance). It can fire without starting a conversation.
+- **`session_remote_started`** fires once on the first remote message of a live conversation, including one that began locally. Its only custom props are the anonymous install id, `hostKind`, `clientDevice` (touch/mobile or desktop browser), `sessionOrigin` (the original first-message origin), and `provider` (the current CLI). A remote-first conversation deliberately emits both this event and `session_start`. The origin and once-only flag are ephemeral, held on the live conversation; after a cold reload the original origin is unknown and omitted, and a new live instance can report remote use again.
+
+All three share the system fields below and the same opt-out/fork gates. Their random Aptabase envelope `sessionId` is shared across conversations within one extension host process and rotates after **more than one hour without an emitted event**, or on process restart. It is never a conversation id. Aptabase session totals therefore count activity windows, which may contain several conversations or just a portal open. **Use the unchanged `session_start` event count for conversation totals comparable with historical data**, rather than Aptabase session totals.
+
+The `session_start` event carries:
 
 | Field | Example | Why |
 |---|---|---|
@@ -22,7 +29,7 @@ The event carries:
 | **Returning install** | `returningInstall: true` / `false` | `true` when this machine already had its anonymous install id stored; `false` on the first `session_start` that also creates that id |
 | **AFK Pilot UI preferences** (when reported by a connected browser) | `remoteFontScale: 140`, `remoteReadRepliesAloud: true` | whether remote users adjust text size or enable spoken replies; omitted when no browser reports them |
 | **Session origin / client device** | `sessionOrigin: remote`, `clientDevice: mobile` | whether the first message came from the desk host or AFK Pilot, and whether that client was a desktop browser or looked touch/mobile; local desk sessions are always desktop |
-| **Host kind** | `hostKind: vscode` / `desktop` | whether the session ran in a VS Code-compatible editor or the standalone desktop client |
+| **Host kind** | `hostKind: vscode` / `desktop` / `sprite` | whether the session ran in a VS Code-compatible editor, the standalone desktop client, or a cloud host; cloud takes precedence even when it runs the desktop binary |
 | **Host app** | `host: Visual Studio Code`, `Cursor`, `Antigravity IDE`, `Grok Build Desktop` | `vscode.env.appName` after a length / character / path check; omitted when missing or malformed. Product names we have not seen yet are forwarded — vocabulary is not allowlisted |
 | **OS name** | `Windows`, `macOS`, `Linux` | coarse platform label (`systemProps.osName`) |
 | **Kernel version** | `10.0.26200`, `23.6.0` | `systemProps.osVersion` is Node's `os.release()` string — a kernel/build id, not a marketing OS version such as "Windows 11" |
@@ -30,7 +37,7 @@ The event carries:
 | **Locale** | `en` | host UI language (`vscode.env.language` / desktop `en`); not a geographic location |
 | **Debug vs Release** | `isDebug: false` | development host vs a published/installed build — this is what splits Aptabase's Debug/Release streams |
 | **SDK label** | `grok-vscode-phuryn@1.6.1` | Aptabase `systemProps.sdkVersion`; names this client, not a third-party SDK |
-| **Event session id** | a random UUID, new on every event | Aptabase envelope `sessionId` — not the grok conversation id and not the install id |
+| **Event session id** | a random UUID shared within the process's activity window | Aptabase envelope `sessionId`, renewed after more than one idle hour or process restart — not the grok conversation id and not the install id |
 | **Country** | derived by Aptabase from your IP | rough geography |
 
 Country is the only thing derived from your IP, and the **IP itself is discarded — never stored**.
@@ -72,14 +79,53 @@ Separate from telemetry: when **Thumbs feedback to SpaceXAI** is on (`grok.thumb
 
 ## Voice input (Speech-to-Text)
 
-Separate from telemetry: **voice input** sends data to SpaceXAI (formerly xAI), but only when you use it. It is **opt-in per use** — nothing is captured until you click the microphone button. In VS Code, ffmpeg captures locally in the extension host. In AFK Pilot, the browser sends ephemeral raw PCM through the linked relay connection to that same host; it is never persisted or content-logged. The host then sends the following to **SpaceXAI's Speech-to-Text endpoint** (`api.x.ai/v1/stt`) to produce the transcript:
+Separate from telemetry: **voice input** sends data to one transcription vendor —
+**SpaceXAI** (formerly xAI) or **OpenAI** — but only when you use it. It is
+**opt-in per use**: nothing is captured until you click the microphone button. In
+VS Code and on the desktop, ffmpeg captures locally in the extension host. In AFK
+Pilot, the browser sends ephemeral raw PCM through the linked relay connection to
+that same host; it is never persisted or content-logged. Explicit local batch mode
+writes a temporary WAV and removes it after transcription.
+
+The host then sends the following to the selected backend — SpaceXAI's
+Speech-to-Text endpoint (`api.x.ai/v1/stt`) or OpenAI's realtime transcription
+endpoint (`api.openai.com/v1/realtime`) — to produce the transcript:
 
 - your **audio** (the recording, streamed live or as a clip);
-- an **STT credential** — the dedicated key you configured (`grok.voiceApiKey` / `GROK_VOICE_API_KEY` / `XAI_API_KEY`) if set, otherwise the token from your `grok login` (`~/.grok/auth.json`), reused so voice works without a separate key;
-- for streaming voice, the configured **language code** (`grok.voiceLanguage`), when set; and
-- for streaming voice, the **recognition keyterms**: the send phrase, `Grok`, and entries from `grok.voiceKeyterms`. These can include project vocabulary, so treat the setting as data sent to SpaceXAI.
+- an **STT credential**, and which one depends on the backend:
+  - **SpaceXAI** — the dedicated key you configured (`grok.voiceApiKey` /
+    `GROK_VOICE_API_KEY` / `XAI_API_KEY`) if set, otherwise the token from your
+    `grok login` (`~/.grok/auth.json`), reused so voice works without a separate
+    key;
+  - **OpenAI** — `grok.voiceOpenAiApiKey` or `OPENAI_API_KEY`, and nothing else.
+    Your **Codex sign-in is never read or forwarded**: there is no fallback to
+    those OAuth credentials, so with no key set this backend is simply
+    unavailable;
+- for streaming voice, the configured **language code** (`grok.voiceLanguage`),
+  when set; and
+- for streaming voice, the **recognition keyterms**: the send phrase, `Grok`, and
+  entries from `grok.voiceKeyterms`. These can include project vocabulary, so
+  treat the setting as data sent to whichever vendor is selected.
 
-The STT credential stays in the extension host and is never sent to AFK Pilot or the browser. Remote microphone audio necessarily crosses AFK Pilot on its way back to your linked host; the host-to-SpaceXAI STT request is otherwise the same as local voice. Voice connection diagnostics log the endpoint and query-parameter names, but redact all query values. If you never use voice, none of this happens. To avoid sending your login token to SpaceXAI specifically, set a dedicated `grok.voiceApiKey`. Setup + details: [docs/voice-setup.md](voice-setup.md).
+The STT credential stays in the extension host and is never sent to AFK Pilot, the
+browser, or the availability frames the chat and remote clients read. Remote
+microphone audio necessarily crosses AFK Pilot on its way back to your linked
+host; the host-to-vendor STT request is otherwise the same as local voice. Voice
+connection diagnostics log the endpoint and query-parameter names, but redact all
+query values, including language and vocabulary. If you never use voice, none of
+this happens.
+
+**To avoid sending your `grok login` token to SpaceXAI specifically, set a
+dedicated `grok.voiceApiKey`** — or pick the OpenAI backend, which never has a
+login token to fall back on.
+
+Which vendor gets the audio: Auto prefers OpenAI on Codex and SpaceXAI on
+Grok/Claude, falling back to the other when the preferred one's credential is
+absent. An explicit choice in settings takes precedence and is never overridden —
+if that backend has no credential, voice is unavailable rather than silently sent
+elsewhere. The chosen vendor is fixed for the whole of a recording, including
+hands-free restarts and errors. Setup + details:
+[docs/voice-setup.md](voice-setup.md).
 
 ## Read simplified summaries
 

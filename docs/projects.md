@@ -139,6 +139,21 @@ For anything that is not github.com, the failure is reported as git described
 it — `gh auth login` cannot help a GitLab or Bitbucket sign-in, and offering it
 would send you down the wrong path.
 
+## Telling them apart
+
+The `⋯` on a project row offers **Set color** and **Set icon**. The colour tints
+the project's mark; the icon is the mark itself — ninety-five to choose from,
+grouped by what projects tend to be (Shapes, Build, Work, Talk, People, Play),
+with a search over their names and the plain folder at the top to go back to
+none.
+
+Both belong to the project rather than to the machine you set them on, so a
+project looks the same in VS Code, in the desktop app, on a Cloud machine and on
+your phone. The mark is drawn everywhere the project is named: its row in the
+rail, the chip above the message box, the project switcher, and the title above
+the file panel. The same project always shows the same glyph — that is the
+point of it.
+
 ## Removing a project
 
 The `⋯` on a project row offers **Remove**, which takes it out of the list and

@@ -782,6 +782,47 @@ describe("projects rail", () => {
     const pinned = (id: string, cwd: string, name: string, at: number) =>
       ({ ...row(id, cwd, name), pinnedAt: at });
 
+    it("pins immediately, preserves a newer unpin through stale replies, and fixes cached row controls", () => {
+      const { doc, window, posted } = boot("/work/alpha");
+      const a = row("a1", "/work/alpha", "alpha one", 9);
+      dispatch(window, { ...pinnedFrame([]), pinRequests: true });
+      dispatch(window, sessionsFrame([a]));
+      click(window, doc.querySelector('.rail-repo [data-session-id="a1"] .rail-pin-btn') as HTMLElement);
+      expect(doc.querySelector('.rail-pinned [data-session-id="a1"]')).not.toBeNull();
+      expect(doc.querySelector('.rail-repo [data-session-id="a1"] .rail-pin-btn')?.getAttribute("title")).toBe("Unpin conversation");
+      const pin = posted.find((m) => m.type === "toggleSessionPin")!;
+      expect(pin.requestId).toEqual(expect.any(String));
+      click(window, doc.querySelector('.rail-pinned [data-session-id="a1"] .rail-pin-btn') as HTMLElement);
+      const unpin = posted.filter((m) => m.type === "toggleSessionPin")[1];
+      expect(unpin.pinned).toBe(false);
+      expect(doc.querySelector(".rail-pinned")).toBeNull();
+      dispatch(window, { ...pinnedFrame([{ ...a, pinnedAt: 10 }]), pinRequests: true, requestId: pin.requestId });
+      expect(doc.querySelector(".rail-pinned")).toBeNull();
+      dispatch(window, { ...pinnedFrame([]), pinRequests: true, requestId: unpin.requestId });
+      dispatch(window, sessionsFrame([{ ...a, pinnedAt: 10 }]));
+      expect(doc.querySelector('.rail-repo [data-session-id="a1"] .rail-pin-btn')?.getAttribute("title")).toBe("Pin conversation");
+    });
+
+    it("does not resurrect a deleted conversation from a pending pin", () => {
+      const { doc, window } = boot("/work/alpha");
+      dispatch(window, { ...pinnedFrame([]), pinRequests: true });
+      dispatch(window, sessionsFrame([row("a1", "/work/alpha", "one", 9)]));
+      click(window, doc.querySelector('.rail-repo [data-session-id="a1"] .rail-pin-btn') as HTMLElement);
+      dispatch(window, { type: "sessionRemoved", id: "a1" });
+      expect(doc.querySelector('[data-session-id="a1"]')).toBeNull();
+    });
+
+    it("rolls back a refused pin and leaves another pending pin visible", () => {
+      const { doc, window, posted } = boot("/work/alpha");
+      dispatch(window, { ...pinnedFrame([]), pinRequests: true });
+      dispatch(window, sessionsFrame([row("a1", "/work/alpha", "one", 9), row("a2", "/work/alpha", "two", 8)]));
+      for (const id of ["a1", "a2"]) click(window, doc.querySelector(`.rail-repo [data-session-id="${id}"] .rail-pin-btn`) as HTMLElement);
+      const requests = posted.filter((m) => m.type === "toggleSessionPin");
+      dispatch(window, { ...pinnedFrame([]), pinRequests: true, requestId: requests[0].requestId });
+      expect(doc.querySelector('.rail-pinned [data-session-id="a1"]')).toBeNull();
+      expect(doc.querySelector('.rail-pinned [data-session-id="a2"]')).not.toBeNull();
+    });
+
     it("shows no Pinned group until something is pinned", () => {
       const { doc } = boot();
       expect([...doc.querySelectorAll(".rail-head-title")].map((e) => e.textContent)).toEqual(["Projects"]);
@@ -1046,7 +1087,7 @@ describe("projects rail", () => {
 
     /** Five projects: one selected, three recent (which the floor would protect
      *  anyway), and two long-idle ones past the floor. */
-    function bootArchive(overrides: Record<string, Record<string, unknown>> = {}) {
+    function bootArchive(overrides: Record<string, Record<string, unknown>> = {}, remote = true) {
       const catalog = [
         repo("home", ago(0), overrides.home),
         repo("one", ago(1), overrides.one),
@@ -1055,7 +1096,7 @@ describe("projects rail", () => {
         repo("stale", ago(80), overrides.stale),
         repo("ancient", ago(400), overrides.ancient),
       ];
-      const h = bootWebview({ remote: true, beforeScripts: withRail });
+      const h = bootWebview({ remote, beforeScripts: withRail });
       dispatch(h.window, { type: "repos", entries: catalog, selectedCwd: "/work/home", activeCwd: "/work/home" });
       // Give every project rows, so activity is read from conversations rather
       // than from the catalog's directory mtime.
@@ -1071,6 +1112,69 @@ describe("projects rail", () => {
       }
       return h;
     }
+
+    it("archives the project you are standing in", () => {
+      // Owner, 2026-09-06: "we can stay inside.... now in the archive. archive
+      // is just a way we group projects." The rail used to refuse to file the
+      // open project under Archived, so Archive on the project a machine boots
+      // into stored the choice and changed nothing on screen -- indistinguishable
+      // from a dead button. An explicit choice outranks the heuristic.
+      const h = bootArchive({}, true);
+      const head = (name: string) => [...h.doc.querySelectorAll(".rail-repo-head")]
+        .find((el) => el.querySelector(".rail-repo-label")?.textContent === name)!;
+      click(h.window, menuItem(openMenu(h.window, head("home")), "Archive project")!);
+      expect(h.posted).toContainEqual({ type: "setRepoArchived", cwd: "/work/home", archived: true });
+      const catalog = ["home", "one", "two", "three", "stale", "ancient"].map((name) =>
+        repo(name, ago(0), name === "home" ? { archived: true, archivedAt: Date.now() } : {}));
+      dispatch(h.window, { type: "repos", entries: catalog, selectedCwd: "/work/home", activeCwd: "/work/home" });
+      expect(sectionRepos(h.doc, "projects")).not.toContain("home");
+      const archiveButton = [...h.doc.querySelectorAll(".rail-head-btn")]
+        .find((el) => el.textContent?.includes("Project Archive"))!;
+      click(h.window, archiveButton);
+      expect(sectionRepos(h.doc, "archived")).toContain("home");
+    });
+
+    it.each([false, true])("archives and restores through the catalog on desktop/remote=%s", (remote) => {
+      const h = bootArchive({}, remote);
+      const head = (name: string) => [...h.doc.querySelectorAll(".rail-repo-head")]
+        .find((el) => el.querySelector(".rail-repo-label")?.textContent === name)!;
+      click(h.window, menuItem(openMenu(h.window, head("one")), "Archive project")!);
+      expect(h.posted).toContainEqual({ type: "setRepoArchived", cwd: "/work/one", archived: true });
+      const catalog = ["home", "one", "two", "three", "stale", "ancient"].map((name) =>
+        repo(name, ago(0), name === "one" ? { archived: true, archivedAt: Date.now() } : {}));
+      dispatch(h.window, { type: "repos", entries: catalog, selectedCwd: "/work/home", activeCwd: "/work/home" });
+      expect(sectionRepos(h.doc, "projects")).not.toContain("one");
+      const archiveButton = [...h.doc.querySelectorAll(".rail-head-btn")]
+        .find((el) => el.textContent?.includes("Project Archive"))!;
+      click(h.window, archiveButton);
+      expect(sectionRepos(h.doc, "archived")).toContain("one");
+      click(h.window, menuItem(openMenu(h.window, head("one")), "Move to Projects")!);
+      expect(h.posted).toContainEqual({ type: "setRepoArchived", cwd: "/work/one", archived: false });
+      dispatch(h.window, {
+        type: "repos", selectedCwd: "/work/home", activeCwd: "/work/home",
+        entries: catalog.map((r) => r.label === "one" ? { ...r, archived: false } : r),
+      });
+      expect(sectionRepos(h.doc, "projects")).toContain("one");
+      h.window.close();
+    });
+
+    it.each([false, true])("age grouping keeps conversation actions usable on desktop/remote=%s", (remote) => {
+      const h = bootArchive({}, remote);
+      click(h.window, [...h.doc.querySelectorAll(".rail-head-btn")]
+        .find((el) => el.textContent?.includes("Project Archive"))!);
+      const stale = [...h.doc.querySelectorAll(".rail-archived .rail-repo")]
+        .find((el) => el.querySelector(".rail-repo-label")?.textContent === "stale")!;
+      expect(stale).toBeTruthy();
+      const menu = openMenu(h.window, stale.querySelector(".rail-repo-head")!);
+      expect(usableItem(menu, "Move to Projects")).toBe(true);
+      expect(usableItem(menu, "Clear all history")).toBe(true);
+      h.doc.dispatchEvent(new h.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      h.posted.length = 0;
+      click(h.window, stale.querySelector('[data-session-id="stale1"]')!);
+      expect(h.posted).toContainEqual(expect.objectContaining({ type: "resumeSession", id: "stale1", cwd: "/work/stale" }));
+      expect(h.posted.some((m) => m.type === "setRepoArchived")).toBe(false);
+      h.window.close();
+    });
 
     it("drops long-idle projects into a folded Project Archive section", () => {
       const { doc } = bootArchive();
@@ -1495,8 +1599,8 @@ describe("projects rail", () => {
       expect(css).toMatch(/\.rail-head-btn\s*\{[^}]*text-transform:\s*uppercase/s);
     });
 
-    it("omits Project Archive and archive actions when the host omits archive fields (desktop)", () => {
-      // Capability = presence of `archived` on rows. Desktop strips the fields;
+    it("omits Project Archive and archive actions when the host omits archive fields (older desktop)", () => {
+      // Capability = presence of `archived` on rows. Older desktop hosts strip the fields;
       // age rule and Archive menu must not run.
       const day = 24 * 60 * 60 * 1000;
       const t = (days: number) => Date.now() - days * day;
@@ -1674,33 +1778,38 @@ describe("projects rail", () => {
       expect(less.textContent).not.toMatch(/\d/);
     });
 
-    it("project rows use folder-closed when collapsed and folder-open when expanded", () => {
+    /**
+     * The chevron says open or closed; the mark says which project. The folder
+     * used to do both, and that is exactly why nothing else could replace it —
+     * a rocket has no open variant.
+     */
+    it("folds on a chevron and leaves the project mark alone", () => {
       const { doc, window } = boot("/work/alpha");
       dispatch(window, sessionsFrame([row("a1", "/work/alpha", "alpha one", 9)]));
       const alpha = () => doc.querySelectorAll(".rail-repo")[repoNames(doc).indexOf("alpha")];
       const twisty = () => alpha().querySelector(".rail-twisty") as HTMLElement;
-      // Expanded: ONE flag drives icon + session list (data-expanded + folder-open).
+      const chevron = () => alpha().querySelector(".rail-chevron") as HTMLElement;
+      const markPath = () => twisty().querySelector("path")?.getAttribute("d");
+      const chevPath = () => chevron().querySelector("path")?.getAttribute("d");
       expect(alpha().getAttribute("data-expanded")).toBe("1");
-      // The two marks are told apart by viewBox — they are the owner's solid
-      // folder artwork (media/icons/folder-*.svg), not a shared 24x24 grid.
-      expect(twisty().innerHTML).toMatch(/viewBox="0 -57 511/);
-      expect(twisty().innerHTML).not.toMatch(/viewBox="0 0 408 408"/);
+      // Filled Material Symbols on their own grid, not the old 24px outline.
+      expect(twisty().querySelector("svg")?.getAttribute("fill")).toBe("currentColor");
+      expect(twisty().querySelector("svg")?.getAttribute("viewBox")).toBe("0 -960 960 960");
       expect(alpha().querySelector(".rail-sessions")).not.toBe(null);
-      // Icon and list cannot disagree: sessions present ⇒ open icon path.
-      expect(!!alpha().querySelector(".rail-sessions")).toBe(
-        /viewBox="0 -57 511/.test(twisty().innerHTML),
-      );
-      // Folder is an indicator (not a button); the whole head toggles.
+      // The chevron precedes the mark: disclosure first, identity second.
+      const kids = [...alpha().querySelector(".rail-repo-head")!.children].map((e) => e.className);
+      expect(kids.indexOf("rail-chevron")).toBeLessThan(kids.indexOf("rail-twisty"));
+      // Both are indicators, not buttons; the whole head toggles.
       expect(twisty().tagName).toBe("SPAN");
+      expect(chevron().tagName).toBe("SPAN");
+      const openMark = markPath();
+      const openChev = chevPath();
       click(window, alpha().querySelector(".rail-repo-head") as HTMLElement);
-      // Collapsed: the closed mark, no sessions, data-expanded=0.
       expect(alpha().getAttribute("data-expanded")).toBe("0");
-      expect(twisty().innerHTML).toMatch(/viewBox="0 0 408 408"/);
-      expect(twisty().innerHTML).not.toMatch(/viewBox="0 -57 511/);
       expect(alpha().querySelector(".rail-sessions")).toBe(null);
-      expect(!!alpha().querySelector(".rail-sessions")).toBe(
-        /viewBox="0 -57 511/.test(twisty().innerHTML),
-      );
+      // Only the chevron answers the fold. The mark is the project's identity.
+      expect(chevPath()).not.toBe(openChev);
+      expect(markPath()).toBe(openMark);
     });
 
     it("the whole project header toggles expand; hover actions do not", () => {
@@ -2206,6 +2315,33 @@ describe("rail transition (optimistic highlight)", () => {
     expect(activeName(doc, "alpha")).toBe("alpha one");
   });
 
+  it.each(["Escape", "input Escape", "Enter", "Cancel", "Rename", "backdrop"])("releases the rename prompt's modal marker through %s", async (exit) => {
+    const h = boot("/work/alpha");
+    dispatch(h.window, { ...sessionsFrame([row("a1", "/work/alpha", "alpha one", 9)]), activeId: "a1" });
+    (h.window as any).__grokFilePanelOpenSettings();
+    const layers = (h.window as any).afkpilotLayers;
+    expect(layers.depth).toBe(1);
+    const changes: number[] = [];
+    h.window.addEventListener("afkpilot-layers", () => changes.push(layers.depth));
+    const section = h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")];
+    click(h.window, menuItem(openMenu(h.window, section.querySelector(".rail-session")!), "Rename")!);
+    const input = h.doc.querySelector(".confirm-input") as HTMLInputElement;
+    input.value = "A new name";
+    expect(h.doc.body.dataset.modalAbove).toBe("prompt");
+    expect(layers.depth).toBe(0);
+    expect(layers.dismissTop()).toBe(false);
+    if (exit === "Escape") h.doc.dispatchEvent(new h.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    else if (exit === "input Escape" || exit === "Enter") input.dispatchEvent(new h.window.KeyboardEvent("keydown", { key: exit === "Enter" ? "Enter" : "Escape", bubbles: true }));
+    else click(h.window, h.doc.querySelector(exit === "backdrop" ? ".confirm-overlay"
+      : exit === "Rename" ? ".confirm-primary" : ".confirm-btn:not(.confirm-primary)")!);
+    await Promise.resolve();
+    expect(h.doc.querySelector(".confirm-overlay")).toBeNull();
+    expect(h.doc.body.dataset.modalAbove).toBeUndefined();
+    expect(layers.depth).toBe(1);
+    expect(changes).toEqual([0, 1]);
+    expect(h.posted.filter((msg) => msg.type === "renameSession")).toHaveLength(exit === "Enter" || exit === "Rename" ? 1 : 0);
+  });
+
   it("paints a rail rename on the header and row before any host frame", async () => {
     const { doc, window } = boot("/work/alpha");
     dispatch(window, {
@@ -2659,5 +2795,197 @@ describe("project header is a fold control, not a repo switch", () => {
     click(window, headFor(doc, "beta"));
     expect(sessionCount(doc, "beta")).toBe(1);
     expect(posted.filter((p) => p.type === "selectRepo")).toEqual([]);
+  });
+});
+
+// The phone's projects drawer opens OVER the conversation, and the model, mode
+// and context popovers are anchored to the composer it covers. web/chat.html
+// owns the drawer (see `withRail` above: the mount is the relay page's), so the
+// renderer cannot see it open — it exposes the close instead.
+describe("the shell can close the renderer's toolbar popovers", () => {
+  const openers = [
+    ["context", "donut", "context-popover"],
+    ["model / gear", "gear-btn", "gear-popover"],
+    ["mode", "mode-btn", "mode-popover"],
+  ] as const;
+
+  it.each(openers)("closes the %s popover", (_label, button, popover) => {
+    const h = bootWebview();
+    withRail(h.window);
+    dispatch(h.window, { type: "session", provider: "grok", models: [], currentModelId: "m" } as any);
+    click(h.window, h.doc.getElementById(button)!);
+    expect(h.doc.getElementById(popover)!.hidden).toBe(false);
+
+    (h.window as any).afkpilotLayers.closePopovers();
+    expect(h.doc.getElementById(popover)!.hidden).toBe(true);
+  });
+
+  // It is not a Back closer: a popover dismisses on the next tap anywhere, so
+  // giving it a history entry would spend the gesture that belongs to the
+  // drawer under it.
+  it("is not counted as a layer", () => {
+    const h = bootWebview();
+    withRail(h.window);
+    const layers = (h.window as any).afkpilotLayers;
+    click(h.window, h.doc.getElementById("donut")!);
+    expect(layers.depth).toBe(0);
+    expect(layers.dismissTop()).toBe(false);
+  });
+});
+
+/**
+ * The icon picker has to survive the keyboard it raises.
+ *
+ * A resize closes the rail's menus, which is right for a MENU -- it hangs under
+ * a row that has probably moved. It was wrong for a picker the user is working
+ * in, because on a phone the on-screen keyboard IS a resize: the picker focused
+ * its search box, the keyboard opened, the resize fired, and the picker removed
+ * itself the frame after it appeared. The owner saw "something flashes and
+ * disappears", and only for icons -- the colour picker focuses a swatch button,
+ * raises no keyboard, and never hit it.
+ *
+ * No browser gate could catch this. `e2e:screens` drives real Chromium and
+ * opens this very picker, but a headless browser has no software keyboard, so
+ * the resize never fires there. The event is the whole mechanism, so a test
+ * that dispatches it is the honest gate.
+ */
+describe("the project icon picker", () => {
+  const withMarks = (entries = repos) =>
+    entries.map((r) => ({ ...r, color: "", icon: r.cwd === "/work/beta" ? "rocket" : "" }));
+
+  const openPicker = (h: any) => {
+    dispatch(h.window, {
+      type: "repos",
+      entries: withMarks(),
+      selectedCwd: "/work/alpha",
+      activeCwd: "/work/alpha",
+    });
+    const alpha = h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")];
+    const menu = openMenu(h.window, alpha.querySelector(".rail-repo-head") as HTMLElement);
+    const item = menuItem(menu, "Set icon");
+    expect(item, "the project menu offers no Set icon").not.toBe(undefined);
+    click(h.window, item as HTMLElement);
+    return h.doc.querySelector(".repo-icon-picker") as HTMLElement;
+  };
+
+  it("stays open when the on-screen keyboard resizes the window", () => {
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    expect(openPicker(h)).not.toBe(null);
+    h.window.dispatchEvent(new h.window.Event("resize"));
+    expect(
+      h.doc.querySelector(".repo-icon-picker"),
+      "the picker closed itself on a resize -- the keyboard is a resize",
+    ).not.toBe(null);
+  });
+
+  it("narrows the grid to one category when a category is clicked", () => {
+    // Half the contract. The other half is CSS -- setting `hidden` on a cell
+    // whose stylesheet declares `display: grid` hides nothing at all -- and no
+    // DOM test can see that, because this harness applies no stylesheet. The
+    // companion assertion lives in repo-icons.test.ts.
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    const picker = openPicker(h);
+    const cells = () => Array.from(picker.querySelectorAll(".repo-icon-cell")) as HTMLElement[];
+    const shown = () => cells().filter((c) => !c.hidden).length;
+    const all = shown();
+    expect(all, "the picker drew no marks").toBeGreaterThan(20);
+    const tab = Array.from(picker.querySelectorAll(".repo-icon-tab"))
+      .find((t) => t.textContent === "Build") as HTMLElement | undefined;
+    expect(tab, "the picker offers no Build category").not.toBe(undefined);
+    click(h.window, tab as HTMLElement);
+    expect(shown(), "clicking a category did not narrow the grid").toBeLessThan(all);
+    // The default is groupless on purpose: "put it back" must not hide behind
+    // a tab you would have to guess.
+    expect(
+      (picker.querySelector(".repo-icon-cell.is-default") as HTMLElement).hidden,
+      "the default folder hid itself behind a category",
+    ).toBe(false);
+  });
+
+  it("keeps the focus in its search box, so the keyboard it raised can be typed into", () => {
+    // The keyboard IS the resize, so the element that raised it is exactly the
+    // element a resize must not blur. The first version of this fix took the
+    // picker out of the document and put it straight back: the markup after is
+    // identical, and the focus is gone. Dispatching a resize at an UNFOCUSED
+    // picker -- which is what the test above does -- is the one state where
+    // that cannot show, so this asserts on focus and not on the node.
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    const picker = openPicker(h);
+    const search = picker.querySelector(".repo-icon-search") as HTMLElement;
+    expect(search, "the picker has no search box").not.toBe(null);
+    search.focus();
+    expect(h.doc.activeElement, "the search box would not take focus").toBe(search);
+    h.window.dispatchEvent(new h.window.Event("resize"));
+    expect(
+      h.doc.activeElement,
+      "the resize blurred the search box -- so tapping it raises a keyboard that closes again",
+    ).toBe(search);
+  });
+
+  it("still lets a resize close a menu, which is what that listener is for", () => {
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    dispatch(h.window, {
+      type: "repos",
+      entries: withMarks(),
+      selectedCwd: "/work/alpha",
+      activeCwd: "/work/alpha",
+    });
+    const alpha = h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")];
+    openMenu(h.window, alpha.querySelector(".rail-repo-head") as HTMLElement);
+    expect(h.doc.querySelector(".rail-menu")).not.toBe(null);
+    h.window.dispatchEvent(new h.window.Event("resize"));
+    expect(h.doc.querySelector(".rail-menu")).toBe(null);
+  });
+
+  it("survives the catalog refresh the host sends whenever a file changes", () => {
+    // The rebuild used to close both pickers outright, so on a phone and in
+    // the desktop app the grid vanished while you were reading it -- the same
+    // report the VS Code side bar got, from the same producer: the host
+    // re-sends the catalog whenever the files behind it change, and another
+    // agent writing transcripts drives that every second or two.
+    //
+    // The rebuild here is a repo RENAME, not a sessions frame, for the reason
+    // the VS Code suite records: sessions do not render under a collapsed
+    // project, so "still there" would pass for the wrong reason. A project row
+    // is always drawn, so the renamed label proves the rail really did rebuild
+    // under the open picker.
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    const picker = openPicker(h);
+    expect(picker).not.toBe(null);
+    const search = picker.querySelector(".repo-icon-search") as HTMLElement;
+    search.focus();
+    dispatch(h.window, {
+      type: "repos",
+      entries: withMarks(repos).map((r) =>
+        r.cwd === "/work/gamma" ? { ...r, label: "renamed" } : r),
+      selectedCwd: "/work/alpha",
+      activeCwd: "/work/alpha",
+    });
+    expect(repoNames(h.doc), "the rail did not rebuild, so this proves nothing")
+      .toContain("renamed");
+    expect(
+      h.doc.querySelector(".repo-icon-picker"),
+      "the rail rebuild closed the picker the user was reading",
+    ).toBe(picker);
+    expect(
+      h.doc.activeElement,
+      "the picker survived but lost its focus -- it was taken out and put back",
+    ).toBe(search);
+  });
+
+  it("closes rather than strands itself when its anchor is gone", () => {
+    // The other half of the rule: follow the anchor while it exists, and give
+    // up when a rebuild has taken the row away, rather than leaving a fixed
+    // popover pointing at nothing.
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    expect(openPicker(h)).not.toBe(null);
+    dispatch(h.window, {
+      type: "repos",
+      entries: withMarks(repos.filter((r) => r.cwd !== "/work/alpha")),
+      selectedCwd: "/work/beta",
+      activeCwd: "/work/beta",
+    });
+    h.window.dispatchEvent(new h.window.Event("resize"));
+    expect(h.doc.querySelector(".repo-icon-picker")).toBe(null);
   });
 });

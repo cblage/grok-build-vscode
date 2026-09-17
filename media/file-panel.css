@@ -137,25 +137,25 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
      overlay bumps this to match the central header's scale (asserted). */
   min-height: 44px;
   overflow: hidden;
-  /* The strip is its own surface so the ACTIVE tab can read as attached to
-     the content below by wearing the content's background (see .gfp-tab-active).
-     editorWidget-background is the header tone in both stock palettes; the
-     color-mix fallback tints toward foreground for pages defining neither. */
+  /* The strip is its own surface, one tone for the whole row: selection is an
+     underline on top of it, not a per-tab background (see the shared
+     ::after rule below). editorWidget-background is the header tone in both
+     stock palettes; the color-mix fallback tints toward foreground for pages
+     defining neither. */
   background: var(--vscode-editorGroupHeader-tabsBackground,
     var(--vscode-editorWidget-background,
       color-mix(in oklab, var(--vscode-foreground) 4%, var(--vscode-sideBar-background, #1e1e1e))));
-  /* The divider is an INSET line, not a border: children stretch over it, so
-     the opaque active tab covers its own segment and joins the content below
-     seamlessly — a border (or an escaping shadow) would be clipped by this
-     element's overflow:hidden and always show through. */
+  /* The divider is an INSET line, not a border, so it cannot be clipped away
+     by this element's overflow:hidden the way a border or an escaping shadow
+     would be. It runs unbroken under the whole strip; the selection underline
+     sits 2px above it. */
   box-shadow: inset 0 -1px 0 var(--gfp-border);
 }
 
-/* Project root: a folder glyph + the repo name at the same weight the rail
-   uses for project rows. Not a heading — no uppercase, no 700, no letter-
-   spacing shout. Idle tabs mix toward descriptionForeground; the title and
-   the active tab keep the inherited foreground token. Theme tokens only. */
+/* Project root is context until selected, matching the Changes button.
+   Keep its weight constant so selecting it cannot change the cached width. */
 .gfp-title {
+  position: relative;
   display: flex;
   flex: 0 1 auto;
   align-items: center;
@@ -165,15 +165,16 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   padding: 0 12px;
   border: 0;
   background: transparent;
-  color: inherit;
+  color: var(--vscode-descriptionForeground, #999);
   font: inherit;
-  font-weight: var(--rail-repo-font-weight, 600);
+  font-weight: normal;
   text-align: start;
   text-transform: none;
   letter-spacing: normal;
   white-space: nowrap;
   cursor: pointer;
 }
+.gfp-title:hover { color: var(--vscode-foreground, inherit); }
 .gfp-title-icon,
 .gfp-tab-icon {
   display: inline-flex;
@@ -215,11 +216,28 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   padding-inline: 12px;
 }
 .gfp-title.gfp-title-icon-only .gfp-title-label { display: none; }
-/* Tree showing: the folder is the selected "tab" — content background, no
-   blue top accent. A file tab takes that treatment (with the accent) instead. */
-.gfp-title.gfp-title-selected {
-  background: var(--vscode-tab-activeBackground,
-    var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e)));
+/* ONE selected treatment for the whole strip: an underline under whichever of
+   the folder, the Changes button and the open files is on screen.
+   Before this there were three answers to the same question and two of them
+   were on opposite edges — the folder wore the content background, a file tab
+   wore that background PLUS a blue top accent, and the Changes button had this
+   underline. The underline is the one that survives every theme, because it is
+   an accent ADDED to whatever ground the strip has rather than a fill whose
+   lighter-or-darker polarity has to be right in both. */
+.gfp-title.gfp-title-selected,
+.gfp-tab.gfp-tab-active,
+.gfp-changes-btn.gfp-changes-selected { color: var(--vscode-foreground, inherit); }
+.gfp-title.gfp-title-selected::after,
+.gfp-tab.gfp-tab-active::after,
+.gfp-changes-btn.gfp-changes-selected::after {
+  content: "";
+  position: absolute;
+  right: 6px;
+  bottom: 2px;
+  left: 6px;
+  height: 2px;
+  border-radius: 1px;
+  background: currentColor;
 }
 
 .gfp-tabs {
@@ -238,13 +256,12 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
    and State C paints icons AND the chip. */
 .gfp-tab[hidden],
 .gfp-overflow-chip[hidden] { display: none !important; }
-/* Close the run: tabs draw a left edge, so the last item also needs a right
-   one or the last tab dissolves into the empty strip. */
-.gfp-tabs > :last-child { border-right: 1px solid var(--gfp-border); }
-/* No files open: the folder "tab" closes its own right edge — with tabs
-   present the first tab's left border draws that line instead (owner:
-   a borderless folder-only strip read as inconsistent). */
-.gfp-header:not(:has(.gfp-tabs > *)) .gfp-title { border-right: 1px solid var(--gfp-border); }
+/* No dividers ANYWHERE in the strip, deliberately. A per-tab border draws a
+   box, and a box says "this is a discrete cell"; the underline says "this one
+   is current". Running both left the strip saying half of each — cells with a
+   stray accent, which is what the owner saw and named. Spacing separates the
+   tabs now, hover gives the cell back on the one under the pointer, and the
+   underline is the only thing that ever marks selection. */
 
 .gfp-tab {
   position: relative;
@@ -262,8 +279,9 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
      floor was the old scroll model's way to stop shrinking — it forced the
      strip to overflow. Icon and close are flex-none so they survive first. */
   max-width: 170px;
-  padding: 0 6px 0 10px;
-  border-left: 1px solid var(--gfp-border);
+  /* Symmetric now. The old 10/6 split existed to sit the text off a left
+     border that no longer exists; kept, it made every tab look nudged right. */
+  padding: 0 8px;
   color: var(--vscode-descriptionForeground, #999);
   cursor: pointer;
 }
@@ -278,17 +296,10 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
      ellipsis appears only when flex genuinely has nothing left to give.
      Icon and X survive regardless (min-width floor + flex-none children). */
   max-width: none;
-  color: inherit;
-  /* Selection reads as CONTINUITY with the content, not as a fill: the active
-     tab wears the panel content's own background (owner, 2026-08-14 — the old
-     foreground-mix fallback painted it DARKER than the strip in light themes,
-     which reads as unselected; raised elements are the lighter ones). The
-     accent moved to the TOP edge, and the 1px drop-shadow below covers the
-     header's border so tab and content join seamlessly — the editor-tab
-     pattern, polarity-correct in both themes by construction. */
-  background: var(--vscode-tab-activeBackground,
-    var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e)));
-  box-shadow: inset 0 1px 0 var(--vscode-focusBorder, #007acc);
+  /* Colour and the underline come from the shared selected rule above. The
+     background and the top accent that used to live here are gone: two tabs
+     could be lit at once (the folder or Changes selected while a file kept the
+     fill), and the fill's light-theme polarity had already needed one fix. */
 }
 /* No name cap in B/C: ~10ch is the planner's MINIMUM guarantee, never a
    ceiling — planStrip budgets the active tab at its full width, and capping
@@ -303,14 +314,25 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.gfp-tab-dirty { flex: 0 0 10px; text-align: center; }
+/* The dot sits BEFORE the name, so nothing separates a filename from the X
+   that closes it. It used to sit after, in a 10px slot held open on every tab
+   whether or not there was a dot to put in it — a permanent gap reserved for
+   an absent mark, in the one place where a gap costs something. Collapsing the
+   empty slot is free (the planner measures the rendered DOM, so the width it
+   gives back is width the names get) and a dirty file spends it in front,
+   where it never comes between the pair. */
+.gfp-tab-dirty { flex: 0 0 10px; color: var(--tdiff-mod-line, #d7ba7d); text-align: center; }
+.gfp-tab-dirty:empty { display: none; }
 .gfp-tab-icon-only {
   flex: 0 0 auto;
   max-width: none;
   padding: 0 8px;
 }
 .gfp-tab-icon-only .gfp-tab-name { display: none; }
-.gfp-tab-icon-only .gfp-tab-dirty:empty { display: none; }
+/* No name, no X — an X alone on an icon-only tab is a control with nothing to
+   say what it would close. collectStripMeasurements budgets this mode from the
+   icon and the dirty dot, so hiding it here costs the planner nothing. */
+.gfp-tab-icon-only .gfp-tab-close { display: none; }
 /* Fingers need a wider target than a 16px glyph + padding gives (the relay's
    touch gate floors tappables at 36px). The planner measures the DOM, so the
    wider tabs feed straight back into the A/B/C decision on touch. */
@@ -319,9 +341,23 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   .gfp-overflow-chip { min-width: 40px; }
 }
 
+/* Something behind the chip is unsaved. Same dot the tabs and the menu rows
+   use, in the corner rather than in the flow, because the chip's content is
+   the ellipsis and a second glyph beside it would read as two files. */
+.gfp-overflow-chip-dirty::after {
+  content: "•";
+  position: absolute;
+  top: 1px;
+  right: 3px;
+  line-height: 1;
+  color: var(--tdiff-mod-line, #d7ba7d);
+}
 /* The chip IS a tab (owner): same cell chrome as an idle tab — full height,
-   both edges, idle-tab tone, hover — holding "…" where a name would sit. */
+   idle-tab tone, hover — holding "…" where a name would sit. The edges it used
+   to draw went with every other tab's: one idiom, and the idiom is spacing
+   plus an underline on whatever is current. */
 .gfp-overflow-chip {
+  position: relative;
   display: flex;
   flex: 0 0 auto;
   align-items: center;
@@ -330,8 +366,6 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   min-width: 40px;
   padding: 0 10px;
   border: 0;
-  border-left: 1px solid var(--gfp-border);
-  border-right: 1px solid var(--gfp-border);
   background: transparent;
   color: var(--vscode-descriptionForeground, #999);
   font: inherit;
@@ -355,6 +389,16 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   white-space: nowrap;
 }
 .gfp-overflow-dirty { flex: 0 0 auto; }
+/* The overflow menu is the tab strip on a phone, so its rows close files the
+   same way tabs do. The row is the flex container; the name button takes the
+   width and the X keeps its own tap target. */
+.gfp-overflow-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.gfp-overflow-row .gfp-overflow-item { flex: 1 1 auto; min-width: 0; }
+.gfp-overflow-close { flex: 0 0 auto; }
 .gfp-tab-close,
 .gfp-close,
 .gfp-icon-button,
@@ -365,6 +409,10 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
   justify-content: center;
   padding: 0;
   border: 0;
+  /* A <button> does not inherit the page font: without this the Changes word
+     and both count badges render in the browser's own button font (Arial at
+     13.33px on Windows) beside a title in the host's font at 13px. */
+  font: inherit;
   background: transparent;
   color: var(--vscode-descriptionForeground, #999);
   cursor: pointer;
@@ -411,16 +459,15 @@ body.desk-rail-collapsed .desk-rail-open-btn { display: inline-flex; }
 .gfp-close { align-self: center; margin: 0 8px 0 0; }
 .gfp-close[hidden] { display: none !important; }
 
-/* Re-list the tree (#134). First of the trailing controls, and the one that
-   carries the auto margin pinning the whole group to the strip's RIGHT edge —
-   .gfp-tabs is display:none while empty, so nothing else grows to do it.
-   Exactly one auto margin may be live or the free space splits between them,
-   which is why maximize and close no longer carry their own. That is safe
-   because this control is hidden ONLY in the viewer, and the viewer always has
-   a tab open, so .gfp-tabs is there to grow instead. */
+/* Pin the strip controls even when the tab list is empty. Only one auto margin
+   is live: maximize when shown, otherwise close. Refresh belongs to the body. */
+.gfp-header > .gfp-maximize:not([hidden]),
+.gfp-header > .gfp-maximize[hidden] + .gfp-close,
+.gfp-header > .gfp-tabs + .gfp-close { margin-left: auto; }
 .gfp-refresh {
   align-self: center;
-  margin: 0 4px 0 auto;
+  flex: 0 0 auto;
+  margin: 0 0 0 auto;
 }
 .gfp-refresh[hidden] { display: none !important; }
 .gfp-refresh[disabled] { opacity: 0.5; cursor: default; }
@@ -467,12 +514,21 @@ body.desk-ft-maximized .gfp-panel {
   min-width: 0;
 }
 
-.gfp-filter {
+.gfp-filter-row {
+  display: flex;
   flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  margin: 7px 8px 4px;
+  min-width: 0;
+}
+.gfp-filter {
+  flex: 1 1 auto;
+  min-width: 0;
   box-sizing: border-box;
   width: auto;
   height: 28px;
-  margin: 7px 8px 4px;
+  margin: 0;
   padding: 3px 8px;
   border: 1px solid var(--vscode-input-border, var(--gfp-border));
   border-radius: 5px;
@@ -522,11 +578,28 @@ body.desk-ft-maximized .gfp-panel {
 }
 .gfp-lead svg,
 .gfp-lead img { display: block; width: 16px; height: 16px; }
+/* The "there is uncommitted work here" mark, on the file and on every folder
+   above it, so a collapsed tree still shows where the changes are. A slot
+   that collapses when empty — the row's name gets the width back. */
+.gfp-node-dot {
+  display: none;
+  flex: 0 0 6px;
+  width: 6px;
+  height: 6px;
+  margin: 0 2px;
+  border-radius: 50%;
+  background: var(--tdiff-mod-line, #d7ba7d);
+}
+.gfp-node-changed > .gfp-row > .gfp-node-dot { display: inline-block; }
 .gfp-file-icon-mono {
   display: block;
   width: 16px;
   height: 16px;
-  background: var(--vscode-descriptionForeground, #999);
+  /* currentColor, not the muted grey outright: the icon follows the text it
+     sits beside, so an active tab's icon lights up with its name and a tree
+     row's stays as quiet as its lead. The grey used to be pinned here, which
+     left the selected tab's icon dimmed next to a bright label. */
+  background: currentColor;
   -webkit-mask: var(--gfp-icon-url) center / contain no-repeat;
   mask: var(--gfp-icon-url) center / contain no-repeat;
 }
@@ -919,7 +992,7 @@ body.vscode-light {
 
 /* The filter searches the TREE. With a file open there is no tree to filter, so
    the box is not merely useless there — it invites typing that does nothing. */
-.gfp-panel.gfp-viewing .gfp-filter { display: none; }
+.gfp-panel.gfp-viewing .gfp-filter-row { display: none; }
 
 /* 899, not 640, and the number is not arbitrary: it is the width at which the
    browser client stops giving the panel a third column to dock into
@@ -1040,4 +1113,539 @@ body.vscode-light {
     min-height: 36px;
   }
   .gfp-action { min-width: 36px; }
+}
+
+/* ------------------------------------------------------------------ *
+ * The Changes view
+ *
+ * Deliberately small. The DIFF itself reuses `.tool-diff-region` / `.tdl*`
+ * from chat.css — one diff design for the whole product, and one `--tdiff-*`
+ * palette already tuned for both themes — so what is left here is the list,
+ * the headline and the commit box.
+ *
+ * Every colour below resolves through a VS Code theme token with a literal
+ * fallback, which is what lets the same stylesheet serve the desktop shell,
+ * the IDE webview and a phone browser that has no VS Code palette at all.
+ * ------------------------------------------------------------------ */
+
+/* The button sits with the project title because it names a mode for the whole
+   project, not an action on the open file. It carries `.gfp-icon-button`, so
+   the box, the 16px glyph, the hover and the focus ring all come from the bar
+   primitive above rather than being restated here. */
+.gfp-changes-btn {
+  position: relative;
+  align-self: center;
+  margin-right: 2px;
+}
+.gfp-changes-btn[hidden] { display: none !important; }
+/* Named where there is room, a glyph where there is not.
+   The button is the bar-icon primitive — a 28px square — so wearing a word
+   means giving up the square, which is why the width and padding are restated
+   here rather than inherited. The badge comes out of the corner at the same
+   time: over a word it would cover the last letters, and beside one it reads
+   as what it is, a count of the thing just named. */
+.gfp-changes-label { display: none; }
+.gfp-panel:not(.gfp-strip-compact) .gfp-changes-btn {
+  gap: 6px;
+  width: auto;
+  min-width: 28px;
+  padding: 0 8px;
+}
+.gfp-panel:not(.gfp-strip-compact) .gfp-changes-label { display: inline; }
+.gfp-panel:not(.gfp-strip-compact) .gfp-changes-count {
+  position: static;
+  top: auto;
+  right: auto;
+}
+.gfp-changes-btn.gfp-changes-selected { color: var(--vscode-foreground, inherit); }
+.gfp-changes-btn.gfp-changes-selected::after {
+  content: "";
+  position: absolute;
+  right: 6px;
+  bottom: 2px;
+  left: 6px;
+  height: 2px;
+  border-radius: 1px;
+  background: currentColor;
+}
+/* The badge counts UNCOMMITTED FILES only. It is the one number visible while
+   the view is closed, so it has to mean exactly one thing. */
+.gfp-changes-count,
+.gfp-toggle-count {
+  position: absolute;
+  top: -1px;
+  right: -2px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 9px;
+  /* The "modified" hue, not the theme's badge blue: this number IS the count
+     of modified files, and the same colour marks each of them in the tree. */
+  background: var(--tdiff-mod-line, #d7ba7d);
+  color: var(--tdiff-mod-ink, #2a2000);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.gfp-toggle-count {
+  min-width: 14px;
+  height: 14px;
+  line-height: 14px;
+  border-radius: 7px;
+  font-size: 9px;
+}
+.gfp-changes-count[hidden],
+.gfp-toggle-count[hidden] { display: none !important; }
+/* The same number on the button that opens the panel, so it is readable
+   while the panel is closed — the one moment the Changes button is not. */
+.gfp-toggle { position: relative; }
+
+.gfp-changes {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px 16px;
+}
+.gfp-changes[hidden] { display: none !important; }
+/* The tree's filter box belongs to the tree. Hidden the same way `.gfp-viewing`
+   hides it, rather than by toggling `hidden` from script, so there is one
+   mechanism for "this body mode does not use the filter". */
+.gfp-panel.gfp-changes-mode .gfp-filter-row { display: none; }
+
+/* Where the work is. Quiet, because the branch is context and not news. */
+.gfp-changes-branch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--vscode-descriptionForeground, #999);
+  font-size: 0.92em;
+}
+.gfp-changes-branch-icon { display: inline-flex; flex: 0 0 14px; }
+.gfp-changes-branch-icon svg { width: 14px; height: 14px; }
+.gfp-changes-branch-name {
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: var(--vscode-descriptionForeground, #999);
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-weight: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gfp-changes-branch-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gfp-changes-branch-note::before { content: "· "; }
+.gfp-changes-ask-pull {
+  flex: 0 0 auto;
+  margin-left: auto;
+  min-height: 28px;
+  padding: 0 2px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.gfp-changes-ask-pull:hover { color: var(--vscode-foreground, inherit); }
+.gfp-changes-ask-pull:focus-visible,
+.gfp-changes-notice-action:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.gfp-changes-notice-action { margin-top: 8px; }
+@media (hover: none), (pointer: coarse) {
+  .gfp-changes-ask-pull,
+  .gfp-changes-notice .gfp-changes-notice-action { min-height: 36px; }
+}
+
+/* The answer to "is it safe to walk away", said once. */
+.gfp-changes-headline {
+  margin: 0;
+  font-size: 1.02em;
+  font-weight: 600;
+}
+/* Spent on conflicts and nothing else. A colour that fires on every edit is a
+   colour nobody reads, and it would make the state that blocks committing look
+   the same as the state that does not. */
+.gfp-changes-warn { color: var(--vscode-editorWarning-foreground, var(--tdiff-del-line, #f48771)); }
+.gfp-changes-note { color: var(--vscode-foreground, inherit); }
+.gfp-changes-ok { color: var(--vscode-descriptionForeground, #999); font-weight: 500; }
+
+.gfp-changes-empty {
+  margin: 0;
+  color: var(--vscode-descriptionForeground, #999);
+}
+
+.gfp-changes-notice {
+  border-radius: 6px;
+  border-left: 2px solid currentColor;
+  padding: 6px 10px;
+  background: var(--gfp-hover);
+}
+.gfp-changes-notice-text { margin: 0; }
+.gfp-changes-notice-detail {
+  margin: 6px 0 0;
+  max-height: 120px;
+  overflow: auto;
+  color: var(--vscode-descriptionForeground, #999);
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: 0.86em;
+  white-space: pre-wrap;
+  /* A remote URL has no break opportunity; without this it scrolls sideways. */
+  overflow-wrap: anywhere;
+}
+
+/* One row per changed file. The row is a link to its own diff and nothing
+   else: the destructive action lives one level in, behind having looked at
+   what it would throw away. */
+.gfp-changes-list { display: flex; flex-direction: column; }
+.gfp-change-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.gfp-change-row:hover { background: var(--gfp-hover); }
+.gfp-change-row:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: -2px;
+}
+/* A single letter carrying colour AND shape, so the status survives both a
+   greyscale screenshot and a red/green colour-blindness. */
+.gfp-change-badge {
+  flex: 0 0 14px;
+  color: var(--vscode-descriptionForeground, #999);
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: 0.88em;
+  font-weight: 700;
+  text-align: center;
+}
+/* The diff palette, not the IDE's gitDecoration set: the turn card in the
+   transcript prints the same letters from the same variables, and the two
+   must agree on what yellow means. */
+.gfp-change-m .gfp-change-badge { color: var(--tdiff-mod-line, #d7ba7d); }
+.gfp-change-a .gfp-change-badge,
+.gfp-change-new .gfp-change-badge { color: var(--tdiff-add-line, #4ec9b0); }
+.gfp-change-d .gfp-change-badge { color: var(--tdiff-del-line, #f48771); }
+.gfp-change-r .gfp-change-badge { color: var(--tdiff-read-line, #3794ff); }
+.gfp-change-u .gfp-change-badge { color: var(--vscode-editorError-foreground, var(--tdiff-del-line, #f48771)); }
+
+.gfp-change-name {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+/* The filename is the last thing to give way. It CAN ellipsize -- when it
+   alone does not fit, something has to -- but only after the directory beside
+   it has collapsed to nothing.
+   It is INFLEXIBLE to arrange that, not merely stubborn. A large shrink factor
+   on the path cannot do it: flex shrinking is proportional and simultaneous,
+   so the name keeps a share of every shortfall however small that share is,
+   and one 1/64px layout unit of it is enough for `text-overflow` to drop real
+   characters -- while the path beside it is still a hundred pixels wide. That
+   was the bug. `max-width` is what lets the name ellipsize in the one case
+   where it must: when it alone does not fit the row. */
+.gfp-change-base {
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The 6px separator is real for as long as there are two elements to separate,
+   so the cap allows for it. Moving it into the path as padding does NOT buy
+   the name those pixels back at the last rung -- padding is a floor, the path
+   box cannot go below it, and the row overflows by what the name gained. */
+.gfp-change-base:not(:only-child) {
+  max-width: calc(100% - 6px);
+}
+/* The directory is context for the name beside it, so it takes the same
+   treatment the rail gives a repo's path: smaller, quieter, and the first
+   thing to be truncated. With the name inflexible it is the only item that can
+   shrink, so an ordinary shrink factor already takes the whole shortfall. */
+.gfp-change-dir {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--vscode-descriptionForeground, #999);
+  font-size: 0.86em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+.gfp-change-stat {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 6px;
+  color: var(--vscode-descriptionForeground, #999);
+  font-size: 0.86em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* The same two numbers appear on a tool row and on the turn's Changed N files
+   card in Codex's green and red; grey here made the list read as a different
+   measurement. --tdiff-* is defined in chat.css and carries a light override. */
+.gfp-change-add { color: var(--tdiff-add-line, #4ec9b0); }
+.gfp-change-del { color: var(--tdiff-del-line, #f48771); }
+/* On the headline the pair rides at the end of a sentence, so it takes that
+   sentence's weight back down — it is the size of the change, not a second
+   headline. */
+.gfp-changes-total { font-weight: 400; font-variant-numeric: tabular-nums; }
+
+.gfp-changes-commits { display: flex; flex-direction: column; gap: 2px; }
+.gfp-changes-commit {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  padding: 1px 6px;
+}
+.gfp-changes-sha {
+  flex: 0 0 auto;
+  color: var(--vscode-descriptionForeground, #999);
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: 0.86em;
+}
+.gfp-changes-subject {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gfp-changes-more {
+  margin: 2px 0 0 6px;
+  color: var(--vscode-descriptionForeground, #999);
+  font-size: 0.9em;
+}
+
+.gfp-changes-section {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--vscode-descriptionForeground, #999);
+  font-size: 0.85em;
+}
+.gfp-changes-section::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--gfp-border);
+}
+
+/* The commit choices share a row; the primary gets at least half its width. */
+.gfp-changes-action-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+}
+.gfp-changes-action-row.has-commit-only {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+}
+.gfp-changes-action-row > button { min-width: 0; }
+@media (hover: none), (pointer: coarse) {
+  .gfp-changes-action-row > button,
+  .gfp-refresh { min-height: 36px; }
+}
+
+.gfp-changes-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: 6px;
+}
+.gfp-changes-message {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 48px;
+  padding: 6px 8px;
+  border: 1px solid var(--vscode-input-border, var(--gfp-border));
+  border-radius: 5px;
+  outline: none;
+  background: var(--vscode-input-background, rgba(0, 0, 0, 0.12));
+  color: var(--vscode-input-foreground, inherit);
+  font: inherit;
+  resize: vertical;
+}
+.gfp-changes-message:focus { border-color: var(--vscode-focusBorder, #007acc); }
+.gfp-changes-primary {
+  min-height: 30px;
+  padding: 5px 12px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  border-radius: 5px;
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.gfp-changes-primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground, #1177bb); }
+.gfp-changes-primary:disabled { opacity: 0.5; cursor: default; }
+.gfp-changes-primary:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.gfp-changes-secondary {
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid var(--vscode-button-border, var(--gfp-border));
+  border-radius: 5px;
+  background: var(--vscode-button-secondaryBackground, transparent);
+  color: var(--vscode-button-secondaryForeground, inherit);
+  font: inherit;
+  cursor: pointer;
+}
+.gfp-changes-secondary:hover:not(:disabled) { background: var(--gfp-hover); }
+.gfp-changes-secondary:disabled { opacity: 0.5; cursor: default; }
+.gfp-changes-hint {
+  margin: 0;
+  color: var(--vscode-descriptionForeground, #999);
+  font-size: 0.88em;
+  line-height: 1.4;
+  /* The no-remote sentence wraps on phones. Keep room when the typing hint
+     clears, but let longer copy (or larger text) grow rather than clip. */
+  min-height: 2.8em;
+}
+/* The all-or-nothing rule, under the buttons it governs. Quieter than the
+   hint above the message — the hint is about the press you are about to make, this is
+   about what that press covers, and it is true whether or not you read it. */
+.gfp-changes-rule {
+  margin: 0;
+  color: var(--vscode-descriptionForeground, #999);
+  font-size: 0.82em;
+  line-height: 1.45;
+  opacity: 0.85;
+}
+
+/* One file's diff. The header is the way back and the file's name; the diff
+   below it is the product's own `.tool-diff-region`. */
+.gfp-changes-diff-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.gfp-changes-back {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--vscode-descriptionForeground, #999);
+  cursor: pointer;
+}
+.gfp-changes-back svg { width: 16px; height: 16px; }
+.gfp-changes-back:hover { color: var(--vscode-foreground, inherit); }
+.gfp-changes-back:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: -2px;
+}
+.gfp-changes-diff-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+.gfp-changes-diff-word {
+  flex: 0 0 auto;
+  color: var(--vscode-descriptionForeground, #999);
+  font-size: 0.86em;
+}
+.gfp-diff-region { flex: 0 0 auto; }
+.gfp-changes-diff-foot { display: flex; }
+.gfp-changes-discard {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid var(--vscode-button-border, var(--gfp-border));
+  border-radius: 5px;
+  background: transparent;
+  color: var(--vscode-errorForeground, var(--tdiff-del-line, #fa423e));
+  font: inherit;
+  cursor: pointer;
+}
+.gfp-changes-discard svg { width: 14px; height: 14px; }
+.gfp-changes-discard:hover:not(:disabled) { background: var(--gfp-hover); }
+.gfp-changes-discard:disabled { opacity: 0.5; cursor: default; }
+.gfp-changes-discard:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+/* Touch. Same 36px floor and the same coarse-pointer gate as every other
+   control in this file — the relay's own tap-floor sweep asserts it. */
+@media (hover: none) and (pointer: coarse) {
+  .gfp-change-row { min-height: 36px; }
+  .gfp-changes-primary,
+  .gfp-changes-secondary,
+  .gfp-changes-discard { min-height: 36px; }
+  .gfp-changes-back { width: 36px; height: 36px; min-width: 36px; min-height: 36px; }
+  /* iOS Safari force-zooms the page when a focused input is under 16px. */
+  .gfp-changes-message { font-size: 16px; }
+  .gfp-changes-count { top: 3px; right: 2px; }
+}
+
+.gfp-changes-branch-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.gfp-changes-branch-input {
+  grid-column: 1 / -1;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-input-border, var(--vscode-widget-border, #3c3c3c));
+  background: var(--vscode-input-background, #313131);
+  color: var(--vscode-input-foreground, inherit);
+  font: inherit;
+}
+.gfp-changes-branch-input:focus {
+  outline: 1px solid var(--vscode-focusBorder, #0078d4);
+  outline-offset: -1px;
+}
+.gfp-changes-branch-row .gfp-changes-primary,
+.gfp-changes-branch-row .gfp-changes-secondary {
+  margin: 0;
+}
+
+@media (hover: none) and (pointer: coarse) {
+  /* iOS Safari force-zooms the page when a focused input is under 16px. */
+  .gfp-changes-branch-input { font-size: 16px; min-height: 36px; }
 }

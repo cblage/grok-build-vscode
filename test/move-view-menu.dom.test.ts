@@ -13,7 +13,7 @@
  * this is the half that decides what a user is offered.
  */
 import { describe, expect, it } from "vitest";
-import { bootWebview, click, dispatch, type Harness } from "./webview-harness";
+import { openAppSettings, bootWebview, click, dispatch, type Harness } from "./webview-harness";
 
 type Caps = Record<string, boolean>;
 
@@ -38,10 +38,7 @@ function boot(capabilities: Caps, opts: { remote?: boolean } = {}): Harness {
 
 /** Open Settings → Advanced, where Move view lives. */
 function openMoveView(h: Harness): void {
-  const gear = h.doc.getElementById("gear-btn") || h.doc.getElementById("rail-gear-btn");
-  click(h.window, gear!);
-  const settings = items(h).find((el) => /(^|\s)Settings$/.test(text(el)));
-  if (settings) click(h.window, settings);
+  openAppSettings(h.window, h.doc);
   const advanced = [...h.doc.querySelectorAll("#settings-overlay .settings-nav-item")]
     .find((el) => (el.textContent || "").trim() === "Advanced");
   if (advanced) click(h.window, advanced);

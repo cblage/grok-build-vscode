@@ -32,6 +32,10 @@ import { pathsEqual } from "../src/worktree";
 const sorted = (a: readonly string[]) => [...a].sort();
 
 describe("remote-policy classification tables", () => {
+  it.each(["questionResolved", "uiConfirmResolved"] as const)("mirrors %s within the owning session scope", (type) => {
+    expect(OUTBOUND_DISPOSITION[type]).toBe("mirror");
+    expect(OUTBOUND_PROJECT_AUTH[type]).toBe("scope");
+  });
   // tsc already forces this via Record<Union["type"], …>; the runtime assert
   // guards the compiled-JS path the same way protocol.test.ts does.
   it("classifies every WebviewMsg type (no drift behind the protocol)", () => {
@@ -84,6 +88,7 @@ describe("remote-policy classification tables", () => {
     expect(INBOUND_DISPOSITION.selectRepo).toBe("view");
     expect(INBOUND_DISPOSITION.toggleRepoPin).toBe("full");
     expect(INBOUND_DISPOSITION.setRepoColor).toBe("full");
+    expect(INBOUND_DISPOSITION.setRepoIcon).toBe("full");
     // native pickers/editors/mic act on the LOCAL VS Code — never remote-drivable
     expect(INBOUND_DISPOSITION.openFile).toBe("host-local");
     expect(INBOUND_DISPOSITION.showInFolder).toBe("host-local");
@@ -165,6 +170,7 @@ describe("remote repo target gate", () => {
     expect(allowRemoteRepoTarget({ type: "selectRepo", cwd: "/work/a" }, discovered)).toBe(true);
     expect(allowRemoteRepoTarget({ type: "toggleRepoPin", cwd: "/work/b", pinned: true }, discovered)).toBe(true);
     expect(allowRemoteRepoTarget({ type: "setRepoColor", cwd: "/work/a", color: "blue" }, discovered)).toBe(true);
+    expect(allowRemoteRepoTarget({ type: "setRepoIcon", cwd: "/work/a", icon: "rocket" }, discovered)).toBe(true);
     expect(allowRemoteRepoTarget({ type: "resumeSession", id: "s", cwd: "/work/a" }, discovered)).toBe(true);
     expect(allowRemoteRepoTarget({ type: "clearAllSessions", cwd: "/work/a" }, discovered)).toBe(true);
     // The rail previews a repo without selecting it — same catalog gate, so it
@@ -205,8 +211,12 @@ describe("remote repo target gate", () => {
     ).toBe(false);
     expect(allowRemoteRepoTarget({ type: "selectRepo", cwd: "/etc" }, discovered)).toBe(false);
     expect(allowRemoteRepoTarget({ type: "toggleRepoPin", cwd: "/etc", pinned: true }, discovered)).toBe(false);
-    // A colour write that names an arbitrary cwd is the same hole as archive/pin.
+    // A colour or mark write that names an arbitrary cwd is the same hole as
+    // archive/pin. Both are in the switch for that reason: the default branch
+    // returns true, so a type that names a cwd and is NOT listed here is a
+    // remote-writable path the host never published.
     expect(allowRemoteRepoTarget({ type: "setRepoColor", cwd: "/etc", color: "teal" }, discovered)).toBe(false);
+    expect(allowRemoteRepoTarget({ type: "setRepoIcon", cwd: "/etc", icon: "rocket" }, discovered)).toBe(false);
     expect(allowRemoteRepoTarget({ type: "resumeSession", id: "s", cwd: "/etc" }, discovered)).toBe(false);
     expect(allowRemoteRepoTarget({ type: "clearAllSessions", cwd: "/etc" }, discovered)).toBe(false);
   });
@@ -367,15 +377,10 @@ describe("mayDeliverRemoteHostMsg (outbound project authorization)", () => {
     });
 
     describe("routinesMessageForRemote", () => {
-      // The desk offers archived projects in the picker on purpose (archiving
-      // hides a project from the RAIL, and a routine is not the rail), while
-      // `remoteAuthorizedCwds` excludes them on purpose (archiving revokes
-      // remote access). Both rules are right; composed without a filter they
-      // meant one archived project anywhere blanked the whole page on a phone.
       it("drops what a connection may not reach instead of dropping the page", () => {
         const full = frame(
           [routine(open[0]), routine(closed)],
-          [{ cwd: open[0], label: "open" }, { cwd: closed, label: "archived" }],
+          [{ cwd: open[0], label: "open" }, { cwd: closed, label: "removed" }],
         ) as Extract<HostMsg, { type: "routines" }>;
 
         expect(mayDeliverRemoteHostMsg(full, open, undefined, same)).toBe(false);
@@ -399,8 +404,8 @@ describe("mayDeliverRemoteHostMsg (outbound project authorization)", () => {
         expect(trimmed.models).toEqual(clean.models);
       });
 
-      // Repoint a routine from A to B, then archive A. The entry now passes
-// under B while a RETAINED run still names A — so the routine's own cwd
+      // Repoint a routine from A to B, then remove A. The entry now passes
+      // under B while a RETAINED run still names A — so the routine's own cwd
       // does not vouch for its history, and filtering only the top level sends
       // a revoked project's path and session id across the wire.
       const withRun = (routineCwd: string, runCwd: string) => {
@@ -467,7 +472,7 @@ describe("mayDeliverRemoteHostMsg (outbound project authorization)", () => {
       });
 
       it("yields an empty page rather than nothing when NOTHING is reachable", () => {
-        const none = frame([routine(closed)], [{ cwd: closed, label: "archived" }]) as Extract<
+        const none = frame([routine(closed)], [{ cwd: closed, label: "removed" }]) as Extract<
           HostMsg,
           { type: "routines" }
         >;
@@ -768,9 +773,16 @@ describe("allowFromRemote tier gating", () => {
     }
   });
 
-  it("refuses remote connector connect/disconnect at every tier but mirrors the list", () => {
-    expect(INBOUND_DISPOSITION.connectMcpConnector).toBe("host-local");
-    expect(INBOUND_DISPOSITION.disconnectMcpConnector).toBe("host-local");
+  it("allows connector changes at full and mirrors workspace OAuth frames for every tab without project scope", () => {
+    expect(INBOUND_DISPOSITION.connectMcpConnector).toBe("full");
+    expect(INBOUND_DISPOSITION.disconnectMcpConnector).toBe("full");
+    expect(OUTBOUND_DISPOSITION.mcpConnectorAuthorization).toBe("mirror");
+    expect(OUTBOUND_PROJECT_AUTH.mcpConnectorAuthorization).toBe("none");
+    const frame: HostMsg = { type: "mcpConnectorAuthorization", id: "notion", attemptId: "attempt-1", status: "waiting", url: "https://vendor.example/authorize" };
+    expect(mayDeliverRemoteHostMsg(frame, [], undefined, pathsEqual)).toBe(true);
+    expect(transformHostMsgForRemote(frame)).toEqual(frame);
+    expect(transformHostMsgForRemote({ type: "mcpConnectors", connectors: [], remoteConnect: true }))
+      .toEqual({ type: "mcpConnectors", connectors: [], remoteConnect: true });
     expect(OUTBOUND_DISPOSITION.mcpConnectors).toBe("mirror");
     expect(OUTBOUND_DISPOSITION.mcpServers).toBe("allowlist");
     expect(OUTBOUND_PROJECT_AUTH.mcpServers).toBe(OUTBOUND_PROJECT_AUTH.mcpConnectors);
@@ -780,14 +792,14 @@ describe("allowFromRemote tier gating", () => {
     expect(allowFromRemote("listMcpServers", "full")).toBe(true);
     for (const type of ["connectMcpConnector", "disconnectMcpConnector"] as const) {
       for (const tier of ["read-only", "propose", "full"] as const) {
-        expect(allowFromRemote(type, tier)).toBe(false);
+        expect(allowFromRemote(type, tier)).toBe(tier === "full");
       }
     }
   });
 
-  it("a remote cannot set, read, or clear a connector key even at full", () => {
+  it("a remote may write or clear a connector key at full", () => {
     for (const type of ["connectMcpConnector", "disconnectMcpConnector"] as const) {
-      expect(allowFromRemote(type, "full")).toBe(false);
+      expect(allowFromRemote(type, "full")).toBe(true);
     }
   });
 
@@ -1475,5 +1487,15 @@ describe("a cloud environment is its own desk", () => {
     expect([...promoted].sort()).toEqual([
       "githubSignOut", "logout", "refreshProviders", "setTelemetryEnabled", "setThumbsFeedback",
     ]);
+  });
+});
+
+
+describe("the diff-card preference belongs to each device", () => {
+  it("keeps both directions host-local and needs no remote session binding", () => {
+    expect(INBOUND_DISPOSITION.setExpandDiffCard).toBe(INBOUND_DISPOSITION.setPromptNav);
+    expect(REMOTE_REQUIRES_BOUND_SESSION.setExpandDiffCard).toBe(false);
+    expect(OUTBOUND_DISPOSITION.expandDiffCard).toBe("host-local");
+    expect(transformHostMsgForRemote({ type: "expandDiffCard", value: true })).toBeNull();
   });
 });

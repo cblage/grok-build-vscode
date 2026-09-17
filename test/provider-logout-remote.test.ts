@@ -6,6 +6,7 @@ import type { HostMsg } from "../src/protocol";
 
 function makeSidebar(update: () => Promise<void> = async () => {}): any {
   const sidebar = Object.create(GrokSidebar.prototype) as any;
+  sidebar.pendingConfirms = new Map();
   sidebar.cliPath = "grok";
   sidebar.locateProvider = vi.fn((provider: "grok" | "codex") => provider);
   sidebar.locatedProviders = vi.fn(() => ({ grok: true, codex: true }));
@@ -73,10 +74,10 @@ describe("provider logout real-entry wiring", () => {
     grok.status = "working";
     grok.activeSessionId = "grok-session";
     grok.turnToken = {};
-    grok.client = { dispose: vi.fn() } as any;
+    grok.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     const codex = sidebar.focused as Session;
     codex.activeSessionId = "codex-session";
-    codex.client = { dispose: vi.fn() } as any;
+    codex.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     sidebar.remoteClients.ready("grok-tab");
     sidebar.remoteClients.setActive("grok-tab", grok);
     sidebar.pool = new Set([grok, codex]);
@@ -110,7 +111,7 @@ describe("provider logout real-entry wiring", () => {
     const focused = new Session();
     focused.provider = "grok";
     focused.cwd = "/repo";
-    focused.client = { dispose: vi.fn(), prompt: vi.fn() } as any;
+    focused.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn(), prompt: vi.fn() } as any;
     sidebar.focused = focused;
     sidebar.pool.add(focused);
 
@@ -130,7 +131,7 @@ describe("provider logout real-entry wiring", () => {
     const focused = new Session();
     focused.provider = "grok";
     focused.cwd = "/repo";
-    focused.client = { dispose: vi.fn(), prompt: vi.fn() } as any;
+    focused.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn(), prompt: vi.fn() } as any;
     sidebar.focused = focused;
     sidebar.pool.add(focused);
 
@@ -151,12 +152,12 @@ describe("provider logout real-entry wiring", () => {
     const focused = new Session();
     focused.provider = "grok";
     focused.cwd = "/repo";
-    focused.client = { dispose: vi.fn() } as any;
+    focused.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     focused.queuedSends = [{ text: "queued before sign-out", chips: [] }];
     const remote = new Session();
     remote.provider = "grok";
     remote.cwd = "/repo";
-    remote.client = { dispose: vi.fn() } as any;
+    remote.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     remote.queuedSends = [{ text: "remote queued before sign-out", chips: [] }];
     sidebar.focused = focused;
     sidebar.pool = new Set([focused, remote]);
@@ -192,7 +193,7 @@ describe("provider logout real-entry wiring", () => {
     background.cwd = "/repo";
     background.activeSessionId = "background-grok";
     background.hasHistory = true;
-    background.client = { dispose: vi.fn() } as any;
+    background.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     background.queuedSends = [{ text: "keep this background draft", chips: [] }];
     sidebar.pool.add(background);
     sidebar.sessionDisplayName = vi.fn((session: Session) =>
@@ -224,7 +225,7 @@ describe("provider logout real-entry wiring", () => {
       detached.cwd = "/repo";
       detached.activeSessionId = "detached-grok";
       detached.hasHistory = true;
-      detached.client = { dispose: vi.fn() } as any;
+      detached.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
       detached.queuedSends = [{ text: "draft from disconnected phone", chips: [] }];
       sidebar.pool.add(detached);
       sidebar.remoteClients.identify("old-socket", "stable-tab");
@@ -237,7 +238,7 @@ describe("provider logout real-entry wiring", () => {
 
       await logoutFromRealCommand(sidebar);
 
-      sidebar.remoteAuthorizedSessionCwds = vi.fn(() => ["/repo"]);
+      sidebar.authorizedSessionCwds = vi.fn(() => ["/repo"]);
       sidebar.localRepoCatalogEntries = vi.fn(() => []);
       sidebar.buildInitialStateMsg = vi.fn(() => ({ type: "initialState", cwd: "/repo" }));
       sidebar.providerStateMessage = vi.fn(() => ({ type: "providerState", providers: [] }));
@@ -282,7 +283,7 @@ describe("provider logout real-entry wiring", () => {
     const focused = new Session();
     focused.provider = "grok";
     focused.cwd = "/project-b";
-    focused.client = { dispose: vi.fn() } as any;
+    focused.client = { setHumanWaitActive: vi.fn(), dispose: vi.fn() } as any;
     focused.queuedSends = [{ text: "B-only draft", chips: [] }];
     sidebar.focused = focused;
     sidebar.pool.add(focused);

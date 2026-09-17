@@ -9,12 +9,10 @@
   const vscode = acquireVsCodeApi();
 
   const ICON = {
-    // Solid folder marks supplied by the owner (media/icons/folder-*.svg),
-    // inlined because the rail sets them with innerHTML. `fill:currentColor`
-    // is the change from the originals — it is what lets a project's colour
-    // tint them, and what keeps them legible in a light theme.
-    folderClosed: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 408 408" fill="currentColor" aria-hidden="true"><path d="M372,88.661H206.32l-33-39.24c-0.985-1.184-2.461-1.848-4-1.8H36c-19.956,0.198-36.023,16.443-36,36.4v240c-0.001,19.941,16.06,36.163,36,36.36h336c19.94-0.197,36.001-16.419,36-36.36v-199C408.001,105.08,391.94,88.859,372,88.661z"/></svg>`,
-    folderOpen: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -57 511.99973 511" fill="currentColor" aria-hidden="true"><path d="m506.039062 180.988281c-7.78125-12.546875-21.53125-20.046875-36.78125-20.046875h-339.5625c-16.832031 0-32.140624 9.488282-39.011718 24.179688l-89.8125 188.308594c3.390625 13.789062 16.269531 24.089843 31.609375 24.089843h361.269531c15.445312 0 29.5625-8.734375 36.460938-22.554687l77.628906-155.59375c6.128906-12.3125 5.449218-26.660156-1.800782-38.382813zm0 0"/><path d="m72.402344 156.15625c6.863281-14.6875 22.175781-24.179688 39.011718-24.179688h319.753907v-40.898437c0-16.859375-14.222657-30.578125-31.703125-30.578125h-186.445313c-.273437 0-.460937-.070312-.53125-.121094l-33.371093-46.660156c-5.910157-8.277344-15.671876-13.21875-26.101563-13.21875h-121.304687c-17.488282 0-31.710938 13.71875-31.710938 30.578125v276.875zm0 0"/></svg>`,
+    // Lucide project marks. The outline inherits the project tint through
+    // currentColor, just like the other rail glyphs.
+    folderClosed: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>`,
+    folderOpen: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>`,
     plus: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>`,
     // New session. The SAME glyph the chat header's New button uses (ICON.squarePen
     // in media/chat.js) — one action should not have two icons depending on which
@@ -119,6 +117,7 @@
   let menuEl = null;
   let menuAnchorEl = null;
   let colorPickerEl = null;
+  let iconPickerEl = null;
 
   /**
    * Identity key for a project cwd. Mirrors `cwdKey` in media/chat.js and
@@ -217,6 +216,60 @@
   const pendingRepoColor = createPendingOverlay({
     onExpire() { render(); },
   });
+  const pendingRepoIcon = createPendingOverlay({
+    onExpire() { render(); },
+  });
+  const pendingPins = new Map();
+  let pinSequence = 0;
+  let pinRequests = false;
+
+  function pinnedRows() {
+    const rows = new Map(state.pinnedSessions.map((row) => [row.id, row]));
+    for (const [id, pending] of pendingPins) {
+      if (pending.pinned) rows.set(id, pending.row);
+      else rows.delete(id);
+    }
+    return [...rows.values()].sort((a, b) => (b.pinnedAt || 0) - (a.pinnedAt || 0));
+  }
+
+  function sessionIsPinned(row) {
+    const pending = pendingPins.get(row.id);
+    if (pending) return pending.pinned;
+    return state.pinnedKnown
+      ? state.pinnedSessions.some((entry) => entry.id === row.id)
+      : typeof row.pinnedAt === "number";
+  }
+
+  function togglePinnedRow(row, cwd) {
+    const pinned = !sessionIsPinned(row);
+    const requestId = pinRequests ? `pin-${Date.now()}-${++pinSequence}-${Math.random().toString(36).slice(2)}` : undefined;
+    const previous = pendingPins.get(row.id);
+    if (previous) clearTimeout(previous.timer);
+    const pending = { pinned, requestId, row: { ...row, cwd, pinnedAt: Date.now() } };
+    pending.timer = setTimeout(() => {
+      if (pendingPins.get(row.id) !== pending) return;
+      pendingPins.delete(row.id);
+      render();
+    }, 30000);
+    pendingPins.set(row.id, pending);
+    render();
+    vscode.postMessage({ type: "toggleSessionPin", id: row.id, cwd, pinned,
+      ...(requestId ? { requestId } : {}) });
+  }
+
+  function settlePendingPins(msg) {
+    pinRequests = msg.pinRequests === true;
+    for (const [id, pending] of pendingPins) {
+      const settled = pending.requestId
+        ? pending.requestId === msg.requestId
+        : state.pinnedSessions.some((row) => row.id === id) === pending.pinned;
+      if (settled) {
+        clearTimeout(pending.timer);
+        pendingPins.delete(id);
+      }
+    }
+  }
+
   const pendingRename = createPendingOverlay({
     onExpire() { render(); },
   });
@@ -225,6 +278,25 @@
     const painted = pendingRepoColor.valueFor(cwdKey(repo && repo.cwd));
     if (painted !== undefined) return painted;
     return typeof repo?.color === "string" ? repo.color : "";
+  }
+
+  function repoIconOf(repo) {
+    const painted = pendingRepoIcon.valueFor(cwdKey(repo && repo.cwd));
+    if (painted !== undefined) return painted;
+    return typeof repo?.icon === "string" ? repo.icon : "";
+  }
+
+  /**
+   * Markup for a project's mark. The default — and the fallback for an id this
+   * build does not ship — is the filled folder, NOT the open/closed pair: the
+   * chevron beside it is what says open or closed now, so the mark is free to
+   * be an identity rather than a disclosure control. That separation is what
+   * makes any of the other 95 usable.
+   */
+  function repoMarkHTML(repo) {
+    const marks = typeof globalThis !== "undefined" ? globalThis.GrokRepoIcons : null;
+    if (!marks) return ICON.folderClosed;
+    return marks.svg(repoIconOf(repo)) || marks.svg("folder_open");
   }
 
   function sessionRowName(s) {
@@ -238,6 +310,11 @@
     render();
   }
 
+  function paintPendingRepoIcon(cwd, icon) {
+    pendingRepoIcon.paint(cwdKey(cwd), icon);
+    render();
+  }
+
   function paintPendingRename(id, name) {
     if (!id) return;
     pendingRename.paint(id, name);
@@ -245,7 +322,9 @@
   }
 
   function settlePendingRepoColor(entries) {
-    pendingRepoColor.settleAny((entries || []).map((r) => r && cwdKey(r.cwd)).filter(Boolean));
+    const keys = (entries || []).map((r) => r && cwdKey(r.cwd)).filter(Boolean);
+    pendingRepoColor.settleAny(keys);
+    pendingRepoIcon.settleAny(keys);
   }
 
   function settlePendingRename(entries) {
@@ -377,6 +456,15 @@
       colorPickerEl.remove();
       colorPickerEl = null;
     }
+     flushDeferredRender();
+  }
+
+  function closeIconPicker() {
+    if (iconPickerEl) {
+      iconPickerEl.remove();
+      iconPickerEl = null;
+    }
+     flushDeferredRender();
   }
 
   /** Drop the action menu only. Colour picker is separate so "Set color" can
@@ -388,11 +476,52 @@
       menuEl = null;
     }
     menuAnchorEl = null;
+    flushDeferredRender();
   }
 
   function closeMenu() {
     closeMenuOnly();
     closeColorPicker();
+    closeIconPicker();
+  }
+
+  /**
+   * Hold the rail still while a popover is up.
+   *
+   * `render()` throws every node in #rail-scroll away and builds it again, so
+   * it used to close the menu and both pickers first -- their anchors were
+   * about to stop existing. That is fine when a rebuild is a rare event and
+   * ruinous when it is not: the host re-sends sessions whenever the files
+   * backing them change, and ANOTHER extension writing its own transcripts is
+   * enough to drive that every second or two. The owner, in VS Code: "all
+   * popups close every 1-3 sec... context menu under ..., color, icon".
+   *
+   * The chat.js rail answers this by re-anchoring an open menu to the button
+   * that replaced its anchor. Here the simpler answer holds, and it removes
+   * work rather than adding it: nothing under an open popover needs to move
+   * for the few seconds it is up, so the rebuild waits for it. Nothing can be
+   * lost, because every close path flushes -- and the frame that lands is the
+   * newest state, not the one that was deferred.
+   *
+   * What this costs, said plainly: the rail is a beat stale while you have a
+   * menu open. That is the same beat in which you are looking at the menu.
+   */
+  let renderDeferred = false;
+
+  function railPopoverOpen() {
+    return !!(menuEl || colorPickerEl || iconPickerEl);
+  }
+
+  function flushDeferredRender() {
+    if (!renderDeferred) return;
+    // Out of line, so a close that runs mid-handler -- the menu item that
+    // closes itself and then opens a picker -- finishes before the rail is
+    // rebuilt under it.
+    setTimeout(() => {
+      if (!renderDeferred || railPopoverOpen()) return;
+      renderDeferred = false;
+      render();
+    }, 0);
   }
 
   // A click somewhere else in VS Code never reaches this document, so a menu
@@ -627,6 +756,35 @@
     placePopover(picker, anchor, at ? { x: at.left, y: at.top } : undefined);
   }
 
+  /**
+   * Ninety-five marks plus the default folder, in six tabs with a search box.
+   * Host-persisted via setRepoIcon; capability-gated by iconSupported. The grid
+   * itself is media/repo-icon-picker.js, shared with the desktop/browser rail
+   * so both surfaces offer the same marks in the same order.
+   */
+  function openIconPicker(anchor, repo, at) {
+    closeIconPicker();
+    if (!anchor || !repo) return;
+    const builder = typeof globalThis !== "undefined" ? globalThis.GrokRepoIconPicker : null;
+    if (!builder) return;
+    const picker = builder.create({
+      currentIcon: repoIconOf(repo),
+      onClose() { closeIconPicker(); },
+      onPick(id) {
+        closeIconPicker();
+        vscode.postMessage({ type: "setRepoIcon", cwd: repo.cwd, icon: id });
+        // Paint now. The next `repos` frame that names this cwd is the
+        // authority — confirm, contradict, or a silent host's expiry.
+        paintPendingRepoIcon(repo.cwd, id);
+      },
+    });
+    if (!picker) return;
+    document.body.appendChild(picker.el);
+    iconPickerEl = picker.el;
+    placePopover(picker.el, anchor, at ? { x: at.left, y: at.top } : undefined);
+    picker.focus();
+  }
+
   document.addEventListener("click", (e) => {
     if (menuEl) {
       if (menuEl.contains(e.target)) return;
@@ -638,6 +796,7 @@
       return;
     }
     if (colorPickerEl && !colorPickerEl.contains(e.target)) closeColorPicker();
+    if (iconPickerEl && !iconPickerEl.contains(e.target)) closeIconPicker();
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeMenu();
@@ -673,6 +832,13 @@
    */
   function colorSupported() {
     return state.repos.some((r) => typeof r.color === "string");
+  }
+
+  /** Same capability rule for marks — and the glyph data has to be on the page
+   *  too, since a picker with no paths would offer 96 empty squares. */
+  function iconSupported() {
+    const marks = typeof globalThis !== "undefined" ? globalThis.GrokRepoIcons : null;
+    return !!marks && state.repos.some((r) => typeof r.icon === "string");
   }
 
   /**
@@ -756,9 +922,10 @@
   function render() {
     const root = document.getElementById("rail-scroll");
     if (!root) return;
+    // Not while the user is working in one -- see flushDeferredRender.
+    if (railPopoverOpen()) { renderDeferred = true; return; }
     root.classList.add("rail-rebuilding");
     root.innerHTML = "";
-    closeMenu();
 
     const q = state.filter.trim();
     let shown = false;
@@ -768,7 +935,7 @@
     // never a version. An older host that never sends pinnedSessions shows no
     // group rather than an empty one.
     if (state.pinnedKnown) {
-      const pinned = uniqueSessionRows(state.pinnedSessions).filter(
+      const pinned = uniqueSessionRows(pinnedRows()).filter(
         (s) => matchesFilter(s.displayName) || matchesFilter(repoLabelFor(s.cwd)),
       );
       if (pinned.length) {
@@ -816,12 +983,26 @@
     }
 
     const { current, other } = partitionRepos();
-    const { active, archived } = splitByArchive(other);
+    // The open folder goes through the split like everything else. Lifting it
+    // out first was a SECOND mechanism holding it in Projects, on top of the
+    // guards in repoIsArchived -- so archiving it stored the choice and moved
+    // nothing, and fixing only the guards fixed only half of it.
+    const { active, archived } = splitByArchive(current ? [current, ...other] : other);
 
-    // Open folder stays first inside Projects; everything else remains alphabetical.
-    const projectRepos = (current ? [current, ...active] : active)
-      .filter((r) => !q || repoHasMatch(r));
-    if (projectRepos.length) {
+    // Open folder stays first inside Projects; everything else remains
+    // alphabetical. If the user archived it, it is not in Projects to lead.
+    const ordered = current && active.indexOf(current) > 0
+      ? [current, ...active.filter((r) => r !== current)]
+      : active;
+    const projectRepos = ordered.filter((r) => !q || repoHasMatch(r));
+    // Archiving every project must not take the screen's controls with it. The
+    // header, the "+" and the wide add target all live inside this block, so
+    // the last archived row used to leave a rail with no way to add anything --
+    // and the `!shown` fallback below could not step in, because the archive
+    // section had already set `shown`. The archive is a grouping, not a
+    // different screen, so Projects stays with an empty state of its own.
+    const emptyProjects = !projectRepos.length && !q && archived.length > 0;
+    if (projectRepos.length || emptyProjects) {
       const forcedOpen = !!q;
       const open = forcedOpen || !state.groupCollapsed.projects;
       root.appendChild(collapsibleGroupHead({
@@ -844,6 +1025,12 @@
           }));
         }
         root.appendChild(list);
+        if (emptyProjects) {
+          const note = document.createElement("div");
+          note.className = "rail-note";
+          note.textContent = "Every project is archived.";
+          root.appendChild(note);
+        }
         // A full-width target under the list, not only the small "+" beside the
         // group title. The owner's reason, and it is about where the eye goes:
         // with one project or none the rail is mostly empty space, and the only
@@ -1184,12 +1371,14 @@
    *    for it to have been recent about.
    */
   function repoIsArchived(repo, floorKeys, now) {
-    if (sameCwd(repo.cwd, state.workspaceCwd)) return false;
-    if (sameCwd(repo.cwd, state.currentCwd)) return false;
     const { known } = sessionsForRepo(repo);
     const at = repoActivity(repo);
     const archivedAt = Number(repo.archivedAt) || 0;
     if (archivedAt > 0 && (!known || archivedAt >= at)) return !!repo.archived;
+    // Guesses only, below an answer. Standing in a project exempts it from
+    // being archived FOR you by the age rule; it must not veto your own click.
+    if (sameCwd(repo.cwd, state.workspaceCwd)) return false;
+    if (sameCwd(repo.cwd, state.currentCwd)) return false;
     if (!known) return !!repo.archived;
     if (floorKeys.has(cwdKey(repo.cwd))) return false;
     return at > 0 ? now - at > RAIL_ARCHIVE_AFTER_MS : true;
@@ -1197,6 +1386,9 @@
 
   /** Split the catalog into what belongs in Projects and what belongs in the Archive. */
   function splitByArchive(repos) {
+    if (!state.repos.some((r) => typeof r.archived === "boolean")) {
+      return { active: repos, archived: [] };
+    }
     const now = Date.now();
     const byActivity = state.repos.slice().sort((a, b) => repoActivity(b) - repoActivity(a));
     const floorKeys = new Set(
@@ -1242,9 +1434,20 @@
       (expanded ? "Collapse " : "Expand ") + (repo.label || leaf(repo.cwd)),
     );
 
+    // Disclosure first, identity second. The folder used to be both — open when
+    // expanded, closed when not — which is exactly why no other glyph could
+    // replace it: a rocket has no open variant. Splitting them frees the mark
+    // to say WHICH project while the chevron says open or closed, and the
+    // chevron states it without being pointed at, which dimming does not.
+    const chev = document.createElement("span");
+    chev.className = "rail-chevron";
+    chev.innerHTML = expanded ? ICON.chevronDown : ICON.chevronRight;
+    chev.setAttribute("aria-hidden", "true");
+    head.appendChild(chev);
+
     const twisty = document.createElement("span");
     twisty.className = "rail-twisty";
-    twisty.innerHTML = expanded ? ICON.folderOpen : ICON.folderClosed;
+    twisty.innerHTML = repoMarkHTML(repo);
     twisty.setAttribute("aria-hidden", "true");
     const repoColor = repoColorOf(repo);
     if (repoColor) twisty.dataset.repoColor = repoColor;
@@ -1380,11 +1583,20 @@
       if (colorSupported()) {
         items.push({
           label: "Set color",
-          title: "Tint this project's folder icon so it is easy to find",
+          title: "Tint this project's icon so it is easy to find",
           onSelect: () => openColorPicker(menuBtn, repo, lastMenuRect),
         });
-        items.push(null);
       }
+      // Under the colour, because they answer the same question in the same
+      // place: how do I recognise this project at a glance.
+      if (iconSupported()) {
+        items.push({
+          label: "Set icon",
+          title: "Give this project its own icon instead of a folder",
+          onSelect: () => openIconPicker(menuBtn, repo, lastMenuRect),
+        });
+      }
+      if (colorSupported() || iconSupported()) items.push(null);
       items.push({
         label: "Clear all history",
         danger: true,
@@ -1553,7 +1765,7 @@
       row.appendChild(where);
     }
 
-    const isPinned = typeof s.pinnedAt === "number";
+    const isPinned = sessionIsPinned(s);
     if (isPinned) row.classList.add("pinned");
 
     const actions = document.createElement("div");
@@ -1568,12 +1780,7 @@
       pinBtn.setAttribute("aria-label", pinBtn.title);
       pinBtn.onclick = (e) => {
         e.stopPropagation();
-        vscode.postMessage({
-          type: "toggleSessionPin",
-          id: s.id,
-          cwd: s.cwd || repo.cwd,
-          pinned: !isPinned,
-        });
+        togglePinnedRow(s, s.cwd || repo.cwd);
       };
       actions.appendChild(pinBtn);
     }
@@ -1607,12 +1814,7 @@
           label: isPinned ? "Unpin conversation" : "Pin conversation",
           disabled: !state.pinnedKnown,
           onSelect: () =>
-            vscode.postMessage({
-              type: "toggleSessionPin",
-              id: s.id,
-              cwd,
-              pinned: !isPinned,
-            }),
+            togglePinnedRow(s, cwd),
         },
         null,
         {
@@ -1764,6 +1966,9 @@
       case "sessionRemoved": {
         if (!msg.id) break;
         state.currentSessions = state.currentSessions.filter((s) => s.id !== msg.id);
+        const pendingPin = pendingPins.get(msg.id);
+        if (pendingPin) clearTimeout(pendingPin.timer);
+        pendingPins.delete(msg.id);
         state.pinnedSessions = state.pinnedSessions.filter((s) => s.id !== msg.id);
         for (const preview of Object.values(state.previews)) {
           const before = preview.entries.length;
@@ -1810,6 +2015,7 @@
       }
       case "pinnedSessions": {
         state.pinnedSessions = uniqueSessionRows(msg.entries);
+        settlePendingPins(msg);
         state.pinnedKnown = true;
         settlePendingRename(state.pinnedSessions);
         if (msg.dots && typeof msg.dots === "object") {

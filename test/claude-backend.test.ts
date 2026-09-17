@@ -3,6 +3,7 @@ import * as path from "node:path";
 import {
   ClaudeBackend,
   claudeModeId,
+  claudeModelDescription,
   configStateFromClaudeOptions,
   isClaudeCredentialError,
   listClaudeSessions,
@@ -81,8 +82,9 @@ describe("Claude session model mapping", () => {
   it("turns configOptions into the host picker envelope", () => {
     const models = modelsFromClaudeConfigOptions(configOptions);
     expect(models.currentModelId).toBe("claude-opus-4-6");
-    expect(models.availableModels).toHaveLength(3);
-    expect(models.availableModels[1]).toMatchObject({
+    expect(models.availableModels.map((m) => m.modelId))
+      .toEqual(["claude-opus-4-6", "claude-sonnet-4-6"]);
+    expect(models.availableModels.find((m) => m.modelId === "claude-opus-4-6")).toMatchObject({
       modelId: "claude-opus-4-6",
       name: "Opus",
       _meta: {
@@ -97,7 +99,56 @@ describe("Claude session model mapping", () => {
     const normalized = normalizeClaudeSessionResponse({ sessionId: "s1", configOptions });
     expect(normalized.sessionId).toBe("s1");
     expect(normalized.models.currentModelId).toBe("claude-opus-4-6");
-    expect(normalized.models.availableModels).toHaveLength(3);
+    expect(normalized.models.availableModels).toHaveLength(2);
+  });
+
+  // The vendor's own list, measured out of claude-agent-acp on 2026-09-14.
+  const shippedOptions = (currentValue: string) => [{
+    id: "model",
+    currentValue,
+    options: [
+      { value: "default", name: "Default (recommended)", description: "Opus (1M context)" },
+      { value: "opus[1m]", name: "Opus 5", description: "Opus 5 with 1M context · Best for everyday, complex tasks" },
+      { value: "sonnet", name: "Sonnet 5", description: "Sonnet 5 · Efficient for routine tasks" },
+    ],
+  }];
+
+  it("keeps a policy row out of a list of models", () => {
+    expect(modelsFromClaudeConfigOptions(shippedOptions("sonnet")).availableModels.map((m) => m.modelId))
+      .toEqual(["opus[1m]", "sonnet"]);
+  });
+
+  // Dropping the row a session is ON would leave the picker with nothing
+  // checked and the composer chip showing the raw id.
+  it("keeps it when it is the model the session is actually on", () => {
+    expect(modelsFromClaudeConfigOptions(shippedOptions("default")).availableModels.map((m) => m.modelId))
+      .toEqual(["default", "opus[1m]", "sonnet"]);
+  });
+
+  // The picker promotes a description's lead over the name when it spells the
+  // name out more fully, so a capability qualifier there becomes the model's
+  // visible name everywhere — picker row AND composer chip.
+  it("keeps a context size out of the model's name", () => {
+    const opus = modelsFromClaudeConfigOptions(shippedOptions("sonnet"))
+      .availableModels.find((m) => m.modelId === "opus[1m]");
+    expect(opus.description).toBe("Opus 5 · Best for everyday, complex tasks");
+  });
+});
+
+describe("claudeModelDescription", () => {
+  it("strips the context qualifier wherever the vendor spells it", () => {
+    expect(claudeModelDescription("Opus 5 with 1M context · Best for everyday")).toBe("Opus 5 · Best for everyday");
+    expect(claudeModelDescription("Sonnet 5 with 200K context")).toBe("Sonnet 5");
+    expect(claudeModelDescription("Opus 5 with 1.5M context · x")).toBe("Opus 5 · x");
+  });
+
+  it("leaves a description that is not one alone", () => {
+    expect(claudeModelDescription("Sonnet 5 · Efficient for routine tasks"))
+      .toBe("Sonnet 5 · Efficient for routine tasks");
+    // "context" as prose, not as a window size.
+    expect(claudeModelDescription("Best with a lot of context")).toBe("Best with a lot of context");
+    expect(claudeModelDescription(undefined)).toBeUndefined();
+    expect(claudeModelDescription(42)).toBeUndefined();
   });
 });
 

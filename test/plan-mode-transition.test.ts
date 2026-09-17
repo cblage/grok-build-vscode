@@ -18,7 +18,7 @@ function makeSidebar(session: Session): any {
   sidebar.state = { get: () => ({}), update: vi.fn(async () => {}) };
   sidebar.openDiffsByRequest = { take: () => undefined };
   sidebar.host = {
-    getConfiguration: () => ({ update: vi.fn(async () => {}) }),
+    getConfiguration: () => ({ update: vi.fn(async () => {}), inspect: () => undefined }),
     workspaceRoot: () => "/workspace",
     showErrorMessage: vi.fn(async () => undefined),
     showWarningMessage: vi.fn(async () => undefined),

@@ -32,6 +32,7 @@ function setup(origin: "local" | "remote", provider: "grok" | "codex" | "claude"
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "summary.json"), JSON.stringify({ num_messages: 0 }));
   const sidebar = Object.create(GrokSidebar.prototype) as any;
+  sidebar.pendingConfirms = new Map();
   const session = new Session();
   session.cwd = cwd;
   session.provider = provider;
@@ -47,7 +48,7 @@ function setup(origin: "local" | "remote", provider: "grok" | "codex" | "claude"
   sidebar.view = { webview: { postMessage: vi.fn() } };
   sidebar.projectsRail = { webview: { postMessage: vi.fn() } };
   sidebar.uplink = { broadcastTo: vi.fn() };
-  sidebar.remoteAuthorizedSessionCwds = () => [cwd];
+  sidebar.authorizedSessionCwds = () => [cwd];
   sidebar.state = { get: (_key: string, fallback: unknown) => fallback };
   sidebar.sessionCache = new Map();
   sidebar.host = { appendLine: vi.fn() };
@@ -125,6 +126,7 @@ describe.each(["local", "remote"] as const)("abandoning an empty %s session", (o
       const deleted = new Promise<void>((resolve, reject) => { resolveDelete = resolve; rejectDelete = reject; });
       const exited = new Promise<void>((resolve) => { resolveExit = resolve; });
       const client = {
+        setHumanWaitActive: vi.fn(),
         deleteSession: vi.fn(() => deleted),
         dispose: vi.fn(() => exited),
       };
@@ -193,7 +195,7 @@ describe.each(["local", "remote"] as const)("abandoning an empty %s session", (o
 
 it("keeps removal local after its project loses remote authorization", () => {
   const { sidebar, park, delivered } = setup("local");
-  sidebar.remoteAuthorizedSessionCwds = () => [];
+  sidebar.authorizedSessionCwds = () => [];
   park();
   expect(delivered()).toEqual([{ type: "sessionRemoved", id, cwd }]);
   expect(sidebar.uplink.broadcastTo).not.toHaveBeenCalled();

@@ -1,6 +1,7 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface, Interface } from "node:readline";
 import { EventEmitter } from "node:events";
+import { claudeSubscriptionWindows, grokSubscriptionWindows, type SubscriptionWindow } from "./subscription-usage";
 import * as path from "node:path";
 import {
   collectToolImages,
@@ -41,7 +42,7 @@ import { filterAdvertisedCommands } from "./slash-filter";
 import { grokCliNeedsShell } from "./cli-process";
 import { compareVersionTuple, parseGrokVersion } from "./cli-locator";
 import { resolvedTerminalShellDialect } from "./terminal-manager";
-import type { AcpBackend, AcpProvider, BackendSessionListResult } from "./acp-backend";
+import type { AcpBackend, AcpProvider, BackendSessionListResult, BackendSteeringCapabilities } from "./acp-backend";
 import { buildGrokAgentArgs, grokBackend } from "./grok-backend";
 import {
   parseWorktreeApply,
@@ -82,46 +83,7 @@ export type PromptContentBlock =
   | { type: "text"; text: string }
   | { type: "image"; mimeType: string; data: string };
 
-/**
- * Oldest grok whose `_x.ai/interject` honors `content` (text + image blocks).
- * 0.2.x accepts `{sessionId, text}` and ignores unknown fields, so images
- * would drop silently — the host refuses image-bearing Steer instead.
- * Fail closed unless the version is live-verified. Inspected on 1.0.5
- * (`InterjectRequest.content` in `extensions/interject.rs`).
- */
-export const GROK_INTERJECT_CONTENT_MIN_VERSION: [number, number, number] = [1, 0, 0];
-
-/** True only for a live-verified grok that will apply interject `content`. */
-export function cliHonorsInterjectContent(
-  grokVersion?: string | null,
-  versionVerified = false,
-): boolean {
-  if (!versionVerified) return false;
-  const parsed = parseGrokVersion(grokVersion ?? "");
-  if (!parsed) return false;
-  return compareVersionTuple(parsed, GROK_INTERJECT_CONTENT_MIN_VERSION) >= 0;
-}
-
-/**
- * `_x.ai/interject` params. `content` is omitted entirely when there are no
- * image blocks so the legacy `{sessionId, text}` wire stays byte-identical
- * (the TUI does the same). The Text block, when present, is the rewritten
- * prompt (`buildPromptWithImages`) and wins over `text` on a capable CLI.
- */
-export function buildInterjectParams(
-  sessionId: string,
-  text: string,
-  content?: readonly PromptContentBlock[],
-): { sessionId: string; text: string; content?: PromptContentBlock[] } {
-  const params: { sessionId: string; text: string; content?: PromptContentBlock[] } = {
-    sessionId,
-    text,
-  };
-  if (content && content.some((block) => block.type === "image")) {
-    params.content = [...content];
-  }
-  return params;
-}
+export { buildInterjectParams, cliHonorsInterjectContent, GROK_INTERJECT_CONTENT_MIN_VERSION } from "./grok-backend";
 
 export interface AcpClientOptions {
   cliPath: string;
@@ -154,10 +116,12 @@ export interface AcpClientOptions {
    * Host-owned MCP servers for `session/new` and `session/load`. A getter is
    * read at request time so a Connect that lands after construct still applies.
    * The getter may be async so a host can re-read its own secrets first.
+   * Register cleanup for private spawn files; the CLI lifetime includes proxies
+   * initialized asynchronously after session/new and any adapter restarts.
    * Omitted / empty is the historical `[]` — the field is still sent because
    * grok rejects session/new without it.
    */
-  mcpServers?: AcpMcpStdioServer[] | (() => AcpMcpStdioServer[] | Promise<AcpMcpStdioServer[]>);
+  mcpServers?: AcpMcpStdioServer[] | ((onDispose: (dispose: () => void) => void) => AcpMcpStdioServer[] | Promise<AcpMcpStdioServer[]>);
 }
 
 export interface ModelInfo {
@@ -236,6 +200,7 @@ export interface QuestionItem {
 export interface QuestionRequest {
   id: number | string;
   sessionId: string;
+  toolCallId?: string;
   questions: QuestionItem[];
 }
 
@@ -337,6 +302,8 @@ export class AcpClient extends EventEmitter {
   private pending = new Map<number, Pending>();
   private readonly backend: AcpBackend;
   private readonly timeouts: AcpTimeouts;
+  private humanWaitActive = false;
+  private steering: BackendSteeringCapabilities;
 
   readonly provider: AcpProvider;
   readonly usesClientPlanGate: boolean;
@@ -398,6 +365,7 @@ export class AcpClient extends EventEmitter {
   constructor(private opts: AcpClientOptions) {
     super();
     this.backend = opts.backend ?? grokBackend;
+    this.steering = this.backend.steeringCapabilities(undefined, opts);
     this.provider = this.backend.provider;
     this.usesClientPlanGate = this.backend.usesClientPlanGate;
     this.currentReasoningEffort = this.opts.effort || undefined;
@@ -457,6 +425,7 @@ export class AcpClient extends EventEmitter {
     // a final successful interject response must be parsed before exit recovery
     // decides whether its user text still needs to be reclaimed.
     this.proc.on("close", (code) => {
+      this.disposeMcpFiles();
       for (const [id, p] of this.pending) {
         this.pending.delete(id);
         if (p.timer) clearTimeout(p.timer);
@@ -478,13 +447,28 @@ export class AcpClient extends EventEmitter {
         this.opts.grokVersionVerified === true,
       ),
     });
+    this.steering = this.backend.steeringCapabilities(init, this.opts);
     this.emit("initialized", init);
   }
 
   private async mcpServersForSession(): Promise<AcpMcpStdioServer[]> {
     const value = this.opts.mcpServers;
-    if (typeof value === "function") return await value();
+    if (typeof value === "function") return await value((dispose) => {
+      if (this.mcpFilesDisposed) dispose();
+      else this.mcpFileDisposers.add(dispose);
+    });
     return Array.isArray(value) ? value : [];
+  }
+
+  private readonly mcpFileDisposers = new Set<() => void>();
+  private mcpFilesDisposed = false;
+
+  private disposeMcpFiles(): void {
+    this.mcpFilesDisposed = true;
+    for (const dispose of this.mcpFileDisposers) {
+      try { dispose(); } catch { /* best-effort */ }
+    }
+    this.mcpFileDisposers.clear();
   }
 
   async newSession(modelId?: string): Promise<{ sessionId: string }> {
@@ -513,6 +497,34 @@ export class AcpClient extends EventEmitter {
       this.availableModels.find((m) => m.modelId === this.currentModelId)?.reasoningEffort ||
       this.opts.effort ||
       undefined;
+    // Adapters take effort as an RPC AFTER session/new (below), so what the CLI
+    // just advertised is its own config default -- while `session` is the frame
+    // that publishes the catalog the picker reads. Emitting the default and
+    // applying the request a moment later is why a Codex effort change snapped
+    // back: the strip showed gpt-6-astra's configured `ultra` again, and nothing
+    // afterwards corrects it (setReasoningEffort emits no event, and the
+    // `modelChanged` a model switch emits keeps an in-ladder level). Publish the
+    // level this session is about to be configured with -- but only one the
+    // model actually offers, since an off-menu level is refused below and the
+    // CLI's own value is then the honest thing to show.
+    const requestedEffort = this.opts.effort;
+    if (requestedEffort && this.provider !== "grok") {
+      const current = this.availableModels.find((m) => m.modelId === this.currentModelId);
+      if (current?.reasoningEfforts?.includes(requestedEffort)) {
+        this.currentReasoningEffort = requestedEffort;
+        current.reasoningEffort = requestedEffort;
+      }
+    }
+    // Grok's TOML default can override the spawn flag in session/new's
+    // effective state. Apply the preference to the session itself before its
+    // catalog reaches the picker (#162, #164).
+    if (requestedEffort && this.provider === "grok" && this.currentModelSupportsEffort()) {
+      try {
+        await this.setReasoningEffort(requestedEffort);
+      } catch (err) {
+        this.opts.log(`[acp] Failed to set reasoning effort to ${requestedEffort}: ${(err as Error).message}.`);
+      }
+    }
     this.emit("session", res);
 
     if (modelId && modelId !== this.currentModelId) {
@@ -747,47 +759,54 @@ export class AcpClient extends EventEmitter {
   }
 
   /**
-   * Mid-turn steering (#52) — "Steer". Queues `text` into the session's pending
-   * interjection buffer, which the agent drains at its next safe point. It does
-   * **not** cancel the turn and loses no in-flight tool work: probed on 0.2.101
-   * against a live turn, the model changed course mid-stream and the turn still
-   * ended `end_turn` (research/grok-build-oss-findings.md § 3a).
-   *
-   * `_x.ai/interject` is unadvertised, so a pre-~0.2.96 CLI answers -32601. That
-   * returns `"unsupported"` (not a throw) so the caller can fall back to queueing
-   * — the user's text must never be lost to a capability gap.
-   *
-   * `content` is additive: image-capable CLIs take structured text + image
-   * blocks (the Text block wins over `text`); older CLIs keep reading `text`.
-   * Omit it when there are no images so the legacy wire stays byte-identical.
-   * The host must not pass image blocks to a CLI that ignores `content`.
+   * Inject into the running turn without cancelling in-flight work. The backend
+   * owns the method, content support and initialize capability. An unavailable
+   * capability or -32601 returns "unsupported" so the caller queues the whole
+   * contribution, including attachments. Grok's unadvertised method starts
+   * optimistic and latches off on -32601.
    */
   async interject(
     text: string,
     onQueued?: () => void,
     content?: readonly PromptContentBlock[],
-  ): Promise<"ok" | "unsupported"> {
+  ): Promise<"ok" | "unsupported" | "failed"> {
+    if (!this.supportsInterject()) return "unsupported";
+    if (content?.some((block) => block.type === "image") && !this.honorsInterjectContent()) {
+      return "unsupported";
+    }
     if (!this.sessionId) throw new Error("no session");
+    const call = this.backend.interject(this.sessionId, text, content);
+    if (!call) return "unsupported";
     try {
-      await this.request(
-        "_x.ai/interject",
-        buildInterjectParams(this.sessionId, text, content),
+      const result = await this.request(
+        call.method,
+        call.params,
         () => onQueued?.(),
       );
+      // A steering RPC can RESOLVE and still report that nothing was applied.
+      // Reported rather than thrown, and deliberately NOT the same answer as a
+      // throw: a throw means the call itself died, while this arrives from a
+      // live session whose turn is still streaming. The caller has to fall back
+      // WITHOUT suppressing a reply that is perfectly fine.
+      if (!this.backend.steerDelivered(result)) return "failed";
       return "ok";
     } catch (e: any) {
       if (isMethodNotFoundError(e)) {
-        this.opts.log("[interject] CLI does not support _x.ai/interject; falling back to queue");
+        this.steering = { supported: false, acceptsContent: false };
+        this.opts.log(`[interject] CLI does not support ${call.method}; falling back to queue`);
         return "unsupported";
       }
       throw e;
     }
   }
 
-  /** Live-verified grok that will apply interject `content` rather than drop it. */
+  supportsInterject(): boolean {
+    return this.steering.supported;
+  }
+
+  /** Whether this backend will apply structured steering content. */
   honorsInterjectContent(): boolean {
-    return this.provider === "grok"
-      && cliHonorsInterjectContent(this.opts.grokVersion, this.opts.grokVersionVerified === true);
+    return this.supportsInterject() && this.steering.acceptsContent;
   }
 
   /**
@@ -963,6 +982,22 @@ export class AcpClient extends EventEmitter {
     }
   }
 
+  private billingUnsupported = false;
+
+  async getSubscriptionUsage(): Promise<SubscriptionWindow[]> {
+    if (this.provider !== "grok" || this.billingUnsupported) return [];
+    try {
+      return grokSubscriptionWindows(await this.request("_x.ai/billing", {}));
+    } catch (error) {
+      if (isMethodNotFoundError(error)) {
+        this.billingUnsupported = true;
+        this.opts.log("[billing] CLI does not support _x.ai/billing");
+        return [];
+      }
+      throw error;
+    }
+  }
+
   /**
    * List rewind points for this session (P2-9). One point per user prompt;
    * each carries a prompt preview + whether file snapshots exist.
@@ -1060,6 +1095,23 @@ export class AcpClient extends EventEmitter {
     return this.writeLine(makeQuestionCancelledResponse(requestId));
   }
 
+  /** Release the CLI for binary replacement, rejecting if it stays alive. */
+  async disposeForUpdate(timeoutMs = 3000): Promise<void> {
+    const proc = this.proc;
+    await this.dispose(timeoutMs);
+    if (!proc || proc.exitCode != null || proc.signalCode != null) return;
+    // dispose's bounded fallback may have only just signalled the hard kill.
+    // A binary replacement must observe exit or refuse to run the updater.
+    await new Promise<void>((resolve, reject) => {
+      const exited = () => { clearTimeout(timer); resolve(); };
+      const timer = setTimeout(() => {
+        proc.off("exit", exited);
+        reject(new Error("CLI process did not exit; update was not started."));
+      }, timeoutMs);
+      proc.once("exit", exited);
+    });
+  }
+
   /**
    * Tear the process down, resolving only once it has *actually* exited — a
    * caller that must replace the binary (`grok update`) can't race a still-open
@@ -1072,10 +1124,12 @@ export class AcpClient extends EventEmitter {
    * callers can ignore the returned promise — the kill is still initiated now.
    */
   dispose(timeoutMs = 3000): Promise<void> {
+    this.setHumanWaitActive(false);
     this.rl?.close();
     const proc = this.proc;
     if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
       try { proc?.kill(); } catch { /* already gone */ }
+      this.disposeMcpFiles();
       return this.disposeExecutionBackend();
     }
     if (this.provider !== "grok") {
@@ -1085,6 +1139,7 @@ export class AcpClient extends EventEmitter {
           if (done) return;
           done = true;
           clearTimeout(timer);
+          this.disposeMcpFiles();
           resolve();
         };
         const abruptKill = () => {
@@ -1109,6 +1164,7 @@ export class AcpClient extends EventEmitter {
         if (done) return;
         done = true;
         clearTimeout(timer);
+        this.disposeMcpFiles();
         resolve();
       };
       const timer = setTimeout(finish, timeoutMs);
@@ -1200,6 +1256,7 @@ export class AcpClient extends EventEmitter {
             now: Date.now(),
             idleMs: this.timeouts.promptIdleTimeoutMs,
             absoluteMs: this.timeouts.promptAbsoluteTimeoutMs,
+            humanWaitActive: this.humanWaitActive,
           });
           if (!Number.isFinite(waitMs)) return;
         } else {
@@ -1214,6 +1271,19 @@ export class AcpClient extends EventEmitter {
       entry.armTimer = arm;
       arm();
     });
+  }
+
+  /** Human waits suspend idle detection, never the independent absolute cap. */
+  setHumanWaitActive(active: boolean): void {
+    if (this.humanWaitActive === active) return;
+    this.humanWaitActive = active;
+    const now = Date.now();
+    for (const p of this.pending.values()) {
+      if (!p.isPrompt) continue;
+      // Answering starts a fresh idle interval, even after a long absence.
+      if (!active) p.lastActivityAt = now;
+      p.armTimer?.();
+    }
   }
 
   /** Re-arm in-flight `session/prompt` idle timers on live ACP traffic. */
@@ -1280,6 +1350,10 @@ export class AcpClient extends EventEmitter {
     const foreign = isForeignSessionUpdate(sessionId, this.sessionId);
     const normalized = this.backend.normalizeUpdate(u, meta);
     if (!foreign) {
+      if (this.provider === "claude") {
+        const windows = claudeSubscriptionWindows(normalized.update);
+        if (windows !== undefined) this.emit("subscriptionUsage", windows);
+      }
       if (normalized.sessionTitle) {
         this.currentSessionTitle = normalized.sessionTitle;
         this.emit("sessionTitle", normalized.sessionTitle);
@@ -1532,6 +1606,8 @@ export class AcpClient extends EventEmitter {
         const req: QuestionRequest = {
           id,
           sessionId: params?.sessionId ?? this.sessionId ?? "",
+          ...(typeof params?.toolCallId === "string" && params.toolCallId
+            ? { toolCallId: params.toolCallId } : {}),
           questions: Array.isArray(params?.questions) ? params.questions : [],
         };
         this.emit("questionRequest", req);
@@ -1556,6 +1632,8 @@ export class AcpClient extends EventEmitter {
           if (typeof upd.model_id === "string" && upd.model_id) {
             this.currentModelId = resolveModelId(upd.model_id, this.availableModels) ?? upd.model_id;
           }
+          const current = this.availableModels.find((model) => model.modelId === this.currentModelId);
+          if (current) current.reasoningEffort = this.currentReasoningEffort;
         }
         this.emit("xaiNotification", params?.update);
         if (id != null) this.respondOk(id, {});

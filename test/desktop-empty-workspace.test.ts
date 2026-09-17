@@ -13,6 +13,7 @@ function makeDesktopSidebar(opts?: { cwd?: string; folders?: string[] }): any {
   const cwd = opts?.cwd ?? "";
   const folders = opts?.folders ?? [];
   const sidebar = Object.create(GrokSidebar.prototype) as any;
+  sidebar.pendingConfirms = new Map();
   const memento: Record<string, unknown> = {};
   sidebar.providerConnectionState = { grok: true, codex: false };
   sidebar.providerConnections = vi.fn(() => sidebar.providerConnectionState);

@@ -34,6 +34,13 @@ function makeSidebar(): any {
   sidebar.postProviderState = vi.fn();
   sidebar.workspaceRoot = vi.fn(() => "C:\\repo");
   sidebar.host = { appendLine: vi.fn(), workspaceRoot: () => "C:\\repo" };
+  // Clearing the flag also re-arms auth recovery on this provider's sessions,
+  // so the walk over every session has to find somewhere to walk. There are no
+  // sessions in a warm-up test; `auth-renewal-resumes.test.ts` is where the
+  // re-arm itself is exercised.
+  sidebar.focused = undefined;
+  sidebar.pool = new Set();
+  sidebar.remoteClients = { detachedActiveValues: () => [], clients: () => [] };
   return sidebar;
 }
 

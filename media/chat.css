@@ -1,4 +1,9 @@
 ﻿:root {
+  /* Effort scale: chart hues, cool to warm. */
+  --e1: #4ec9b0;
+  --e2: #3794ff;
+  --e3: #a978f5;
+  --e4: #f48771;
   --pad: 8px;
   --gap: 6px;
   --radius: 6px;
@@ -25,18 +30,41 @@
      nested corners visually concentric and matches the 8px icon buttons. */
   --chat-radius-message: 12px;
   --chat-radius-code: 8px;
-  /* Project folder colours (rail). No raw hex ÔÇö blue IS the theme link token;
-     the other five are fixed oklch hues mixed with --vscode-foreground so
-     contrast polarity follows the theme without a light/dark branch (same
-     reason as --chat-surface-user above: a pure token can vanish when themes
-     map surfaces onto each other). Swatch picker and folder stroke both read
-     these, so a seventh colour is one custom property + one palette id. */
-  --repo-color-blue: var(--vscode-textLink-foreground);
-  --repo-color-teal: color-mix(in oklab, oklch(0.68 0.12 200) 72%, var(--vscode-foreground) 28%);
-  --repo-color-green: color-mix(in oklab, oklch(0.68 0.15 145) 72%, var(--vscode-foreground) 28%);
-  --repo-color-amber: color-mix(in oklab, oklch(0.76 0.14 85) 72%, var(--vscode-foreground) 28%);
-  --repo-color-coral: color-mix(in oklab, oklch(0.68 0.15 30) 72%, var(--vscode-foreground) 28%);
-  --repo-color-purple: color-mix(in oklab, oklch(0.64 0.15 305) 72%, var(--vscode-foreground) 28%);
+  /* Project colours (rail). Six hues dealt out at even intervals around the
+     wheel, at full chroma, with a light-theme branch below.
+
+     They used to be mixed 28% into --vscode-foreground so one set of values
+     would serve both themes without a branch. That bought theme-proofing with
+     chroma and the bill came due: six hues compressed toward one grey, close
+     enough that people could not tell their projects apart — and blue was the
+     worst of it, because blue WAS the link token, about 20° from teal.
+
+     Same six names, so nothing anybody has already picked is thrown away. Mark
+     and swatch picker both read these, so a seventh colour is still one custom
+     property + one palette id. Keep in step with projects-rail.css. */
+  --repo-color-blue: oklch(0.70 0.16 250);
+  --repo-color-teal: oklch(0.75 0.13 195);
+  --repo-color-green: oklch(0.76 0.17 145);
+  --repo-color-amber: oklch(0.80 0.16 80);
+  --repo-color-coral: oklch(0.70 0.19 25);
+  --repo-color-purple: oklch(0.68 0.19 305);
+}
+
+body.vscode-light {
+  /* Darker and more saturated on a light ground — the same hue at the same
+     lightness washes out on white. Amber is the weakest of the twelve at about
+     3.8:1, which clears the 3:1 WCAG asks of a graphical object; it cannot go
+     much darker without turning olive. Keep in step with projects-rail.css. */
+  --repo-color-blue: oklch(0.55 0.17 250);
+  --repo-color-teal: oklch(0.56 0.12 195);
+  --repo-color-green: oklch(0.55 0.15 145);
+  --repo-color-amber: oklch(0.62 0.15 75);
+  --repo-color-coral: oklch(0.56 0.18 25);
+  --repo-color-purple: oklch(0.52 0.20 305);
+  --e1: #1a8f7d;
+  --e2: #1a85ff;
+  --e3: #8250df;
+  --e4: #cd3131;
 }
 
 /* The VS Code panel is a narrow column, and the same gutter that reads as
@@ -106,6 +134,18 @@ html:has(body.desk) {
 }
 
 body {
+  /* Re-reveal, and the whole point of the pair: getHtml's inline critical
+     style holds the body invisible until THIS stylesheet has arrived.
+     VS Code serves it through the webview service worker, which can
+     cold-start a beat after the HTML renders -- most visibly on the first
+     load after an install, when nothing is warm -- and the link does not
+     block that paint. The gap showed the skeleton bars as white
+     rectangles, the composer as a bare monospace textarea and the context
+     meter as raw text, for long enough to need a video to catch.
+
+     The inline style still paints html's background, so what shows during
+     the gap is the theme colour, not a blank white panel. */
+  visibility: visible;
   display: flex;
   flex-direction: column;
   /* grok.chatFontScale zooms the chat via --chat-zoom (set inline on <body>).
@@ -140,7 +180,22 @@ body {
   --rail-repo-line-height: 1.45;
   --rail-repo-min-height: 34px;
   --rail-indent: 16px;
+  /* Conversations under a PROJECT sit one tier deeper than those under
+     Pinned or Recent, which have no parent to tuck under. The number is
+     not a taste: the project row now leads with a chevron, so its mark
+     moved right by that chevron's width, and a child that did not follow
+     would land LEFT of its own parent and flatten the tree into a list.
+     Same 32px as the VS Code rail, because the two heads are the same
+     geometry -- 4px of head padding, a 16px chevron, a 2px gap, then a
+     26px mark box. Change the chevron and this has to follow. */
+  --rail-indent-nested: 32px;
   --rail-icon-size: 14px;
+  /* The project's mark is sized on its own, not off --rail-icon-size, because
+     it is an IDENTITY rather than an affordance: it is the thing the eye finds
+     when scanning for a project, and the design it comes from draws it at 16.
+     --rail-icon-size stays 14 for what it still feeds -- the worktree branch
+     glyph, and the side bar's action icons. */
+  --rail-mark-size: 16px;
   --rail-row-radius: 5px;
   --rail-hover-bg: var(--vscode-list-hoverBackground);
 }
@@ -563,16 +618,55 @@ body.rail-resizing * {
   border: 0;
   border-radius: 4px;
 }
-/* Folder is an open/closed indicator ÔÇö the whole head is the hit target. */
+/* The disclosure control, split off the mark so the mark could become an
+   identity: a rocket has no open variant. The whole head is still the hit
+   target, so neither of these takes pointer events. 16px is the width the
+   nested indent is calculated from -- change one and --rail-indent-nested
+   has to follow. Without this rule the chevron is a bare inline span and
+   the two states size themselves: chevronRight is 14px and chevronDown is
+   12px, so the mark and the name shifted 2px sideways on every expand. */
+.rail-chevron {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 16px;
+  height: 28px;
+  color: var(--vscode-descriptionForeground);
+  cursor: inherit;
+  pointer-events: none;
+}
+.rail-chevron svg { width: 12px; height: 12px; }
 .rail-twisty { cursor: inherit; pointer-events: none; }
-/* Stroke tint only (SVGs use currentColor). None / missing attr keeps the
-   descriptionForeground from .rail-twisty. */
-.rail-twisty[data-repo-color="blue"] { color: var(--repo-color-blue); }
-.rail-twisty[data-repo-color="teal"] { color: var(--repo-color-teal); }
-.rail-twisty[data-repo-color="green"] { color: var(--repo-color-green); }
-.rail-twisty[data-repo-color="amber"] { color: var(--repo-color-amber); }
-.rail-twisty[data-repo-color="coral"] { color: var(--repo-color-coral); }
-.rail-twisty[data-repo-color="purple"] { color: var(--repo-color-purple); }
+/* One hue, every surface that draws the project's mark: the rail, the
+   composer chip, the switcher rows and the file panel's title. The marks are
+   currentColor, so tinting the host is the whole mechanism. On the chip the
+   attribute sits on the BUTTON, so the rule has to reach the icon rather than
+   the button, or the project name beside it takes the hue too. A missing
+   attribute keeps each host's own descriptionForeground. */
+.rail-twisty[data-repo-color="blue"],
+.repo-chip[data-repo-color="blue"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="blue"],
+.gfp-title-icon[data-repo-color="blue"] { color: var(--repo-color-blue); }
+.rail-twisty[data-repo-color="teal"],
+.repo-chip[data-repo-color="teal"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="teal"],
+.gfp-title-icon[data-repo-color="teal"] { color: var(--repo-color-teal); }
+.rail-twisty[data-repo-color="green"],
+.repo-chip[data-repo-color="green"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="green"],
+.gfp-title-icon[data-repo-color="green"] { color: var(--repo-color-green); }
+.rail-twisty[data-repo-color="amber"],
+.repo-chip[data-repo-color="amber"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="amber"],
+.gfp-title-icon[data-repo-color="amber"] { color: var(--repo-color-amber); }
+.rail-twisty[data-repo-color="coral"],
+.repo-chip[data-repo-color="coral"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="coral"],
+.gfp-title-icon[data-repo-color="coral"] { color: var(--repo-color-coral); }
+.rail-twisty[data-repo-color="purple"],
+.repo-chip[data-repo-color="purple"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="purple"],
+.gfp-title-icon[data-repo-color="purple"] { color: var(--repo-color-purple); }
 .rail-action-btn { cursor: pointer; }
 /* Hover controls sit on the row's own hover surface ÔÇö no darker per-icon chip
    (Codex-style). Focus outline remains for keyboard; active pin is colour-only. */
@@ -580,7 +674,7 @@ body.rail-resizing * {
 .rail-action-btn.active { color: var(--vscode-foreground); background: transparent; }
 .rail-action-btn:focus-visible,
 .rail-more:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: -1px; }
-.rail-twisty svg { width: var(--rail-icon-size); height: var(--rail-icon-size); }
+.rail-twisty svg { width: var(--rail-mark-size); height: var(--rail-mark-size); }
 .rail-repo-name {
   display: flex;
   align-items: center;
@@ -791,6 +885,14 @@ body.desk:not(.desk-with-ft) .rail-action-btn { width: 24px; height: 24px; }
    differently depending on which group it sat in. The 4px stays on the
    project lists, where the gap separates whole projects. */
 .rail-sessions { display: flex; flex-direction: column; min-width: 0; gap: 2px; padding: 2px 0 5px 0; }
+/* A conversation drawn UNDER a project (.rail-sessions) tucks under its
+   parent's mark; one drawn under Pinned or Recent (.rail-list) has no
+   parent and keeps the shallow indent. Before this both sat at 16px, so a
+   grandchild lined up with a child and the tree read as a flat list --
+   which is what "the chat room of the parent group is further right than
+   the subgroup's" was describing, on a PHONE screenshot. This rail is the
+   one that screenshot came from. */
+.rail-sessions .rail-session { padding-left: var(--rail-indent-nested); }
 .rail-session {
   position: relative;
   display: flex;
@@ -969,6 +1071,12 @@ body.desk:not(.desk-with-ft) .rail-action-btn { width: 24px; height: 24px; }
     --rail-repo-min-height: 40px;
     --rail-row-font-size: 15px;
     --rail-repo-font-size: 16px;
+    /* The mark rides with the glyphs beside it. Everything else on this row is
+       20px here, and the comment on that rule says why: on a 36px tap target a
+       smaller glyph "read as a different, lesser control". A project's own mark
+       is the last thing that should read as lesser, and at 16 against the
+       compose button's 20 it was the odd one out. */
+    --rail-mark-size: 20px;
   }
   .rail-repo-actions,
   .rail-session-actions {
@@ -1240,6 +1348,12 @@ a:hover {
 .repo-chip.disabled:hover { background: transparent; }
 .repo-chip.browsing { border-color: var(--vscode-focusBorder); color: var(--vscode-foreground); }
 .repo-chip-icon, .repo-chip > svg { display: inline-flex; flex: none; }
+/* The mark carries no width/height of its own (see repo-icons.js), and an
+   unsized <svg> inside a flex host has no intrinsic size to resolve a
+   flex-basis from: it collapses to 0x0 and `flex: none` never grows it, so
+   a missing rule here makes the mark VANISH rather than overflow. 13px is
+   what ICON.folder drew before, so the top bar keeps its geometry. */
+.repo-chip-icon svg { width: 13px; height: 13px; }
 .repo-chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---- toolbar popovers ---- */
@@ -1258,11 +1372,35 @@ a:hover {
 /* Shrink-to-fit otherwise takes the fineprint as one line (Claude/Codex
    "Last prompt" copy is long). 350px still reads on the phone profile. */
 #context-popover {
+  /* Shrink-to-fit plus `overflow-wrap: anywhere` on the rows sizes this box
+     toward MIN-content, which is what split 10,284 into "10,28" and "4" on a
+     phone: the cap was never the binding constraint, the intrinsic width was.
+     Ask for the content's natural width and let max-width do the capping. */
+  width: max-content;
   max-width: 350px;
   box-sizing: border-box;
 }
+/* 350px is a desk number. On a phone the rows want more, and the ask was for
+   up to 80% of the screen before anything wraps -- which this cap already
+   clears, so it stays where it is and `width: max-content` above is what
+   actually lets the box take it. */
+@media (hover: none), (pointer: coarse) {
+  #context-popover { max-width: min(94vw, 420px); }
+}
 #context-popover .popover-fineprint,
 #context-popover .popover-info { white-space: normal; }
+/* A figure is one word however the label behaves: `overflow-wrap: anywhere` is
+   there for long version strings in the About panel, and applied to a number it
+   breaks it mid-digits. Wrapping is the label's job. */
+#context-popover .popover-info > :last-child {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+.subscription-usage { border-top: 1px solid var(--vscode-panel-border); margin-top: 8px; }
+.subscription-window + .subscription-window { margin-top: 10px; }
+.subscription-fullness { height: 5px; border-radius: 3px; overflow: hidden; margin: 2px 10px 8px; background: var(--vscode-editorWidget-border, #6666); }
+.subscription-fullness > i { display: block; height: 100%; background: var(--vscode-textLink-foreground); }
+.subscription-usage .popover-fineprint { margin-top: 4px; }
 /* .history-popover sets display:flex, which would otherwise beat the UA
    [hidden]{display:none} rule (author styles win), so it could never hide. */
 .toolbar-popover[hidden] { display: none; }
@@ -1468,15 +1606,19 @@ a:hover {
 body.thinking-hidden .msg.thinking.find-reveal { display: block; }
 
 .welcome {
+  /* The RELAY's half of the pair above, and it cannot be folded into it: the
+     web client hides `.welcome` rather than the body in its own inline
+     critical style (web/chat.html), and an element's own `visibility: hidden`
+     is not undone by making an ancestor visible. Deleting this line leaves
+     the phone's welcome screen invisible forever -- with nothing in this repo
+     to notice, which is why grok-remote pins the pair in a test of its own. */
+  visibility: visible;
   display: flex;
   flex-direction: column;
   align-items: center;
   text-align: center;
   padding: 32px 12px;
   gap: 8px;
-  /* Re-reveal: the inline critical style in getHtml holds the welcome
-     invisible until this stylesheet has loaded (anti-FOUC). */
-  visibility: visible;
 }
 /* The explicit display above beats the UA's [hidden]{display:none}, so
    clearWelcome()'s `hidden` attribute needs this companion rule ÔÇö without it
@@ -1508,6 +1650,51 @@ body.thinking-hidden .msg.thinking.find-reveal { display: block; }
 }
 .welcome-tip b { font-weight: 600; }
 .welcome-tip [role="button"] { cursor: pointer; }
+.welcome-cli-update { max-width: 46ch; overflow-wrap: anywhere; }
+/* The offer state. Everything else in this slot is advice the reader may
+   ignore, so the whole box is deliberately quiet - but an out-of-date CLI is
+   the one thing here we are asking someone to act on, and at `muted` weight
+   under a `muted-link` it reads as disabled text. Full-strength copy over a
+   slightly firmer ground, and the action becomes the secondary button this
+   codebase uses everywhere else. The status states keep `muted`. */
+.welcome-cli-update-offer {
+  opacity: 1;
+  color: var(--vscode-foreground, CanvasText);
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}
+.welcome-cli-update button {
+  /* Its own line, always. The copy above it is an inline span, so an
+     inline-level button flows INTO the sentence and the last word wraps around
+     it — which is exactly what shipped. `display: flex` makes the box
+     block-level (new line, like the `display: block` this replaced) while
+     `width: fit-content` keeps it button-sized instead of full-bleed. */
+  display: flex;
+  width: fit-content;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  margin-top: 10px;
+  padding: 5px 14px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground, CanvasText));
+  background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.2));
+}
+.welcome-cli-update button:hover:not(:disabled) {
+  background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.3));
+}
+.welcome-cli-update button:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+.welcome-cli-update button:disabled { opacity: 0.5; cursor: default; }
+/* The 44px touch floor this file applies to every other control. */
+@media (hover: none), (pointer: coarse) {
+  .welcome-cli-update button { min-height: 44px; font-size: 13.5px; }
+}
 
 /* Empty-state advice shares the hint's box and measure, so the two tenants of
    this slot cannot look like different features. It differs only in being a
@@ -1884,7 +2071,6 @@ a.onb-action.onb-secondary:hover {
 .gear-lead .provider-glyph { margin-right: 1px; }
 .model-picker-row .gear-lead { min-width: 0; }
 .model-picker-row .model-picker-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.model-provider-heading { margin-top: 4px; }
 
 .msg {
   display: flex;
@@ -2489,6 +2675,20 @@ body.thinking-hidden .msg.thinking { display: none; }
   white-space: nowrap;
 }
 .run-progress-card .run-progress-phase { flex: none; opacity: 0.85; }
+/* The liveness dots sit after the phase (see the template in chat.js) and must
+   not shrink: a squashed set of three reads as a rendering fault, and the row
+   has the title's ellipsis to give away instead. */
+.run-progress-card .run-progress-row .blink-dots { flex: none; }
+/* The run's elapsed time. Tabular figures so the row does not twitch once a
+   second, and last in the row so it never pushes the phase off a narrow
+   phone. Same treatment as .grokking-elapsed — it is the same readout. */
+.run-progress-card .run-progress-elapsed {
+  flex: none;
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.92em;
+  opacity: 0.75;
+}
 .run-progress-card .run-progress-sub,
 .run-progress-card .run-progress-detail {
   margin-top: 3px;
@@ -2727,20 +2927,28 @@ body.thinking-hidden .msg.thinking { display: none; }
    default; light overrides on the VS Code body class. bg = translucent tint,
    line = the solid stroke used for the left border + the +/- glyph + the stat. */
 :root {
-  --tdiff-add-bg: #40c9773b;
-  --tdiff-del-bg: #fa423e3b;
-  --tdiff-read-bg: #4ea1d93b;
-  --tdiff-add-line: #40c977;
-  --tdiff-del-line: #fa423e;
-  --tdiff-read-line: #4ea1d9;
+  --tdiff-add-bg: #4ec9b03b;
+  --tdiff-del-bg: #f487713b;
+  --tdiff-read-bg: #3794ff3b;
+  --tdiff-add-line: #4ec9b0;
+  --tdiff-del-line: #f48771;
+  --tdiff-read-line: #3794ff;
+  /* The fourth colour: "modified, not committed". The dot on a dirty tab or a
+     changed tree row, the M beside a file, and the count badges — every mark
+     that says "there is work here" is this one hue, so a person learns it
+     once. `-ink` is the text that sits ON a badge of it. */
+  --tdiff-mod-line: #d7ba7d;
+  --tdiff-mod-ink: #2a2000;
 }
 body.vscode-light {
-  --tdiff-add-bg: #00a24026;
-  --tdiff-del-bg: #ba262326;
-  --tdiff-read-bg: #0e639c26;
-  --tdiff-add-line: #00a240;
-  --tdiff-del-line: #ba2623;
-  --tdiff-read-line: #0e639c;
+  --tdiff-add-bg: #0f8a7426;
+  --tdiff-del-bg: #c0392b26;
+  --tdiff-read-bg: #005fb826;
+  --tdiff-add-line: #0f8a74;
+  --tdiff-del-line: #c0392b;
+  --tdiff-read-line: #005fb8;
+  --tdiff-mod-line: #895503;
+  --tdiff-mod-ink: #fff;
 }
 /* Edit rows: the always-visible "+A ÔłĺR" change count (green adds, red removes),
    shown inline after the label AND rolled up onto a collapsed group header, so an
@@ -2748,6 +2956,192 @@ body.vscode-light {
 .diff-stat { white-space: nowrap; }
 .diff-stat-add { color: var(--tdiff-add-line); }
 .diff-stat-del { color: var(--tdiff-del-line); }
+
+/* Turn-level file change summary — one collapsible card per coding turn.
+   A file row reveals its own tool diff on every surface. */
+.turn-diff-summary {
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.35));
+  border-radius: var(--chat-radius-block, 8px);
+  /* An inset block inside flowing text, which is what textBlockQuote names and
+     what the six other inset blocks in this file already use.
+     `editor.inactiveSelectionBackground` was the outlier -- the only borrowed
+     token in the file, and a SELECTION colour, which a theme is entitled to
+     make solid and vivid because its job is to mark text you highlighted
+     somewhere else. In the default dark theme it is #3A3D41: opaque, and
+     visibly heavier than everything around it, so the card read as a tinted
+     slab rather than a quiet grouping. The remote never saw it, because that
+     page defines no such variable and fell through to the neutral below -- so
+     the same card looked right on a phone and wrong in the IDE. */
+  background: var(--vscode-textBlockQuote-background, rgba(127, 127, 127, 0.08));
+  font-size: 0.92em;
+}
+.turn-diff-summary-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 4px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  color: var(--vscode-descriptionForeground);
+}
+.turn-diff-summary.expanded .turn-diff-summary-header { margin-bottom: 6px; }
+.turn-diff-summary-header:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: 2px;
+}
+.turn-diff-summary-chevron { display: inline-flex; flex: 0 0 12px; }
+.turn-diff-summary-chevron svg { width: 12px; height: 12px; }
+.turn-diff-summary.expanded .turn-diff-summary-chevron { transform: rotate(90deg); }
+.turn-diff-summary-list[hidden],
+.turn-diff-summary-foot[hidden] {
+  display: none;
+}
+.turn-diff-summary-title {
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+.turn-diff-summary-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.turn-file-diff {
+  min-width: 0;
+  margin: 4px 0 8px;
+}
+.turn-diff-file {
+  /* letter · path · stat. A grid rather than the old space-between flex, so
+     the status letters make a column of their own and the paths start on one
+     line whatever letter precedes them. */
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  /* The transcript has no measure of its own, so on a wide desktop window
+     space-between threw the +A −R a thousand pixels from the filename it
+     belongs to and the pair stopped reading as one row. Capped, the stats
+     still align in a column across rows and stay next to their path. */
+  max-width: 640px;
+  margin: 0;
+  padding: 3px 6px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: default;
+}
+button.turn-diff-file.has-diff {
+  cursor: pointer;
+}
+button.turn-diff-file.has-diff:hover {
+  background: var(--vscode-list-hoverBackground, rgba(127, 127, 127, 0.12));
+}
+button.turn-diff-file.has-diff:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -1px;
+}
+.turn-diff-file-path {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  color: var(--vscode-foreground);
+}
+/* Name first, path second — the same order and the same ladder as the
+   Changes panel, so one file reads the same way on both surfaces. The path
+   gives way first and is cut from the LEFT, keeping the folders nearest the
+   file: full name + full path, trimmed path, no path, and only then a trimmed
+   name. The name is INFLEXIBLE to arrange that — a shrink factor cannot, for
+   the reason written out over the same pair in file-panel.css — and the
+   `max-width` is what still lets it ellipsize when it alone does not fit.
+   The name here always has a path beside it (chat.js writes plain text into
+   the container when there is no directory), so the cap always allows for the
+   6px separator, which is real for as long as there are two elements. */
+.turn-diff-file-name {
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: calc(100% - 6px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.turn-diff-file-dir {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+  color: var(--vscode-descriptionForeground, #999);
+  font-size: 0.86em;
+}
+.turn-diff-file.is-deleted .turn-diff-file-path {
+  text-decoration: line-through;
+  opacity: 0.85;
+}
+/* M / A / D — the same letters git status prints and the Changes view shows,
+   in the same colours, so the card and the view read as one vocabulary. */
+.turn-diff-file-status {
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  text-align: center;
+}
+.turn-diff-file-status.is-m { color: var(--tdiff-mod-line); }
+.turn-diff-file-status.is-a { color: var(--tdiff-add-line); }
+.turn-diff-file-status.is-d { color: var(--tdiff-del-line); }
+/* The way out of the card, into the Changes view. It shipped first as a text
+   link so as not to compete with the rows; the owner wanted a button, and he
+   is right — it is the card's one action that leaves the card, and the rows
+   are quiet enough that a small secondary button does not shout over them. */
+.turn-diff-summary-foot {
+  display: flex;
+  margin-top: 8px;
+}
+.turn-diff-open-changes {
+  min-height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--vscode-button-border, var(--vscode-widget-border, rgba(127, 127, 127, 0.35)));
+  border-radius: 6px;
+  background: var(--vscode-button-secondaryBackground, transparent);
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+body.changes-unavailable .turn-diff-open-changes { display: none; }
+.turn-diff-open-changes:hover {
+  background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground, rgba(127, 127, 127, 0.12)));
+}
+.turn-diff-open-changes:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: 1px;
+}
+/* A button is still a target on a phone. */
+@media (hover: none), (pointer: coarse) {
+  .turn-diff-summary-header { min-height: 36px; }
+  .turn-diff-open-changes { min-height: 36px; padding: 6px 12px; }
+}
+/* Knowledge work hides the card; tool expansion never does. */
+body.hide-turn-diff-summary .turn-diff-summary { display: none; }
+/* A file row opens a diff, so on a phone it is a real target. */
+@media (hover: none), (pointer: coarse) {
+  .turn-diff-file {
+    min-height: 36px;
+    padding: 6px 8px;
+  }
+}
 
 /* Codex-style inline diff inside the edit row's expandable detail: a line-number
    gutter, a colored left-border stripe, a subtle per-line tint, and a small +/-
@@ -3102,23 +3496,34 @@ body.vscode-light {
   border-color: var(--vscode-focusBorder);
 }
 
-/* Floating "Scroll to bottom" (#28). Anchored to the composer (the chat input
-   area), so it sits inside the `--chat-zoom` scaled coordinate space and stays
+/* Scroll to bottom (#16). Anchored to the composer rather than the message
+   area, so it sits inside the `--chat-zoom` scaled coordinate space and stays
    correctly placed above the input at any font scale. Hidden (opacity + no
-   pointer events) until the user scrolls away from the bottom. */
-.scroll-bottom-btn {
+   pointer events) until the user scrolls away from the bottom. The experimental
+   Previous-prompt circle (#150) shares the chrome and the reveal so the two
+   cannot drift apart, and differs only in shape and in where it sits. */
+.scroll-bottom-btn,
+.prompt-prev-btn {
   position: absolute;
   /* Sit above the composer's top edge by the same gap the card sits inside the
-     composer (its top padding, --pad) ÔÇö symmetric spacing. */
+     composer (its top padding, --pad) — symmetric spacing. */
   bottom: calc(100% + var(--pad));
-  left: 50%;
-  transform: translate(-50%, 4px);
   z-index: 6;
+  /* ONE height for both, set here and raised once for touch, because the two
+     sit side by side above the same composer and a 3px difference reads as a
+     mistake. It was one: the pill was sized by its padding and the circle by
+     its width, so they agreed on nothing and drifted by 3px on the desk and
+     2px on touch. Everything shape-specific below is derived from it. */
+  --float-ctl-h: 26px;
+  height: var(--float-ctl-h);
+  border-radius: calc(var(--float-ctl-h) / 2);
+  /* Mobile WebKit and Chrome paint their default tap highlight over the BORDER
+     BOX, which ignores border-radius, so a circle flashes as a blue square.
+     Safe to remove here because :active below is the press feedback on every
+     surface — it lasts exactly as long as the finger is down. */
+  -webkit-tap-highlight-color: transparent;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 4px 11px 4px 9px;
-  border-radius: 13px;
   border: 1px solid var(--vscode-editorWidget-border);
   background: var(--vscode-editorWidget-background, var(--vscode-input-background));
   color: var(--vscode-foreground);
@@ -3131,32 +3536,96 @@ body.vscode-light {
   pointer-events: none;
   transition: opacity 0.14s ease, transform 0.14s ease, background 0.12s ease;
 }
-.scroll-bottom-btn.visible {
-  opacity: 1;
-  transform: translate(-50%, 0);
-  pointer-events: auto;
+.scroll-bottom-btn {
+  left: 50%;
+  transform: translate(-50%, 4px);
+  gap: 5px;
+  /* Horizontal only — the height is the shared token, not a padding sum. */
+  padding: 0 11px 0 9px;
 }
+.scroll-bottom-btn.visible { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+/* RIGHT edge, not the left. It first sat on the left because the prompts are
+   `align-self: flex-end` at 77% and so never reach that side — true of the
+   bubbles, and the wrong element to have measured. What the circle actually
+   floats over is the last message's `.msg-actions` row, and that row defaults
+   to `flex-start`: an agent reply keeps Copy and the thumbs on the LEFT, which
+   is what the circle covered.
+
+   Both sides carry such a row, so the choice is about WHEN. The agent's is
+   there whenever a conversation is sitting finished — the resting state, and
+   the state someone reaches for this control in. `.msg.user .msg-actions` is
+   `flex-end`, so the right is only occupied in the moment between sending and
+   the first token arriving. Transient beats permanent.
+
+   Bottom rather than top because it is tapped repeatedly and the thumb is down
+   here; the mark on the prompt is what serves the eye up there. */
+.prompt-prev-btn {
+  right: var(--pad);
+  transform: translateY(4px);
+  justify-content: center;
+  /* Square, so the shared radius resolves to a circle. */
+  width: var(--float-ctl-h);
+  padding: 0;
+}
+.prompt-prev-btn.visible { opacity: 1; transform: translateY(0); pointer-events: auto; }
 /* Layer the hover tint OVER the button's own fill rather than replacing it.
    VS Code themes define toolbar-hoverBackground as a translucent wash (Dark+:
-   rgba(90,93,94,0.31)) meant to tint an opaque toolbar ÔÇö used as the whole
+   rgba(90,93,94,0.31)) meant to tint an opaque toolbar — used as the whole
    background it left this button see-through, with the conversation reading
    through the label. The browser client happens to define the same token as
    opaque hex, which is why it only ever looked wrong on the desk. */
-.scroll-bottom-btn:hover {
+/* Hover only where a pointer can actually LEAVE. A tap applies :hover and
+   leaves it applied until something else is tapped, so on a phone the circle
+   stayed lit after every jump - reported as "it stays focused after the
+   click". The scroll pill has always had the same rule and nobody ever saw it,
+   because that one disappears the instant it is used; this one is built to be
+   tapped repeatedly and stays on screen, which is what exposed it. */
+@media (hover: hover) {
+  .scroll-bottom-btn:hover,
+  .prompt-prev-btn:hover:not(:disabled) {
+    background:
+      linear-gradient(var(--vscode-toolbar-hoverBackground), var(--vscode-toolbar-hoverBackground)),
+      var(--vscode-editorWidget-background, var(--vscode-input-background));
+  }
+}
+/* A tap still has to acknowledge itself. :active lasts exactly as long as the
+   finger or button is down and cannot stick, so it is the press feedback on
+   every surface. */
+.scroll-bottom-btn:active,
+.prompt-prev-btn:active:not(:disabled) {
   background:
     linear-gradient(var(--vscode-toolbar-hoverBackground), var(--vscode-toolbar-hoverBackground)),
     var(--vscode-editorWidget-background, var(--vscode-input-background));
 }
+.prompt-prev-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -2px; }
 .scroll-bottom-btn svg { display: block; }
+.prompt-prev-btn svg { display: block; width: 15px; height: 15px; stroke-width: 2.5; }
 .scroll-bottom-label { white-space: nowrap; }
+
+/* The prompt a jump landed on. The control is at the bottom and the prompt it
+   finds arrives at the top, so the mark is the only thing joining the two —
+   without it a short jump reads as "nothing happened". Same blue as find, so a
+   jump target reads like a search hit rather than a new vocabulary. */
+.msg.user.prompt-nav-target .msg-bubble {
+  /* The BUBBLE, not `.msg.user` - that outer element is transparent with zero
+     padding and no radius, so a tint there sits behind an opaque bubble and is
+     invisible. Blend into the surface rather than layering a transparent wash
+     over it, so the bubble stays opaque, and ring it with box-shadow, which
+     follows the border-radius that an outline would square off. */
+  background: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 18%, var(--chat-surface-user));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 55%, transparent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .msg.user.prompt-nav-target .msg-bubble { transition: background 120ms ease-out; }
+}
 
 /* The input is a textarea layered over a "backdrop" that highlights recognized
    voice commands (e.g. "grok send"). Textareas can't style their own text, so
    the backdrop renders a mirrored copy with the command wrapped in an accent
    pill; the textarea sits on top with a transparent background so the pill shows
    through behind the matching words. Border + fill + focus ring belong to the
-   enclosing .composer-card; the wrap stays position:relative because the mic
-   button and the highlight backdrop anchor to the textarea's box. */
+   enclosing .composer-card; the wrap stays position:relative for the highlight backdrop. The mic
+   belongs to the toolbar, so every text line gets the full input width. */
 .composer-input-wrap {
   position: relative;
 }
@@ -3165,8 +3634,7 @@ body.vscode-light {
 textarea#input,
 .input-highlight {
   margin: 0;
-  /* extra right padding leaves room for the mic button in the top-right corner */
-  padding: 6px 34px 6px 8px;
+  padding: 6px 8px;
   border: 0;
   /* UI font, not the editor's monospace ÔÇö typed text should look like the
      user message it becomes (textareas default to monospace otherwise). */
@@ -3221,29 +3689,10 @@ textarea#input {
   box-shadow: 0 0 0 1px var(--vscode-charts-blue, #3794ff);
 }
 
-/* ---- mic / voice-input button (top-right corner of the textbox) ---- */
+/* ---- mic / voice-input button (ordinary toolbar icon tier) ---- */
 
 .mic-btn {
-  /* Anchored inside .composer-input-wrap (position:relative) so it tracks the
-     textarea's top-right corner ÔÇö not the composer, which grows when the
-     attachments row appears above the input (that made the mic "jump"). */
-  position: absolute;
-  top: 5px;
-  right: 6px;
-  /* Above the textarea (z-index:1) so its top-right padding doesn't swallow the
-     hover/click ÔÇö the textarea was lifted for the highlight overlay. */
-  z-index: 2;
-  width: 24px;
-  height: 24px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
-  cursor: pointer;
+  position: relative; /* The setup badge belongs to the button. */
   opacity: 0.75;
   transition: background 0.12s, color 0.12s, opacity 0.12s;
 }
@@ -3439,82 +3888,177 @@ textarea#input {
   text-overflow: ellipsis;
 }
 
-/* Once the card is too narrow to give the prose a useful home, keep the
-   distinct mode glyph and context arc while reclaiming the label widths before
-   the existing flex ellipsis can abbreviate them. */
-@container composer-card (max-width: 360px) {
-  #mode-btn .btn-label,
-  .context-donut #donut-label {
-    display: none;
+/* The card's CONTENT box drives one ladder on every surface. The outer
+   composer includes its gutter and the card border; a 334px IDE composer has
+   a 324px query box. Keep the container here: fixed rail popovers are siblings
+   and must not acquire a new containing block. */
+#gear-btn.model-chip {
+  flex: 0 1 auto;
+  min-width: 0;
+  gap: 5px;
+  padding: 0 7px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.model-chip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.model-chip-effort { flex: none; color: var(--vscode-descriptionForeground); }
+.model-chip-effort:empty { display: none; }
+#chips:empty { display: none; }
+.composer-effort-notice {
+  position: absolute; bottom: calc(100% + 4px); left: var(--pad); right: var(--pad);
+  padding: 8px 10px; border: 1px solid var(--vscode-editorWidget-border); border-radius: 6px;
+  background: var(--vscode-editorWidget-background); color: var(--vscode-foreground);
+  font-size: 12px; z-index: 50;
+}
+.composer-effort-notice:empty { display: none; }
+/* The donut's own numbers are the FIRST rung, above the mode word: they are the
+   one readout here that nothing in the message depends on, and the donut's
+   tooltip and its popover both still carry them in full. Wide surfaces keep
+   them — the chip's width pressure is real at 334px, not at 640px. */
+@container composer-card (max-width: 470px) {
+  .context-donut #donut-label { display: none; }
+}
+@container composer-card (max-width: 430px) {
+  #mode-btn .btn-label { display: none; }
+}
+@container composer-card (max-width: 300px) {
+  .model-chip-effort { display: none; }
+}
+@container composer-card (max-width: 272px) {
+  .model-chip-name { max-width: 66px; }
+}
+/* The name is the chip's whole content now, so the narrowest rung trims it
+   rather than hiding it -- the glyph that used to stand in its place is gone. */
+@container composer-card (max-width: 224px) {
+  .model-chip-name { max-width: 44px; }
+}
+@media (hover: none), (pointer: coarse) {
+  /* min-width, not just height: the mode word is the first rung of the collapse
+     ladder, so on a phone this button is its glyph alone — and a 32px-wide
+     glyph button is under the tap floor the rest of the app is held to. */
+  #gear-btn.model-chip, #mode-btn { height: 36px; font-size: 15px; }
+  #mode-btn { min-width: 36px; justify-content: center; }
+  /* Unconditional touch rule: effort is one tap away in the chip. */
+  .model-chip-effort { display: none; }
+  @container composer-card (max-width: 296px) {
+    .model-chip-name { max-width: 82px; }
+  }
+  /* The final rungs reclaim spacing too. Six toolbar controls still need
+     real hit targets when the composer itself is only 240px wide. */
+  @container composer-card (max-width: 272px) {
+    .composer-toolbar { padding-left: 0; padding-right: 0; gap: 2px; }
+    .toolbar-right { gap: 2px; }
+    #gear-btn.model-chip { padding: 0 2px; gap: 2px; min-width: 36px; }
+  }
+  @container composer-card (max-width: 250px) {
+    .model-chip-name { max-width: 52px; }
   }
 }
 
-/* ---- gear popover: model + effort row ---- */
-
+/* ---- model picker: pinned strip, scrolling models, pinned recovery ---- */
 .gear-popover { min-width: 230px; }
-
-.model-effort-row {
+#gear-popover.model-picker {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-  padding: 4px 6px;
-}
-.model-name-btn {
-  flex-shrink: 1;
+  flex-direction: column;
+  overflow: hidden;
+  width: 300px;
   min-width: 0;
-  padding: 3px 5px;
-  font-size: 13px;
+  max-width: 100%;
+  max-height: min(420px, 70vh);
 }
+#gear-popover.model-picker[hidden] { display: none; }
+.model-picker > :not(.model-picker-list) { flex: none; }
+.model-picker-list { flex: 1 1 auto; min-height: 0; max-height: 230px; overflow-y: auto; }
+.model-picker button.toolbar-popover-item {
+  width: 100%; border: 0; background: transparent; color: inherit;
+  font: inherit; text-align: left;
+}
+.model-picker button.toolbar-popover-item:hover { background: var(--vscode-list-hoverBackground); }
+/* Locked is not faded. `opacity` here made the whole picker look half-erased
+   over the transcript for the length of a turn (owner, 2026-09-13: "this should
+   never be semi-transparent. Like during a round. It just looks bad") -- and it
+   washed out the effort ramp, whose colour IS the readout. Say it in the text
+   colour instead and leave the dots and the gradient at full strength; the
+   `disabled` attribute is what actually stops the interaction. */
+.model-picker button:disabled {
+  cursor: default;
+  color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground));
+}
+.model-picker button:disabled:hover { background: transparent; }
+.model-picker button:focus-visible, .context-compact:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px;
+}
+.model-effort-strip { padding: 6px 6px 4px; }
+.effort-strip-header { display: flex; align-items: center; gap: 8px; padding: 0 2px; }
+.effort-strip-header > span { color: var(--vscode-descriptionForeground); }
+.effort-reset {
+  margin-left: auto; height: 24px; padding: 0 6px; border: 0;
+  border-radius: 5px; background: transparent; color: var(--vscode-descriptionForeground);
+  font: inherit; cursor: pointer;
+}
+.effort-reset:hover { background: var(--vscode-toolbar-hoverBackground); }
+.effort-strip-track {
+  position: relative; height: 34px; margin: 2px 2px 0;
+  display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; align-items: center;
+  /* The knob is draggable, so the browser must not claim the gesture as a
+     scroll the moment the finger moves vertically -- on a phone it always does.
+     `none` on the track covers the stops too, but they set it themselves
+     because a press that starts ON a dot is the common case. */
+  touch-action: none; user-select: none;
+}
+/* Rail and fill share a box. Clip the gradient slice, never compress it by
+   sizing the fill's width: the same effort must always have the same colour. */
+.effort-strip-rail, .effort-strip-fill {
+  position: absolute; top: 50%; height: 5px; margin-top: -2.5px; border-radius: 3px;
+  left: calc(50% / var(--n)); right: calc(50% / var(--n));
+}
+.effort-strip-rail { background: var(--vscode-editorWidget-border); }
+.effort-strip-fill {
+  background: linear-gradient(90deg, var(--e1), var(--e2) 38%, var(--e3) 70%, var(--e4));
+  clip-path: inset(0 calc((1 - var(--f)) * 100%) 0 0);
+  transition: clip-path 160ms ease;
+}
+.effort-strip-stop {
+  height: 34px; padding: 0; border: 0; background: transparent; cursor: pointer;
+  display: grid; place-items: center; position: relative; z-index: 1;
+  touch-action: none;
+}
+.effort-strip-stop.current { cursor: grab; }
+.effort-strip-track:active .effort-strip-stop.current { cursor: grabbing; }
+.effort-strip-stop i {
+  width: 8px; height: 8px; border-radius: 50%; display: block;
+  background: var(--vscode-editorWidget-border);
+  transition: width 160ms ease, height 160ms ease;
+}
+.effort-strip-stop.past i { background: var(--vscode-editorWidget-background); opacity: .6; }
+.effort-strip-stop.current i {
+  width: 16px; height: 16px; background: var(--knob);
+  box-shadow: 0 0 0 3px var(--vscode-editorWidget-background), 0 1px 4px rgba(0,0,0,.35);
+}
+.effort-strip-tip { font-size: 11.5px; color: var(--vscode-descriptionForeground); padding: 2px 4px 0; min-height: 16px; }
+@media (prefers-reduced-motion: reduce) {
+  .effort-strip-fill, .effort-strip-stop i { transition: none; }
+}
+@media (hover: none), (pointer: coarse) {
+  .model-picker-list { max-height: none; }
+  .effort-strip-track, .effort-strip-stop { height: 42px; }
+  .effort-strip-stop.current i { width: 20px; height: 20px; }
+  .effort-strip-rail, .effort-strip-fill { height: 6px; margin-top: -3px; }
+  .model-picker button.toolbar-popover-item { min-height: 40px; }
+}
+#mode-btn.disabled { opacity: .45; cursor: not-allowed; pointer-events: none; }
 
-.effort-dots {
-  display: inline-flex;
-  align-items: center;
-  gap: 1px;
-  flex-shrink: 0;
+.context-fullness {
+  height: 6px; border-radius: 3px; background: var(--vscode-panel-border);
+  margin: 2px 8px 8px; overflow: hidden;
 }
-.effort-dot {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  user-select: none;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border-radius: 50%;
-  opacity: 0.6;
-  box-sizing: border-box;
-}
-/* Inner CSS-shaped dot ÔÇö identical size for active + inactive. Avoids the
-   Unicode ÔŚĆ/ÔŚő glyph-pair mismatch where the empty circle renders larger. */
-.effort-dot::before {
-  content: "";
-  display: block;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  box-sizing: border-box;
-  border: 1.5px solid var(--vscode-descriptionForeground);
-  background: transparent;
-}
-/* Same reason as .popover-check: `button.background` is hcDark BLACK, which
-   made the filled dots vanish on the high-contrast background (#139). */
-.effort-dot.active::before {
-  background: var(--vscode-textLink-foreground, #3794ff);
-  border-color: var(--vscode-textLink-foreground, #3794ff);
-}
-.effort-dot:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
-.effort-dot.active { opacity: 1; }
-
-/* Model + effort are locked while the session is busy/priming (mirrors the
-   disabled send button). No pointer, no hover affordance. */
-.model-name-btn.disabled,
-#mode-btn.disabled,
-.effort-dot.disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-  pointer-events: none;
+.context-fullness > i { display: block; height: 100%; background: var(--context-fill); }
+.context-compact {
+  display: block; width: calc(100% - 16px); margin: 2px 8px 8px;
+  text-align: center; padding: 0 10px; height: 28px; border: 0; border-radius: 4px;
+  background: var(--vscode-button-secondaryBackground, #3a3d41);
+  color: var(--vscode-button-secondaryForeground, #fff);
+  font: inherit; font-weight: 500; cursor: pointer;
 }
 #sandbox-btn.disabled {
   opacity: 0.45;
@@ -3526,25 +4070,29 @@ textarea#input {
   opacity: 0.85;
   background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08));
 }
-.effort-dot.disabled:hover { background: transparent; }
-/* Loading placeholder dots ÔÇö a gentle pulse while the session's model/effort
-   menu is still loading (so it reads as "not final yet", not a real ladder). */
-.effort-dot.loading { opacity: 0.3; animation: effort-dot-pulse 1.2s ease-in-out infinite; }
-@keyframes effort-dot-pulse { 0%, 100% { opacity: 0.2; } 50% { opacity: 0.5; } }
-@media (prefers-reduced-motion: reduce) { .effort-dot.loading { animation: none; } }
+.context-compact:hover { background: var(--vscode-button-secondaryHoverBackground, #45494e); }
+.context-compact:disabled { opacity: .5; cursor: default; }
+.context-compact:disabled:hover { background: var(--vscode-button-secondaryBackground, #3a3d41); }
+@media (hover: none), (pointer: coarse) { .context-compact { height: 38px; } }
 
 /* ---- mode / section popover extras ---- */
 
 .mode-popover-item { min-width: 240px; }
+/* A section header sits on a divider, so it needs air on BOTH sides of it:
+   above, to separate it from the section that ended; below, to attach the
+   label to the rows it heads. It had 2px and 5px, which read as the divider
+   being stuck to whatever was above it — reported on a phone against three
+   different headers (Subscription usage, In this window, and the model
+   picker's provider groups), which is one rule seen three times. */
 .popover-section {
-  padding: 5px 10px 2px;
+  padding: 8px 10px 4px;
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.5px;
   text-transform: uppercase;
   color: var(--vscode-descriptionForeground);
   border-top: 1px solid var(--vscode-editorWidget-border);
-  margin-top: 2px;
+  margin-top: 8px;
 }
 .popover-section:first-child,
 .popover-section-first { border-top: none; margin-top: 0; }
@@ -3554,19 +4102,32 @@ textarea#input {
 .popover-section-toggle {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+  /* The marker belongs NEXT TO the label, not at the far right of the box.
+     Floated right it read as a separate control that happened to share a row —
+     you could not tell which word it opened. Same arrangement as the rail's
+     PROJECTS header, down to the 2px. */
+  justify-content: flex-start;
+  gap: 0;
   padding-bottom: 5px;
   cursor: pointer;
   user-select: none;
 }
 .popover-section-toggle:hover { color: var(--vscode-foreground); }
-.popover-section-toggle .popover-chevron { transition: transform 0.12s ease; }
-.popover-section-toggle.expanded .popover-chevron { transform: rotate(90deg); }
 .popover-value { color: var(--vscode-descriptionForeground); font-size: 10px; }
 .popover-external { color: var(--vscode-descriptionForeground); font-size: 12px; }
 .popover-back { color: var(--vscode-textLink-foreground); }
-.popover-chevron { color: var(--vscode-descriptionForeground); flex-shrink: 0; }
+/* Mirrors .rail-head-twisty: the open/closed chevron is SWAPPED, not rotated,
+   so the closed state is a real "›" and the open state a real "⌄" rather than
+   the same glyph on its side. */
+.popover-twisty {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 16px;
+  margin-left: 2px;
+  color: var(--vscode-descriptionForeground);
+}
+.popover-twisty svg { width: 12px; height: 12px; display: block; }
 
 /* Non-clickable info rows (About panel: versions, update status). */
 .popover-info {
@@ -3828,7 +4389,7 @@ textarea#input {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 32px;
+  padding: 48px 32px 90px;
   background: rgba(0, 0, 0, 0.72);
 }
 .image-preview-overlay[hidden] { display: none; }
@@ -3885,6 +4446,33 @@ textarea#input {
   line-height: 1;
   cursor: pointer;
 }
+.image-preview-actions {
+  position: absolute;
+  bottom: 16px;
+  left: 16px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  gap: 8px;
+  color: #fff;
+}
+.image-preview-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 40px;
+  padding: 8px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 20px;
+  background: rgba(0, 0, 0, 0.75);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.image-preview-copy:disabled { opacity: 0.5; cursor: default; }
+.image-preview-copy svg { width: 16px; height: 16px; }
+.image-preview-status { font-size: 12px; text-align: center; }
 .attachment-remove {
   display: inline-flex;
   align-items: center;
@@ -4121,8 +4709,11 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
 .card-actions button.primary { font-weight: 600; }
 .card-actions button.danger {
   color: var(--vscode-errorForeground);
+  /* The gap sets No apart from the Yeses. There is no border-top here because
+     the button above already draws its own border-bottom, and the two together
+     rendered as TWO rules 10px apart -- one closing the allow group and one
+     opening this button. Visible with four options, obvious at three. */
   margin-top: 10px;
-  border-top: 1px solid var(--vscode-editorWidget-border);
 }
 .card-actions button.danger.arming { pointer-events: none; }
 .card-actions button:disabled { opacity: 0.4; cursor: default; }
@@ -4182,13 +4773,15 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
   line-height: 1.35;
   font-family: var(--vscode-font-family);
 }
-/* The chosen answer, shown once the card is answered ÔÇö kept bright (the card
-   isn't dimmed) so it's an unmistakable "grok got this" signal. */
+/* Keep submitted and recovered answers readable and copyable. */
 .card.question.resolved { opacity: 1; }
 .card .question-answer {
   font-size: 13px;
   font-weight: 600;
   color: var(--vscode-charts-green, #89d185);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 .card .question-options { display: flex; flex-direction: column; gap: 4px; }
 .card button.question-option {
@@ -4268,6 +4861,27 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
      terminate a gradient opaquely ÔÇö use the sidebar-composited variant. */
   background: linear-gradient(to bottom, transparent, var(--chat-surface-user-opaque));
   pointer-events: none;
+}
+/* ...and on the TINTED colour once a jump has landed on this prompt. The fade
+   exists to occlude the clipped text, so it has to end on whatever the bubble
+   is actually painted, and a highlighted bubble is not the same colour any
+   more -- leaving it produced a dark band across the bottom of a blue bubble
+   (owner, desktop app, dark theme, 2026-09-11).
+
+   The same 18 % blue as the highlight, mixed into the OPAQUE variant for the
+   same reason the rule above uses it. That lands on exactly the painted
+   colour rather than approximately: `--chat-surface-user-opaque` is
+   `--chat-surface-user` already composited over the sidebar, and mixing an
+   opaque blue into a translucent fill and then compositing gives the same
+   result as compositing first and mixing after. */
+.msg.user.collapsible.prompt-nav-target .body::after {
+  background: linear-gradient(to bottom, transparent,
+    color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 18%, var(--chat-surface-user-opaque)));
+}
+@media (prefers-reduced-motion: no-preference) {
+  /* Matches the bubble's own 120ms, so the fade and the fill arrive together
+     instead of the band snapping a frame ahead of the tint. */
+  .msg.user.collapsible .body::after { transition: background 120ms ease-out; }
 }
 .msg-expand-btn {
   display: none;
@@ -4372,6 +4986,62 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
   min-width: 160px;
 }
 .session-superseded-btn:hover { background: var(--vscode-button-hoverBackground); }
+
+/* The lapsed-account offer. Same card shape as the superseded one -- the owner
+   already told us a thin stripe over a live-looking composer reads as
+   ignorable chrome -- but it sits ABOVE a composer that still works, so it
+   takes the warning border rather than the focus one. */
+.provider-signin-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  text-align: left;
+  padding: 14px 16px;
+  border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-editorWidget-border));
+  border-radius: 8px;
+  margin: 0 0 8px;
+  background: var(--vscode-inputValidation-warningBackground, var(--vscode-textBlockQuote-background, rgba(86, 156, 214, 0.08)));
+}
+.provider-signin-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--vscode-foreground);
+}
+.provider-signin-body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--vscode-descriptionForeground);
+}
+.provider-signin-btn {
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  min-height: 34px;
+  padding: 7px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  cursor: pointer;
+  align-self: flex-start;
+  min-width: 160px;
+}
+.provider-signin-btn:hover { background: var(--vscode-button-hoverBackground); }
+/* Where the button sits while a sign-in is actually running. Same box, so the
+   composer does not move under a thumb that is still near it. */
+.provider-signin-busy {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  min-height: 34px;
+  padding: 7px 0;
+  line-height: 20px;
+  color: var(--vscode-descriptionForeground);
+}
 /* The composer is frozen, so it does not sit under the card pretending
    otherwise. Every control inside it is `disabled` in the renderer as well —
    opacity alone still takes clicks. */
@@ -4524,6 +5194,10 @@ body.session-superseded .msg-edit-btn {
 }
 .repo-row-main:disabled { cursor: default; }
 .repo-row-icon { display: inline-flex; flex: none; color: var(--vscode-descriptionForeground); }
+/* Same as the chip: viewBox-only marks collapse to 0x0 in a flex host
+   without this. 13px is what ICON.folder drew here before; a worktree row
+   still draws ICON.gitBranch, which brings its own 14px. */
+.repo-row-icon svg { width: 13px; height: 13px; }
 .repo-row-copy { min-width: 0; display: flex; flex-direction: column; }
 .repo-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .repo-row-meta { color: var(--vscode-descriptionForeground); font-size: 11px; margin-top: 2px; }
@@ -4849,7 +5523,19 @@ mjx-container[display="true"] {
 .confirm-overlay {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  /* A CONFIRMATION IS THE TOPMOST THING ON SCREEN, BY DEFINITION. It asks a
+     question about something the person cannot undo, so nothing may cover it.
+     At 100 it sat under almost everything that opens it, and that was patched
+     twice per-caller instead of here: the panel's own menus went 1000 -> 1300
+     in 2026-08-15, the connect wizard 100 -> 200. The third instance was the
+     Changes view's Discard on a phone — the panel goes full-screen at 1200, so
+     the dialog was painted underneath it and tapping Discard appeared to do
+     nothing at all, leaving a destructive confirm floating invisibly behind the
+     panel (owner-caught, 2026-09-09).
+     Above every layer that can launch one: the rail's colour picker (10000),
+     the panel's menus (1300), the phone's full-screen panel (1200), the rail
+     (1100), the image preview (1000) and Settings (120). */
+  z-index: 10100;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4861,11 +5547,6 @@ mjx-container[display="true"] {
    two links and a set of steps. At the confirm dialog's 340px that stack ran
    to 600px tall and the code wrapped awkwardly. Wider, and scrollable rather
    than clipped on a short phone screen. */
-/* Above the settings overlay (z-index 120), because Settings is one of the two
-   places this is opened FROM. At the confirm dialog's 100 it opened behind the
-   page that launched it — the very failure the wizard replaced. */
-.connect-wizard-overlay { z-index: 200; }
-
 .confirm-panel.connect-wizard-panel {
   width: min(460px, 100%);
   max-height: min(88vh, 760px);
@@ -5192,13 +5873,32 @@ body.vscode-light .preview-overlay {
 @media (hover: none), (pointer: coarse) {
   .toolbar-btn svg { width: 18px; height: 18px; }
   .context-donut svg { width: 22px; height: 22px; }
+  /* Must be HERE, not in the composer's own touch block above: `.context-donut`
+     is declared later in this file at the same specificity, so an earlier copy
+     of these two lines is simply overwritten. */
+  .context-donut { min-width: 36px; height: 36px; justify-content: center; }
   #donut-label { display: none; }
+  /* Six controls at a 36px tap floor need 224px of pure button and this rung
+     has less. The donut goes rather than something shrinking below the floor:
+     it is the readout the ladder already drops first, its numbers live in its
+     own tooltip and popover, and a control too small to hit is worse than one
+     that is honestly not there. */
+  @container composer-card (max-width: 250px) {
+    .context-donut { display: none; }
+  }
 }
 
-/* Touch devices: the scroll-to-bottom pill matches the 36px control row. */
+/* Touch devices: both floating controls match the 36px control row — one token
+   now, which is what the line above always claimed and neither control quite
+   did. A finger needs the bigger target; a mouse on a desk, an IDE panel or a
+   desk browser does not, and 26px there keeps the pair from shouting over a
+   transcript. This query is the only thing that separates those two worlds. */
 @media (hover: none), (pointer: coarse) {
-  .scroll-bottom-btn { padding: 8px 16px 8px 13px; border-radius: 19px; font-size: 13px; }
+  .scroll-bottom-btn,
+  .prompt-prev-btn { --float-ctl-h: 36px; }
+  .scroll-bottom-btn { padding: 0 16px 0 13px; font-size: 13px; }
   .scroll-bottom-btn svg { width: 18px; height: 18px; }
+  .prompt-prev-btn svg { width: 19px; height: 19px; }
 }
 
 /* Touch devices: question/permission cards are tap surfaces ÔÇö roomier option
@@ -5226,8 +5926,12 @@ body.vscode-light .preview-overlay {
 /* Phones: "Last turn" is billing diagnostics ÔÇö hide it in the donut's context
    popover (the Session total above it is the number that matters). */
 @media (hover: none), (pointer: coarse) {
-  #context-popover .popover-section-toggle,
-  #context-popover .popover-section-toggle + div { display: none; }
+  /* Addressed BY NAME. This used to say `.popover-section-toggle`, which meant
+     "Last turn" only while Last turn was the sole fold — the moment Session
+     total became one too, the same rule would have deleted the number this
+     comment calls the one that matters, on the surface it matters most. */
+  #context-popover [data-fold="lastTurn"],
+  #context-popover [data-fold="lastTurn"] + div { display: none; }
 }
 
 /* The "continue in a new chat" destination question. Reached from the
@@ -5672,3 +6376,129 @@ a.add-project-github-open {
   gap: 4px;
 }
 .onb-steps li { margin: 0; }
+/* One strip above every covering surface, with space reserved for its chrome. */
+.host-wait-strip {
+  position: fixed;
+  inset: auto 0 0;
+  z-index: 10050;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+  color: var(--vscode-foreground, #ddd);
+  background: var(--vscode-editorWidget-background, #252526);
+  border-top: 1px solid var(--vscode-widget-border, #555);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.host-wait-strip[hidden] { display: none; }
+.host-wait-copy { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.host-wait-strip button { flex: none; color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 4px; padding: 6px 10px; cursor: pointer; }
+.host-wait-spinner { width: 14px; height: 14px; flex: none; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: host-wait-spin 1s linear infinite; }
+@keyframes host-wait-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .host-wait-spinner { animation: none; border-style: dotted; } }
+body.host-wait-visible { padding-bottom: var(--host-wait-height, 76px); }
+body.host-wait-visible .settings-overlay,
+body.host-wait-visible .gfp-panel.gfp-overlay { bottom: var(--host-wait-height, 76px) !important; }
+.settings-pending { grid-column: 1 / -1; font-size: 12px; opacity: .8; }
+
+/* ── Project mark picker (media/repo-icon-picker.js) ─────────────────────────
+   Ninety-five marks is too many to scan, so the grid is never the first thing
+   you reach: focus lands in the search box and Enter takes the top hit. The
+   tabs are for browsing, the box is for knowing what you want. */
+.repo-icon-picker {
+  position: fixed;
+  z-index: 1000;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 296px;
+  max-width: calc(100vw - 16px);
+  padding: 10px;
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+  border: 1px solid var(--vscode-menu-border, var(--vscode-editorWidget-border));
+  border-radius: 8px;
+  box-shadow: 0 4px 16px color-mix(in oklab, var(--vscode-widget-shadow) 40%, transparent);
+}
+.repo-icon-search {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 26px;
+  padding: 3px 7px;
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  background: var(--vscode-input-background, transparent);
+  border: 1px solid var(--vscode-input-border, var(--vscode-editorWidget-border, transparent));
+  border-radius: 4px;
+  font: inherit;
+  font-size: 12px;
+}
+.repo-icon-search:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.repo-icon-tabs { display: flex; flex-wrap: wrap; gap: 3px; }
+.repo-icon-tab {
+  padding: 2px 6px;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.repo-icon-tab:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); }
+.repo-icon-tab.is-active {
+  color: var(--vscode-foreground);
+  background: color-mix(in oklab, var(--vscode-foreground) 12%, transparent);
+}
+.repo-icon-tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.repo-icon-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(32px, 1fr));
+  gap: 2px;
+  /* Eight rows before it scrolls: enough that a whole group is one glance,
+     short enough that the popover still fits above a rail row near the
+     bottom of a short window. */
+  max-height: 272px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.repo-icon-cell {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1;
+  padding: 0;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+/* The `display: grid` above is an author rule, and an author `display` beats
+   the UA stylesheet's [hidden] { display: none } outright. Without this the
+   filter sets `hidden` on ninety cells and all ninety-six stay on screen, so
+   both the category tabs and the search box look dead -- which is how they
+   were reported. Eight other elements in this file already carry the same
+   line; the picker's cells were the ones that missed it. */
+.repo-icon-cell[hidden] { display: none; }
+.repo-icon-cell svg { width: 18px; height: 18px; }
+.repo-icon-cell:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
+.repo-icon-cell:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.repo-icon-cell.is-selected {
+  color: var(--vscode-foreground);
+  border-color: color-mix(in oklab, var(--vscode-focusBorder) 70%, transparent);
+  background: color-mix(in oklab, var(--vscode-foreground) 10%, transparent);
+}
+/* The default sits first in every tab and is the way back, so it is marked as
+   a different KIND of cell rather than just another glyph. */
+.repo-icon-cell.is-default { border-style: dashed; border-color: color-mix(in oklab, var(--vscode-foreground) 25%, transparent); }
+.repo-icon-empty { padding: 6px 2px; color: var(--vscode-descriptionForeground); font-size: 12px; }
+
+/* Touch: the universal 36px floor. The grid widens with the cells rather than
+   keeping eight cramped columns a thumb cannot hit. */
+@media (hover: none), (pointer: coarse) {
+  .repo-icon-search { min-height: 36px; }
+  .repo-icon-tab { min-height: 32px; }
+  .repo-icon-grid { grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); }
+}

@@ -63,7 +63,7 @@ describe("multi-provider review regressions", () => {
     instance.remoteTargetableCwd = vi.fn(() => true);
     // The project closes after ingress validation but before the list builder.
     // The combined builder must own the second check because it owns the scan.
-    instance.remoteAuthorizedSessionCwds = vi
+    instance.authorizedSessionCwds = vi
       .fn()
       .mockReturnValueOnce([closed])
       .mockReturnValue([open]);
@@ -129,7 +129,6 @@ describe("multi-provider review regressions", () => {
         cwd,
         { offset: 0, limit: 2 },
         null,
-        "local",
       );
 
       expect(result.entries.map((entry: SessionListEntry) => entry.id)).toEqual(["mtime-old", "mtime-new"]);
@@ -185,7 +184,7 @@ describe("multi-provider review regressions", () => {
     expect(warm).toContain("await warmCodexModelCache(");
     expect(warm).toContain("model-cache warm-up failed");
     const reprobe = methodBody("private async reprobeProviderCredentials(");
-    expect(reprobe).toContain('if (provider === "codex")');
+    expect(reprobe).toContain('if (provider === "codex" || provider === "claude")');
     expect(reprobe).toContain("this.warmConnectedCodexModels()");
     const recheck = sidebar.slice(sidebar.indexOf('case "recheckConnection":'), sidebar.indexOf('case "logout":'));
     expect(recheck).toContain("await this.reprobeProviderCredentials(provider)");

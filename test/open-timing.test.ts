@@ -4,6 +4,8 @@ vi.mock("../src/acp", async (importOriginal) => {
   const { EventEmitter } = await import("node:events");
   const actual = await importOriginal<typeof import("../src/acp")>();
   class FakeAcpClient extends EventEmitter {
+    setHumanWaitActive = vi.fn();
+    supportsInterject(): boolean { return true; }
     provider = "grok" as const;
     usesClientPlanGate = false;
     sessionId: string | undefined;
@@ -264,7 +266,7 @@ function makeSidebar(cwd: string): any {
 describe("startSession open-timing line", () => {
   it("logs one summary with every phase after a fake-client resume", async () => {
     const sidebar = makeSidebar("/repo");
-    const previous = { dispose: vi.fn(async () => {}) };
+    const previous = { setHumanWaitActive: vi.fn(), dispose: vi.fn(async () => {}) };
     sidebar.focused.client = previous;
 
     const client = await sidebar.startSession("resume-1", sidebar.focused);

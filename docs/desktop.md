@@ -17,14 +17,20 @@ Asset names are stable so a landing page can link them by version:
 | macOS | Intel (x64) | `Grok-Build-Desktop-<version>-mac-x64.dmg` |
 | macOS | arm64 / x64 (archive) | `Grok-Build-Desktop-<version>-mac-arm64.zip` / `…-mac-x64.zip` |
 | Windows | x64 | `Grok-Build-Desktop-<version>-win-x64.exe` |
+| Linux | x86_64 (AppImage) | `Grok-Build-Desktop-<version>-linux-x86_64.AppImage` |
 
 Example for version `3.1.0`:
 
 - `Grok-Build-Desktop-3.1.0-mac-arm64.dmg`
 - `Grok-Build-Desktop-3.1.0-mac-x64.dmg`
 - `Grok-Build-Desktop-3.1.0-win-x64.exe`
+- `Grok-Build-Desktop-3.1.0-linux-x86_64.AppImage`
 
-Optional Linux AppImage (when built on Linux): `Grok-Build-Desktop-<version>-linux-x64.AppImage`.
+**Note the Linux arch spelling.** electron-builder writes `x86_64` for AppImage
+targets and `x64` for every other one, so anything matching installer names by
+pattern needs both spellings. There is exactly one AppImage per release — see
+[Running in a cloud environment](cloud-environments.md) for why adding a second
+would break the fleet tooling.
 
 ## Build commands
 
@@ -33,6 +39,7 @@ npm install
 npm run compile          # required; electron-builder packs out/ + media/ + resources/
 
 npm run dist:win         # Windows x64 NSIS installer → dist-desktop/
+npm run dist:linux       # Linux x86_64 AppImage (must run on Linux)
 npm run dist:mac         # macOS arm64 + x64 dmg + zip (must run on macOS)
 npm run dist             # current host's default targets
 npm run dist:dir         # unpacked dir only (fast layout check; no installer)
@@ -62,9 +69,9 @@ privilege so the normal download path works.
 
 | From → produces | Windows installer | macOS installers | Linux AppImage |
 |---|---|---|---|
-| **Windows** | yes (`dist:win`) | **no** | not configured here |
+| **Windows** | yes (`dist:win`) | **no** | **no** |
 | **macOS** | possible* | yes (`dist:mac`, both archs) | possible* |
-| **Linux** | possible* | **no** | yes (if you add/run linux targets) |
+| **Linux** | possible* | **no** | yes (`dist:linux`) |
 
 \* electron-builder can cross-build some Windows targets from macOS/Linux; macOS
 targets **require a Mac** (Apple tooling / dmg). This repo's documented path is:
@@ -143,16 +150,33 @@ cert is available.
 
 ## Auto-update
 
-Packaged Windows and macOS builds check a relay-served generic feed
-(`https://afkpilot.com/update/win/latest.yml` and
-`…/mac/latest-mac.yml`) on start and every 12 hours, download in the
+Packaged Windows, macOS and Linux builds check a relay-served generic feed
+(`https://afkpilot.com/update/win/latest.yml`, `…/mac/latest-mac.yml` and
+`…/linux/latest-linux.yml`) on start and every 12 hours, download in the
 background, and install on quit or when the rail button says **Restart to
 update**. Check or download failure is silent and falls back to the
 **Update available** notice (opens `https://afkpilot.com/desktop-update`).
 No GitHub provider — a vsix-only release would stall that feed.
 
-`electron-builder.yml` has a generic `publish` block so `latest.yml` /
-`latest-mac.yml` are generated; `dist*` still uses `--publish never` and
+**Linux serves the same AppImage the cloud machines install, and needs no cloud
+check to stay safe.** `AppImageUpdater.isUpdaterActive()` returns false unless
+`process.env.APPIMAGE` is set, and a cloud machine execs the extracted
+`squashfs-root` rather than the AppImage — so it asks the feed nothing and
+`checkForUpdates()` resolves null with a log line, no error event and no
+notice. A desk user who ran the file normally gets a real in-place update.
+Keep that structural: a cloud check here would be one more thing to keep true.
+
+**A desk user can land in the same state, and still hears about updates.**
+`APPIMAGE` is unset whenever the AppImage was extracted rather than run — which
+is what somebody does when their distro has no `libfuse2`. The check treats a
+null result like a failed one and falls back to the **Update available**
+notice, so they are told a new version exists even though nothing can install
+itself. That is one branch, not a platform check, and it is why a cloud
+machine needs no exemption from it.
+
+`electron-builder.yml` has a generic `publish` block per platform so
+`latest.yml` / `latest-mac.yml` / `latest-linux.yml` are generated; `dist*`
+still uses `--publish never` and
 the workflow attaches those yml files to the GitHub Release. Windows
 signature verification is off until an Authenticode cert lands.
 

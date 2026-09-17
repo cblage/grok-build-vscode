@@ -1,8 +1,8 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
-import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import * as path from "node:path";
-import { codexManagedBinaryPath } from "./codex-managed-installer";
+import { findCliOnPath } from "./cli-path";
+import { codexManagedBinaryName, codexManagedBinaryPath, codexManagedRoot } from "./codex-managed-installer";
 
 export interface CodexLocatorFs {
   exists(path: string): boolean;
@@ -40,15 +40,6 @@ const defaultFs: CodexLocatorFs = {
     try { return statSync(file).isFile(); } catch { return false; }
   },
 };
-
-function defaultWhich(name: string, platform: NodeJS.Platform): string | undefined {
-  try {
-    const command = platform === "win32" ? `where ${name}` : `command -v ${name}`;
-    return execSync(command, { encoding: "utf8" }).trim().split(/\r?\n/)[0]?.trim() || undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 function versionParts(name: string): number[] {
   const match = /openai\.chatgpt-(\d+(?:\.\d+)*)/i.exec(name);
@@ -135,7 +126,7 @@ export function locateCodexCli(options: CodexLocatorOptions = {}): string | unde
   // to click. `cli-locator.ts` has always put `grok.cmd` first for this reason.
   const names = platform === "win32" ? ["codex.cmd", "codex.exe", "codex"] : ["codex"];
   for (const name of names) {
-    const found = (options.which ?? ((candidate) => defaultWhich(candidate, platform)))(name);
+    const found = (options.which ?? ((candidate) => findCliOnPath(candidate, env, platform, options.fs?.isFile)))(name);
     if (found && fs.isFile(found)) return found;
   }
 
@@ -146,6 +137,25 @@ export function locateCodexCli(options: CodexLocatorOptions = {}): string | unde
   if (options.managedStorageRoot) {
     const managed = codexManagedBinaryPath(options.managedStorageRoot, platform);
     if (fs.isFile(managed)) return managed;
+    // The install directory carries the pinned tag, so moving the pin renames
+    // it out from under someone who installed Codex through us: their working
+    // binary is still on disk and simply stops counting. On a cloud machine
+    // that is unrecoverable — `installCodex` is host-local, so the phone gets
+    // "Codex is missing at the desk" and no button — and Codex would appear to
+    // vanish on an update. So an install WE made still resolves.
+    //
+    // Ranking between leftovers does not matter: a successful install prunes
+    // the others, so there is at most one, and any binary we put there runs.
+    // Determinism does, hence the sort. Being a version behind is visible and
+    // fixable, which is the whole point — the update action is right there.
+    const root = codexManagedRoot(options.managedStorageRoot);
+    const binary = codexManagedBinaryName(platform);
+    let entries: string[] = [];
+    try { entries = [...fs.readDir(root)].sort().reverse(); } catch { /* none installed */ }
+    for (const entry of entries) {
+      const candidate = path.join(root, entry, "bin", binary);
+      if (fs.isFile(candidate)) return candidate;
+    }
   }
   return undefined;
 }

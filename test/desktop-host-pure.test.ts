@@ -109,6 +109,7 @@ import {
   registryIdFromUrlPath,
 } from "../src/desktop/resource-registry";
 import { parseWebviewMsg } from "../src/desktop/webview-msg-validate";
+import { WEBVIEW_MESSAGE_TYPES } from "../src/protocol";
 import {
   deliverSuggestedFileSave,
   planSuggestedSaveDialog,
@@ -177,12 +178,15 @@ describe("desktop ConfigStore", () => {
     const store = new ConfigStore(file);
     expect(store.getConfiguration("grok").get("cliPath", "")).toBe("");
     expect(store.getConfiguration("grok").get("showThinking", false)).toBe(false);
+    expect(store.getConfiguration("grok").get("expandDiffCard", true)).toBe(false);
 
     await store.getConfiguration("grok").update("cliPath", "/bin/fake-grok");
     expect(store.getConfiguration("grok").get("cliPath")).toBe("/bin/fake-grok");
+    await store.getConfiguration("grok").update("expandDiffCard", true, "global");
 
     const again = new ConfigStore(file);
     expect(again.getConfiguration("grok").get("cliPath")).toBe("/bin/fake-grok");
+    expect(again.getConfiguration("grok").get("expandDiffCard")).toBe(true);
   });
 
   it("persists the Codex CLI override through the desktop config store", async () => {
@@ -705,10 +709,11 @@ describe("desktop main wiring (source gates)", () => {
       sidebar.indexOf("return `<!DOCTYPE html>", sidebar.indexOf("const filePanelStyle")),
     );
     expect(assetGate).toContain("this.host.canSwitchWorkspaceFolder");
+    expect(assetGate).toContain("HOST_CAPABILITIES.editProviderConfigFiles");
     expect(assetGate).toContain('mediaUri("file-panel.css")');
     expect(assetGate).toContain('mediaUri("file-panel.js")');
-    // An empty branch means the VS Code webview receives neither tag; absence
-    // of a mount call is not the thing enforcing the product decision.
+    // VS Code loads the component for provider config files too. Project files
+    // still use its native explorer; only desktop injects that panel's mount.
     expect(assetGate.match(/:\s*"";/g)).toHaveLength(2);
 
     // First-frame desktop chrome: rail visible + files shell in getHtml so the
@@ -1248,6 +1253,56 @@ describe("app-resource serve policy (no credential leak)", () => {
     });
     expect(lexicalOnly).toBe(true);
     expect(appResourceMayServe(auth, roots)).toBe(false);
+  });
+});
+
+describe("webview message schema validation — every type is registered", () => {
+  it("accepts sandbox profile selections and rejects malformed payloads", () => {
+    for (const profile of ["off", "workspace", "strict", "MyCustomProfile"]) {
+      const message = { type: "setSandbox", profile };
+      expect(parseWebviewMsg(message)).toEqual(message);
+    }
+    for (const profile of [undefined, null, 42, {}, []]) {
+      expect(parseWebviewMsg({ type: "setSandbox", profile })).toBeNull();
+    }
+  });
+
+  // The per-message tests below were each written AFTER a type shipped dead on
+  // the desktop app, and they only ever cover the type someone remembered. On
+  // 2026-09-14 seven were missing at once — gitStatus/gitFileDiff/gitRun (the
+  // whole Changes panel), updateCodex/updateClaude, refreshContextDetails and
+  // refreshSubscriptionUsage — so the git panel and both popover refreshes were
+  // dead on desktop while VS Code, which does not load this gate, was fine.
+  //
+  // TypeScript cannot catch it: the switch ends in `default: return null`, so
+  // omitting a case is exhaustive as far as the compiler is concerned. This
+  // asserts on the SOURCE instead, which is the only place the omission exists.
+  it("gives every WebviewMsg type a case label in the validator", () => {
+    const src = fs.readFileSync(
+      fileURLToPath(new URL("../src/desktop/webview-msg-validate.ts", import.meta.url)),
+      "utf8",
+    );
+    const labelled = new Set(
+      [...src.matchAll(/case "([^"]+)":/g)].map((m) => m[1]),
+    );
+    const missing = WEBVIEW_MESSAGE_TYPES.filter((type) => !labelled.has(type));
+    expect(missing, `webview-msg-validate.ts drops these on the desktop app: ${missing.join(", ")}`)
+      .toEqual([]);
+  });
+});
+
+describe("webview message schema validation — display-preference setters", () => {
+  // The desktop app gates every webview message through parseWebviewMsg, and
+  // an unknown type is dropped silently (default: return null). A setter that
+  // VS Code accepts (no gate there) and a phone never posts (local-only) can
+  // therefore be dead on the desktop and on a cloud machine alone — which is
+  // exactly what happened to setExpandDiffCard the day it shipped.
+  it("accepts setExpandDiffCard with a boolean and refuses anything else", () => {
+    expect(parseWebviewMsg({ type: "setExpandDiffCard", value: true }))
+      .toEqual({ type: "setExpandDiffCard", value: true });
+    expect(parseWebviewMsg({ type: "setExpandDiffCard", value: false })?.type).toBe("setExpandDiffCard");
+    expect(parseWebviewMsg({ type: "setExpandDiffCard", value: "yes" })).toBeNull();
+    expect(parseWebviewMsg({ type: "setExpandDiffCard" })).toBeNull();
   });
 });
 
@@ -4296,7 +4351,7 @@ describe("file tree rebind on project change (P2-3)", () => {
     expect(src).toContain("onRootChanged");
     expect(src).toContain("onScopeChanged");
     expect(src).toContain("listener(normalizeRoot(await api.root()))");
-    expect(filePanelJs).toContain("function setScope(scope)");
+    expect(filePanelJs).toContain("function setScope(scope");
     expect(filePanelJs).toContain("state = makeScopeState(scope)");
     expect(filePanelJs).toContain("scopes.set(scope.id, state)");
   });

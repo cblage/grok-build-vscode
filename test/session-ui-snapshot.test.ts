@@ -13,6 +13,7 @@ describe("sessionUiSnapshot", () => {
     session.queuedSends = [{ text: "queued for B", chips: [] }];
 
     expect(sessionUiSnapshot(session, "plan")).toEqual([
+      { type: "subscriptionUsage", windows: [] },
       { type: "modeChanged", modeId: "plan" },
       { type: "planModeAvailability", available: true, reason: undefined, recheckable: false },
       { type: "feedbackAvailability", available: false },

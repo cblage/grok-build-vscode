@@ -1,25 +1,298 @@
 # Changelog
 
-## 4.1.9-sandbox.1 — 2026-09-05
+## 4.9.1-sandbox.1 — 2026-09-17
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.1.8.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.9.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
   - **Session behavior:** the chosen profile is fixed for the life of a conversation and restored when that conversation resumes. Built-in application failures warn and continue like Grok; invalid or unapplied custom profiles refuse to start; and loss of the live delegated-operation sandbox ends the affected session instead of silently weakening it.
-  - **Sandbox controls:** supported macOS hosts get a compact lock/unlock indicator stacked between the voice and Send controls; profile names, distinct source icons, and source labels for built-in, user-defined, and workspace-defined profiles live in its picker. Hovering or keyboard-focusing the control always shows a read-only inspector with the resolved base profile, filesystem access, network behavior, and any custom read-only, writable, or deny rules; clicking it while enabled replaces that preview with the profile-switching menu. The sandbox control stays selection-locked from session startup through the full active turn because its boundary is fixed for the conversation, while Agent Mode remains available mid-turn. Changing the profile of an existing conversation opens the Summarize or Just Restart flow required to start a new session under the new boundary.
+  - **Sandbox controls:** supported macOS hosts get a compact lock/unlock indicator above Send at the right edge of the composer; profile names, distinct source icons, and source labels for built-in, user-defined, and workspace-defined profiles live in its picker. Hovering or keyboard-focusing the control always shows a read-only inspector with the resolved base profile, filesystem access, network behavior, and any custom read-only, writable, or deny rules; clicking it while enabled replaces that preview with the profile-switching menu. The sandbox control stays selection-locked from session startup through the full active turn because its boundary is fixed for the conversation, while Agent Mode remains available mid-turn. Changing the profile of an existing conversation opens the Summarize or Just Restart flow required to start a new session under the new boundary.
   - **Ported onto the 3.2.0 host abstraction.** Upstream split the shared host core out of the VS Code extension host for the desktop app, so the sandbox code now speaks the same `Host` interface: no direct `vscode.*` calls, and the project-scoped profile choice is keyed by workspace root in extension state rather than a VS Code-only workspace memento.
   - See the [macOS sandbox architecture guide](docs/macos-sandbox-architecture.md) for the full access matrix, profile resolution rules, process topology, and enforcement boundary.
 
 ### Fixed
 
+- **The desktop app accepts sandbox profile changes.** Its renderer-message validator now recognizes the sandbox picker request and checks its profile field instead of silently dropping the selection.
 - **The “Read simplified summaries” toggle no longer errors during a live extension upgrade.** If a VS Code-derived host has not yet refreshed its contributed-settings registry, the extension temporarily preserves the choice in extension state instead of rejecting it as an unregistered `grok.summarizeRepliesAloud` setting. The contributed User setting remains authoritative as soon as the host registers the current manifest.
 - **Sandboxing stays scoped to Grok now that Codex can run alongside it.** The compiled Seatbelt policy only ever knew about `$GROK_HOME`, so nothing stopped a Codex session from being routed through a broker built for a home directory it doesn't use. The sandbox lock control and its menu now hide on a Codex session, and session start never compiles a policy or attaches a broker to one — Codex sessions run exactly as they would with sandboxing off, matching what the CLI itself sees.
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.9.0 — 2026-09-17
+
+**This release is about being asked less and being told more.** A turn that edited five files made you open five tool rows to see what happened to one of them; a permission card asked the same question forty times a session because answering "don't ask again" granted almost nothing; and a workflow reported its progress as a percentage that was really a count of agents spent. Each of those is a place where the app had the information and handed you something else.
+
+### Added
+
+- **See a whole turn's changes to one file, in one diff (#168).** The Changes summary on a finished turn now expands each file into a single diff covering everything the turn did to it, instead of one diff per edit spread across the tool rows. The baseline is taken the moment the turn starts, so it is what the file looked like before the agent touched it — not before its last edit. It works wherever the card does: the VS Code side bar, the desktop app, a browser and your phone.
+
+  Where a diff cannot be taken honestly, it is not taken at all. A folder that is not a git repository, a turn from a conversation you have reloaded, a project you switched away from between sending and clicking, a repository busy with another command — each of those falls back to the per-edit tool rows exactly as before, rather than showing you a diff of the wrong state.
+
+- **Stop being asked about a command you have already approved (#61, #123).** A terminal permission card now offers **"Yes, and allow this program this session"**, naming the program it would allow. Grant `npm` once and `npm test`, `npm run build` and `npm ci` stop asking for the rest of the conversation.
+
+  This is the part that was actually broken. The agent's own "don't ask again" remembers the **exact command string**, so approving `npm test -- users` does nothing for `npm test -- orders`; in a session where nearly every command differs by a path or a flag, nearly every one is a fresh question. That is why the setting felt like it was not working — it was working, on one string at a time.
+
+  The grant is deliberately narrow. It lasts for the conversation and is gone when it ends; nothing is granted until you grant it; a chained command is judged one segment at a time, so `npm test && rm -rf build` does not ride in on an `npm` grant; a command we cannot take apart with confidence still asks; and while you are in Plan mode nothing is auto-approved at all. Every command allowed this way still appears in the transcript as an answered card, because "it stopped asking" must never mean "I could not see what it did".
+
+  For a grant that outlives the conversation, the agent's own `[permission]` rules in `.grok/config.toml` take glob patterns and are enforced before the request ever reaches us.
+
+### Fixed
+
+- **The permission card asks one question with three answers, not four (#154).** It offered four rows of equal weight, two of which remembered your answer in ways that mostly did not help. Now: yes, yes-and-allow-this-program, no. The row that was removed is the one the two reports above are about — it promised to remember and remembered one exact string.
+
+- **Agent edits stop closing your open editor tabs (#167).** Opening the diff for a proposed change took VS Code's preview slot — the italic tab a single click in the Explorer produces — and whatever was sitting there was gone at that instant. It read as the agent closing your files; it never closed anything, it took the seat. The diff now opens as its own tab and never asks for that slot. (3.19.2 fixed the same report's other half, which is why it came back.)
+
+  One consequence worth knowing: a turn with many edits now leaves a diff tab each rather than reusing one. They close as you answer each card, so they only accumulate where cards go unanswered — which is the case where you wanted the tabs anyway.
+
+- **A workflow no longer reports how much of its budget it has spent as though it were progress (#163).** A deep-research or workflow run drew `agents used / agent budget` as a percentage, in the same place a Goal card draws real completion — so "2%" meant "one agent of fifty gone", and a run doing an hour of useful work inside a single agent sat at the same number the whole time. It now reads `3/50 agents`: the same fact, in a form that cannot be mistaken for a finish line. The card also shows elapsed time while a run is working, so a long quiet stretch is visibly *working* rather than possibly wedged.
+
+## 4.8.0 — 2026-09-17
+
+**A project can now wear an icon, so you can find it without reading.** Colour told two projects apart; it could not say which was which, and a rail of six tinted folders is still six folders. Each project now carries a mark you choose, drawn everywhere the project is named.
+
+### Added
+
+- **Give a project an icon (#165).** **Set icon**, on a project's ⋯ menu or its right-click menu, opens a grid of ninety-five marks in six groups — Shapes, Build, Work, Talk, People, Play — with a search over their names and the plain folder at the top to go back to none. What you pick is drawn on the project's row in the rail, on the chip above the message box, in the project switcher and above the file panel, and it is the same glyph in every one of them. It belongs to the project rather than to the machine you set it on, so it follows you from VS Code to the desktop app to a Cloud machine to your phone.
+
+### Fixed
+
+- **Menus on a project row stop closing themselves.** In VS Code every popover on a project row — the ⋯ menu, the colour swatches, the new icon grid — closed itself every second or two. The rail rebuilds whenever the conversation files behind it change, and another extension writing its own transcripts is enough to drive that indefinitely; the rebuild now waits until you are finished with the menu. It was always this way — a menu you dismiss in two seconds tolerates it, a grid of marks you are reading does not.
+
+- **Conversations sit under their project on your phone and in the desktop app.** A project's row indents for its fold arrow and its conversations did not, so a conversation sat to the left of the project it belongs to and the rail read as a flat list. The VS Code side bar had already been fixed for this; the phone, which is where it was reported, had not.
+
+## 4.7.0 — 2026-09-16
+
+**Linux is a platform we offer, not just one we use.** The desktop app has built a Linux AppImage on every release since 4.5.2 — it is what Cloud machines run — but it was never offered to anyone, and the few people who found it got no updates. Both halves are fixed. Nothing changes in the VS Code extension itself; this release is the desktop app and the download page.
+
+### Added
+
+- **Grok Build Desktop for Linux, offered properly.** The download page recognises a Linux machine and gives you the AppImage, with the two things you actually need to run one: make it executable, and have FUSE installed (`libfuse2` on Debian and Ubuntu). A phone gets told an AppImage will not run there rather than being handed one — every Android browser calls itself Linux, and Chrome OS cannot run one either.
+
+- **Linux desktop builds keep themselves up to date.** Packaged Linux builds now use the same update feed Windows and macOS have had since the feature shipped: a new version downloads quietly in the background and installs when you quit, or when you click **Restart to update**. Before this there was no Linux feed at all, so the app fell back to a notice that sent you to a page which did not recognise the operating system it had sent you from — a dead end that looked like a download link.
+
+  **If you are already running it, one manual replace gets you onto that.** A build can only update itself if it carries the feed, and no release before this one did. So on 4.6.1 or earlier: download the AppImage once more and replace the file you have. After that it stays current on its own. **Windows and macOS are unaffected** — they have had a real feed all along.
+
+  If you run the AppImage **extracted** rather than as a file — what you do when your distro has no `libfuse2` — nothing can install itself in place, so the app tells you a new version is out and you replace it by hand, exactly as before.
+
+## 4.6.1 — 2026-09-16
+
+Four fixes, each one the same shape: something the app recorded once and kept trusting after it had stopped being true.
+
+### Fixed
+
+- **The reasoning effort you pick is the one you get (#162, #164).** If your `~/.grok/config.toml` sets `models.default_reasoning_effort`, that value quietly won over the level you chose — every new conversation started at the config's level whatever the picker showed, and the strip snapped back a second later. Your choice is now applied to the session itself before the picker ever reads it. (4.5.2 fixed a different cause of this same symptom — a workspace setting outranking a global one. This is the one that was left, and it is why the report reopened.)
+
+- **AFK Pilot can open a conversation again after you close a project at the desk.** A browser connecting after the folder it had been using was closed inherited that closed folder and was refused — including when it asked for a conversation in a project that was still open. New tabs now follow the folders that are actually open, reconnecting tabs recheck what they restored before using it, and asking for a specific conversation in an open project gets you there from a stale tab. A refusal now says so, instead of leaving the page waiting on a conversation it would never receive.
+
+- **An old conversation with nothing in it lets you change agent.** Opening a saved conversation assumed it had history, and history is what pins it to the agent that made it. One that turns out to be empty now offers your other connected agents; one that fails to load keeps the lock rather than guessing.
+
+- **Pinning and unpinning answer the click.** The row waited for the desk to write the change and report back, which read as a dead control and invited a second click that undid the first. It now moves when you click it and reconciles with the host's answer afterwards, so a slow reply cannot undo a newer click, and a change that fails to save puts the row back where it was.
+
+## 4.6.0 — 2026-09-14
+
+**When an agent's sign-in expires in the middle of a conversation, the app now helps you fix it where it broke.** Until now the vendor simply started refusing turns, and every way back to a sign-in was somewhere else — the onboarding card deliberately refuses to paint over a live conversation, so the one screen that explains how to connect an agent was the one screen you could not get to. Alongside that: voice typing no longer needs an xAI key if you already pay OpenAI, and the context donut now shows how much of your subscription window is left.
+
+### Added
+
+- **A way back in, above the message box.** When the agent you are talking to needs signing in again, a card appears directly above the composer — on the conversation that is failing, not in a settings page you have to go and find. It says the account is still linked and only its sign-in expired, and it offers the same sign-in the accounts row does. Your conversation stays usable; being locked out of your own transcript over somebody else's expired token would be worse than one more refused send. On a phone it runs the device-code flow; where the host is too old to sign in remotely it says so plainly instead of showing a button that does nothing.
+
+- **Voice typing with the account you already pay for (#124).** Speech-to-text was xAI-only, so without an xAI subscription you had to supply an xAI API key at $0.08 a minute to dictate a prompt. OpenAI is now a second backend, at a fraction of that, using a key you may already hold. Pick one in Settings, or leave it to follow the agent you are using. (Anthropic publishes no speech-to-text API at all, so there is no Claude-native option to offer — that is the vendor's boundary, not a gap here.)
+
+- **How much of your subscription window is left (#159).** The context donut has always answered "how full is this conversation". It now also answers "how much of my plan have I used this week", as labelled windows with a meter, a reset time, and when the reading was taken. Grok asks its account, Codex reads the file Codex itself writes, and Claude's arrives with your next reply — which the panel says, rather than showing a blank that reads like a broken screen.
+
+### Changed
+
+- **Claude's model picker names models.** It was listing policy names and context sizes; it now says which model you are choosing.
+
+- **Opening Projects on a phone closes what it slides over.** The drawer used to come across an open model, mode or context popover and leave it underneath.
+
+- **Section headers in popovers have air on both sides of their divider**, and the subscription note's reset and observation times are two lines of one remark rather than two remarks with a gap between them.
+
+### Fixed
+
+- **Signing in actually fixes the conversation you signed in for.** Renewing an account used to leave the failing conversation exactly as it was: it still held a process built on the dead token, and that process had already spent its one automatic retry, so the very next message was refused again and the card came back. Completing a sign-in now re-arms that retry everywhere, and the next message restarts the conversation's agent behind the scenes and sends what you typed.
+
+- **The offer stops appearing and disappearing on its own.** The card blinked and then vanished, most visibly on a phone. Two separate things were quietly deciding the account was fine again — starting a fresh agent process, and a history listing that came back — and neither is evidence: both complete perfectly against a dead token. Only something the account itself accepted clears it now: a turn that was answered, a message that went through on the second try, an explicit re-check, or a sign-in the vendor confirmed.
+
+- **A prompt sent during an expiry is not sent twice.** When the app restarted the conversation to retry your message, the agent's own replay put that message back on screen and the retry added a second copy. It now recognises the one the replay restored.
+
+- **On a desktop, signing in again keeps you in the conversation.** Renewing an expired account used to park the transcript you were in and open a new empty one — from a card whose whole purpose was to save you that trip. Connecting an additional account still starts fresh, because that genuinely is a different errand.
+
+- **The sign-in you are already doing is not offered again.** After you pasted the device code, the entry field closed while verification ran and the card underneath went straight back to "Sign in" for a second or two — which reads as a failure at the exact moment it is working, and a second tap restarts the flow. It now says "Signing in…" until the flow actually ends.
+
+- **A sign-in that worked says so.** The agent's refusal used to stay the last thing on screen, so a wizard closing in silence read as another failure. A short line now appears under it. It is deliberately temporary and does not come back when you reopen the conversation.
+
+- **Codex account usage reads the newest observation, not the newest file.** Codex does not always write to the file with the latest name, so the panel could report an older reading as current.
+
+- **A phone's microphone says why it cannot record.** It failed silently — no message, no error, nothing. It now names the reason.
+
+- **The desktop app stops dropping messages nothing had registered for**, which is what made some controls do nothing at all there while working everywhere else.
+
+- **A question card closes when the agent stops waiting for an answer**, instead of sitting there after the moment has passed — on every surface, not just the one you answered it on.
+
+- **The subscription panel does not promise numbers your computer cannot send.** Opened from a phone against an extension older than this release, it painted the section anyway — telling a Claude user to wait for a reply that could never fill it. It now appears only once the reading it needs has actually arrived.
+
+## 4.5.2 — 2026-09-13
+
+**If your project had its own setting for reasoning effort, the picker could not move it.** You dragged the strip, the new level showed while the popover was open, and about a second after you closed it the level went back — to the same one every time, whatever you picked. Reported as "can't set effort level; goes back to 'low'" (#162), and invisible to anyone without such a setting, which is why it took a screen recording to see.
+
+### Fixed
+
+- **The effort you pick is the effort the conversation runs at.** Your choice was written to your user settings while the next session read the value that actually applies here — and a project-level setting outranks a user one. So every change was recorded faithfully somewhere nothing would ever read, the conversation restarted at the project's level, and the strip reconciled to that. The picker now moves the setting wherever it lives, so what you pick is what the conversation gets. The model and mode pickers were written the same way and are fixed with it.
+
+- **One level is called one thing.** The effort strip's header said "Extra high" while the tip directly beneath it said "XHigh", because the tips were spelled out separately from the name. They share it now, and the descriptions in Settings match.
+
+## 4.5.1 — 2026-09-13
+
+**The control under the message box stops being an anonymous cog.** It says which model is answering and how hard it is thinking, right there on the button, and opens the picker rather than a menu you then navigate. Effort became a strip you can drag instead of five dots with no scale attached. The picker now stays open while you change your mind — pick a model, then pick an effort, one visit — and both changes leave together when you close it. Alongside that, three things that were plainly wrong on a phone: effort changes that appeared not to save, a picker that went half-transparent for the length of a turn, and a context breakdown that broke numbers in half.
+
+### Added
+
+- **A composer chip that names what it holds.** Which model is answering and what effort it is running at, on the face of the button, where it used to take a click and a menu to find out. Clicking it opens the model picker directly. The mode button beside it is unchanged.
+
+- **Effort is a strip, and you can drag it.** Five dots are a quantity with no scale attached; this is a rail with a gradient and a knob, and the stops come from what the model you are on actually advertises — so the ladder matches the model rather than a fixed list. Drag it with a finger or a mouse, or tap a stop. One effort is one colour on every surface: the same four anchors are declared in the extension, the desktop app and the web client.
+
+- **The microphone moved out of the message box.** It sat inside the text area, so every line of a long prompt was indented around a button that only matters at the start. It is in the toolbar now, and the text takes the full width.
+
+### Changed
+
+- **The picker stays open when you pick a model.** Choosing one used to close it, so "this model at that effort" cost two visits — and the second could not start until the first had finished restarting the conversation. Now the chip and the strip update the moment you tap, the popover stays up, and the change is committed once when you close it. Reopen it before it has landed and you see what you picked, not the value being replaced.
+
+- **Model and effort leave as one message, and cost at most one restart.** When a single visit changes both, they travel together rather than racing each other, and if the model change has to restart the conversation the effort rides that restart instead of asking for a second one. Pressing **Send** with the picker still open commits it first, so the prompt runs on the model you just chose and not the one you replaced — and a send waits for the change to land. If applying it needs a restart and the app asks you about it, the send stops waiting and goes to the conversation you are in, because a question on screen must never quietly swallow what you typed.
+
+- **The context ledger says thousands as thousands.** `1.48K`, `10.28K`, `499K`, `1.2M` — two decimals below a hundred thousand and none above it, with the exact figure still in the donut's own tooltip. Numbers under a thousand are short enough to say outright and are left alone.
+
+### Fixed
+
+- **An effort change sticks instead of silently snapping back.** Reported on a phone as "starts saving, refreshes, then nothing happens", with the control unmovable a second time. Two causes under one symptom: on a conversation with no history the app restarts the session to change effort, which locked the control mid-gesture and swallowed every correction after the first — the strip now previews while it is open and commits once, at the end, on the level you actually landed on, which is also one restart rather than one per stop your finger crossed. And on Codex the conversation announced the CLI's own configured default a moment before the requested level applied, so the strip redrew at whatever `~/.codex/config.toml` says and stayed there.
+
+- **The picker stops going half-transparent while an answer streams.** Selection is locked for the length of a turn, and that was being said with opacity — over a transcript on a phone it read as a half-erased panel rather than a locked one, and it washed out the effort gradient, whose colour is the whole readout. Locked is a text colour now.
+
+- **The context breakdown stops breaking numbers in half on a phone.** `10,284` was arriving as "10,28" and then "4" on the next line. The popover is shrink-to-fit, and the rule that lets long version strings wrap in the same rows had collapsed it toward the width of a single character; it now asks for the width its contents want, and a figure is one word whatever its label does.
+
+## 4.5.0 — 2026-09-11
+
+**Steer stops being a Grok feature, and every installer starts aiming at the version this app tells you to be on.** Codex hears a mid-turn correction now, attachments and all. Both ACP adapters moved — Codex ten minors, Claude seven — behind a new gate that drives the real adapters against your own CLIs instead of a stand-in. And a chain of small dishonesty around CLI versions is gone: the Providers row named a version, every installer fetched whatever was newest instead, and pressing **Update** stopped every session on that provider to install something already on disk.
+
+### Added
+
+- **Steer works with OpenAI Codex.** A message sent while an agent is working has always had two outcomes — queue it, or **Steer** it into the running turn without cancelling anything or losing the tool work in flight. That second one was Grok-only, and not because Codex could not do it: its adapter registers mid-turn steering and advertises it at startup, and the button was being drawn off a provider name instead. Your correction now reaches the turn you are watching, with attached files and images along with it. Claude Code has no mid-turn interject at any version, so there the button stays absent and a message you send while it works queues, which is what it always did.
+
+- **Edit the config file each CLI actually reads.** Gear → **Provider config files** opens `~/.grok/config.toml`, `~/.codex/config.toml` and `~/.claude/settings.json` in the same editor the file panel already uses — from a phone as readily as at the desk. Those three files are the whole list; the credentials that sit beside them are not reachable from here. A CLI reads its config at startup, so the panel offers to restart the conversation you have open once you save, and says plainly that other running sessions keep the settings they started with.
+
+- **Changes wherever there is a repository.** The Changes view was gated on Coding purpose. It now appears whenever the conversation has a repository, because cloning one and reading what changed in it is not a coding-only thing to do. The Changed-files card at the end of a turn stays Coding-only — it belongs to the turn that made the edits, not to the repository.
+
+### Changed
+
+- **The Codex and Claude adapters moved to the versions people actually run** — `@agentclientprotocol/codex-acp` to 1.11.0 (ten minors) and `claude-agent-acp` to 0.76.0 (seven). An adapter bump moves streaming shape, tool-call framing, permission parameters and session resume at once, and until now nothing in the test suite drove a real one. `npm run smoke:acp` does: it takes both real adapters against your own Codex and Claude CLIs and reports pass or fail per capability — initialize, session, streaming, a tool call, a permission request, mid-turn cancellation, resume, and steering — so a bump that breaks one provider is dropped alone instead of shipping.
+
+- **Update installs the version the app names.** The Providers row reports the version this release is built against and offers to move you to it, and then every installer fetched "latest" instead — so a machine that had just been updated could still be told it was behind. npm installs, the CLIs' own updaters and the cloud machines' boot script now all take the exact version. Codex's own updater is the one deliberate exception: we never measured a version-capable form of it, and guessing one turns a working update into a failing one.
+
+- **Update stops tearing your sessions down for nothing.** The row that enables the button can be minutes old, and you may have updated in a terminal since — or another window may have done it already. The version is re-read at the moment you press, and a CLI that is already current simply says so, instead of stopping every conversation on that provider for a few minutes to install what was already there. A version that cannot be read is not treated as current: that is not evidence of anything, and refusing on it would strand you on a broken binary.
+
+### Fixed
+
+- **A returning machine reconnects in seconds instead of half a minute.** A laptop or cloud machine that suspends leaves its connection frozen open at the relay, so the same host coming back was told the device was taken — and then doubled its own retry delay on every refusal: 2, 4, 8, 16, 30 seconds. Measured on a real machine rather than reasoned about, eight of those ladders over three days. The service now asks the connection it is holding whether it is still alive the moment somebody knocks, and the returning host waits that check out instead of spending a full backoff step on it.
+
+- **Waking a cloud machine from a phone says what is happening, and offers something to press.** The page used to infer the machine's state from how long it had been quiet, which is how a machine that was already awake could look asleep, and one that would never answer could look busy indefinitely. It now reports what is actually known — checking, waking, waiting for the host, reachable, failed — and a wake that fails ends in a **Retry** rather than a spinner.
+
+- **A correction Codex refuses no longer takes the answer you were reading with it.** Codex can refuse a steer in-band, as a perfectly successful response that carries a failure inside it, and the first version of this feature read that as a dead connection — dropping the reply that was streaming at the time. A refusal now queues your text, tells you it did, and leaves the running answer and the Steer button alone. A refused correction sent from a phone is no longer billed twice, either.
+
+- **Copy image works for pictures the agent generated, in the desktop app.** Copying at original resolution needs a handle to the file on disk, and generated images never got one, so the button was disabled with an honest message and no way forward. It works now, and a phone keeps the picture it already has rather than fetching it again.
+
+- **A connector whose server we watched fail is no longer handed to the agent.** A connector with a valid token whose proxy cannot reach its server used to go to the agent anyway: the agent called a tool on it and the call hung, which on a phone is a dead end. That outcome is now remembered, and only a proxy that exited with a terminal connection error counts — a timeout, a spawn failure, a registry lookup or a successful transport fallback all withhold nothing, because a false positive silently removes a connector that works.
+
+## 4.4.0 - 2026-09-09
+
+**Is my work safe to walk away from?** The panel now answers that without leaving the conversation: a **Changes** view that says where things stand in one sentence and carries one button for the whole promise, a **Changed N files** card at the end of every coding turn, and a refused push that names the next move instead of quoting git at you. Alongside it, a design pass over the file panel's strip: one selected thing, one palette for "changed", and a folder icon that means "project" and nothing else.
+
+### Added
+
+- **A Changes view, reachable from a phone.** The file panel's branch button carries a badge of not-committed files and opens a view that answers the question you actually have — conflicts, then uncommitted work, then unpushed commits, then clean — in one sentence, with the size of the change beside it. **Commit** and **Commit and push** share one row, unpushed commits get **Push N commits**, and **Move to a new branch…** takes the whole batch aside. It is every changed file or none: to leave one out, discard it from inside its diff, because an irreversible action should require having looked. Each file opens into the same diff the chat renders under a tool call. It never runs `git fetch`, so *behind* is as of your last one and the line says so. Coding purpose only, and it reads and works the same from a phone as at the desk.
+
+- **A refused push says what to do next.** When GitHub will not let you push, the notice reads **Push needs GitHub. Connect it in Settings.** with a **Connect GitHub** button that takes you there. When the remote has commits you do not have, it says so and offers **Ask the agent to pull**. A protected branch, a repository that is not there, a remote that cannot be reached and hosts other than GitHub each get one plain sentence, with git's own line underneath for those who want it. **Ask agent to pull** also sits on the branch line at all times; it puts the request into the message box and leaves sending to you.
+
+- **A "Changed N files" card at the end of every coding turn** ([#82](https://github.com/phuryn/grok-build-vscode/issues/82), [PR #83](https://github.com/phuryn/grok-build-vscode/pull/83)). Every path the turn touched with its `+N −M`, git's own M / A / D letters in front, and **Open Changes** one tap away. Tap a row for that file's diff, or the header to fold and unfold the card. **Expand diff card** (Settings → General) chooses whether cards start open; on a phone the choice is per device. Built by @datvm.
+
+### Changed
+
+- **One selected thing in the file panel's strip.** The project folder, the file tabs and the Changes button used to mark "where am I" three different ways, and entering Changes lit two at once. Now one underline, on whichever of the three is showing. Every named tab closes itself, and so does every row of the overflow menu, so shutting five files on a phone no longer means opening five files first.
+
+- **One palette for "changed".** The yellow that means "modified, not committed" marks the dot on a tab, the M beside a file, the count badges, and a small dot on every changed file and every folder above it — so a closed folder that hides a change now says so. Added is teal and deleted is coral on the tree, the card and the diff alike, with darker relatives on a light theme.
+
+- **A folder icon means a project.** Tree rows lost their folder glyphs; the strip title wears the open-folder outline and stays muted until it is the selected thing; the projects rail draws its folders in outline too. The count badge is a circle. Refresh lives beside the tree's filter and only there — Changes re-reads on its own.
+
+## 4.3.0 - 2026-09-08
+
+**A long conversation stops paying twice for the context it already sent.** An outside contributor benchmarked multi-turn conversations and found prompt caching never engaging at all — input climbing turn after turn while nothing was ever read back from cache. Five separate causes, each fixed where it started. Alongside that: copying a picture out of a conversation, an experimental button that walks back through your own prompts, and dragging files in from the Explorer finally doing what it looks like it does.
+
+### Added
+
+- **Copy a picture out of a conversation** ([#150](https://github.com/phuryn/grok-build-vscode/issues/150)). Click an image in the transcript to enlarge it, and **Copy image** puts it on your clipboard at its original resolution — not the preview you are looking at, which is scaled to fit. It works from a phone or a browser as well as at the desk. A host older than this release cannot supply the original, and there the button is simply absent rather than quietly handing you a smaller picture than you asked for. Requested by @Emma-Walker.
+
+- **A button that jumps back to your previous prompt** ([#150](https://github.com/phuryn/grok-build-vscode/issues/150)). Off by default, under **Settings → Advanced → "Experimental: Previous prompt button"**. A circle sits above the message box and walks backwards through your own prompts, marking the one it lands on so you can see which it means — including while an answer is still streaming, which is exactly when "what did I ask?" comes up. Pressed from inside an answer it takes you to the prompt that answer started from, and it stops at the first prompt rather than wrapping. The setting is per device, so a phone and a desk can disagree. Experimental because the shape of it is still an open question with the person who asked for it. Requested by @Emma-Walker.
+
+- **The Explorer's context menu attaches everything you selected.** **Add to Grok chat** attached only the file you right-clicked, so highlighting five files and choosing it attached one. It now attaches the whole selection, and a file outside the conversation's project is refused once rather than once per file.
+
+- **Two more tips on an empty conversation**, both about gestures that already worked and that nothing told you about: how to drag files in from the Explorer, and pasting a screenshot straight into the message box. The paste tip is withheld on a phone, which cannot do it.
+
+### Fixed
+
+- **A conversation stops re-sending context it has already sent** ([#151](https://github.com/phuryn/grok-build-vscode/issues/151)). Prompt caching never engaged, so every turn re-paid for the whole conversation: input grew 6.6k → 21.5k → 28.5k tokens over three turns with nothing read from cache. Reported with measurements and tested diffs by @zfzfg.
+
+- **A large editor selection is sent as a reference instead of a copy of the file.** A big selection re-injected around 102,000 characters into every single turn. Over 400 lines or 20,000 characters it now becomes the file's path and the line range. Older conversations still restore correctly.
+
+- **Steering an agent no longer re-sends whatever files happen to be open.** An interjection was quietly appending the ambient editor chips, so each one re-sent the current editor on top of what you typed.
+
+- **Each agent remembers its own effort level.** A single Grok-scoped setting was being used as the default for Codex and Claude Code too, so choosing an effort for one agent leaked to the others.
+
+- **An exhausted quota costs one turn instead of two.** A 403 that was not a credential problem re-sent the whole prompt against the same ceiling before giving up, and reported the second failure rather than the real one.
+
+- **No more command windows flashing on Windows.** Finding an agent's CLI shelled out to `where`; it now reads `PATH` directly, and falls back to a shell only when it has to — with the window suppressed.
+
+- **Dragging files out of the Explorer works** ([#136](https://github.com/phuryn/grok-build-vscode/issues/136)). It read as doing nothing, and was two bugs stacked. VS Code blocks its own drags from reaching any panel unless Shift is held, so the Explorer — the drag everyone tries first — never arrived. Shift was also *our* modifier for pasting a file's text inline, so the drops that did land silently became whole-file inline attachments and dragged images skipped image import entirely. Shift now means "inline" only for a drag that came from outside the editor. Reported by @rj-au.
+
+- **The context popover opens on the figure you clicked it for.** Reading one number unrolled two full ledgers and a list of restatements over it. Those fold now, each remembering whether you left it open, and the marker sits next to the word it opens instead of adrift at the far edge of the row.
+
+## 4.2.0 — 2026-09-07
+
+**Keep an agent's CLI current without leaving the app, and connect an app from your phone.** Two things that used to need a terminal — updating the CLI an agent runs on, and finishing a connector's sign-in — now work from wherever you are, including a cloud machine where there is no terminal to reach.
+
+### Added
+
+- **Update Codex's and Claude Code's CLI from Settings → Providers.** When the CLI on your machine is older than the version this release is built against, its row offers to update it — installed the way *you* installed it (npm, Homebrew, or the vendor's own installer), never quietly switching you to a different one. The row names the version you have and the one available, and appears only when there is actually something to take. Running sessions stop while it happens and the conversations you had open reopen when it finishes. **Refresh** re-reads the installed version, so a CLI you changed in a terminal is noticed without restarting anything — which is the only way to notice it on a cloud machine, where there is no window to reload. Codex also says so on an empty conversation, because an old CLI there costs you the newer models.
+
+- **Connect an app from a phone, and from a cloud machine.** A connector's sign-in used to end with a failed `http://127.0.0.1:…` address you had to copy out of your phone's browser and paste back into the app. The sign-in now lands on a real page that tells you to return to AFK Pilot, and the app collects the code over the network and finishes the exchange itself — there is nothing left to copy. (GitHub is unchanged: it takes a token you paste, because that is what GitHub issues.) Connectors are offered on cloud machines too, which previously had no way to reach them at all.
+
+- **Archive a project.** Projects you are done with fold away on every surface — desk, browser and phone — including the one you are currently standing in. Archived is a property of the project rather than of the window you happen to be looking at, so it no longer differs between surfaces.
+
+### Fixed
+
+- **Plumbing that lost a race is not an error in your conversation.** A connector whose server was slow to answer left a red `mcp__…__startup` row sitting in the transcript, with nothing you could do about it. Those rows never enter the conversation now; a genuine failure is written to the host log where it belongs.
+
+- **An empty conversation is no longer "could not be reopened" after a CLI update.** Reopening a conversation you never typed in asked the CLI for a session it had never saved, so the update finished by reporting a failure that had not happened. An untouched conversation simply starts fresh.
+
+- **"Update completed" stops greeting every new conversation.** The result of an update stayed on screen indefinitely and reappeared on each new conversation. It is cleared when you start one.
+
+- **An update is not reported as completed over a red conversation**, and a session start you did not ask for no longer announces itself in your transcript.
+
+- **A connector keeps the registration that owns its tokens.** A refresh could pair a connector's tokens with a different registration, after which the connector could not be used until it was signed in again.
+
+- **A provider's models are re-read when its CLI changes underneath the app**, instead of offering the list the old CLI had.
+
+- **A connector sign-in belongs to the workspace, not to the tab that opened it** — so closing that tab, or switching to another, no longer strands a sign-in half-finished.
+
+- **Archiving every project no longer takes the controls with it**, leaving a page with nothing on it and no way back.
+
+- **A connector waiting for your consent no longer spends the session's startup budget**, which could make the whole conversation fail to start rather than just that connector.
+
+### Changed
+
+- **Anonymous usage telemetry can now tell remote and cloud use apart.** Cloud machines reported as the desktop app, and a conversation started at a desk and continued from a phone counted as a desk conversation, so remote use was undercounted by an unknown amount. Two small events — opening the remote portal, and the first remote message of a conversation — and a third value for the host kind fix both. No content is involved, the opt-out is unchanged, and every field is listed in [docs/privacy.md](docs/privacy.md).
 
 ## 4.1.8 — 2026-09-05
 

@@ -67,7 +67,7 @@ export function resolveAcpTimeouts(raw: AcpTimeoutInput = {}): AcpTimeouts {
 
 /**
  * Milliseconds until the next `session/prompt` timeout should fire.
- * `Number.POSITIVE_INFINITY` means both caps are disabled — do not arm a timer.
+ * `Number.POSITIVE_INFINITY` means neither cap is active — do not arm a timer.
  */
 export function promptTimerDelayMs(args: {
   startedAt: number;
@@ -75,9 +75,11 @@ export function promptTimerDelayMs(args: {
   now: number;
   idleMs: number;
   absoluteMs: number;
+  /** Suspend only idle detection while the host holds a human request. */
+  humanWaitActive: boolean;
 }): number {
   const idleRemaining =
-    args.idleMs <= 0
+    args.humanWaitActive || args.idleMs <= 0
       ? Number.POSITIVE_INFINITY
       : Math.max(0, args.idleMs - (args.now - args.lastActivityAt));
   const absRemaining =

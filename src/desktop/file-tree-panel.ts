@@ -134,6 +134,18 @@ export function fileTreePanelBootSource(_iconsDir?: string): string {
       reveal: async (scopeId, relPath) => (await requireScope(scopeId))
         ? api.reveal(relPath)
         : { ok: false, reason: "workspace changed" },
+      // The Changes view. Present on the desktop shell and absent on a remote
+      // built against an older host, which is exactly how the panel decides
+      // whether to draw the button: the affordance exists if the call does.
+      gitStatus: async (scopeId) => (await requireScope(scopeId))
+        ? api.gitStatus()
+        : { ok: false, kind: "failed", reason: "workspace changed" },
+      gitDiff: async (scopeId, relPath) => (await requireScope(scopeId))
+        ? api.gitDiff(relPath)
+        : { ok: false, reason: "workspace changed" },
+      gitRun: async (scopeId, request) => (await requireScope(scopeId))
+        ? api.gitRun(request)
+        : { ok: false, reason: "workspace changed" },
     };
 
     const componentScript = document.querySelector('script[src*="file-panel.js"]');
@@ -168,12 +180,37 @@ export function fileTreePanelBootSource(_iconsDir?: string): string {
         confirm: typeof window.__grokFilePanelConfirm === "function"
           ? window.__grokFilePanelConfirm
           : undefined,
+        askAgent: typeof window.__grokFilePanelAskAgent === "function"
+          ? window.__grokFilePanelAskAgent
+          : undefined,
+        openSettings: typeof window.__grokFilePanelOpenSettings === "function"
+          ? window.__grokFilePanelOpenSettings
+          : undefined,
         renderMarkdown: typeof window.__grokRenderMarkdown === "function"
           ? window.__grokRenderMarkdown
           : undefined,
         revealLabel: ${JSON.stringify(revealLabel)},
         fileIcons: { baseUrl: iconBase },
+        // The docked tree is injected into the CHAT document, so the renderer
+        // that owns the project catalog is already on the page and publishes
+        // these. Absent on a chat.js too old to publish them, which just leaves
+        // the title its folder.
+        projectMark: typeof window.__grokProjectMark === "function"
+          ? window.__grokProjectMark
+          : undefined,
+        projectMarkColor: typeof window.__grokProjectMarkColor === "function"
+          ? window.__grokProjectMarkColor
+          : undefined,
       },
+      // No gitEnabled option here, deliberately. The panel decides on evidence
+      // — it withholds Changes when the host reports no git or not-a-repo —
+      // and that answer is right on both mounts without either of them knowing
+      // what the person is using the app FOR. This used to pass the Coding
+      // purpose through, matching the remote client; the remote client stopped
+      // doing it, and a desk that kept the gate would hide Changes on a real
+      // repository purely because the same person also writes prose in it.
+      //
+      // (No backticks in this comment: the whole block is a template literal.)
       preferences: {
         getWidth: () => {
           try { return Number(localStorage.getItem("desk-ft-width")) || 280; } catch (_) { return 280; }

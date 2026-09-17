@@ -57,6 +57,7 @@ describe("promptTimerDelayMs", () => {
       now: 1_500,
       idleMs: 1_000,
       absoluteMs: 10_000,
+      humanWaitActive: false,
     })).toBe(500);
   });
 
@@ -67,6 +68,7 @@ describe("promptTimerDelayMs", () => {
       now: 9_600,
       idleMs: 1_000,
       absoluteMs: 10_000,
+      humanWaitActive: false,
     })).toBe(400);
   });
 
@@ -77,6 +79,7 @@ describe("promptTimerDelayMs", () => {
       now: 2_000,
       idleMs: 1_000,
       absoluteMs: 10_000,
+      humanWaitActive: false,
     })).toBe(0);
   });
 
@@ -87,6 +90,22 @@ describe("promptTimerDelayMs", () => {
       now: 1,
       idleMs: 0,
       absoluteMs: 0,
+      humanWaitActive: false,
     })).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("suspends only idle detection during a human wait", () => {
+    const args = { startedAt: 0, lastActivityAt: 0, now: 5_000, idleMs: 1_000, absoluteMs: 10_000 };
+    expect(promptTimerDelayMs({ ...args, humanWaitActive: false })).toBe(0);
+    expect(promptTimerDelayMs({ ...args, humanWaitActive: true })).toBe(5_000);
+    expect(promptTimerDelayMs({ ...args, now: 10_000, humanWaitActive: true })).toBe(0);
+    expect(promptTimerDelayMs({ ...args, absoluteMs: 0, humanWaitActive: true })).toBe(Infinity);
+  });
+
+  it("gives a fresh full idle interval after the caller stamps the answer as activity", () => {
+    expect(promptTimerDelayMs({
+      startedAt: 0, lastActivityAt: 5_000, now: 5_000,
+      idleMs: 1_000, absoluteMs: 10_000, humanWaitActive: false,
+    })).toBe(1_000);
   });
 });

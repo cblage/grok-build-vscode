@@ -62,8 +62,60 @@ Conclusion: don't tie diff visibility to the card. Render from the always-presen
 - `buildInlineDiffRegion(hunks)` — Codex-style rendering: **ONE `.tool-diff-region` per diff BLOCK holding N hunks** (one per site), *never* one region per site — the region is a 320px scroll box, so 148 of them would stack 148 nested scrollers. Each hunk is `.tdl` grid rows `[+/− sign][line-number gutter][code]`, colored left-border stripe + subtle per-line tint. Each hunk seeds its own gutter from its site's lines via `fileLineOr1` (falls back to 1 when absent or bogus — 0/negative/non-number — the old region-relative rendering). Non-contiguous hunks are parted by a quiet `.tdl-sep` hairline (a replace-all's sites sit at scattered lines; `newLine !== ` the previous hunk's next new-side line ⇒ separate) — never before the first hunk, never between contiguous ones. `MAX_INLINE_DIFF_LINES = 400` is a budget **across** the block's hunks (not per hunk), then a `.tool-diff-more` note + `open diff →`; the `+N −M` stat is summed over every site independently of it. The gutter track sizes to the widest number *actually rendered* (`--tdl-num-w` = `max(4ch, digits+1)`, set per region): 4ch through 999 (unchanged), wider only for a 1000+ line file — real line numbers made 4–5 digits reachable, and a fixed track would clip them into the `+/−` glyph. The sign is a color-blind affordance. Palette = **Codex's exact green/red** via `--tdiff-*` vars (dark default + `body.vscode-light` override), reused by the `+N −M` stat.
 - The gear toggle `grok.expandCommandOutputs` label was renamed **Expand tool details** (key unchanged) since it now governs edit diffs as well as command IN/OUT.
 
+## Turn-level file change summary
+
+One **Changed N files · +A −R** card per agent turn, listing every path touched
+in that turn. Pure client aggregation — no disk re-diff, no new ACP surface.
+
+- **Edits:** `attachDiffPreviewToToolItem` records each toolCallId's
+  `{path, added, removed, oldText, newText, openDiff}` into
+  `state.turnEditsByToolCallId`.
+- **Deletes:** `maybeRecordTurnDelete` on every tool row — ACP `kind:"delete"`
+  **or** shell verbs parsed by pure `parseShellDeletePaths` (PowerShell
+  `Remove-Item`/`ri`/`del`, POSIX `rm`). Grok often deletes via shell because
+  there is no write-path delete RPC the client owns.
+- **Path merge:** pure `normalizeTurnEditPathKey` (slash-normalize + lower-case)
+  so `F1.txt` and `f1.txt` are one row on Windows.
+- **Multi-edit:** pure `aggregateTurnEdits` **sums** every edit's +/− for that
+  path (create in batch 1 + edit in batch 2 both count — we do not keep only
+  the last). The aggregate carries **no `openDiff`** — see below. A delete after edits wins; an edit after a delete recreates the row.
+- **Live / restore / click:** card pins at turn end; restore rebuilds from
+  completed `tool_call`s; a click reveals that file's own tool row.
+- **When it shows (#83 rebase).** The card repeats, one line per file, what an
+  expanded diff row already shows in full — so it is gated on
+  `isCodingPurpose() && !detailShouldExpand()`. Knowledge work never shows it;
+  Coding shows it while tool details are collapsed, and hides it the moment
+  *Expand tool details* or the Expand-All latch opens them. Hidden via a body
+  class, never removed: the reverse flip has to bring back cards whose
+  `turnEditsByToolCallId` entries are gone.
+- **Clicking a row (#83 rebase).** One behaviour on every surface: entries
+  carry their `toolCallId` and the click calls `revealToolDiff`, expanding
+  that file's inline diff in the transcript. Two independent reasons there is
+  no native-diff branch:
+  - a remote may not post `openDiff` at all — it is `host-local` in
+    `remote-policy.ts`, so the row would have been a dead control on a phone;
+  - a host has nothing honest to post. `oldText`/`newText` on the wire are
+    the **replaced region** of a single edit, not snapshots, so the PR's
+    first.oldText → last.newText span is a substitution nobody performed —
+    and `expandDiffToWholeFile` finds the last region on disk and renders the
+    fiction as an authoritative whole-file diff. Two search_replaces show the
+    first search string becoming the second replacement; a Write followed by
+    one edit shows the file's entire contents as the last replacement token.
+    A true turn-level diff needs the pre-turn baseline `f274026` would have
+    kept, and that commit is not in this rebase.
+
+  So `aggregateTurnEdits` no longer returns an `openDiff` field. The real
+  diff is one row up, with its own `open diff →` to the native editor.
+  Residue, accepted: on a card whose tool rows have since left the window the
+  tap does nothing. It is one turn's own card and the rows are right above it,
+  so this is rare enough not to buy machinery for.
+- **Out of scope:** non-delete shell mutations (`sed`, `mv`, redirects),
+  subagent child edits, LLM prose "what changed".
+
 ## Tests
 
-- `test/webview-helpers.test.ts` → `computeLineDiff` (word change, context, new file, deletion, CRLF, size-cap).
+- `test/webview-helpers.test.ts` → `computeLineDiff` (word change, context, new file, deletion, CRLF, size-cap) + `aggregateTurnEdits` / `turnDiffSummaryTitle`.
 - `test/tool-edit-expand.dom.test.ts` → row `+N −M`, group-header totals + path dedupe, inline diff render, expand via row click, `open diff →`, replay idempotency, new-file, restore, expand-tool-details pre-open. Plus the timing half: totals on the **in-progress** header growing per edit (and surviving the `addToToolGroup` header rebuild) with no `promptComplete`, a running batch with a landed diff still **collapsed**, the overwrite echo→authoritative correction (+7 −0 → +4 −3, one stat not two, roll-up follows), one working toggle after a repaint, and an identical repaint staying a no-op with the row's open state intact. Plus the replace-all half (fixtures copied from `edit-diff-lines.log`'s A-replace-all case): 3 sites → 3 hunks at the real non-contiguous lines `[3,3,5,5,7,7]` with `line_prefix` in the rendered text and `+3 −3` (not the block's `+1 −1`), one region + one `open diff →` per block, separators only between non-contiguous hunks, still collapsed by default, echo→completed upgrading 1 approximate hunk → 3 without double-counting the roll-up, a 250-site render capping at 400 rows while the stat still reads `+250 −250`, and the single-site Write/new-file shapes rendering exactly as before.
+- `test/turn-diff-summary.dom.test.ts` → live card, path-dedupe + multi-edit sum, openDiff click, echo→completed no double-count, next-turn fresh card, session/load restore (incl. multi-edit same file), non-edit turns stay empty. Multi-edit suite: three appends, add-then-remove same line, add-then-rewrite, three-pass append/edit/remove, live growth mid-turn, interleaved A/B/A, delete+recreate.
+- `test/webview-helpers.test.ts` → `aggregateTurnEdits` multi-edit (sum + first→last openDiff), add/remove/rewrite same content, unchained regions, delete lifecycle, case-fold path keys, `parseShellDeletePaths`.
 - `test/command-details.dom.test.ts` → exit-0-no-output done marker (empty-pre drop) + non-zero/whitespace variants.

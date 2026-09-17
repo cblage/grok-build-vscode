@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import { bootWebview, click, dispatch, press } from "./webview-harness";
+import { openAppSettings, bootWebview, click, dispatch, press } from "./webview-harness";
 
 const sidebarSrc = readFileSync(new URL("../src/sidebar.ts", import.meta.url), "utf8");
 
@@ -45,6 +45,78 @@ function bootRemotePcm() {
   return { ...harness, getNode: () => node };
 }
 
+describe("remote mic when the host has no speech-to-text credential", () => {
+  // REGRESSION. The mic used to be DISABLED here with the reason in a `title`,
+  // and a `title` is invisible on a touch device — so on a phone this was a
+  // button that did nothing at all, with no way to find out why. It was
+  // reported exactly that way, and it reproduces only on a host reporting no
+  // credential, which includes the seconds around a host restart.
+  //
+  // Assert on an ENABLED button AND on the message the tap produces. Asserting
+  // the title alone would pass against the broken version, which is the same
+  // mistake as reading textContent off a hidden popover.
+  const noCredential = {
+    provider: "claude", preference: "auto", backend: undefined,
+    hasXai: false, hasOpenAi: false,
+    backends: { grok: null, codex: null, claude: null },
+  };
+
+  it("keeps the button live and lets the host say what is missing", () => {
+    const { window, doc, posted } = bootRemotePcm();
+    // Grok connected, so "Connect Grok" is NOT the right advice — this is the
+    // case whose only accurate explanation lives on the host.
+    dispatch(window, { type: "providerState", checking: false, providers: [
+      { id: "grok", connected: true }, { id: "claude", connected: true },
+    ] });
+    dispatch(window, { type: "voiceConfigured", value: false, backendState: noCredential });
+
+    const mic = doc.getElementById("mic-btn") as HTMLButtonElement;
+    expect(mic.disabled).toBe(false);
+
+    click(window, mic);
+    expect(posted.map((p) => p.type)).toContain("remoteVoiceStart");
+  });
+
+  it("still offers Connect Grok when Grok is the missing piece", () => {
+    const { window, doc, posted } = bootRemotePcm();
+    dispatch(window, { type: "providerState", checking: false, providers: [
+      { id: "grok", connected: false }, { id: "claude", connected: true },
+    ] });
+    dispatch(window, { type: "voiceConfigured", value: false, backendState: noCredential });
+
+    const mic = doc.getElementById("mic-btn") as HTMLButtonElement;
+    expect(mic.disabled).toBe(false);
+
+    click(window, mic);
+    // The in-chat card, not a start: nothing to start until an account exists.
+    expect(posted.map((p) => p.type)).not.toContain("remoteVoiceStart");
+    expect(doc.body.textContent).toContain("Connect Grok");
+  });
+
+  it("does not mistake a present credential for a missing account", () => {
+    const { window, doc, posted } = bootRemotePcm();
+    dispatch(window, { type: "providerState", checking: false, providers: [
+      { id: "grok", connected: false }, { id: "claude", connected: true },
+    ] });
+    // An xAI key exists but the explicit choice is OpenAI, so no backend
+    // resolves. "Connect Grok" would be a lie; the host's error is accurate.
+    dispatch(window, { type: "voiceConfigured", value: false, backendState: {
+      ...noCredential, preference: "openai", hasXai: true,
+    } });
+
+    const mic = doc.getElementById("mic-btn") as HTMLButtonElement;
+    expect(mic.disabled).toBe(false);
+    expect(mic.title).not.toContain("Grok");
+
+    // Assert the TAP, not only the tooltip. A title is what a phone cannot
+    // show, so a test that stops there is checking the half of this that was
+    // never the problem.
+    click(window, mic);
+    expect(posted.map((p) => p.type)).toContain("remoteVoiceStart");
+    expect(doc.body.textContent).not.toContain("Connect Grok");
+  });
+});
+
 // #projects-rail lives in web/chat.html, never in getHtml(). The gear's
 // Basic/Advanced entry points are gated on that mount existing, so a harness
 // without it shows the VS Code shape instead of AFK Pilot's.
@@ -60,10 +132,7 @@ const withRailMount = (w: any) => {
 
 /** Open the gear, then the Settings overlay where Text size lives. */
 const openSettingsGeneral = (window: any, doc: Document) => {
-  click(window, (doc.getElementById("rail-gear-btn") || doc.getElementById("gear-btn"))!);
-  const entry = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
-    .find((el) => /(^|\s)Settings$/.test((el.textContent || "").replace(/\s+/g, " ").trim()));
-  if (entry) click(window, entry as HTMLElement);
+  openAppSettings(window, doc);
 };
 
 const fontSlider = (doc: Document) =>
@@ -351,6 +420,13 @@ describe("AFK Pilot shared webview controls", () => {
     expect(doc.getElementById("mic-btn")!.classList.contains("connecting")).toBe(false);
   });
 
+  // The invariant is the MICROPHONE, not the button: a host with no credential
+  // must never cause a permission prompt or an open stream. It used to be
+  // enforced by disabling the button, which also made the tap unanswerable on
+  // a phone — `title` does not exist without hover. The button is live now and
+  // the tap asks the host, which replies with `voiceError` plus a visible
+  // error; hosts back to 4.5.2 answer that way, so this holds against whatever
+  // version is installed. getUserMedia is still never reached.
   it("keeps the browser microphone closed when the host reports voice unavailable", async () => {
     let getUserMediaCalls = 0;
     const { window, posted, doc } = bootWebview({
@@ -374,11 +450,9 @@ describe("AFK Pilot shared webview controls", () => {
     click(window, mic);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(mic.disabled).toBe(true);
-    expect(mic.title).toMatch(/unavailable.*host/i);
-    expect(mic.title).not.toMatch(/set up/i);
+    expect(mic.disabled).toBe(false);
     expect(getUserMediaCalls).toBe(0);
-    expect(posted.filter((m) => m.type === "remoteVoiceStart")).toEqual([]);
+    expect(posted.filter((m) => m.type === "remoteVoiceStart")).toHaveLength(1);
   });
 
   it("surfaces a denied browser microphone permission and resets the button", async () => {
@@ -765,7 +839,8 @@ describe("AFK Pilot shared webview controls", () => {
     expect(doc.querySelector(".msg.queued .queued-tag")?.textContent).toBe("Not sent");
     expect(doc.querySelector(".msg.queued .queued-tag")?.getAttribute("title"))
       .toMatch(/rejected.*edit.*retry/i);
-    expect(doc.querySelectorAll(".msg.queued .queued-action")).toHaveLength(3);
+    expect(doc.querySelectorAll(".msg.queued .queued-action")).toHaveLength(2);
+    expect(doc.querySelector(".queued-steer")).toBeNull(); // No host capability advertised.
     expect(doc.getElementById("send-btn")!.classList.contains("stop")).toBe(false);
   });
 
@@ -884,10 +959,7 @@ describe("AFK Pilot shared webview controls", () => {
       usesTouch: false,
     });
 
-    click(window, doc.getElementById("gear-btn")!);
-    const settings = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
-      .find((el) => /(^|\s)Settings$/.test((el.textContent || "").replace(/\s+/g, " ").trim()))!;
-    click(window, settings);
+    openAppSettings(window, doc);
     clickSettingsNav(window, doc, "Voice");
     const toggle = doc.querySelector('[data-id="readRepliesAloud"] .settings-switch') as HTMLElement;
     expect(toggle).toBeTruthy();
@@ -957,10 +1029,7 @@ describe("AFK Pilot shared webview controls", () => {
       },
     });
     dispatch(window, { type: "initialState", readRepliesAloud: false });
-    click(window, doc.getElementById("gear-btn")!);
-    const settings = [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")]
-      .find((el) => /(^|\s)Settings$/.test((el.textContent || "").replace(/\s+/g, " ").trim()))!;
-    click(window, settings);
+    openAppSettings(window, doc);
     clickSettingsNav(window, doc, "Voice");
     const summarize = doc.querySelector('[data-id="summarizeRepliesAloud"]') as HTMLElement;
     expect(summarize.querySelector(".settings-switch.on")).not.toBeNull();

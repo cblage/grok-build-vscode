@@ -317,6 +317,34 @@ describe("shared file-panel component", () => {
     expect((h.document.querySelector(".gfp-editor") as HTMLTextAreaElement).value).toBe("draft");
   });
 
+  it("a file that does not exist yet is savable without claiming anybody edited it", async () => {
+    // Provider configs open as an empty draft when the file is absent, so Save
+    // has to be live before a keystroke — the buffer IS the file. What must NOT
+    // follow is the tab calling itself dirty: the close prompt, the tab dot and
+    // the page's own unload guard all read `dirty`, and a phone reload would
+    // have warned about edits nobody made.
+    let confirms = 0;
+    const h = harness({
+      confirm: async () => { confirms++; return "discard"; },
+      read: async (_scopeId: string, relPath: string) => ({
+        ok: true, relPath, kind: "text", text: "", missing: true,
+        stamp: { mtimeMs: 0, size: -1 }, absPath: "/work/app/" + relPath,
+      }),
+    });
+    await settle();
+    await h.panel.openPath("notes.md", true);
+    await settle();
+
+    expect((h.document.querySelector(".gfp-save") as HTMLButtonElement).disabled).toBe(false);
+    expect(h.panel.hasDirty()).toBe(false);
+    expect(h.document.querySelector(".gfp-tab-dirty")?.textContent).toBe("");
+
+    click(h.window, h.document.querySelector(".gfp-tab-close"));
+    await settle();
+    expect(confirms).toBe(0);
+    expect([...h.document.querySelectorAll(".gfp-tab-name")]).toEqual([]);
+  });
+
   it("keeps keystrokes typed while Save is in flight dirty", async () => {
     const pending = deferred<unknown>();
     const h = harness({ write: async () => pending.promise });
@@ -496,22 +524,35 @@ describe("shared file-panel component", () => {
     const dockHost = document.createElement("aside");
     dockHost.style.display = "none";
     document.body.append(panelHost, dockHost);
+    const presentations: boolean[] = [];
     const panel = createFilePanel({
       access: { currentScope: async () => null, list: async () => ({ ok: true, entries: [] }) },
       document,
       window,
       mount: { panelHost, dockHost, presentation: "responsive" },
+      onPresentationChanged: (overlay: boolean) => {
+        const element = document.querySelector(".gfp-panel")!;
+        expect(element.classList.contains("gfp-overlay")).toBe(overlay);
+        expect(element.parentElement).toBe(overlay ? panelHost : dockHost);
+        presentations.push(overlay);
+      },
     });
 
     panel.setOpen(true);
     await settle();
     expect(panel.element.classList.contains("gfp-overlay")).toBe(true);
     expect(panel.element.parentElement).toBe(panelHost);
+    expect(panel.isOverlay()).toBe(true);
+    expect(presentations).toEqual([true]);
 
     dockHost.style.display = "block";
     window.dispatchEvent(new window.Event("resize"));
     expect(panel.element.classList.contains("gfp-docked")).toBe(true);
     expect(panel.element.parentElement).toBe(dockHost);
+    expect(panel.isOverlay()).toBe(false);
+    window.dispatchEvent(new window.Event("resize"));
+    expect(presentations).toEqual([true, false]);
+    panel.destroy();
   });
 
   it("refreshes a stamp for Overwrite but refuses a different file identity", async () => {
@@ -1472,7 +1513,10 @@ describe("title strip is a folder label plus file-type tabs", () => {
     });
     expect(srcs[0]).toMatch(/typescript\.svg/);
     expect(srcs[1]).toMatch(/markdown\.svg/);
-    expect(h.document.querySelector(".gfp-title-icon img, .gfp-title-icon .gfp-file-icon-mono")).toBeTruthy();
+    // The folder never comes from the theme: it is the outline glyph whatever
+    // the files beside it wear, so the title stays lighter than its tabs.
+    expect(h.document.querySelector(".gfp-title-icon svg path")?.getAttribute("d")).toMatch(/^m6 14 1\.5-2\.9/);
+    expect(h.document.querySelector(".gfp-title-icon img, .gfp-title-icon .gfp-file-icon-mono")).toBeNull();
   });
 
   it("stripShrinkState is compact at the default split and extreme near min width", () => {
@@ -1591,6 +1635,31 @@ describe("planStrip three-state layout", () => {
     tabIconWidths: Array.from({ length: n }, () => icon),
   });
 
+  // Nothing selected means the Changes list or the tree is what you are
+  // looking at. B's whole idea is "name the current file, demote the rest", so
+  // with no current file it demotes ALL of them: a row of anonymous glyphs
+  // with no names and — because an icon-only tab hides its close — no way to
+  // shut any of them either. C is the honest answer at that width: one … chip
+  // whose menu lists every file by name with its own X.
+  it("never picks B when nothing is selected, however much room there is", () => {
+    const base = {
+      stripWidth: 400,
+      titleWidth: 80,
+      titleIconWidth: 24,
+      trailingWidth: 32,
+      tabCount: 3,
+      ...widths(3, 160, 32),
+      chipWidth: 36,
+    };
+    // Same width, same tabs: with a selection B is right and is chosen.
+    expect(planStrip({ ...base, activeIndex: 1 }).state).toBe("b");
+    const none = planStrip({ ...base, activeIndex: -1 });
+    expect(none.state).toBe("c");
+    // And C with no active tab shows the chip alone rather than a bare strip.
+    expect(none.visible).toEqual([]);
+    expect(none.overflow).toEqual([0, 1, 2]);
+  });
+
   it("picks A when named tabs plus the title fit", () => {
     const plan = planStrip({
       stripWidth: 500,
@@ -1644,6 +1713,53 @@ describe("planStrip three-state layout", () => {
     expect(squeezed.visible).toEqual([1]);
     expect(squeezed.overflow).toEqual([0, 2]);
     expect(squeezed.tabModes).toEqual(["icon", "full", "icon"]);
+  });
+
+  it("skips B entirely on a touch screen, where an icon-only tab is anonymous", () => {
+    // Same widths that produced an all-icon B above. A finger gets the chip
+    // instead: three files became three identical glyphs, and the strip grew a
+    // second ✕ beside the one that closes the panel.
+    const base = {
+      titleWidth: 80,
+      titleIconWidth: 24,
+      trailingWidth: 32,
+      tabCount: 3,
+      activeIndex: 1,
+      ...widths(3, 120, 32),
+      chipWidth: 36,
+      stripWidth: 330,
+    };
+    expect(planStrip(base).state).toBe("b");
+
+    const touch = planStrip({ ...base, preferChip: true });
+    expect(touch.state).toBe("c");
+    expect(touch.visible).toEqual([1]);
+    expect(touch.overflow).toEqual([0, 2]);
+    // 80 + 120 + 36 = 236 <= 298, so the project keeps its name — C is now
+    // reached with room to spare and must not give the name up for nothing.
+    expect(touch.title).toBe("full");
+
+    // A fits on its own; preferChip is about B, not about hiding what fits.
+    expect(planStrip({ ...base, preferChip: true, stripWidth: 600 }).state).toBe("a");
+  });
+
+  it("hides every tab in C when nothing is active, rather than picking one", () => {
+    // The Changes list is showing: no file is being viewed, so the chip holds
+    // all of them and the strip has exactly one selected thing in it.
+    const plan = planStrip({
+      titleWidth: 80,
+      titleIconWidth: 24,
+      trailingWidth: 32,
+      tabCount: 3,
+      activeIndex: -1,
+      ...widths(3, 120, 32),
+      chipWidth: 36,
+      stripWidth: 330,
+      preferChip: true,
+    });
+    expect(plan.state).toBe("c");
+    expect(plan.visible).toEqual([]);
+    expect(plan.overflow).toEqual([0, 1, 2]);
   });
 
   it("keeps the active tab visible when overflowing and updates membership as it changes", () => {
@@ -1706,15 +1822,17 @@ describe("planStrip three-state layout", () => {
 });
 
 describe("tab strip structure follows the overflow design", () => {
-  it("renders a close button only on the active tab", async () => {
+  it("renders a close button on every named tab, active or not", async () => {
     const h = harness();
     await settle();
     await h.panel.openPath("src/a.ts");
     await h.panel.openPath("notes.md");
     const tabs = [...h.document.querySelectorAll(".gfp-tab")];
     expect(tabs).toHaveLength(2);
+    // Closing a file must not require opening it first — the phone case, where
+    // State C shows one tab and the rest live in the … menu.
     expect(tabs[0].classList.contains("gfp-tab-active")).toBe(false);
-    expect(tabs[0].querySelector(".gfp-tab-close")).toBeNull();
+    expect(tabs[0].querySelector(".gfp-tab-close")).toBeTruthy();
     expect(tabs[1].classList.contains("gfp-tab-active")).toBe(true);
     expect(tabs[1].querySelector(".gfp-tab-close")).toBeTruthy();
     expect(tabs.every((tab) => tab.querySelector(".gfp-tab-icon"))).toBe(true);
@@ -1778,6 +1896,41 @@ describe("tab strip structure follows the overflow design", () => {
     await settle();
     expect(h.document.querySelector(".gfp-tab-active .gfp-tab-name")?.textContent).toBe("notes.md");
     expect((h.document.querySelector(".gfp-editor") as HTMLTextAreaElement).value).toBe("draft");
+  });
+
+  it("closes a file from the overflow menu, which is the only strip a phone has", async () => {
+    // In State C every file but the active one lives in this menu. Without a
+    // close here, shutting five files meant opening five files first.
+    const h = harness();
+    await settle();
+    await h.panel.openPath("notes.md");
+    await h.panel.openPath("src/a.ts");
+    await h.panel.openPath("src/b.ts");
+    h.panel._forceStripPlan(planStrip({
+      stripWidth: 80,
+      titleWidth: 80,
+      titleIconWidth: 24,
+      trailingWidth: 0,
+      tabCount: 3,
+      activeIndex: 2,
+      tabFullWidths: [120, 120, 120],
+      tabIconWidths: [32, 32, 32],
+      chipWidth: 36,
+    }));
+    click(h.window, h.document.querySelector(".gfp-overflow-chip"));
+    await settle();
+    const rows = [...h.document.querySelectorAll(".gfp-overflow-row")];
+    expect(rows).toHaveLength(2);
+
+    click(h.window, rows[0].querySelector(".gfp-overflow-close"));
+    await settle();
+    await settle();
+    // The file is gone, the one that was open is still the one open, and the
+    // menu — a list of tabs, now stale — has dismissed itself.
+    const names = [...h.document.querySelectorAll(".gfp-tab-name")].map((el) => el.textContent);
+    expect(names).toEqual(["a.ts", "b.ts"]);
+    expect(h.document.querySelector(".gfp-tab-active .gfp-tab-name")?.textContent).toBe("b.ts");
+    expect(h.document.querySelector(".gfp-overflow-menu")).toBeNull();
   });
 
   it("marks the title as selected in treeMode and not while a file is showing", async () => {
@@ -1869,8 +2022,10 @@ describe("file-tree row actions stay on hover / keyboard / open menu, not a mous
  * asks for the folder again (#134). These cover the asking.
  */
 function refreshButton(document: Document): HTMLButtonElement {
-  const button = document.querySelector(".gfp-refresh") as HTMLButtonElement | null;
+  const button = document.querySelector(".gfp-filter-row > .gfp-refresh") as HTMLButtonElement | null;
   expect(button).toBeTruthy();
+  expect(document.querySelector(".gfp-header .gfp-refresh")).toBeNull();
+  expect(document.querySelectorAll(".gfp-refresh")).toHaveLength(1);
   return button!;
 }
 
@@ -2040,6 +2195,21 @@ describe("refreshing the file tree", () => {
     h.panel.destroy();
   });
 
+  it("uses only the chevron on directory rows, keeping the change-dot slot", async () => {
+    const h = listingHarness();
+    h.panel.setOpen(true);
+    await settle();
+    for (let i = 0; i < 3; i++) {
+      const row = treeRow(h.document, "src")!;
+      expect(row.querySelector(".gfp-dir-icon")).toBeNull();
+      expect(row.querySelector(".gfp-lead svg")).toBeTruthy();
+      expect(row.querySelector(".gfp-node-dot")).toBeTruthy();
+      click(h.window, row);
+      await settle();
+    }
+    h.panel.destroy();
+  });
+
   it("offers the cure inside an empty folder, where the doubt is", async () => {
     const h = listingHarness();
     h.dirs.src = [];
@@ -2189,5 +2359,78 @@ describe("collapsing a folder", () => {
     // Only the root: neither the collapsed folder nor anything under it.
     expect(h.calls.slice(before)).toEqual([""]);
     h.panel.destroy();
+  });
+});
+
+/**
+ * The title's icon is the PROJECT's mark, not a folder icon that happens to
+ * look like one.
+ *
+ * Every renderer that names a project draws the same glyph from the same
+ * catalog field; the panel is the one that reaches it through a `ui` hook,
+ * because the panel also mounts over things that are not projects at all (the
+ * provider-config directory), and those must keep their own folder.
+ */
+describe("file panel title mark", () => {
+  const ROCKET = '<svg viewBox="0 -960 960 960"><path d="M263-465q26-69 61-119"/></svg>';
+
+  const mount = (ui: Record<string, unknown>) => {
+    const window = new Window({ url: "https://example.test/" });
+    const document = window.document;
+    const panel = createFilePanel({
+      access: {
+        currentScope: async () => ({ id: "/work/alpha", label: "alpha", title: "/work/alpha" }),
+        list: async () => ({ ok: true, entries: [], truncated: false }),
+      },
+      document,
+      window,
+      mount: { panelHost: document.body, presentation: "overlay" },
+      ui,
+    });
+    panel.setOpen(true);
+    return { window, document, panel };
+  };
+
+  it("draws the project's mark above its files, in the project's hue", async () => {
+    const asked: string[] = [];
+    const h = mount({
+      projectMark: (cwd: string) => { asked.push(cwd); return ROCKET; },
+      projectMarkColor: () => "teal",
+    });
+    await settle();
+    const icon = h.document.querySelector(".gfp-title-icon") as HTMLElement;
+    expect(asked).toContain("/work/alpha");
+    expect(icon.classList.contains("gfp-title-icon-mark")).toBe(true);
+    expect(icon.querySelector("path")?.getAttribute("d")).toBe("M263-465q26-69 61-119");
+    // The hue is carried as an attribute, not a style: one CSS rule tints every
+    // surface that draws a mark, and the panel is one of them.
+    expect(icon.dataset.repoColor).toBe("teal");
+    h.panel.destroy();
+    h.window.happyDOM.abort();
+  });
+
+  it("keeps its own folder for a scope that is not a project", async () => {
+    // What the provider-config mount is: a real directory, no catalog row, so
+    // the hook answers "" and the panel falls back rather than inventing a mark.
+    const h = mount({ projectMark: () => "", projectMarkColor: () => "" });
+    await settle();
+    const icon = h.document.querySelector(".gfp-title-icon") as HTMLElement;
+    expect(icon.classList.contains("gfp-title-icon-mark")).toBe(false);
+    expect(icon.dataset.repoColor).toBeUndefined();
+    expect(icon.innerHTML.length).toBeGreaterThan(0);
+    h.panel.destroy();
+    h.window.happyDOM.abort();
+  });
+
+  it("keeps its own folder when nothing published a mark at all", async () => {
+    // A chat.js too old to publish the bridge, and the settings mount, which
+    // passes no ui hooks. Neither may throw, and neither may render an empty box.
+    const h = mount({});
+    await settle();
+    const icon = h.document.querySelector(".gfp-title-icon") as HTMLElement;
+    expect(icon.classList.contains("gfp-title-icon-mark")).toBe(false);
+    expect(icon.innerHTML.length).toBeGreaterThan(0);
+    h.panel.destroy();
+    h.window.happyDOM.abort();
   });
 });

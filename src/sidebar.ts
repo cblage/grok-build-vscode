@@ -12,6 +12,7 @@ import { Uri, disposeAll, formatRemoteInstallId, shouldRehydrateOnWebviewReady }
 import { isCanonicallyInsideRoot } from "./file-tree";
 import * as fs from "node:fs";
 import * as os from "node:os";
+import { MISSING_PROVIDER_CONFIG_STAMP, resolveProviderConfigFile, writeProviderConfigFile } from "./provider-config";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
 import { AcpClient, EffortLevel, ExitPlanRequest, PermissionRequest, QuestionRequest } from "./acp";
@@ -19,9 +20,11 @@ import type { AcpProvider, BackendSessionListEntry } from "./acp-backend";
 import { isAdapterProvider, isAcpProvider, ACP_PROVIDERS } from "./acp-backend";
 import { CODEX_ACP_ADAPTER_VERSION, CodexBackend, isCodexCredentialError } from "./codex-backend";
 import { locateCodexCli, resolveCodexHome } from "./codex-cli-locator";
-import { CODEX_MANAGED_VERSION, installManagedCodex } from "./codex-managed-installer";
+import { readCodexSubscriptionWindows } from "./codex-usage";
+import { CODEX_MANAGED_VERSION, codexManagedRoot, installManagedCodex } from "./codex-managed-installer";
+import { CLI_NPM_PACKAGE, cliUpdatePlan, selfUpdateArgs } from "./cli-update-plan";
 import { warmCodexModelCache } from "./codex-model-cache";
-import { CLAUDE_ACP_ADAPTER_VERSION, ClaudeBackend, isClaudeCredentialError } from "./claude-backend";
+import { CLAUDE_ACP_ADAPTER_VERSION, CLAUDE_PINNED_CLI_VERSION, ClaudeBackend, isClaudeCredentialError } from "./claude-backend";
 import { locateClaudeCli, parseClaudeVersionOutput } from "./claude-cli-locator";
 import { warmClaudeModelCache } from "./claude-model-cache";
 import {
@@ -84,12 +87,14 @@ import {
 import { buildReapCandidates, selectReapable, computeDot, Dot } from "./session-pool";
 import { resolveVoiceKey, extractGrokAuthKey, parseVoiceCommand, buildSttKeyterms, voiceSettingForRepo, voiceSettingWriteTarget, sanitizeVoiceSendPhrase, sanitizeVoiceKeyterms, voiceConfiguredFingerprint, DEFAULT_SEND_PHRASE, MAX_RECORDING_SECONDS } from "./voice";
 import { VoiceRecorder, transcribeAudio, resolveWindowsAudioDevice } from "./voice-recorder";
-import { PcmVoiceStreamer, VoiceStreamer } from "./voice-streamer";
+import { PcmVoiceStreamer, PcmSttStream, createPcmVoiceStreamer, VoiceStreamer } from "./voice-streamer";
+import { pickSttBackend, resolveOpenAiVoiceKey, SttBackend, SttPreference, VoiceBackendState, parseFinalVoiceCommand } from "./voice";
+import { OPENAI_STT_MODEL } from "./openai-voice";
 import { summarizeForSpeech } from "./speech-summary";
 import type { PromptResultMeta, PromptUsage, SessionInfoContext } from "./acp-dispatch";
 import { MediaRef, adapterCompactSignal, adapterContextOccupancy, agentTimestampMsFromMeta, autoCompactStartedNote, childStreamFromRoute, commandOutputForToolCall, commandOutputFromLiveTerminal, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isResumeNotFound, isRateLimitError, isSubagentLifecycleUpdate, occupancyFromAdapterTurn, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sessionInfoCacheFresh, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement, type UpdateRoute } from "./acp-dispatch";
 import { createMcpPrepareState, prepareMcpToolCall } from "./mcp-tool";
-import { modeToRemember, startsInYolo } from "./mode-prefs";
+import { EFFORT_PREFS_KEY, configWriteTarget, modeToRemember, rememberedEffort, startsInYolo, type EffortPrefs } from "./mode-prefs";
 import { beginAuthRecovery, oauthShadowsXaiApiKey } from "./auth-recovery";
 import {
   WELCOME_TIPS_KEY,
@@ -156,14 +161,21 @@ import {
 import {
   APTABASE_APP_KEY_PROD,
   buildSessionStartEvent,
+  buildRemotePortalOpenedEvent,
+  buildSessionRemoteStartedEvent,
+  nextTelemetrySession,
   osNameFromPlatform,
   postEvent,
   sessionStartHostKind,
   sessionStartSurface,
   shouldSendTelemetry,
   OFFICIAL_EXTENSION_ID,
+  type AptabaseEvent,
+  type SystemProps,
+  type TelemetrySession,
 } from "./telemetry";
 import { randomUUID } from "node:crypto";
+import { SubscriptionUsageBinding, SubscriptionUsageCache, subscriptionCredentialContext, type SubscriptionWindow } from "./subscription-usage";
 import { execGrokCli } from "./cli-process";
 import { listGitWorktreePaths } from "./git-worktree-list";
 import {
@@ -252,6 +264,7 @@ import {
   collectAvailableSandboxProfileOptions,
   configDisablesBypassPermissions,
   configForcesAlwaysApprove,
+  ensureConfigToml,
   globalConfigPath,
   isProjectOnlySandboxProfile,
   isUnregisteredConfigurationError,
@@ -270,7 +283,7 @@ import {
   unreferencedUploadsForRemovedSessions,
 } from "./file-upload";
 import { MAX_DIFF_EXPAND_BYTES, expandDiffToWholeFile } from "./diff-view";
-import { applyAgentModeToHostPlan, effectivePlanActive, isPlanReviewPermission, permissionAnswerAllowed, permissionOptionsForPlan, pickRejectOption, planReviewVerdictForOption, planTextFromPermissionToolCall, shouldRejectPermission } from "./plan-gate";
+import { applyAgentModeToHostPlan, commandProgramsForGrant, effectivePlanActive, isPlanReviewPermission, permissionAnswerAllowed, permissionOptionsForPlan, pickRejectOption, planReviewVerdictForOption, planTextFromPermissionToolCall, shouldRejectPermission } from "./plan-gate";
 import { appendPlanEntry, planRestoreSource, truncateResolvedAfter, countsAsUserBubble, decideRestoreState, isInterjectionText } from "./plan-restore";
 import {
   planReviewFileName,
@@ -292,6 +305,8 @@ import {
   resolveRemoteFileRoot,
   writeRemoteProjectFile,
 } from "./remote-files";
+import { GitRunGate, captureGitTurnBaseline, readGitFileDiff, readGitTurnFileBefore, readGitStatus, runGitPlan, type GitTurnBaseline } from "./git-run";
+import { describeGitFailure, isKnownChangedPath, planGitOp } from "./git-status";
 import {
   isCloudEnvironment,
   CLOUD_ENVIRONMENT_ENV, buildLinkStartBody, deviceDisplayName, httpBaseFromRelayUrl, parseRelayFrame, RELAY_DEVICE_TOKEN_SECRET, resolveRelayUrl } from "./remote-frames";
@@ -334,6 +349,7 @@ import {
   SessionMetaOverrides,
   RepoArchives,
   RepoColors,
+  RepoIcons,
   RepoListEntry,
   RepoPins,
   capAutoName,
@@ -352,7 +368,9 @@ import {
   isEmptySession,
   isPathInside,
   isRepoColor,
+  isRepoIcon,
   REPO_COLOR_IDS,
+  REPO_ICON_IDS,
   mostRecentSession,
   neighbourAfterDelete,
   normalizeRepoPath,
@@ -363,11 +381,8 @@ import {
   readContextUsage,
   relativePathWithin,
   readSessionEntries,
-  remoteAuthorizedCwds,
-  archivedProjectKeys,
   expiredArchiveChoiceKeys,
   newestTranscriptMtime,
-  type TrustedSessionCwd,
   resolveGrokHome,
   sessionCatalogDirs,
   sessionDirFor,
@@ -473,6 +488,7 @@ import {
   mcpConfigPaths,
   mcpConnectorSecretKey,
   mcpRemoteArgs,
+  STATIC_OAUTH_CLIENT_INFO_FLAG,
   mergeReserved,
   parseConnectedConnectorStore,
   reservedFromMcpInventory,
@@ -485,10 +501,13 @@ import {
 import {
   authorizeMcpRemote,
   connectorsLackingOAuthToken,
+  connectorsWithUnavailableServer,
   npxSpawnPlan,
   persistConnectorOAuthClientMetadata,
+  recordMcpRemoteOutcome,
   writeOAuthClientMetadataFile,
 } from "./mcp-connector-auth";
+import { authorizeMcpConnectorOAuth, ownedMcpOAuthClient, writeOAuthClientInfoFile } from "./mcp-connector-oauth";
 
 // HostMsg (host -> webview) and WebviewMsg (webview -> host) both live in
 // src/protocol.ts now — the single source of truth for the message contract,
@@ -507,18 +526,19 @@ const PROVIDER_CONNECTIONS_KEY = "grok.providerConnections";
 const PROVIDER_MODEL_CACHE_KEY = "grok.providerModelCache";
 const PROJECT_PROVIDER_DEFAULTS_KEY = "grok.projectProviderDefaults";
 const REPO_PINS_KEY = "grok.repoPins";
-/** Shared client-state key for the remote rail's Archived section. Stored under
- *  ~/.grok/client-state so the choice follows you to a phone and survives a
- *  cleared browser — archiving
- *  is curation of your projects, not a preference about one sidebar. Read by the
- *  browser client only; the VS Code repo picker ignores it entirely. */
+/** Timestamped archive choices, stored under ~/.grok/client-state rather than
+ *  per-client so the choice follows you to a phone and survives a cleared
+ *  browser — archiving is curation of your projects, not a preference about one
+ *  sidebar. Every rail reads it; the VS Code repo picker ignores it entirely. */
 const REPO_ARCHIVES_KEY = "grok.repoArchives";
 /** Shared client-state key for per-project folder colours in the conversation
  *  rail. Stored under ~/.grok/client-state so the choice follows you to a phone
- *  and survives a cleared browser — same home as pins/archives. Both desktop
- *  and VS Code host this (unlike archives, which desktop strips because open/
- *  close already owns the curated list). */
+ *  and survives a cleared browser — same home as pins/archives. */
 const REPO_COLORS_KEY = "grok.repoColors";
+/** Shared client-state key for per-project marks. Same home and same reasoning
+ *  as the colours above — the glyph you gave a project should be waiting for
+ *  you on the phone. */
+const REPO_ICONS_KEY = "grok.repoIcons";
 /**
  * Folders the user added to the rail by hand, on a host that cannot open them.
  *
@@ -579,6 +599,10 @@ const REMOVED_PROJECT_FOLDERS_KEY = "grok.removedProjectFolders";
  *  Send a discriminated form (`<id>:desktop`) and leave the bare id to the
  *  extension, whose already-linked rows store it bare. */
 const INSTALL_ID_KEY = "grok.installId";
+
+// Shared across sidebar instances/conversations in this extension host process.
+// Aptabase sessions measure activity windows; session_start still counts conversations.
+let telemetrySession: TelemetrySession | undefined;
 /** VS Code-local globalState key for the eye-off choice on the active-editor context chip.
  *  The chip is rebuilt from scratch on every file switch, so the user's "don't
  *  send this" has to live outside it or every switch silently re-enables the
@@ -591,7 +615,11 @@ const OAUTH_SHADOW_WARNING_KEY = "grok.oauthShadowWarningShown";
 interface RemoteVoiceEntry {
   credentialCwd: string;
   session: Session;
-  streamer: PcmVoiceStreamer;
+  streamer: PcmSttStream;
+  backend: SttBackend;
+  key: string;
+  model: string;
+  starting?: Promise<void>;
   ingress: RemotePcmIngress;
   phrase: string;
   keyterms: string[];
@@ -813,6 +841,11 @@ export class GrokSidebar {
   private set chips(value: FileChip[]) { this.focused.chips = value; }
   /** Attachment-staging ops still in flight — see trackAttach. */
   private readonly pendingAttach = new Set<Promise<void>>();
+  /** The model/effort change the picker last committed, while it is still
+   *  landing — see trackPickerChange. */
+  private pickerChange?: Promise<void>;
+  /** What ends a wait on it early — see releasePickerWaits. */
+  private pickerRelease?: () => void;
   /** Cached findFiles snapshot for the `@` popover (no open-editor merge).
    *  One snapshot serves {@link MENTION_INDEX_TTL_MS}; concurrent queries share
    *  one in-flight build. Open tabs are layered on at read time. */
@@ -827,7 +860,9 @@ export class GrokSidebar {
   private terminalManager = new TerminalManager();
   private voiceRecorder = new VoiceRecorder();
   private voiceTempPath?: string;
+  private voiceBatchCtx?: { backend: SttBackend; key: string };
   private voiceStreamer?: VoiceStreamer;
+  private voiceStoppingStreamer?: VoiceStreamer;
   private voiceFinalizing = false;
   /** Invalidates async voice callbacks after a manual discard or session swap. */
   private voiceGeneration = 0;
@@ -835,6 +870,8 @@ export class GrokSidebar {
   // message = one clean utterance) without re-resolving the mic device.
   private voiceStreamCtx?: {
     key: string;
+    backend: SttBackend;
+    model: string;
     ffmpegPath: string;
     device?: string;
     phrase: string;
@@ -855,6 +892,18 @@ export class GrokSidebar {
   // shipping path is unaffected.
   private uplink?: RemoteUplink;
   private readonly remoteClients: RemoteClientState<Session, RemoteBrowserPreferences>;
+  /**
+   * One git write at a time per repository.
+   *
+   * Not a general concurrency mechanism — the phone and the desk can both be
+   * looking at the same project, and two commits interleaving would stage each
+   * other's files. A second run is refused with a sentence rather than queued,
+   * because by the time a queued commit ran, the message on screen would
+   * describe a tree that no longer exists.
+   */
+  private readonly gitRunGate = new GitRunGate();
+  private readonly turnDiffBaselines = new Map<string, { root: string } & Partial<GitTurnBaseline>>();
+  private readonly pendingTurnDiffCaptures = new WeakSet<object>();
   /** Cold session/load claims the persisted id before ACP has emitted `session`. */
   private readonly sessionLoadReservations = new Map<string, SessionLoadReservation>();
   /** Sessions being spawned on a remote tab's behalf — a reconnect burst must
@@ -900,6 +949,7 @@ export class GrokSidebar {
   private static readonly DEVICE_GLOBAL_REMOTE_TYPES = new Set<HostMsg["type"]>([
     "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "cliUpdating",
     "onboarding", "providerState", "mcpServers", "mcpConnectors", "expandCommandOutputs", "steerByDefault", "soundNotifications",
+    "mcpConnectorAuthorization",
     // Device-global, not session-scoped: a phone reading conversation B asked
     // for the routines page and must get it, even though the desk is focused on
     // conversation A. Without this, `post` routes the answer through the
@@ -965,15 +1015,20 @@ export class GrokSidebar {
     "setAppPurpose",
     "setExpandCommandOutputs",
     "setSteerByDefault",
+    "setPromptNav",
+    "setExpandDiffCard",
     "setSoundNotifications",
     "setProcessingSound",
     "setReadRepliesAloud",
     "setSummarizeRepliesAloud",
     "setVoiceSendPhrase",
     "setVoiceKeyterms",
+    "setVoiceBackend",
+    "configureOpenAiVoice",
     "setTelemetryEnabled",
     "setThumbsFeedback",
     "openGlobalConfig",
+    "openProviderConfig",
     "openProjectConfig",
     "listMcpServers",
     "connectMcpConnector",
@@ -999,6 +1054,8 @@ export class GrokSidebar {
     "cancelDeviceLogin",
     "checkGrokUpdate",
     "updateGrok",
+    "updateCodex",
+    "updateClaude",
     "openRemotePortal",
     "remoteSignIn",
     "unlinkRemoteDevice",
@@ -1067,6 +1124,12 @@ export class GrokSidebar {
   private mcpListSupported: boolean | undefined;
   private grokMcpReserved: ReservedMcpIdentity = { names: [], urls: [] };
   private mcpConnectingId: ConnectorId | undefined;
+  private mcpRemoteAuthorization: {
+    id: ConnectorId;
+    attemptId: string;
+    status: "waiting";
+    url?: string;
+  } | undefined;
   private mcpConnectError: { id: ConnectorId; message: string } | undefined;
   /** In-memory PAT cache for key-auth connectors. Never written to PersistedState. */
   private readonly mcpConnectorKeys = new Map<string, string>();
@@ -1076,6 +1139,9 @@ export class GrokSidebar {
   private grokVersionProbe?: Promise<string>;
   private codexVersionProbe?: Promise<string>;
   private claudeVersionProbe?: Promise<string>;
+  private providerCliUpdates: Partial<Record<AcpProvider, { status: "running" | "succeeded" | "failed"; message: string }>> = {};
+  private providerCliUpdate?: { provider: AcpProvider; done: Promise<void> };
+  private providerModelProbes = new Map<AcpProvider, Set<Promise<boolean>>>();
   /** History browsing scope. Deliberately independent of the live session cwd. */
   private selectedRepoCwd?: string;
   /**
@@ -1154,7 +1220,7 @@ export class GrokSidebar {
     this.providerConnectionState = this.migrateProviderConnections();
     this.focused.provider = this.defaultProviderForProject(this.workspaceRoot());
     this.remoteClients = new RemoteClientState<Session, RemoteBrowserPreferences>(
-      this.workspaceRoot(),
+      () => this.defaultRemoteCwd(),
       normalizeRepoPath,
     );
     context.subscriptions.push(
@@ -1431,20 +1497,13 @@ export class GrokSidebar {
     };
   }
 
-  /**
-   * Three audiences, two frames.
-   *
-   * The desk (chat webview + the standalone Settings tab) gets everything,
-   * archived projects included. Remotes get the same frame trimmed to what they
-   * may reach — filtered rather than merely checked, so one archived project
-   * cannot blank the whole page for a phone. See `routinesMessageForRemote`.
-   */
+  /** Remote routines omit projects outside the host's current trusted set. */
   private postRoutines(): void {
     const message = this.buildRoutinesMessage();
     this.postLocal(message);
     void this.settingsEditor?.webview.postMessage(message);
     this.broadcastRemoteDevice(
-      routinesMessageForRemote(message, this.remoteAuthorizedSessionCwds(), pathsEqual),
+      routinesMessageForRemote(message, this.authorizedSessionCwds(), pathsEqual),
     );
     // The routine count is one of the two facts the empty-state tip pool cannot
     // observe for itself, and it just changed. Posted from here rather than
@@ -1534,7 +1593,7 @@ export class GrokSidebar {
     if (!cwd) return false;
     if (origin !== "remote") return !!this.resolveLocalRepoTarget(cwd);
     void clientId;
-    return cwdIsAuthorized(cwd, this.remoteAuthorizedSessionCwds(), pathsEqual);
+    return cwdIsAuthorized(cwd, this.authorizedSessionCwds(), pathsEqual);
   }
 
   private providerConnections(): ProviderConnections {
@@ -1671,6 +1730,7 @@ export class GrokSidebar {
 
   private setProviderConnectedInMemory(provider: AcpProvider, connected: boolean): void {
     const current = this.providerConnections();
+    if (!connected || !current[provider]) this.invalidateSubscriptionUsage(provider);
     this.providerConnectionState = { ...current, [provider]: connected };
     if (!connected && isAdapterProvider(provider)) {
       const history = this.adapterHistory(provider);
@@ -1710,10 +1770,32 @@ export class GrokSidebar {
     const current = this.providerNeedsLogin ?? {};
     if (!!current[provider] === needsLogin) return;
     this.providerNeedsLogin = { ...current, [provider]: needsLogin };
+    if (needsLogin) this.invalidateSubscriptionUsage(provider);
     // A recovered account must be able to re-list at once; the freshness stamp
     // would otherwise hold the empty catalog for its full back-off window.
     if (!needsLogin && isAdapterProvider(provider)) this.adapterHistory(provider)?.at.clear();
+    // And it must be able to RECOVER again. `authRecoveryTried` survives a
+    // startSession on purpose (#58: an entitlement failure must not pay a
+    // restart+resend on every prompt), and only a clean turn re-arms it -- which
+    // a conversation holding a process built on a dead token can never have. So
+    // a session that spent its recovery kept a dead client forever, and signing
+    // in changed nothing about the conversation the sign-in was asked for.
+    // A sign-in actually completing is new information, and it is exactly the
+    // thing `authRecoveryTried` was standing in for the absence of. Re-arming
+    // here costs the next send one process restart and a resend, which is the
+    // recovery doing its job, rather than a second restart path of its own.
+    if (!needsLogin) this.rearmAuthRecovery(provider);
     this.postProviderState();
+  }
+
+  /** Every session on this provider may try the token dance once more. */
+  private rearmAuthRecovery(provider: AcpProvider): void {
+    const rearm = (session: Session | undefined) => {
+      if (session?.provider === provider) session.authRecoveryTried = false;
+    };
+    rearm(this.focused);
+    for (const session of this.pool) rearm(session);
+    for (const session of this.remoteClients.detachedActiveValues()) rearm(session);
   }
 
   private async warmConnectedCodexModels(): Promise<boolean> {
@@ -1787,8 +1869,17 @@ export class GrokSidebar {
   /** Explicit credential observation. Unlike history refresh this never obeys
    * the listing freshness clock, so a completed sign-in is visible at once. */
   private async reprobeProviderCredentials(provider: AcpProvider): Promise<boolean> {
-    if (provider === "codex") return this.warmConnectedCodexModels();
-    if (provider === "claude") return this.warmConnectedClaudeModels();
+    if (provider === "codex" || provider === "claude") {
+      // These throwaway ACP processes hold the binary too. Don't start one
+      // during replacement; the updater explicitly re-observes afterward.
+      if (this.providerCliUpdate?.provider === provider) return false;
+      const probes = (this.providerModelProbes ??= new Map());
+      const pending = probes.get(provider) ?? new Set<Promise<boolean>>();
+      probes.set(provider, pending);
+      const probe = provider === "codex" ? this.warmConnectedCodexModels() : this.warmConnectedClaudeModels();
+      pending.add(probe);
+      try { return await probe; } finally { pending.delete(probe); }
+    }
     const cliPath = this.locateProvider("grok");
     if (!cliPath) return false;
     // session/new is what actually proves the account, but grok has no ACP
@@ -2107,6 +2198,21 @@ export class GrokSidebar {
         ? await this.deviceLoginCredentialReady(provider)
         : await this.reprobeProviderCredentials(provider)) {
         this.host.appendLine(`[${provider}] device login: credential verified`);
+        // Say it about the needs-login flag too, and not only about `connected`.
+        // For grok and codex this is a no-op -- `reprobeProviderCredentials`
+        // above already lowered it -- but Claude's check is
+        // `probeClaudeAuthStatus`, which answers the question without going
+        // through the probe that clears. Nothing else covered that: a phone
+        // sign-in ends here, and `adoptSessionsForConnectedProvider` leaves a
+        // conversation that still has a client alone by design.
+        //
+        // If this CLI is wrong about its own sign-in, the next prompt raises the
+        // flag again a second later, which is the bounded failure. The
+        // unbounded one is the other direction: the account stays flagged after
+        // a sign-in the app itself just called verified, the card comes back,
+        // and (since the flag is also what re-arms auth recovery) the next send
+        // reuses the process built on the dead token. A refresh does not fix it.
+        this.setProviderNeedsLogin(provider, false);
         // Promote on evidence, exactly as the Providers refresh does. The probe
         // just proved the account works; without this the persisted `connected`
         // flag stays false, so Settings keeps offering Connect and never offers
@@ -2277,9 +2383,11 @@ export class GrokSidebar {
         {
           id: "codex",
           connected: codexConnected,
+          ...(this.providerCliUpdates?.codex ? { cliUpdate: this.providerCliUpdates.codex } : {}),
           ...(codexConnected && needsLogin.codex ? { needsLogin: true } : {}),
           ...(codexConnected && versions.codex ? { cliVersion: versions.codex } : {}),
           ...(codexConnected ? {
+            cliUpdate: this.providerCliUpdates?.codex ?? { status: "idle" as const },
             adapterVersion: CODEX_ACP_ADAPTER_VERSION,
             latestCliVersion: CODEX_MANAGED_VERSION,
             ...(versions.codex ? { updateAvailable: versionIsOlder(versions.codex, CODEX_MANAGED_VERSION) } : {}),
@@ -2288,9 +2396,15 @@ export class GrokSidebar {
         {
           id: "claude",
           connected: claudeConnected,
+          ...(this.providerCliUpdates?.claude ? { cliUpdate: this.providerCliUpdates.claude } : {}),
           ...(claudeConnected && needsLogin.claude ? { needsLogin: true } : {}),
           ...(claudeConnected && versions.claude ? { cliVersion: versions.claude } : {}),
-          ...(claudeConnected ? { adapterVersion: CLAUDE_ACP_ADAPTER_VERSION } : {}),
+          ...(claudeConnected ? {
+            adapterVersion: CLAUDE_ACP_ADAPTER_VERSION,
+            cliUpdate: this.providerCliUpdates?.claude ?? { status: "idle" as const },
+            latestCliVersion: CLAUDE_PINNED_CLI_VERSION,
+            ...(versions.claude ? { updateAvailable: versionIsOlder(versions.claude, CLAUDE_PINNED_CLI_VERSION) } : {}),
+          } : {}),
         },
       ],
       ...(this.providerRefreshInFlight ? { checking: true } : {}),
@@ -2357,11 +2471,20 @@ export class GrokSidebar {
       // lapsed account gets its needsLogin flag. reprobeProviderCredentials
       // already classifies and records that, so nothing is swallowed.
       //
-      // Versions are deliberately not re-probed. They are read once per
-      // activation by design, they do not appear on this page, and every
-      // connected account already probes its version when it connects.
+      // Versions ARE re-probed. They used not to be, on the grounds that they
+      // "do not appear on this page" — true then, and untrue since the CLI
+      // update feature: the version is what decides `updateAvailable`, so a
+      // CLI changed in a terminal left the offer stuck on whatever was read
+      // at boot. The probe is memoized for the life of the host process, and
+      // on a cloud machine there is no window to reload to clear it, which
+      // made Refresh the only door and it was shut.
       await Promise.all(installed.map(async (provider) => {
         const authenticated = await this.reprobeProviderCredentials(provider).catch(() => false);
+        // Codex and Claude only. Their version is what decides
+        // `updateAvailable`; Grok has its own update check, and re-probing it
+        // would re-run the locator this method deliberately leaves alone when
+        // a test forces the CLI missing.
+        if (provider === "codex" || provider === "claude") await this.reprobeProviderVersion(provider);
         // Promote on a SUCCESSFUL probe only. This is the sign-in that happened
         // somewhere the desk could not see; the probe is what makes it a fact
         // rather than a guess. Persisted, so it survives a reload the way the
@@ -2412,6 +2535,39 @@ export class GrokSidebar {
     } satisfies ProjectProviderDefaults);
   }
 
+  private defaultEffortForProvider(provider: AcpProvider): string {
+    return rememberedEffort(
+      this.state.get<EffortPrefs>(EFFORT_PREFS_KEY),
+      provider,
+      this.host.getConfiguration("grok").get<string>("defaultEffort", ""),
+    );
+  }
+
+  /** Persist a picker choice where the next read will actually find it.
+   *  These keys declare no `scope`, so they are `window`-scoped and a workspace
+   *  value outranks the global one — while every read here asks for the
+   *  EFFECTIVE value. Writing Global underneath such an override recorded a
+   *  choice nothing would ever read: the picker moved, the next spawn re-read
+   *  the workspace's value, and the control snapped back to it every time
+   *  (#162). */
+  private async rememberGrokConfig(key: "defaultEffort" | "defaultModel" | "defaultMode", value: string): Promise<void> {
+    const cfg = this.host.getConfiguration("grok");
+    await cfg.update(key, value, configWriteTarget(cfg.inspect<string>(key)));
+  }
+
+  private async rememberProviderEffort(provider: AcpProvider, level: string): Promise<void> {
+    if (provider === "grok") {
+      await this.rememberGrokConfig("defaultEffort", level);
+      return;
+    }
+    // Picker memory follows the host's globalState, like project/provider
+    // defaults; adapter choices must never overwrite the Grok setting.
+    await this.state.update(EFFORT_PREFS_KEY, {
+      ...this.state.get<EffortPrefs>(EFFORT_PREFS_KEY, {}),
+      [provider]: level,
+    });
+  }
+
   private cacheProviderModels(
     provider: AcpProvider,
     models: readonly ProviderModelInfo[] | readonly any[],
@@ -2421,7 +2577,15 @@ export class GrokSidebar {
     const clean = models.map(({ provider: _provider, defaultImplied: _default, ...model }: any) => model);
     const stored = this.state.update(PROVIDER_MODEL_CACHE_KEY, {
       ...current,
-      [provider]: { models: clean, currentModelId, seenAt: Date.now() },
+      [provider]: {
+        models: clean,
+        currentModelId,
+        seenAt: Date.now(),
+        // Stamp the CLI this catalog came from, so a later version change can
+        // be seen. Undefined when the probe has not answered yet, which reads
+        // as "unknown" and costs one re-read later — never a stale catalog.
+        cliVersion: this.providerCliVersions[provider],
+      },
     } satisfies ProviderModelCache);
     // The picker reads this cache, and an adapter's models arrive
     // ASYNCHRONOUSLY — the warm-up runs after the connect returns. Re-posting
@@ -2597,6 +2761,8 @@ export class GrokSidebar {
     const configChanges = this.host.onDidChangeConfiguration((e) => {
       if (
         e.affectsConfiguration("grok.voiceApiKey") ||
+        e.affectsConfiguration("grok.voiceOpenAiApiKey") ||
+        e.affectsConfiguration("grok.voiceBackend") ||
         e.affectsConfiguration("grok.ffmpegPath") ||
         e.affectsConfiguration("grok.voiceSendPhrase") ||
         e.affectsConfiguration("grok.voiceKeyterms")
@@ -2627,6 +2793,21 @@ export class GrokSidebar {
         this.post({
           type: "steerByDefault",
           value: this.host.getConfiguration("grok").get<boolean>("steerByDefault", false),
+        });
+      }
+      // The only path by which the VS Code settings TAB reaches the chat
+      // webview: these toggles post a setter, config changes, and the host
+      // re-broadcasts to the panel that owns the transcript controls.
+      if (e.affectsConfiguration("grok.expandDiffCard")) {
+        this.post({
+          type: "expandDiffCard",
+          value: this.host.getConfiguration("grok").get<boolean>("expandDiffCard", false),
+        });
+      }
+      if (e.affectsConfiguration("grok.promptNav")) {
+        this.post({
+          type: "promptNav",
+          value: this.host.getConfiguration("grok").get<boolean>("promptNav", true),
         });
       }
       if (e.affectsConfiguration("grok.soundNotifications")) {
@@ -2700,7 +2881,16 @@ export class GrokSidebar {
       resolveGrokHome(process.env),
       "auth.json",
     );
-    const refreshVoiceConfigured = () => this.postVoiceConfigured();
+    const refreshVoiceConfigured = () => {
+      this.postVoiceConfigured();
+      // No request here: a running CLI may still hold the previous login.
+      // Publish cleared snapshots now; a new process binds the new account.
+      for (const session of new Set([this.focused, ...this.pool])) {
+        if (session.subscriptionUsage && !session.subscriptionUsage.current()) {
+          this.emit(session, { type: "subscriptionUsage", windows: [] });
+        }
+      }
+    };
     authWatcher.onDidCreate(refreshVoiceConfigured);
     authWatcher.onDidChange(refreshVoiceConfigured);
     authWatcher.onDidDelete(refreshVoiceConfigured);
@@ -2796,7 +2986,16 @@ export class GrokSidebar {
     setTerminalShellPreference(pref === "cmd" ? "cmd" : "auto");
   }
 
-  insertActiveMention(opts?: { selection?: boolean; uri?: Uri; pickIfMissing?: boolean }): void {
+  /** Attaches one file as an explicit chip. Returns whether a chip was added,
+   *  so a caller looping over an Explorer multi-selection can let only the
+   *  FIRST rejection speak (`quiet`) instead of stacking one warning toast per
+   *  selected file — they are nearly always rejected for the same reason. */
+  insertActiveMention(opts?: {
+    selection?: boolean;
+    uri?: Uri;
+    pickIfMissing?: boolean;
+    quiet?: boolean;
+  }): boolean {
     const editor = this.host.getActiveTextEditor();
     // Prefer a full Uri end-to-end (scheme + authority) so asRelativePath matches
     // remote workspace folders. Explorer Send File passes the explorer Uri via
@@ -2816,7 +3015,7 @@ export class GrokSidebar {
           "Grok: open a file in the editor first, then run this command.",
         );
       }
-      return;
+      return false;
     }
     // Same fence as the implicit chip, and for the same reason: the attachment
     // has to belong to the CONVERSATION, not to the window. Once the rail could
@@ -2832,11 +3031,13 @@ export class GrokSidebar {
     const sessionRoot = this.sessionCwd(this.focused);
     const relPath = this.conversationRelPath(absPath);
     if (relPath === undefined) {
-      void this.host.showWarningMessage(
-        `That file is outside ${path.basename(sessionRoot) || "this project"}, which is where ` +
-          "this conversation is running. Open a conversation in its project first.",
-      );
-      return;
+      if (!opts?.quiet) {
+        void this.host.showWarningMessage(
+          `That file is outside ${path.basename(sessionRoot) || "this project"}, which is where ` +
+            "this conversation is running. Open a conversation in its project first.",
+        );
+      }
+      return false;
     }
     let selStart: number | undefined;
     let selEnd: number | undefined;
@@ -2848,6 +3049,7 @@ export class GrokSidebar {
     this.chips.push(makeExplicitChip(absPath, relPath, selStart, selEnd));
     this.postChips();
     this.revealAndFocusComposer();
+    return true;
   }
 
   newSession(): void {
@@ -2924,12 +3126,11 @@ export class GrokSidebar {
       return;
     }
     if (modelId === client.currentModelId) return;
-    const cfg = this.host.getConfiguration("grok");
     if (!modelId) {
       if (session.hasHistory) return;
       const discardId = session.activeSessionId;
       await this.rememberProjectProvider(this.sessionCwd(session), provider, undefined);
-      if (provider === "grok") await cfg.update("defaultModel", "", "global");
+      if (provider === "grok") await this.rememberGrokConfig("defaultModel", "");
       else if (isAdapterProvider(provider)) await this.discardAdapterEmptySession(provider, discardId, this.sessionCwd(session), client);
       await this.startSession(undefined, session);
       if (provider === "grok") this.discardRestartedEmptySession(discardId, session);
@@ -2938,7 +3139,7 @@ export class GrokSidebar {
     try {
       await client.setModel(modelId);
       await this.rememberProjectProvider(this.sessionCwd(session), provider, modelId);
-      if (provider === "grok") await cfg.update("defaultModel", modelId, "global");
+      if (provider === "grok") await this.rememberGrokConfig("defaultModel", modelId);
     } catch (e) {
       if (!isIncompatibleAgentError(e)) {
         this.reportRequester(requester, "error", `Failed to set model: ${(e as Error).message}`);
@@ -2949,7 +3150,7 @@ export class GrokSidebar {
         // with a fresh grok id. There is nothing to summarize or preserve.
         // Drop it after the restart, carrying over any rename the user made.
         const discardId = session.activeSessionId;
-        await cfg.update("defaultModel", modelId, "global");
+        await this.rememberGrokConfig("defaultModel", modelId);
         await this.startSession(undefined, session);
         this.discardRestartedEmptySession(discardId, session);
         return;
@@ -2964,9 +3165,77 @@ export class GrokSidebar {
       }
       const mode = await this.pickRestartMode("Switching to this model requires a new session.");
       if (!mode) return; // dismissed — keep the current model
-      await cfg.update("defaultModel", modelId, "global");
+      await this.rememberGrokConfig("defaultModel", modelId);
       await this.restartSession(mode, session);
     }
+  }
+
+  /** Apply a reasoning-effort change: live where the CLI honors one, by restart
+   *  where it does not. Reached from the picker's own `setEffort`, and from a
+   *  `setModel` that carries a level because the picker's close changed both.
+   *
+   *  Deliberately NOT acknowledged back to the renderer. The chip sets the
+   *  level optimistically and reconciles on the next `initialState` —
+   *  exactly as the effort dots did before it. Emitting `initialState` as
+   *  an acknowledgement looks free and is not: `emit` buffers it into the
+   *  session replay AND fans it to every remote holding the conversation,
+   *  and that frame is action-shaped (`restoreRememberedRemoteSession`
+   *  posts `resumeSession` from it), so a phone changing effort would clear
+   *  and replay its own transcript and drop an in-flight recording. The
+   *  residue we accept instead: dismiss the restart prompt and the chip
+   *  shows the level you picked until the conversation next reloads. */
+  private async applyEffort(
+    newLevel: string,
+    session: Session,
+    origin: MsgOrigin,
+    clientId: string | undefined,
+    requester: RemoteRequester | undefined,
+  ): Promise<void> {
+    if (session.priming) return; // ignore changes fired mid-session-start (see switchModel)
+
+    if (!session.hasHistory || !session.client) {
+      // As with a model switch on an empty session: restart without the summarize-vs-restart
+      // prompt and discard the abandoned empty session — but only when it truly had no
+      // history (a dead client on a session WITH history must keep that history).
+      const wasEmpty = !session.hasHistory;
+      const discardId = session.activeSessionId;
+      await this.rememberProviderEffort(session.provider, newLevel);
+      if (wasEmpty && isAdapterProvider(session.provider)) {
+        await this.discardAdapterEmptySession(session.provider, discardId, this.sessionCwd(session), session.client);
+      }
+      await this.startSession(undefined, session);
+      if (wasEmpty && session.provider === "grok") this.discardRestartedEmptySession(discardId, session);
+      return;
+    }
+
+    // Live effort switch — no restart — when the CLI honors per-session
+    // effort (grok ≥ the build advertising models[]._meta.supportsReasoningEffort
+    // + accepting set_model _meta.reasoningEffort; confirmed 0.2.101). Only a
+    // real, non-empty effort qualifies — "unset" (back to default) still needs
+    // a fresh spawn without --reasoning-effort. Persist the preference ONLY
+    // after the switch actually lands (live-applied, or restart accepted) — a
+    // persist-before that fails + dismissed restart would leave the saved
+    // default changed while the session ran at the old effort.
+    if (newLevel && session.client.currentModelSupportsEffort()) {
+      const applied = await session.client.setReasoningEffort(newLevel).catch(() => false);
+      if (applied) {
+        await this.rememberProviderEffort(session.provider, newLevel);
+        return;
+      }
+    }
+
+    if (origin === "remote" && clientId) {
+      this.reportRequester(
+        requester,
+        "warning",
+        "Changing reasoning effort here requires restarting the conversation from the VS Code view.",
+      );
+      return;
+    }
+    const mode = await this.pickRestartMode("Changing reasoning effort requires restarting the session.");
+    if (!mode) return; // dismissed — leave the remembered effort untouched
+    await this.rememberProviderEffort(session.provider, newLevel);
+    await this.restartSession(mode, session);
   }
 
   openModePopover(): void {
@@ -3469,8 +3738,7 @@ Only continue if you trust this code.`,
     // directly). `modeToRemember` drops Plan (a transient per-task choice).
     const remember = modeToRemember(modeId);
     if (remember) {
-      void this.host.getConfiguration("grok")
-        .update("defaultMode", remember, "global");
+      void this.rememberGrokConfig("defaultMode", remember);
     }
     if (modeId === "yolo") {
       if (this.configDisablesYolo(this.sessionCwd(session))) {
@@ -3651,6 +3919,7 @@ Only continue if you trust this code.`,
 
     function commitVerdict(): void {
       session.pendingExitPlans.delete(requestId);
+      sidebar.syncHumanWait(session);
       sidebar.persistPlanVerdict(session, verdict, planText);
       // Same rule as answering a permission or a question: a plan verdict is
       // activity, but it only resumes the turn if nothing else is outstanding.
@@ -3901,7 +4170,7 @@ Only continue if you trust this code.`,
    * the whole wait and a brand-new conversation is missing entirely.
    *
    * Every project and every session is treated the same; there is no special
-   * case for archived, which is a VS Code presentation concept and has no
+   * case for archived, which is a client presentation concept and has no
    * business in the activity path.
    */
   private noteSessionActivity(session: Session): void {
@@ -3941,6 +4210,7 @@ Only continue if you trust this code.`,
   private persistPermissionAnswer(session: Session, requestId: number | string, optionId: string): void {
     const pending = session.pendingPermissions.get(requestId);
     session.pendingPermissions.delete(requestId);
+    this.syncHumanWait(session);
     if (!pending) return;
     const sid = session.activeSessionId ?? session.client?.sessionId;
     if (!sid) return;
@@ -4013,9 +4283,51 @@ Only continue if you trust this code.`,
                   req.options.find((o) => o.kind === "allow_once");
       if (opt) { client.respondPermission(req.id, opt.optionId); return; }
     }
+    const execute = String(req.toolCall?.kind ?? "").toLowerCase() === "execute";
+    const command = (req.toolCall?.rawInput as { command?: unknown } | undefined)?.command;
+    const programs = execute && typeof command === "string"
+      ? commandProgramsForGrant(command, resolvedTerminalShellDialect()) : undefined;
+    const allowOnce = req.options.find((o) => o.kind === "allow_once");
+    // Every segment must be covered: an npm grant cannot smuggle in `&& rm`.
+    // is_background deliberately does not matter; it runs the same program.
+    if (!planActive && allowOnce && programs?.every((program) => session.allowedCommandPrograms.has(program))) {
+      if (client.respondPermission(req.id, allowOnce.optionId)) {
+        // The COMMAND, not `toolCall.title` -- grok's title for an execute card
+        // is often just "Shell", and what ran is the one thing this line exists
+        // to show. Reads after the collapsed card's verb, which is "Answered"
+        // because the card carries no option the renderer can name; nobody
+        // answered it, so the title is where the reason has to live too.
+        const title = `${command} — auto-approved for this session`;
+        session.pendingPermissions.set(req.id, createPendingPermission({
+          title, toolCallId: req.toolCall?.toolCallId, toolKind: req.toolCall?.kind,
+          options: [allowOnce],
+        }));
+        // Existing frames, delivered atomically. No actionable buttons or keyboard
+        // default, and no needs-you/human-wait transition, even for a remote.
+        this.emit(session, { type: "historyBatch", messages: [
+          { type: "permissionRequest", req: { ...req, toolCall: { ...req.toolCall, title }, options: [] } },
+          { type: "permissionResolved", requestId: req.id, optionId: allowOnce.optionId },
+        ] });
+        this.persistPermissionAnswer(session, req.id, allowOnce.optionId);
+        return;
+      }
+    }
+    // The card no longer offers "no, and never ask again"; execute cards also
+    // stop writing the CLI's exact-string grants (#123). The CLI and
+    // .grok/config.toml remain the route for either persistent policy.
+    const options = req.options.filter((o) => o.kind !== "reject_always" && (!execute || o.kind !== "allow_always"));
+    const ungranted = [...new Set(programs?.filter((program) => !session.allowedCommandPrograms.has(program)))];
+    let commandGrant;
+    if (allowOnce && ungranted.length > 0 && ungranted.length <= 3) {
+      // Namespacing plus a collision check keeps even an unfamiliar CLI id opaque.
+      let optionId = "grok-build:allow-command-session";
+      while (req.options.some((o) => o.optionId === optionId)) optionId += ":host";
+      commandGrant = { optionId, allowOnceId: allowOnce.optionId, programs: ungranted };
+      options.push({ optionId, kind: "allow_always", name: `Yes, and allow ${ungranted.map((p) => JSON.stringify(p)).join(", ")} this session` });
+    }
     // Remember it so the answer can be persisted for replay on resume.
     const visibleOptions = permissionOptionsForPlan(
-      req.options ?? [],
+      options,
       planActive,
       req.toolCall?.kind,
     );
@@ -4039,12 +4351,10 @@ Only continue if you trust this code.`,
       toolCallId: req.toolCall?.toolCallId,
       toolKind: req.toolCall?.kind,
       plan,
-      options: (req.options ?? []).map((o) => ({
-        optionId: o.optionId,
-        kind: o.kind,
-        name: o.name,
-      })),
+      options,
+      commandGrant,
     }));
+    this.syncHumanWait(session);
     this.emit(session, {
       type: "permissionRequest",
       req: {
@@ -4261,12 +4571,13 @@ Only continue if you trust this code.`,
       this.reportRequester(
         requester,
         "warning",
-        "This Grok CLI cannot steer attachments mid-turn — your message was queued instead. It will send when the turn finishes.",
+        "This agent cannot steer attachments mid-turn — your message was queued instead. It will send when the turn finishes.",
       );
       return;
     }
 
-    const implicitChips = session.chips.filter((chip) => isImplicitChip(chip));
+    // A steer should carry only its authored contribution: the editor may have
+    // moved since this turn started, and ambient snippets would be repeated.
     const slashCommand = matchSlashCommand(
       queuedSendsText(contributions) || authored,
       client.availableCommands.map((c) => c.name),
@@ -4274,12 +4585,12 @@ Only continue if you trust this code.`,
     const built = builtContributions.length === 1
       ? buildPromptWithImages(
         builtContributions[0].text,
-        [...builtContributions[0].chips, ...implicitChips],
+        builtContributions[0].chips,
         builtContributions[0].images,
         promptDeps,
         slashCommand != null,
       )
-      : buildQueuedPromptWithImages(builtContributions, implicitChips, promptDeps, slashCommand != null);
+      : buildQueuedPromptWithImages(builtContributions, [], promptDeps, slashCommand != null);
 
     await this.retainUploadedFilesForSession(
       session,
@@ -4287,6 +4598,31 @@ Only continue if you trust this code.`,
     );
     if (gen !== session.gen || session.client !== client) {
       putBackOnComposer();
+      return;
+    }
+    // The turn ended before the steer landed — while attachments were being
+    // read, or, on a phone, while `steerSend` was still crossing the relay.
+    // The backends disagree about what an idle steer means and only one of
+    // them is harmless: grok buffers it, but codex-acp’s
+    // `performSteeringRequest` documents "otherwise starts a new turn", and a
+    // turn the host never began paints no Stop and ends no busy state — the
+    // agent works on while the chat looks finished. The queue is what Steer
+    // was offering to skip, so it is the honest home for the text; flushing
+    // it sends the ordinary tracked turn the user was going to get anyway.
+    // `turnInFlight` and not `status`: only the token can tell "working"
+    // from "was working and never settled".
+    if (!this.turnInFlight(session)) {
+      putBackOnQueue();
+      // This text is already paid for: the relay meters `steerSend` on ingress
+      // exactly like `send`, which is why every other fallback in this function
+      // declines the relay round-trip. Those fallbacks can leave the flag alone
+      // because they do not flush. This one does — and a `fromQueue` steer
+      // arrives with the flag set by the original `queueSend`, which
+      // `putBackOnQueue` faithfully restores. Left standing it would send the
+      // correction back out through the phone as a fresh `send` and charge the
+      // person a second time for one message.
+      session.queuedSendRequiresRelay = false;
+      void this.maybeFlushQueuedSends(session);
       return;
     }
 
@@ -4306,7 +4642,7 @@ Only continue if you trust this code.`,
         if (gen === session.gen && session.client === client) session.interjectionCount += 1;
       }, images.length ? built.blocks : undefined);
       if (r === "unsupported") {
-        // Pre-~0.2.96 CLI: latch the button off and hand the item to the queue,
+        // Unsupported backend: latch the button off and hand the item to the queue,
         // which is exactly the behavior Steer was offering to skip.
         this.emit(session, { type: "steerUnavailable" });
         this.emit(session, { type: "agentReset" });
@@ -4314,7 +4650,36 @@ Only continue if you trust this code.`,
         this.reportRequester(
           requester,
           "warning",
-          "Steering needs a newer Grok Build CLI — your message was queued instead. Update via Settings → About.",
+          // Grok’s method is unadvertised, so "unsupported" here means an old
+          // CLI that an update fixes — say so rather than describe the agent as
+          // incapable. Every other backend advertises, so there is nothing to do.
+          session.provider === "grok"
+            ? "Steering needs a newer Grok Build CLI — your message was queued instead. Update via Settings → About."
+            : "This agent cannot steer mid-turn — your message was queued instead. It will send when the turn finishes.",
+        );
+        return;
+      }
+      if (r === "failed") {
+        // The adapter answered successfully and said it could not apply the
+        // correction. The turn is STILL RUNNING, which is what separates this
+        // from the catch below: `agentReset` there suppresses the rest of a
+        // turn, and doing that here would delete the reply the person is
+        // reading. The reply is fine. It is the correction that did not land,
+        // so the queue takes it — the fallback Steer was offering to skip.
+        putBackOnQueue();
+        // Already paid for: the relay meters `steerSend` on ingress exactly
+        // like `send`. `putBackOnQueue` faithfully restores the flag a
+        // `fromQueue` steer arrived with, and left standing it would send this
+        // correction back out through the phone as a fresh `send` and charge
+        // the person twice for one message that never landed. Same reasoning
+        // as the idle-turn fallback above, and the same single line.
+        session.queuedSendRequiresRelay = false;
+        // No `steerUnavailable`: this is one refusal, not a missing capability.
+        // The button stays, because the next correction may well land.
+        this.reportRequester(
+          requester,
+          "warning",
+          "The agent could not take that correction mid-turn — your message was queued instead. It will send when the turn finishes.",
         );
         return;
       }
@@ -4381,9 +4746,7 @@ Only continue if you trust this code.`,
     // would refuse to answer the card still on the reader's screen, leaving
     // that agent blocked with no way back short of restarting the session.
     if (!turnIsInFlight(session)) {
-      session.pendingQuestions.clear();
-      session.pendingPermissions.clear();
-      session.pendingExitPlans.clear();
+      this.clearPendingHumanRequests(session);
     }
     if (session.replaying || session.suppressContent) return;
     session.liveFeedbackEligible = true;
@@ -4972,6 +5335,14 @@ Only continue if you trust this code.`,
     // process cwd (that would create sessions under the install directory).
     if (this.host.canSwitchWorkspaceFolder) return "";
     return process.cwd();
+  }
+
+  /** New remote tabs follow the current open set, never the app's startup folder. */
+  private defaultRemoteCwd(): string {
+    const authorized = this.authorizedSessionCwds();
+    return authorizedListCwd(this.workspaceRoot(), authorized, pathsEqual)
+      ?? this.openWorkspaceFolders().find((cwd) => authorizedListCwd(cwd, authorized, pathsEqual))
+      ?? "";
   }
 
   /** Effective cwd for a session (worktree path or workspace root). */
@@ -6044,8 +6415,6 @@ Only continue if you trust this code.`,
       fs: defaultFs,
       grokHome: resolveGrokHome(process.env),
       pins,
-      // Desktop ignores shared repo-archives.json (canArchiveRepos false);
-      // VS Code still applies stored choices.
       archives: this.host.canArchiveRepos
         ? this.state.get<RepoArchives>(REPO_ARCHIVES_KEY, {})
         : undefined,
@@ -6053,6 +6422,8 @@ Only continue if you trust this code.`,
       // AFK Pilot). Always passed so every row carries `color` (possibly "") —
       // field presence is the client capability probe.
       colors: this.state.get<RepoColors>(REPO_COLORS_KEY, {}),
+      // Marks ride with the colours, for the same reason and on the same terms.
+      icons: this.state.get<RepoIcons>(REPO_ICONS_KEY, {}),
       tmpDir: os.tmpdir(),
       // Open folders remain selectable before Grok creates a catalog row (and
       // bypass managed-worktree exclusion when the user opened a worktree).
@@ -6118,19 +6489,26 @@ Only continue if you trust this code.`,
             continue;
           }
           // Trusted open folder with no catalog row yet — still show it.
-          // Colour still comes from the shared store so a painted project
-          // keeps its tint when Grok has not created a sessions catalog yet.
+          // Colour and mark still come from the shared store so a painted
+          // project keeps them when Grok has not created a sessions catalog yet.
           const colors = this.state.get<RepoColors>(REPO_COLORS_KEY, {});
           const colorChoice = colors[key]?.color;
+          const iconChoice = this.state.get<RepoIcons>(REPO_ICONS_KEY, {})[key]?.icon;
+          const archiveChoice = this.state.get<RepoArchives>(REPO_ARCHIVES_KEY, {})[key];
           entries.push({
             cwd,
             label: path.basename(cwd) || cwd,
             available: true,
             pinned: false,
             updatedAt: 0,
+            archived: !!archiveChoice?.archived,
+            archivedAt: archiveChoice?.at ?? 0,
             // Stored choices are non-empty ids; missing/invalid → "" for none.
             color: colorChoice && (REPO_COLOR_IDS as readonly string[]).includes(colorChoice)
               ? colorChoice
+              : "",
+            icon: iconChoice && (REPO_ICON_IDS as readonly string[]).includes(iconChoice)
+              ? iconChoice
               : "",
           });
         }
@@ -6212,86 +6590,12 @@ Only continue if you trust this code.`,
     return this.localTrustedSessionCwds(overrides);
   }
 
-  /**
-   * Cwds a REMOTE client may name: the trusted set, minus everything belonging
-   * to an archived project.
-   *
-   * A narrowing, and deliberately remote-only. Archiving on the desk means "fold
-   * this away" — the project stays one keystroke from being worked in, so
-   * subtracting it from the LOCAL set would break the thing archiving is for.
-   * From a phone it should mean what it looks like: gone.
-   *
-   * Cheap on purpose: this runs on every inbound AND outbound remote message.
-   * The stored choices are read as they are, because expired ones have already
-   * been retired from the store ({@link normalizeArchiveChoices}), and the
-   * filter is by each cwd's owning project, which the trusted-set builder
-   * recorded on the way past.
-   *
-   * Nothing to subtract on a host that cannot archive: desktop ignores stored
-   * choices entirely, and its remote set is already just the open folders.
-   */
-  private remoteAuthorizedSessionCwds(): string[] {
-    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
-    const trusted = this.localTrustedSessionEntries(overrides);
-    if (!this.host.canArchiveRepos) return trusted.map((t) => t.cwd);
-    // First use in this window: retire stale choices before trusting them, so a
-    // project worked in before the extension started is not fenced on a flag
-    // that expired long ago.
-    if (!this.archiveChoicesNormalized) this.normalizeArchiveChoices();
-    return remoteAuthorizedCwds({
-      trusted,
-      archivedProjects: archivedProjectKeys({
-        archives: this.state.get<RepoArchives>(REPO_ARCHIVES_KEY, {}),
-        openCwds: [...this.openWorkspaceFolders(), this.workspaceRoot()],
-      }),
-    });
-  }
-
-  /** Whether stale archive choices have been retired since this window opened. */
-  private archiveChoicesNormalized = false;
-
-  /**
-   * Retire archive choices that newer work has already made moot, in the store.
-   *
-   * Called from ONE place — building the catalog — and deliberately from
-   * nowhere else.
-   *
-   * ## Why it is not wired into the session lifecycle
-   *
-   * Earlier versions hung this off session start, then turn completion, then a
-   * prompt commit point, each time to make the phone's view agree with the
-   * rail's the instant the desk worked in a project. Every one of those was a
-   * hole, because every one inferred "work happened after the archive" from a
-   * proxy — an event, a pool membership, a queued-vs-ordinary flag — and each
-   * proxy turned out to be reachable or ambiguous.
-   *
-   * The reason those were treated as holes at all was a framing mistake worth
-   * recording: a remote here is the OWNER'S OWN authenticated device, and the
-   * worst outcome of a stale answer is that they see a project they had tidied
-   * away. Archiving is a decluttering gesture — the rail even applies it
-   * automatically after 30 days idle, which nothing that gates a capability
-   * could ever do. Building race-free machinery for it put complexity into the
-   * path that decides whether a prompt runs, in exchange for preventing
-   * something nobody is harmed by.
-   *
-   * So: correct in the steady state, and lagging by at most one catalog build.
-   * A project worked in at the desk stays out of the phone's view until the
-   * next session open, project switch or pin — all of which post a catalog.
-   * Erring toward withholding is the safe direction and it self-heals.
-   *
-   * The evidence is still `updates.jsonl` and not the session directory
-   * ({@link newestTranscriptMtime}), because that part cost nothing and a
-   * signal that moves when a conversation is merely loaded is simply wrong.
-   * Activity in a WORKTREE counts for its project, since the rail merges those
-   * catalogs when it answers the same question.
-   */
+  /** Retire choices superseded by transcript activity, including worktrees.
+   *  Store maintenance only, performed when publishing the catalog. */
   private normalizeArchiveChoices(): void {
     if (!this.host.canArchiveRepos) return;
     const archives = this.state.get<RepoArchives>(REPO_ARCHIVES_KEY, {});
-    if (!Object.keys(archives).length) {
-      this.archiveChoicesNormalized = true;
-      return;
-    }
+    if (!Object.keys(archives).length) return;
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const grokHome = resolveGrokHome(process.env);
     const expired = expiredArchiveChoiceKeys({
@@ -6305,7 +6609,6 @@ Only continue if you trust this code.`,
         return newest;
       },
     });
-    this.archiveChoicesNormalized = true;
     if (!expired.length) return;
     const next: RepoArchives = { ...archives };
     for (const key of expired) {
@@ -6315,19 +6618,12 @@ Only continue if you trust this code.`,
     void this.state.update(REPO_ARCHIVES_KEY, next);
   }
 
-  /**
-   * Every cwd a remote client may legitimately name. Delegates to the shared
-   * authorization query, narrowed by {@link remoteAuthorizedSessionCwds} —
-   * never a separate recomputation of the open set.
-   */
   private remoteTargetableCwd(cwd: string): boolean {
     if (!cwd) return false;
-    return cwdIsAuthorized(cwd, this.remoteAuthorizedSessionCwds(), pathsEqual);
+    return cwdIsAuthorized(cwd, this.authorizedSessionCwds(), pathsEqual);
   }
 
   private postRepoCatalog(): void {
-    // The catalog changing is exactly when "which projects are archived" can
-    // change, so it is recomputed here and read cheaply everywhere else.
     this.normalizeArchiveChoices();
     // Both local and remote attached clients see the host's catalog: curated
     // open folders on desktop, full discovery on VS Code. Archive fields only
@@ -6401,7 +6697,7 @@ Only continue if you trust this code.`,
       defaultProvider: this.defaultProviderForProject(entry.cwd),
     })),
   ): HostMsg {
-    const authorized = this.remoteAuthorizedSessionCwds();
+    const authorized = this.authorizedSessionCwds();
     const selectedCwd =
       authorizedListCwd(this.remoteClients.cwdIfPresent(clientId), authorized, pathsEqual) ?? "";
     const active = this.remoteClients.active(clientId);
@@ -6410,13 +6706,7 @@ Only continue if you trust this code.`,
       const sc = this.sessionCwd(active);
       if (authorizedListCwd(sc, authorized, pathsEqual)) activeCwd = sc;
     }
-    // Archived projects are dropped from the ROWS, not merely refused when
-    // named. A row a phone cannot open is a dead affordance, and the catalog is
-    // also what the client builds its own Archive group from — leaving them in
-    // would put a section on screen whose every row fails.
-    // Against the set already computed above — `remoteTargetableCwd` would
-    // rebuild it per row, and on VS Code building it re-runs project discovery,
-    // so a per-row call turns one catalog post into one disk walk per project.
+    // Per-tab fields and rows must still exclude projects actually removed.
     const reachable = entries.filter((r) => cwdIsAuthorized(r.cwd, authorized, pathsEqual));
     return {
       type: "repos",
@@ -6478,15 +6768,6 @@ Only continue if you trust this code.`,
       this.host.appendLine(`[rail] listRepoSessions failed: project unavailable (${scope})`);
       return { type: "repoSessions", cwd, entries: [], dots: {}, total: 0, error: "project-unavailable" };
     }
-    // `listRepoSessions` is already gated on remoteTargetableCwd at the inbound
-    // choke point, so an archived repo never gets this far from a phone. Said
-    // again here because this method resolves through the CATALOG, which is the
-    // wider set — a future caller reaching it another way would otherwise get
-    // rows the fence exists to withhold.
-    if (scope === "remote" && !this.remoteTargetableCwd(hit.cwd)) {
-      this.host.appendLine("[rail] listRepoSessions failed: project unavailable (remote)");
-      return { type: "repoSessions", cwd, entries: [], dots: {}, total: 0, error: "project-unavailable" };
-    }
     // Clamp: the rail wants a handful, and an unbounded limit would make every
     // repo row a full history read.
     const size = Math.max(1, Math.min(20, Math.trunc(Number(limit)) || REPO_PREVIEW_SIZE));
@@ -6494,7 +6775,6 @@ Only continue if you trust this code.`,
       hit.cwd,
       { offset: 0, limit: size },
       activeId,
-      scope,
     );
     if (list.type !== "sessions") {
       this.host.appendLine(`[rail] listRepoSessions failed: session list unavailable (${scope})`);
@@ -6898,7 +7178,7 @@ Only continue if you trust this code.`,
    *
    * "Done" has to mean usable from the surface that asked. Host-owned: this
    * reuses the same `selectRemoteRepo` an explicit tap goes through, including
-   * its archived/targetable checks, so it grants a remote nothing it could not
+   * its project checks, so it grants a remote nothing it could not
    * already ask for.
    */
   private async enterProjectForRequester(
@@ -7746,14 +8026,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Same catalog the client was sent (open folders on desktop, full on VS Code).
     const hit = this.localRepoCatalogEntries().find((r) => pathsEqual(r.cwd, cwd));
     if (!hit || !hit.available) return;
-    // The catalog is the WIDER set. `selectRepo` is already gated on
-    // remoteTargetableCwd at the inbound choke point, so this is belt — but it
-    // is the belt that matters, because selecting is how a tab acquires the cwd
-    // every later message is judged against.
-    if (!this.remoteTargetableCwd(hit.cwd)) {
-      this.host.appendLine(`[remote] refused selectRepo (archived project): ${hit.cwd}`);
-      return;
-    }
     if (this.remoteVoice.has(clientId)) void this.handleRemoteVoiceStop(clientId, true);
     this.parkRemoteSession(clientId);
     this.remoteClients.select(clientId, hit.cwd);
@@ -7815,13 +8087,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Record where a project belongs in the rail. Both answers are stored,
    *  including "not archived" — that one exists to hold a long-idle project in
    *  view against the rail's own age rule, so forgetting it is not the same as
-   *  storing it (see RepoArchiveChoice). No-op when the host cannot archive
-   *  (desktop curated open/close) — the shared repo-archives.json file is
-   *  simply ignored, so a project archived in VS Code and then opened on the
-   *  desktop still shows. */
+   *  storing it (see RepoArchiveChoice). */
   private async setRepoArchived(cwd: string, archived: boolean): Promise<void> {
     if (!this.host.canArchiveRepos) return;
-    const hit = this.repoCatalog().find((r) => pathsEqual(r.cwd, cwd));
+    const hit = this.localRepoCatalogEntries().find((r) => pathsEqual(r.cwd, cwd));
     if (!hit) return;
     const archives = this.state.get<RepoArchives>(REPO_ARCHIVES_KEY, {});
     const key = normalizeRepoPath(hit.cwd);
@@ -7845,6 +8114,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (color === "") delete next[key];
     else next[key] = { cwd: hit.cwd, color };
     await this.state.update(REPO_COLORS_KEY, next);
+    this.postRepoCatalog();
+  }
+
+  /** Record a project's mark (or clear it). Empty `icon` removes the stored
+   *  entry so the wire reports `""` again. Unknown ids are ignored rather than
+   *  stored: a newer client can name a mark this build has never shipped, and
+   *  persisting the string it was handed would hand every other surface an id
+   *  none of them can draw. */
+  private async setRepoIcon(cwd: string, icon: string): Promise<void> {
+    if (!isRepoIcon(icon)) return;
+    const hit = this.localRepoCatalogEntries().find((r) => pathsEqual(r.cwd, cwd));
+    if (!hit) return;
+    const icons = this.state.get<RepoIcons>(REPO_ICONS_KEY, {});
+    const key = normalizeRepoPath(hit.cwd);
+    const next: RepoIcons = { ...icons };
+    if (icon === "") delete next[key];
+    else next[key] = { cwd: hit.cwd, icon };
+    await this.state.update(REPO_ICONS_KEY, next);
     this.postRepoCatalog();
   }
 
@@ -7881,12 +8168,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       else next[id] = entry;
       return next;
     });
-    // The pin lives in globalState, not in the session's summary.json, so the
-    // file's mtime does not move and the entry cache would keep serving a row
-    // with the OLD pin state — the pin control would then still say "Pin" right
-    // after pinning, and clicking it would pin again instead of unpinning. Same
-    // reason `customName` invalidates here: an override changes the entry
-    // without touching disk.
+    // Pins, like customName, live in globalState without changing disk mtimes.
+    // Without invalidation, buildPinnedSessions sorts by stale pinnedAt values,
+    // so a new pin can appear below older pins. The pendingPins overlay hides
+    // this only in the initiating view until acknowledgement or expiry;
+    // other views and the settled client still need fresh host rows.
     this.sessionCache.delete(id);
     this.postSessionsList(); // fans out the pinned refresh too
   }
@@ -7973,18 +8259,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Every pinned conversation across every repo, newest pin first. Reads are
    *  grouped by the stored home cwd so this costs one index scan per repo that
    *  actually holds a pin — not one per repo in the catalog. */
-  private buildPinnedSessions(
-    /** Whose pins these are. Remote gets the archive-narrowed set — and it has
-     *  to be applied HERE, not at delivery: `pinnedSessions` is authorized as a
-     *  whole (every entry or nothing), so one pin in an archived project would
-     *  otherwise refuse the entire frame and take every other pin off the phone
-     *  with it. Defaults to the stricter answer. */
-    scope: "local" | "remote" = "remote",
-  ): { entries: SessionListEntry[]; dots: Record<string, Dot> } {
+  private buildPinnedSessions(): { entries: SessionListEntry[]; dots: Record<string, Dot> } {
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     // Enforce authorization at build time — never trust pin metadata alone.
-    const authorized =
-      scope === "remote" ? this.remoteAuthorizedSessionCwds() : this.authorizedSessionCwds();
+    const authorized = this.authorizedSessionCwds();
     const grokHome = resolveGrokHome(process.env);
     const log = (m: string) => this.host.appendLine(m);
     const byCwd = new Map<string, { cwd: string; ids: string[] }>();
@@ -8001,7 +8279,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const cachedAdapterIds = new Set(
       [...this.allAdapterCatalogs()].flat().map((entry) => entry.id),
     );
-    for (const { cwd, ids } of byCwd.values()) {
+    for (const { cwd, ids: bucketIds } of byCwd.values()) {
+      const ids: string[] = [];
+      for (const id of bucketIds) {
+        const live = [...this.pool].find((session) => session.activeSessionId === id);
+        const entry = live && this.liveSessionEntry(live, id, this.sessionCwd(live), overrides);
+        if (entry && entry.cwd && sessionCwdBelongsToRepo(entry.cwd, [cwd], pathsEqual)) {
+          entries.push({ ...entry, pinnedAt: overrides[id]?.pinnedAt });
+        } else ids.push(id);
+      }
       const adapterIds = new Set(ids.filter((id) => {
         const provider = overrides[id]?.provider;
         return (provider && isAdapterProvider(provider)) || cachedAdapterIds.has(id);
@@ -8047,25 +8333,18 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return { entries: filtered, dots };
   }
 
-  private postPinnedSessions(clientId?: string): void {
+  private postPinnedSessions(clientId?: string, requestId?: string): void {
     const hasRemote = this.remoteClients.clients().length > 0;
     // Desktop multi-folder rail OR the VS Code primary-side-bar projects view.
     const hasLocalRail = this.host.canSwitchWorkspaceFolder || !!this.projectsRail;
     if (!clientId && !hasRemote && !hasLocalRail) return;
-    // Built PER AUDIENCE, not once and fanned out: the desk keeps its pins in
-    // archived projects (archiving folds a project away, it does not put it out
-    // of your own reach), while a remote must not receive them at all.
+    const message: HostMsg = { type: "pinnedSessions", ...this.buildPinnedSessions(), pinRequests: true, ...(requestId ? { requestId } : {}) };
     if (clientId) {
-      this.sendRemoteClient(clientId, { type: "pinnedSessions", ...this.buildPinnedSessions("remote") });
+      this.sendRemoteClient(clientId, message);
       return;
     }
-    if (hasLocalRail) {
-      this.postLocal({ type: "pinnedSessions", ...this.buildPinnedSessions("local") });
-    }
-    const remotes = this.remoteClients.clients();
-    if (!remotes.length) return;
-    const forRemote: HostMsg = { type: "pinnedSessions", ...this.buildPinnedSessions("remote") };
-    for (const id of remotes) this.sendRemoteClient(id, forRemote);
+    if (hasLocalRail) this.postLocal(message);
+    for (const id of this.remoteClients.clients()) this.sendRemoteClient(id, message);
   }
 
   private annotateWorktreeLabels(
@@ -8157,7 +8436,22 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       const webview = this.view?.webview;
       if (webview && this.isServableFromDisk(safePath, session.provider)) {
         const src = webview.asWebviewUri(Uri.file(safePath)).toString();
-        this.emit(session, { type: "media", media: m.media, src, mimeType: mime, path: safePath });
+        // Copy image needs PIXELS, and a webview cannot read them back out of an
+        // app-resource:// URI it is only permitted to display. That is why
+        // attached images have always carried a handle and generated ones —
+        // which arrive as a served URI rather than a data: one — never could.
+        //
+        // Mint it through the same predicate the FETCH will ask, not the one
+        // that let us serve the file. The two deliberately disagree:
+        // `isServableFromDisk` knows about Codex's own image root, while
+        // `imagePathStillAuthorized` knows only an open folder or Grok session
+        // media whose catalog cwd is still open. A handle the fetch will refuse
+        // is worse than no handle — the button would enable and then fail after
+        // a twenty-second silence, where today it is disabled and says why.
+        const fullId = m.media === "image" && this.isImagePathAuthorizedNow(safePath, session)
+          ? this.registerFullImage(safePath)
+          : undefined;
+        this.emit(session, { type: "media", media: m.media, src, mimeType: mime, path: safePath, fullId });
         return;
       }
       // A custom GROK_HOME/CODEX_HOME may not be among this webview's resource
@@ -8818,6 +9112,33 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
   }
 
+  /** Forget the memoized `--version` and read the binary again.
+   *
+   *  Drains the old memo before clearing it — the ordering
+   *  updateProviderCliOnDemand uses for the same reason: a late response
+   *  from the in-flight probe would otherwise land after the fresh read and
+   *  restore the number we just replaced.
+   *
+   *  The cached version is NOT deleted first. On success the probe
+   *  overwrites it; on failure the last known version is better than a blank
+   *  row, and unlike the update path nothing here says the binary changed. */
+  private async reprobeProviderVersion(provider: "codex" | "claude"): Promise<void> {
+    // Same guard reprobeProviderCredentials carries, for the same reason: a
+    // `--version` spawn holds the binary the updater is replacing. The updater
+    // drains the in-flight probe before it replaces, so a probe started after
+    // that drain is precisely the one it cannot see -- and on Windows the
+    // replace then fails and the row reports an update that did not happen.
+    // Reachable by opening Providers, which posts refreshProviders, and
+    // pressing Update before the credential probe ahead of this one returns.
+    // The updater re-reads the version itself when it finishes.
+    if (this.providerCliUpdate?.provider === provider) return;
+    const inFlight = provider === "codex" ? this.codexVersionProbe : this.claudeVersionProbe;
+    await inFlight?.catch(() => "");
+    if (provider === "codex") this.codexVersionProbe = undefined;
+    else this.claudeVersionProbe = undefined;
+    await this.probeProviderVersion(provider).catch(() => "");
+  }
+
   private probeProviderVersion(provider: AcpProvider): Promise<string> {
     if (provider === "codex") return this.probeCodexVersion();
     if (provider === "claude") return this.probeClaudeVersion();
@@ -8832,7 +9153,61 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return this.grokVersionProbe;
   }
 
-  /** Read `codex --version` once per activation. The adapter handshake reports
+  /**
+   * Re-read a provider's model catalog when its CLI changed under us.
+   *
+   * The catalog is the CLI's own answer (`model/list` for Codex), and this
+   * cache is persisted, so updating the CLI left the picker showing the old
+   * models indefinitely. The owner hit exactly that: Codex was updated on a
+   * cloud machine, a new model still did not appear, and the only remedy was
+   * disconnect → connect — which nobody would guess, because nothing about the
+   * picker suggests it is a cache.
+   *
+   * Keyed on the OBSERVED version rather than on an update we performed, so a
+   * CLI that updated itself, or one an agent or `npm` moved underneath us,
+   * counts the same. That matters here: the CLIs all self-update.
+   *
+   * ONE attempt per observed version, whatever the outcome — the stamp is
+   * written BEFORE the probe. A CLI that cannot answer must not re-probe on
+   * every activation for ever, which is the same trap the grok updater already
+   * documents.
+   */
+  private async refreshModelsIfCliChanged(provider: AcpProvider, version: string): Promise<void> {
+    if (!version) return;
+    const cache = this.state.get<ProviderModelCache>(PROVIDER_MODEL_CACHE_KEY, {});
+    const cached = cache[provider];
+    // Nothing cached yet: the ordinary warm-up owns that case and a re-probe
+    // here would only race it.
+    if (!cached) return;
+    if (cached.cliVersion === version) return;
+    await this.state.update(PROVIDER_MODEL_CACHE_KEY, {
+      ...cache,
+      [provider]: { ...cached, cliVersion: version },
+    } satisfies ProviderModelCache);
+    this.host.appendLine(
+      `[${provider}] CLI ${cached.cliVersion ?? "unknown"} -> ${version}; re-reading the model catalog`,
+    );
+    await this.reprobeProviderCredentials(provider);
+  }
+
+  /**
+   * A version reading taken NOW, not the memo.
+   *
+   * `probeCodexVersion`/`probeClaudeVersion` cache until an explicit update,
+   * which is right for display and wrong for deciding whether to tear a
+   * person's sessions down. Drain whatever is already in flight before dropping
+   * the memo — the same ordering the update's own `finally` uses, and for the
+   * same reason: a late answer from the old probe would otherwise land on top
+   * of the reading taken here.
+   */
+  private async reReadProviderCliVersion(provider: "codex" | "claude"): Promise<string> {
+    await (provider === "codex" ? this.codexVersionProbe : this.claudeVersionProbe);
+    if (provider === "codex") this.codexVersionProbe = undefined;
+    else this.claudeVersionProbe = undefined;
+    return this.probeProviderVersion(provider);
+  }
+
+  /** Memoize `codex --version` until an explicit update. The adapter handshake reports
    * its own package version, not the binary it launches. */
   private probeCodexVersion(): Promise<string> {
     if (this.codexVersionProbe) return this.codexVersionProbe;
@@ -8848,6 +9223,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (!version) throw new Error("unrecognized version output");
         this.providerCliVersions.codex = version;
         this.postProviderState();
+        await this.refreshModelsIfCliChanged("codex", version);
         return version;
       } catch (error) {
         this.host.appendLine(`codex --version failed: ${(error as Error).message}`);
@@ -8858,7 +9234,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return this.codexVersionProbe;
   }
 
-  /** Read `claude --version` once per activation. The adapter handshake version
+  /** Memoize `claude --version` until an explicit update. The adapter handshake version
    * is a stale package constant (0.49.0 on 0.69.0) and must not be displayed. */
   private probeClaudeVersion(): Promise<string> {
     if (this.claudeVersionProbe) return this.claudeVersionProbe;
@@ -8874,6 +9250,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (!version) throw new Error("unrecognized version output");
         this.providerCliVersions.claude = version;
         this.postProviderState();
+        await this.refreshModelsIfCliChanged("claude", version);
         return version;
       } catch (error) {
         this.host.appendLine(`claude --version failed: ${(error as Error).message}`);
@@ -9150,6 +9527,43 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       );
       return;
     }
+    // The About panel's Update button is drawn from a grokUpdateStatus that can
+    // be minutes old, and grok may well have moved since — its own startup
+    // auto-update runs on every host launch, and another window may have done
+    // this already. Everything past this point tears the WHOLE pool down, so ask
+    // the binary once more at the destructive moment.
+    //
+    // Skipped when the policy names a target: --check answers "is there a newer
+    // one", which is a different question from "are you on the version we
+    // require", and a pinned move must not be talked out of it by the wrong one.
+    if (!policy.target) {
+      try {
+        const { stdout } = await execGrokCli(cliPath, ["update", "--check", "--json"], { timeout: 30_000 });
+        const info = JSON.parse(stdout) as {
+          currentVersion?: string;
+          latestVersion?: string;
+          updateAvailable?: boolean;
+        };
+        if (info.updateAvailable === false) {
+          this.postGrokUpdateStatus({
+            type: "grokUpdateStatus",
+            current: info.currentVersion ?? null,
+            latest: info.latestVersion ?? null,
+            updateAvailable: false,
+            policy,
+          });
+          void this.host.showInformationMessage(
+            `Grok Build CLI is already on v${info.currentVersion ?? "the latest version"}.`,
+          );
+          return;
+        }
+      } catch (e) {
+        // A check that cannot answer is not evidence of being current. Fall
+        // through and update rather than strand someone on a binary we could not
+        // read — the old behaviour, which is the safe one to keep here.
+        this.host.appendLine(`grok update --check before updating failed: ${(e as Error).message}`);
+      }
+    }
     const updateArgs = policy.target ? ["update", "--version", policy.target] : ["update"];
     // The update tears down the whole pool (the binary is locked while any session
     // holds it open), so a session that's mid-turn or waiting on you would be
@@ -9188,6 +9602,199 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     await this.startSession(resumeId);
   }
 
+  /** Did WE install this Codex? Then our installer is its updater. No managed
+   *  store means nothing is managed — never a reason to fail an update. */
+  private isManagedCodexBinary(provider: AcpProvider, cliPath: string): boolean {
+    const storageRoot = this.context?.globalStorageUri?.fsPath;
+    if (provider !== "codex" || !storageRoot) return false;
+    const relative = path.relative(codexManagedRoot(storageRoot), cliPath);
+    return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+  }
+
+  /** Explicit updates of user-owned CLIs. Keep Session identities (including
+   * remote tab bindings), but release every process using the target binary.
+   * Other providers can keep working. No native UI is involved. */
+  /**
+   * Forget a FINISHED CLI update. A running one stays — it is still true.
+   *
+   * `providerCliUpdates` had no expiry, and `providerState` carries it to every
+   * surface, so "Update completed · Codex CLI v0.153.4" reappeared on the empty
+   * state of every new conversation for the life of the host process (owner,
+   * 2026-09-06). Retaining it was deliberate — an update stops and resumes
+   * sessions, and the answer must survive that re-render rather than vanishing
+   * with the conversation that asked for it — but "survive the resume" was
+   * implemented as "never expire".
+   *
+   * Starting a new conversation is the person moving on from that answer, which
+   * is why this hangs off the inbound `newSession` message and not off
+   * `startSession`: our own post-update resume also starts a session, and
+   * clearing there would erase the outcome before anyone read it.
+   */
+  private clearSettledCliUpdates(): void {
+    const updates = this.providerCliUpdates;
+    if (!updates) return;
+    let changed = false;
+    for (const provider of Object.keys(updates) as AcpProvider[]) {
+      if (updates[provider]?.status === "running") continue;
+      delete updates[provider];
+      changed = true;
+    }
+    if (changed) this.postProviderState();
+  }
+
+  private async updateProviderCliOnDemand(provider: "codex" | "claude"): Promise<void> {
+    if (this.providerCliUpdate || Object.values(this.providerCliUpdates ?? {}).some((u) => u.status === "running")) return;
+    const name = provider === "codex" ? "Codex CLI" : "Claude Code CLI";
+    const status = (state: "running" | "succeeded" | "failed", message: string) => {
+      (this.providerCliUpdates ??= {})[provider] = { status: state, message };
+      this.postProviderState();
+    };
+    const cliPath = this.locateProvider(provider);
+    if (!cliPath) {
+      status("failed", `${name} was not found. Reconnect the provider and try again.`);
+      return;
+    }
+    let release!: () => void;
+    const done = new Promise<void>((resolve) => { release = resolve; });
+    // Take the lock BEFORE the freshness read below, so a second click is
+    // refused rather than racing a second update through the same window.
+    this.providerCliUpdate = { provider, done };
+    // The row that enabled this button can be minutes old, and the cached
+    // version behind it older still: a person can update in a terminal, or
+    // another window can have run this already. Everything past this point
+    // STOPS their sessions, so re-read at the destructive moment rather than
+    // acting on what we happened to know. Returning here deliberately skips the
+    // try/finally below — that block reports "Update completed" and reopens
+    // conversations, and neither is true of a no-op.
+    const target = provider === "codex" ? CODEX_MANAGED_VERSION : CLAUDE_PINNED_CLI_VERSION;
+    const installed = await this.reReadProviderCliVersion(provider);
+    if (installed && !versionIsOlder(installed, target)) {
+      status("succeeded", `${name} is already on v${installed}. Nothing to update.`);
+      this.providerCliUpdate = undefined;
+      release();
+      return;
+    }
+    const affected = () => [...new Set([
+      ...this.pool, this.focused,
+      ...this.remoteClients.clients().map((id) => this.remoteClients.active(id)),
+    ])].filter((s): s is Session => !!s && s.provider === provider);
+    const stopped: Session[] = [];
+    let failure: string | undefined;
+    status("running", `Stopping ${name} sessions before updating…`);
+    try {
+      // A startup already past the gate can still spawn. Drain it first, then
+      // drain version/model probes, whose throwaway processes also lock the CLI.
+      await Promise.all(affected().map((s) => this.waitForSessionStart(s)));
+      await (provider === "codex" ? this.codexVersionProbe : this.claudeVersionProbe);
+      await Promise.all(this.providerModelProbes?.get(provider) ?? []);
+      await Promise.all(this.adapterHistory(provider)?.refresh?.values() ?? []);
+      const closing = affected().map((session) => {
+        stopped.push(session);
+        const client = this.detachClient(session);
+        this.setStatus(session, "idle");
+        this.emit(session, { type: "setBusy", value: true, locked: true });
+        return client?.disposeForUpdate();
+      });
+      // Await ACTUAL exit, as in disposePool. Signalling a kill alone leaves
+      // the binary locked on Windows. Settle all exits even if one rejects.
+      const exits = await Promise.allSettled(closing);
+      const rejected = exits.find((exit) => exit.status === "rejected");
+      if (rejected?.status === "rejected") throw rejected.reason;
+      status("running", `Updating ${name}… This may take a few minutes.`);
+      // Update it the way it was installed. See cli-update-plan.ts — the CLI's
+      // own updater cannot reach an npm install that sits outside npm's
+      // configured prefix, which is every one of our cloud machines.
+      // npm links its global bins, so the install shape is only visible through
+      // the symlink. Resolving it is best-effort: an unresolvable path is a
+      // reason to fall back to the CLI's own updater, never to fail the update.
+      let realPath = cliPath;
+      try { realPath = await fs.promises.realpath(cliPath); } catch { /* use cliPath */ }
+      const plan = cliUpdatePlan({
+        managed: this.isManagedCodexBinary(provider, cliPath),
+        realPath,
+        packageName: CLI_NPM_PACKAGE[provider],
+        // The pin, not `@latest`. Settings has already told this person their
+        // target is `latestCliVersion` and computed "update available" against
+        // it; fetching whatever is newest installs a version they were never
+        // shown, and leaves the row still claiming an update is available.
+        targetVersion: target,
+      });
+      if (plan.kind === "managed") {
+        // We put this binary here, so updating it means installing the pinned
+        // build with its verified digest — not asking a standalone binary to
+        // replace itself, which is the one shape we never measured. It also
+        // republishes the tag the locator prefers, retiring the older
+        // directory this fell back to.
+        await installManagedCodex({
+          storageRoot: this.context.globalStorageUri.fsPath,
+          signal: new AbortController().signal,
+        });
+      } else {
+        // execGrokCli rejects on a nonzero exit; stdout is diagnostic text,
+        // never a success predicate.
+        const [command, args] = plan.kind === "npm"
+          ? [process.platform === "win32" ? "npm.cmd" : "npm",
+            ["install", "-g", "--prefix", plan.prefix, plan.packageSpec]]
+          : [cliPath, selfUpdateArgs(provider, plan.kind === "self" ? plan.target : undefined)];
+        const { stdout, stderr } = await execGrokCli(command, args, {
+          timeout: 180_000, windowsHide: true, closeStdin: true,
+        });
+        if (stdout.trim()) this.host.appendLine(stdout.trim());
+        if (stderr.trim()) this.host.appendLine(stderr.trim());
+      }
+    } catch (error) {
+      failure = errorDetail(error).slice(0, 1200);
+      this.host.appendLine(`[${provider}] update failed: ${failure}`);
+    } finally {
+      // Drain the OLD memo before clearing it, above. Otherwise its late
+      // response could overwrite the freshly observed version/catalog.
+      if (provider === "codex") this.codexVersionProbe = undefined;
+      else this.claudeVersionProbe = undefined;
+      delete this.providerCliVersions[provider];
+      this.providerCliUpdate = undefined;
+      status("running", `Checking ${name} version and models…`);
+      // Start the fresh probe BEFORE releasing queued starts, so they share it.
+      // It calls refreshModelsIfCliChanged, which re-reads the model catalog.
+      const observed = this.probeProviderVersion(provider);
+      release();
+      const version = await observed;
+      status(failure ? "failed" : "succeeded", failure
+        ? `${name} update failed: ${failure}`
+        : version ? `Update completed · ${name} v${version}`
+          : `Update completed, but the ${name} version could not be verified.`);
+      for (const session of stopped) {
+        this.emit(session, { type: "setBusy", value: false });
+        // Resume the same conversations on every visible surface. Background
+        // sessions keep their ids and load on their next send/focus.
+        if (session === this.focused || this.remoteClients.isActiveValueVisible(session)) {
+          try {
+            // startSessionBody reports its OWN failure into the conversation and
+            // returns undefined rather than throwing, so this catch never sees
+            // the ordinary case and undefined is the only signal there is.
+            // Without checking it the row said "Update completed - Codex CLI
+            // v0.153.4" while the conversation it had just reopened showed a red
+            // "Failed to start Codex", which is the update telling the person
+            // the opposite of what they are looking at (owner, 2026-09-06).
+            // A conversation nobody has typed in yet has nothing to reopen: the
+            // id names a session the CLI never persisted, so asking it to load
+            // one fails, and the row then tells the person their conversation
+            // is gone when there was never anything in it (owner, 2026-09-06 --
+            // he watched it happen on an empty "New session"). Start a fresh
+            // one instead; there is nothing to lose, and leaving the dead id in
+            // place would only move the same failure onto his next message.
+            const resumeId = session.userMessageCount ? session.activeSessionId : undefined;
+            const resumed = await this.startSession(resumeId, session, "ensure", undefined, { silent: true });
+            if (!resumed) {
+              status("failed", `${name} updated, but this conversation could not be reopened. Start a new conversation.`);
+            }
+          } catch (error) {
+            status("failed", `${name} update finished, but the conversation could not resume: ${errorDetail(error)}`);
+          }
+        }
+      }
+    }
+  }
+
   /** Run `grok update`, retrying once on the Windows "locked executable" error.
    *  Even after awaiting the pool teardown a lingering file lock can outlive the
    *  killed processes by a beat (antivirus / handle cleanup); a short pause-and-
@@ -9224,6 +9831,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  (reasoning effort, cross-agent model). Returns the chosen restart mode, or
    *  undefined if the user dismissed the dialog. */
   private async pickRestartMode(message: string): Promise<"clear" | "summarize" | undefined> {
+    // From here on the picker change is blocked on a person, not on the CLI.
+    this.releasePickerWaits();
     const choice = await this.host.showInformationMessage(
       message,
       { modal: true },
@@ -9351,8 +9960,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     target: Session = this.focused,
     intent: SessionStartIntent = "replace",
     clock?: OpenClock,
+    opts: { silent?: boolean; canReplace?: () => boolean } = {},
   ): Promise<AcpClient | undefined> {
-    return this.runExclusiveSessionStart(target, () => this.startSessionBody(resumeId, target, intent, clock));
+    if (this.providerCliUpdate?.provider === target.provider) await this.providerCliUpdate.done;
+    return this.runExclusiveSessionStart(target, () => this.startSessionBody(resumeId, target, intent, clock, opts));
   }
 
   private async startSessionBody(
@@ -9360,12 +9971,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     target: Session,
     intent: SessionStartIntent,
     startedClock?: OpenClock,
+    /** A start the PERSON did not ask for. Its failure belongs wherever the
+     *  caller is reporting, never as a red banner in a conversation they were
+     *  only looking at. The caller reads the undefined return instead. */
+    opts: { silent?: boolean; canReplace?: () => boolean } = {},
   ): Promise<AcpClient | undefined> {
     // Read the caller's clock BEFORE this function can add to it: the load
     // reservation, the workspace-switch queue, the cwd resolution, the
     // `session-meta.json` read and the wait for the exclusive start lock are
     // all already on it, and all of them belong to `resolve`.
     const clock = startedClock ?? new OpenClock();
+    if (opts.canReplace && !opts.canReplace()) return undefined;
     // A re-entry (the reactive downgrade below) arrives with the first pass's
     // phases already on it. Fold them into one NAMED phase and subtract it, so
     // the failed attempt keeps its own number instead of being reported as
@@ -9469,6 +10085,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     approveGateMs = clock.elapsed(consentAt);
     // After the last await before ++gen: a send can have begun a turn (or
     // another start can have finished) while consent was up.
+    if (opts.canReplace && !opts.canReplace()) return undefined;
     const startDecision = decideSessionStart(target, resumeId, intent);
     if (startDecision === "reuse" || startDecision === "refuse-turn") {
       if (startDecision === "refuse-turn") {
@@ -9497,6 +10114,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.queueInFlightPlanCommentsOnExit(session, replacedClient, session.gen);
     }
     const gen = ++session.gen;
+    // Session objects can be reused for load/restart. Their grants cannot.
+    session.allowedCommandPrograms.clear();
     const testDelay = this.testSessionStartDelay;
     if (testDelay && testDelay.resumeId === resumeId) {
       this.testSessionStartDelay = undefined;
@@ -9505,6 +10124,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (gen !== session.gen) return undefined;
     }
     session.buffer = [];
+    session.subscriptionUsage = undefined;
     session.status = "idle";
     // The replacement session has no turn, whatever the old one was doing. This
     // matters most in the case the token exists for: a `prompt()` that never
@@ -9518,6 +10138,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // new/resumed/restarted session (covers New Session, history resume, and
     // model/effort restarts — all of which route through here).
     this.stopVoiceInput(session);
+    this.clearPendingHumanRequests(session);
+    this.drainPendingConfirms(session);
     session.client = undefined;
     // Detach and dispose as one structural operation. Nothing that can return
     // belongs between these lines: the old ACP callbacks remain live until the
@@ -9562,7 +10184,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const configAutoApprove = session.provider === "grok" && this.configForcesAutoApprove(this.sessionCwd(session));
     session.autoApprove = rememberedYolo || configAutoApprove;
     session.planActive = false;
-    session.hasHistory = false;
+    session.hasHistory = !!resumeId;
     session.suppressContent = false;
     session.captureAgentText = undefined;
     session.lastSessionInfoAt = 0;
@@ -9571,8 +10193,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session.sessionInfoUnsupported = false;
     session.sawCompactNotification = false;
     session.lastPlanText = "";
-    session.pendingExitPlans.clear();
-    session.pendingQuestions.clear();
     session.inFlightPlanComments.clear();
     if (session.planModeRecovery?.warningTimer) clearTimeout(session.planModeRecovery.warningTimer);
     session.planModeRecovery = undefined;
@@ -9582,6 +10202,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session.replayUserCounted = false;
     session.replayUserIsInterjection = false;
     session.userMessageCount = 0;
+    if (!resumeId || resumeId !== session.activeSessionId) {
+      session.telemetrySessionOrigin = undefined;
+      session.remoteMessageReported = false;
+    }
     session.inUserMessage = false;
     session.feedbackAvailable = false;
     session.feedbackUnsupported = false;
@@ -9665,10 +10289,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Worktree sessions pin cwd at creation/open; everyone else uses the workspace root.
     const cwd = session.cwd || this.workspaceRoot();
     session.cwd = cwd;
-    // Note there is deliberately nothing here about archiving. Whether a
-    // project counts as archived is DERIVED when the catalog is built, never
-    // written from a lifecycle event like this one — see
-    // effectiveArchivedRepoKeys for the two attempts that taught us why.
     // Re-bind worktree meta from override when resuming (cold open may only have cwd).
     if (!session.worktree && resumeId) {
       const o = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[resumeId];
@@ -9687,7 +10307,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // repository `.env` is allowed to feed the Grok process credentials, but
     // never to redirect GROK_HOME or disable GROK_SANDBOX.
     const sandboxEnv = process.env;
-    const effortStr = cfg.get<string>("defaultEffort", "");
+    const effortStr = this.defaultEffortForProvider(session.provider);
     const effort = effortStr ? (effortStr as EffortLevel) : undefined;
     // A cold resume must reuse the profile frozen into its summary. New macOS
     // sessions resolve the explicit setting/env/global config. Other platforms
@@ -9757,13 +10377,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       sandbox,
       log: (msg) => this.host.appendLine(msg),
       timeouts: this.acpClientTimeouts(),
-      mcpServers: () => this.hostMcpServersFor(session),
+      mcpServers: (onDispose) => this.hostMcpServersFor(session, onDispose),
       ...(session.provider === "grok"
         ? { grokVersion: grokHandshakeVersion, grokVersionVerified }
         : { backend: this.createProviderBackend(session.provider) }),
     });
     brokerClient = client;
     session.client = client;
+    this.syncHumanWait(session);
     // A replacement process may have gained the capability after a CLI update.
     session.lastSessionInfoAt = 0;
     session.lastSessionInfoUsed = undefined;
@@ -9821,6 +10442,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           version: handshakeVersion,
           provider: session.provider,
           init: { protocolVersion: init?.protocolVersion },
+          steeringSupported: client.supportsInterject(),
         },
       });
     });
@@ -9841,7 +10463,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.emit(session, {
         type: "session",
         sessionId: res.sessionId,
-        models: this.modelsForSession(session, client.availableModels, client.currentModelId, !resumeId),
+        models: this.modelsForSession(session, client.availableModels, client.currentModelId, !resumeId || (session.historyEventCount === 0 && session.userMessageCount === 0)),
         currentModelId: client.currentModelId,
         effort: client.currentReasoningEffort,
         worktree: !!session.worktree,
@@ -9996,6 +10618,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (!payload) return;
       if (payload.event === "toolCall" || payload.event === "toolCallUpdate") {
         const prepared = prepareMcpToolCall(payload.call, mcpState);
+        if (prepared.action === "drop") {
+          if (prepared.logLine) this.host.appendLine(prepared.logLine);
+          return;
+        }
         this.emit(session, { type: "childStream", ...payload, call: prepared.call });
         return;
       }
@@ -10046,6 +10672,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     };
     const emitToolCallEvent = (type: "toolCall" | "toolCallUpdate", u: unknown) => {
       const prepared = prepareMcpToolCall(u, mcpState);
+      if (prepared.action === "drop") {
+        if (prepared.logLine) this.host.appendLine(prepared.logLine);
+        return;
+      }
       session.inUserMessage = false;
       session.historyEventCount += 1;
       this.emit(session, { type, call: prepared.call });
@@ -10061,6 +10691,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("toolCallUpdate", (u) => {
       if (gen !== session.gen) return;
+      this.closeQuestionsForToolCall(session, u);
       emitToolCallEvent("toolCallUpdate", u);
     });
     client.on("plan", (u) => {
@@ -10131,6 +10762,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         ...(typeof used === "number" && Number.isFinite(used) && used > 0 ? { used } : {}),
         ...(typeof window === "number" && Number.isFinite(window) && window > 0 ? { window } : {}),
       });
+    });
+    client.on("subscriptionUsage", (windows: SubscriptionWindow[]) => {
+      if (gen !== session.gen || session.client !== client || session.replaying) return;
+      session.subscriptionUsage?.observe(windows);
+      this.publishSubscriptionUsage(session);
     });
     client.on("adapterUsageUpdate", (used: number, window?: number) => {
       if (gen !== session.gen) return;
@@ -10255,7 +10891,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (gen !== session.gen) return;
       // Questions are read-only and need a human — surface them in every mode
       // (plan/YOLO included); there's no sensible auto-answer.
-      session.pendingQuestions.add(req.id);
+      session.pendingQuestions.set(req.id, req.toolCallId);
+      this.syncHumanWait(session);
       this.emit(session, { type: "questionRequest", req });
       this.setStatus(session, "needs-you");
     });
@@ -10272,6 +10909,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // replaced attempt's client away from the current attempt's pipe.
       if (session.priming) {
         if (session.client === client) {
+          this.clearPendingHumanRequests(session);
+          this.drainPendingConfirms(session);
           session.client = undefined;
           this.pool.delete(session);
         }
@@ -10481,7 +11120,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         clock.record("replay(post)", clock.elapsed(replayAt));
         session.activeSessionId = resumeId;
         session.titleGenerated = true; // existing session, name already in storage
-        session.hasHistory = true;
 
         // Plan-gate restoration: the CLI replays its own current_mode_update
         // events during loadSession, which our modeChanged handler honors by
@@ -10541,15 +11179,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           this.host.appendLine(
             `[startup] Default model '${defaultModel}' is not available; switching grok.defaultModel to '${client.currentModelId}'.`,
           );
-          const cfg = this.host.getConfiguration("grok");
-          const scope = cfg.inspect<string>("defaultModel");
-          const target =
-            scope?.workspaceFolderValue !== undefined
-              ? "workspaceFolder"
-              : scope?.workspaceValue !== undefined
-                ? "workspace"
-                : "global";
-          void cfg.update("defaultModel", client.currentModelId, target);
+          void this.rememberGrokConfig("defaultModel", client.currentModelId);
         }
       }
 
@@ -10562,6 +11192,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // Throw into the classifier instead: the retry budget owns transient
       // startup deaths, and the final failure surfaces like any other.
       if (session.client !== client) throw new Error("the provider exited during startup");
+      this.bindSubscriptionUsage(session, env);
+      void this.refreshSubscriptionUsage(session);
       // Session is live — unlock the composer and flush anything typed during
       // the startup window (#37).
       session.priming = false;
@@ -10569,7 +11201,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.pool.add(session);
       this.touch(session);
       this.reapPool(); // enforce the LRU cap now that the pool grew
-      this.setProviderNeedsLogin(session.provider, false);
+      // NOT `setProviderNeedsLogin(provider, false)` here. Starting a process
+      // and loading a session does not exercise the credential: measured on the
+      // owner's cloud host 2026-09-14, session/create + session/load + replay
+      // all completed cleanly against a dead Claude token and the prompt one
+      // second later answered "Authentication required". This line ran inside
+      // recoverAuthAndResend's own restart, so every send cleared the account
+      // flag on its way to failing -- the sign-in card blinked out at the
+      // moment it was most needed. Only an accepted credential clears it now;
+      // see the clean-turn site in handleSend.
       this.emit(session, { type: "setBusy", value: false });
       // A draft this conversation lost to a provider sign-out comes back with
       // it, before the queue flushes — the composer is where it was typed.
@@ -10595,6 +11235,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         /timed out: (initialize|session\/(new|load))|exited \(code null\)/i.test(msg);
       const userFacing = credentialFailure || stdioRegression || replayBegan || attempt >= startSpawnAttempts;
       client.removeAllListeners("exit");
+      this.clearPendingHumanRequests(session);
+      this.drainPendingConfirms(session);
       client.dispose();
       session.client = undefined;
       if (!userFacing) {
@@ -10605,6 +11247,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.pool.delete(session);
       session.priming = false;
       this.emit(session, { type: "setBusy", value: false });
+      // The owner pressed Update, and a red "Failed to start Codex" appeared in
+      // the conversation he was reading -- for a start he never made, about a
+      // resume we performed on his behalf (2026-09-06). Onboarding and busy
+      // state still flow; only the error TEXT is withheld, and the caller
+      // reports it where the action actually happened.
+      const emitError = (text: string) => {
+        if (!opts.silent) this.emit(session, { type: "error", text });
+      };
       // No `403`/`forbidden` here: the CLI deliberately does NOT map 403 to an
       // auth failure (entitlement/policy, which sign-in can't fix — #58); a
       // startup error carrying that wording surfaces as a plain error below.
@@ -10650,13 +11300,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         // Pin unavailable, already attempted, or it didn't help — point the user at
         // the manual workaround instead of a bare timeout.
-        this.emit(session, {
-          type: "error",
-          text:
-            `Failed to start Grok: ${msg}. This matches the Grok CLI 0.2.61–0.2.70 stdio ` +
-            `regression (issue #22, fixed after 0.2.70). Workaround: run ` +
-            `\`grok update --version ${GROK_STDIO_DOWNGRADE_TARGET}\` in a terminal, then start a new session.`,
-        });
+        emitError(
+          `Failed to start Grok: ${msg}. This matches the Grok CLI 0.2.61–0.2.70 stdio ` +
+          `regression (issue #22, fixed after 0.2.70). Workaround: run ` +
+          `\`grok update --version ${GROK_STDIO_DOWNGRADE_TARGET}\` in a terminal, then start a new session.`,
+        );
       } else if (isResumeNotFound(err)) {
         // The person asked for a conversation and got the adapter's own words
         // plus a uuid: “Failed to start Claude: Resource not found:
@@ -10667,16 +11315,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // anything AND a query that died mid-resume, so it names both
         // possibilities and offers the action that settles it, rather than
         // picking one and being wrong half the time.
-        this.emit(session, {
-          type: "error",
-          text:
-            `This conversation could not be opened. It may never have recorded `
-            + `anything, or ${providerDisplayName(session.provider)} may not have `
-            + `finished starting — try opening it again, and start a new `
-            + `conversation if it stays this way.`,
-        });
+        emitError(
+          `This conversation could not be opened. It may never have recorded `
+          + `anything, or ${providerDisplayName(session.provider)} may not have `
+          + `finished starting — try opening it again, and start a new `
+          + `conversation if it stays this way.`,
+        );
       } else {
-        this.emit(session, { type: "error", text: `Failed to start ${providerDisplayName(session.provider)}: ${msg}` });
+        emitError(`Failed to start ${providerDisplayName(session.provider)}: ${msg}`);
       }
       return undefined;
     }
@@ -10813,22 +11459,31 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         else this.postLocal(response);
         break;
       }
-      case "requestImageFull": {
-        // Local webviews open the real file directly, so this exists for remotes,
-        // which otherwise can only enlarge the 320px thumbnail.
-        if (origin !== "remote" || !requester) break;
+      case "requestImageFull":
+      case "requestImageOriginal": {
+        // Local previews can display vscode-resource URLs, but cannot read their
+        // cross-origin pixels. Both surfaces use the same authorized handles.
+        if (origin === "remote" && !requester) break;
         const source = this.fullImagePaths.get(msg.fullId);
         // Unknown handle: say nothing. The overlay keeps showing the thumbnail,
         // and a probe learns nothing about what does or does not exist on disk.
         if (!source) break;
         // Revalidate against the current open set — a handle minted while a
         // folder was open must not survive closing that folder.
-        if (!this.isImagePathAuthorizedNow(source, "remote")) {
-          this.host.appendLine(`[remote] refused imageFull (path no longer authorized)`);
+        if (!this.isImagePathAuthorizedNow(source, session)) {
+          this.host.appendLine(`[image] refused image request (path no longer authorized)`);
           break;
         }
-        const src = await this.renderFullImage(source);
-        this.sendRemoteRequester(requester, { type: "imageFull", fullId: msg.fullId, src });
+        const src = msg.type === "requestImageOriginal"
+          ? await this.readOriginalImage(source)
+          : await this.renderFullImage(source);
+        // A folder may close while the file is being read.
+        if (!this.isImagePathAuthorizedNow(source, session)) break;
+        const response: HostMsg = msg.type === "requestImageOriginal"
+          ? { type: "imageOriginal", fullId: msg.fullId, requestId: msg.requestId, src }
+          : { type: "imageFull", fullId: msg.fullId, src };
+        if (requester) this.sendRemoteRequester(requester, response);
+        else this.postLocal(response);
         break;
       }
       case "send":
@@ -10861,6 +11516,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           break;
         }
         try {
+          // A phone can take over a running turn: its send may be queued before
+          // handleSend reaches the prompt commit point. Receipt is remote use.
+          if (session.hasHistory) this.reportRemoteMessage(session, origin);
           await this.handleSend(msg.text, msg.bare === true, session, origin, queuedSendCommit, msg.submissionId);
         } finally {
           if (queuedSendCommit) finishQueuedSendCommit(session, queuedSendCommit, false);
@@ -10874,6 +11532,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       case "cancel": {
         const cancelled = session.turnToken;
+        this.clearPendingHumanRequests(session);
         await session.client?.cancel("user Stop click");
         if (cancelled) this.armCancelRecovery(session, cancelled);
         break;
@@ -10888,6 +11547,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const text = typeof msg.text === "string" ? msg.text : "";
         const chips = chipsForQueueSend(s.chips, msg.chips);
         if (text.trim() || chips.length) {
+          if (s.hasHistory) this.reportRemoteMessage(s, origin);
           s.queuedSendDispatch = undefined;
           // STICKY, never overwritten back to false: with desk↔remote
           // co-attach both views append to ONE queue, and the combined flush
@@ -10930,6 +11590,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "steerSend":
+        if (session.hasHistory && (msg.text.trim() || msg.chips?.length || session.chips.length)) {
+          this.reportRemoteMessage(session, origin);
+        }
         await this.steerSend(msg.text, session, requester, msg.chips, msg.fromQueue === true);
         break;
       case "turnFeedback":
@@ -10980,6 +11643,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "openRemotePortal":
+        this.reportRemotePortalOpened(msg.withHint === true);
         void this.host.openExternal(httpBaseFromRelayUrl(this.relayUrl()) + (msg.withHint ? "/?remoteHint=1" : ""));
         break;
       case "rewindSession":
@@ -11002,9 +11666,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // what a mismatch means is an answer for somebody else's conversation,
         // and dropping it is right. Ignoring it cannot hang the caller either:
         // the real answer still resolves, and an abandoned confirm already
-        // fails closed when the webview goes away.
+        // fails closed on session teardown or replacement.
         if (pending && pending.session === session) {
           this.pendingConfirms.delete(msg.id);
+          this.emit(session, { type: "uiConfirmResolved", requestId: msg.id });
           pending.resolve(msg.ok === true);
         }
         break;
@@ -11014,6 +11679,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       case "workflowControl":
         await this.controlWorkflow(msg.action, msg.displayName, session);
+        break;
+      case "refreshSubscriptionUsage":
+        void this.refreshSubscriptionUsage(session);
         break;
       case "refreshContextDetails":
         if (session.provider === "grok") {
@@ -11141,6 +11809,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await this.exportExpr(msg, session);
         break;
       case "dropFile":
+        // Which transfer types a drop carried and which one yielded a path.
+        // Silence here means the drag never reached the webview at all — the
+        // distinction #136 needed, and one no drop-side logging could make
+        // afterwards. Type NAMES only: their values are the user's file paths.
+        if (Array.isArray(msg.types)) {
+          this.host.appendLine(
+            `[drop] types=[${msg.types.join(", ")}] via=${msg.via ?? "none"} shift=${msg.shift}`,
+          );
+        }
         // Desktop rewrites a host-minted handle to path before this runs; VS Code
         // still posts a path from drag-drop. Missing path is a no-op (forged
         // handle already refused at the Electron gate).
@@ -11174,7 +11851,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             session.planActive,
             pending.toolKind,
           )) break;
-          if (!session.client?.respondPermission(msg.requestId, msg.optionId)) break;
+          const grant = pending.commandGrant?.optionId === msg.optionId ? pending.commandGrant : undefined;
+          if (!session.client?.respondPermission(msg.requestId, grant?.allowOnceId ?? msg.optionId)) break;
+          if (grant) for (const program of grant.programs) session.allowedCommandPrograms.add(program);
           // Record the resolution in the session buffer so re-focusing this session
           // replays the card collapsed instead of active (the live collapse is a
           // webview-only DOM mutation that the buffer never captured).
@@ -11187,6 +11866,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
               pending.plan,
             );
             session.pendingPermissions.delete(msg.requestId);
+            this.syncHumanWait(session);
           } else {
             // Persist it (title + outcome) so a cold reload replays a collapsed card —
             // the CLI doesn't replay request_permission on session/load.
@@ -11212,30 +11892,66 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // turn ended. Answering it again would write a duplicate JSON-RPC
         // response and drag a settled session back to `working` — with no turn
         // left to ever end it, which on a rented machine bills for ever.
-        if (!session.pendingQuestions.delete(msg.requestId)) break;
+        if (!session.pendingQuestions.delete(msg.requestId)) {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "stale" });
+          break;
+        }
+        this.syncHumanWait(session);
         if (session.client?.respondQuestion(msg.requestId, msg.answers ?? {}, msg.annotations ?? {})) {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "accepted" });
           // Answering a QUESTION is not answering a permission card that is
           // also outstanding — the agent stays blocked on it, so `working`
           // would be wrong and would hold a rented machine awake indefinitely.
           this.noteAnswered(session);
+        } else {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "stale" });
         }
         break;
       case "questionCancel":
-        if (!session.pendingQuestions.delete(msg.requestId)) break;
+        if (!session.pendingQuestions.delete(msg.requestId)) {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "stale" });
+          break;
+        }
+        this.syncHumanWait(session);
         if (session.client?.respondQuestionCancelled(msg.requestId)) {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "accepted" });
           this.noteAnswered(session);
+        } else {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "stale" });
         }
         break;
-      case "setModel":
-        await this.switchModel(
-          msg.modelId,
-          session,
-          requester,
-          isAcpProvider(msg.provider)
-            ? msg.provider
-            : this.providerForRequestedModel(msg.modelId, session.provider),
-        );
+      case "setModel": {
+        const provider = isAcpProvider(msg.provider)
+          ? msg.provider
+          : this.providerForRequestedModel(msg.modelId, session.provider);
+        const { effort } = msg;
+        // One close, one message, and at most ONE restart. The level is
+        // remembered BEFORE the switch, against the provider the switch aims
+        // at, so a restart the switch triggers spawns at it; the live RPC
+        // afterwards is only for the case where nothing restarted — a
+        // compatible `setModel` carries a live effort override through when
+        // the target offers it, so the level must be re-stated to settle a
+        // disagreement between the two.
+        //
+        // Comparing the session id is the whole guard, and it is load-bearing:
+        // `startSession` clears `hasHistory`, so a Summarize & Restart leaves
+        // a session that HOLDS the summary looking empty. Running the effort
+        // path over that read it as empty, deleted it on disk, and restarted
+        // again — the person asked to keep the thread and got a blank one. The
+        // same comparison collapses the cross-provider double restart.
+        //
+        // Everything stays inside trackPickerChange: it must set `pickerChange`
+        // before this handler yields, or a `send` posted behind it sees none.
+        await this.trackPickerChange((async () => {
+          const before = session.activeSessionId;
+          if (typeof effort === "string") await this.rememberProviderEffort(provider, effort);
+          await this.switchModel(msg.modelId, session, requester, provider);
+          if (typeof effort === "string" && session.activeSessionId === before) {
+            await this.applyEffort(effort, session, origin, clientId, requester);
+          }
+        })());
         break;
+      }
       case "listRoutines":
         this.routineError = undefined;
         this.postRoutines();
@@ -11320,56 +12036,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       case "cancelCodexInstall":
         this.codexInstallAbort?.abort(new Error("Installation cancelled."));
         break;
-      case "setEffort": {
-        if (session.priming) break; // ignore changes fired mid-session-start (see switchModel)
-        const newLevel = msg.level;
-        const cfg2 = this.host.getConfiguration("grok");
-
-        if (!session.hasHistory || !session.client) {
-          // As with a model switch on an empty session: restart without the summarize-vs-restart
-          // prompt and discard the abandoned empty session — but only when it truly had no
-          // history (a dead client on a session WITH history must keep that history).
-          const wasEmpty = !session.hasHistory;
-          const discardId = session.activeSessionId;
-          await cfg2.update("defaultEffort", newLevel, "global");
-          if (wasEmpty && isAdapterProvider(session.provider)) {
-            await this.discardAdapterEmptySession(session.provider, discardId, this.sessionCwd(session), session.client);
-          }
-          await this.startSession(undefined, session);
-          if (wasEmpty && session.provider === "grok") this.discardRestartedEmptySession(discardId, session);
-          break;
-        }
-
-        // Live effort switch — no restart — when the CLI honors per-session
-        // effort (grok ≥ the build advertising models[]._meta.supportsReasoningEffort
-        // + accepting set_model _meta.reasoningEffort; confirmed 0.2.101). Only a
-        // real, non-empty effort qualifies — "unset" (back to default) still needs
-        // a fresh spawn without --reasoning-effort. Persist `defaultEffort` ONLY
-        // after the switch actually lands (live-applied, or restart accepted) — a
-        // persist-before that fails + dismissed restart would leave the saved
-        // default changed while the session ran at the old effort.
-        if (newLevel && session.client.currentModelSupportsEffort()) {
-          const applied = await session.client.setReasoningEffort(newLevel).catch(() => false);
-          if (applied) {
-            await cfg2.update("defaultEffort", newLevel, "global");
-            break;
-          }
-        }
-
-        if (origin === "remote" && clientId) {
-          this.reportRequester(
-            requester,
-            "warning",
-            "Changing reasoning effort here requires restarting the conversation from the VS Code view.",
-          );
-          break;
-        }
-        const mode = await this.pickRestartMode("Changing reasoning effort requires restarting the session.");
-        if (!mode) break; // dismissed — leave defaultEffort untouched
-        await cfg2.update("defaultEffort", newLevel, "global");
-        await this.restartSession(mode, session);
+      case "setEffort":
+        await this.trackPickerChange(this.applyEffort(msg.level, session, origin, clientId, requester));
         break;
-      }
       case "addProjectFolder":
         await this.addProjectFolder();
         break;
@@ -11432,6 +12101,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.postWelcomeTips();
         break;
       }
+      case "openProviderConfig": {
+        if (origin !== "local") break;
+        const target = resolveProviderConfigFile(msg.provider);
+        if (!target.ok) break;
+        ensureConfigToml(target.root.filePath, target.stub);
+        await this.host.openHostResolvedPath(target.root.filePath);
+        break;
+      }
       case "openGlobalConfig": {
         // Intent only — host resolves ~/.grok/config.toml (never a renderer path).
         await this.host.openGlobalConfig();
@@ -11447,9 +12124,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "connectMcpConnector":
+        if (origin === "remote" && !clientId) break;
         await this.connectMcpConnector(msg.id, {
           key: typeof msg.key === "string" ? msg.key : undefined,
           readOnly: typeof msg.readOnly === "boolean" ? msg.readOnly : undefined,
+          remote: origin === "remote",
         });
         break;
       case "disconnectMcpConnector":
@@ -11499,6 +12178,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await this.host.getConfiguration("grok")
           .update("steerByDefault", !!msg.value, "global");
         break;
+      case "setExpandDiffCard":
+        await this.host.getConfiguration("grok")
+          .update("expandDiffCard", !!msg.value, "global");
+        break;
+      case "setPromptNav":
+        await this.host.getConfiguration("grok")
+          .update("promptNav", !!msg.value, "global");
+        break;
       case "setSoundNotifications":
         await this.host.getConfiguration("grok")
           .update("soundNotifications", !!msg.value, "global");
@@ -11532,6 +12219,28 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           sanitizeVoiceKeyterms(msg.value),
           voiceSettingWriteTarget(cfg.inspect("voiceKeyterms"), this.host.isInWorkspace(cwd)),
         );
+        break;
+      }
+      case "setVoiceBackend": {
+        if (!["auto", "xai", "openai"].includes(msg.value)) break;
+        const cfg = this.host.getConfiguration("grok", messageCwd);
+        await cfg.update("voiceBackend", msg.value,
+          voiceSettingWriteTarget(cfg.inspect("voiceBackend"), this.host.isInWorkspace(messageCwd)));
+        this.postVoiceConfigured();
+        break;
+      }
+      case "configureOpenAiVoice": {
+        const value = await this.host.showInputBox({
+          title: "OpenAI voice API key",
+          prompt: "An OpenAI API-platform key is required; Codex / ChatGPT sign-in does not include transcription. Saved in host settings. Empty clears the override.",
+          password: true,
+          placeHolder: "OpenAI API key",
+        });
+        if (value === undefined) break;
+        const cfg = this.host.getConfiguration("grok", messageCwd);
+        await cfg.update("voiceOpenAiApiKey", value.trim(),
+          voiceSettingWriteTarget(cfg.inspect("voiceOpenAiApiKey"), this.host.isInWorkspace(messageCwd)));
+        this.postVoiceConfigured();
         break;
       }
       case "setTelemetryEnabled":
@@ -11589,6 +12298,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         // Official CLI owns login. For Claude this is `claude auth login`
         // without --claudeai — we never implement or proxy Claude.ai OAuth.
+        // Connecting an account and RENEWING one are different errands, and
+        // only the second is about the conversation on screen. Read the flag
+        // before the probe below can clear it.
+        const renewing = !!this.providerNeedsLogin?.[provider];
         const loginArgs = provider === "claude" ? ["auth", "login"] : ["login"];
         const term = this.host.createTerminal({
           name: `${providerDisplayName(provider)} Login`,
@@ -11617,7 +12330,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // remote branch above returns before here — TypeScript pointed out the
         // comparison could no longer be false, which is the check that the two
         // paths really are separate rather than merely intended to be.
-        if (session.hasHistory && this.workspaceRoot()) {
+        //
+        // A RENEWAL is the exception, and it is the case the composer's
+        // lapsed-account card asks for: that card sits on a conversation whose
+        // replies are being refused and offers to fix THAT conversation, so
+        // parking it to make room for a panel answers a question nobody asked.
+        // The panel below is posted either way; on a live transcript the
+        // welcome hold declines to paint it, which is the same hold that made
+        // this card necessary. The terminal is the flow there.
+        if (session.hasHistory && this.workspaceRoot() && !renewing) {
           await this.newFocusedSession(origin);
         }
         // ALWAYS show this provider's login panel, and say the terminal was
@@ -11759,6 +12480,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         ))) break;
         await this.updateGrokCliOnDemand();
         break;
+      case "updateCodex":
+      case "updateClaude":
+        await this.updateProviderCliOnDemand(msg.type === "updateCodex" ? "codex" : "claude");
+        break;
       case "listSessions":
         if (origin === "remote" && clientId) {
           this.sendRemoteClient(clientId, this.buildSessionsList(messageCwd, {
@@ -11781,7 +12506,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // Rail pin. Remote always; local when any projects rail is live
         // (desktop multi-folder or VS Code primary-side-bar view).
         if (origin === "remote" || this.host.canSwitchWorkspaceFolder || this.projectsRail) {
-          await this.toggleSessionPin(msg.id, msg.cwd, msg.pinned);
+          try {
+            await this.toggleSessionPin(msg.id, msg.cwd, msg.pinned);
+          } catch (error) {
+            this.reportRequester(requester, "error", `Could not save pin: ${(error as Error).message}`);
+          } finally {
+            this.postPinnedSessions(undefined, msg.requestId);
+          }
         }
         break;
       case "selectRepo":
@@ -11793,6 +12524,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       case "setRepoColor":
         await this.setRepoColor(msg.cwd, msg.color);
+        break;
+      case "setRepoIcon":
+        await this.setRepoIcon(msg.cwd, msg.icon);
         break;
       case "toggleRepoPin":
         await this.toggleRepoPin(msg.cwd, msg.pinned);
@@ -11880,6 +12614,60 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           break;
         }
         await this.trackAttach(this.addDroppedFile(abs, false, attachmentOwner));
+        break;
+      }
+      case "readProviderConfig":
+      case "writeProviderConfig": {
+        if (origin === "remote" && !requester) break;
+        const target = resolveProviderConfigFile(msg.provider);
+        const envelope = {
+          provider: msg.provider,
+          ...(typeof msg.requestId === "string" ? { requestId: msg.requestId } : {}),
+          relPath: target.ok ? target.configPath : "",
+        };
+        const reply = (body: Extract<HostMsg, { type: "providerConfigContent" | "providerConfigWriteResult" }>) => {
+          if (requester) this.sendRemoteRequester(requester, body);
+          else this.postLocal(body);
+        };
+        const unavailable = !HOST_CAPABILITIES.editProviderConfigFiles || !HOST_CAPABILITIES.editProjectFiles;
+        const refusal = unavailable ? "editing is not available" : !target.ok ? target.reason : undefined;
+        if (!target.ok || refusal) {
+          reply({ type: msg.type === "readProviderConfig" ? "providerConfigContent" : "providerConfigWriteResult",
+            ...envelope, ok: false, reason: refusal || "unknown provider config" });
+          break;
+        }
+        if (msg.type === "readProviderConfig") {
+          const wire = projectFileContentForWire(readRemoteProjectFile(target.root, target.relPath), { includeEditMeta: true });
+          reply({ type: "providerConfigContent", ...wire, ...envelope,
+            ...(!wire.ok && wire.reason === "not found" ? {
+              absPath: target.root.filePath, text: target.stub, stamp: MISSING_PROVIDER_CONFIG_STAMP,
+            } : {}) });
+        } else {
+          const written = writeProviderConfigFile(target, msg.text, msg.stamp, msg.expectedAbsPath);
+          reply({ type: "providerConfigWriteResult", ...envelope,
+            ...(written.ok ? { ok: true, stamp: written.stamp } : { ok: false, reason: written.reason }) });
+        }
+        break;
+      }
+      case "restartProviderSession": {
+        if (!HOST_CAPABILITIES.editProviderConfigFiles || !HOST_CAPABILITIES.editProjectFiles) break;
+        const generation = session.gen;
+        const canReplace = () => {
+          if (!isAcpProvider(msg.provider) || !msg.sessionId || msg.provider !== session.provider
+            || msg.sessionId !== session.activeSessionId || session.gen !== generation) {
+            this.reportRequester(requester, "warning", "The current conversation changed. Open the matching provider conversation and restart it there.");
+            return false;
+          }
+          if (session.priming || this.turnInFlight(session)) {
+            this.reportRequester(requester, "warning", "Wait for the current turn to finish before restarting this session.");
+            return false;
+          }
+          return true;
+        };
+        if (!canReplace()) break;
+        // The ordinary start path replaces the process and reloads its history.
+        // Recheck after its async prerequisites, before it replaces the process.
+        await this.startSession(session.hasHistory ? session.activeSessionId : undefined, session, "replace", undefined, { canReplace });
         break;
       }
       case "listProjectDir": {
@@ -12077,6 +12865,222 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         break;
       }
+      case "gitStatus": {
+        // The Changes view's read. Same fence as the file browse above: the
+        // root comes from resolveRemoteFileRoot, never from the message.
+        const correlation = typeof msg.requestId === "string" ? { requestId: msg.requestId } : {};
+        const reply = (body: Extract<HostMsg, { type: "gitStatusResult" }>) => {
+          if (requester) this.sendRemoteRequester(requester, body);
+          else this.post(body);
+        };
+        const rootResult = this.resolveGitRoot(msg.cwd, origin, clientId);
+        if (!rootResult.ok) {
+          reply({ type: "gitStatusResult", ...correlation, cwd: msg.cwd, ok: false, kind: "failed", reason: rootResult.reason });
+          break;
+        }
+        const read = await readGitStatus(rootResult.root);
+        if (!read.ok) {
+          reply({ type: "gitStatusResult", ...correlation, cwd: msg.cwd, ok: false, kind: read.kind, reason: read.reason });
+          break;
+        }
+        reply({
+          type: "gitStatusResult",
+          ...correlation,
+          cwd: msg.cwd,
+          ok: true,
+          snapshot: read.snapshot,
+          busy: this.gitRunGate.isBusy(rootResult.root),
+        });
+        break;
+      }
+      case "gitFileDiff": {
+        const correlation = typeof msg.requestId === "string" ? { requestId: msg.requestId } : {};
+        const reply = (body: Extract<HostMsg, { type: "gitFileDiffResult" }>) => {
+          if (requester) this.sendRemoteRequester(requester, body);
+          else this.post(body);
+        };
+        const rootResult = this.resolveGitRoot(msg.cwd, origin, clientId);
+        if (!rootResult.ok) {
+          reply({ type: "gitFileDiffResult", ...correlation, cwd: msg.cwd, path: String(msg.path || ""), ok: false, reason: rootResult.reason });
+          break;
+        }
+        // The path fence, and it is the one that matters: a path is acceptable
+        // only if the repository is reporting it as changed RIGHT NOW. That
+        // cannot name a file outside the repository, cannot name an unchanged
+        // one, and goes stale in the safe direction.
+        const status = await readGitStatus(rootResult.root);
+        if (!status.ok) {
+          reply({ type: "gitFileDiffResult", ...correlation, cwd: msg.cwd, path: String(msg.path || ""), ok: false, reason: status.reason });
+          break;
+        }
+        if (!isKnownChangedPath(status.snapshot, msg.path)) {
+          this.host.appendLine(`[git] diff refused for a path the repository is not reporting as changed`);
+          reply({
+            type: "gitFileDiffResult",
+            ...correlation,
+            cwd: msg.cwd,
+            path: String(msg.path || ""),
+            ok: false,
+            reason: "That file is no longer changed. Refresh and try again.",
+          });
+          break;
+        }
+        const entry = status.snapshot.files.find((file) => file.path === msg.path);
+        const diff = await readGitFileDiff(rootResult.root, msg.path, { untracked: entry?.status === "?" });
+        if (!diff.ok) {
+          reply({ type: "gitFileDiffResult", ...correlation, cwd: msg.cwd, path: msg.path, ok: false, reason: diff.reason });
+          break;
+        }
+        reply({
+          type: "gitFileDiffResult",
+          ...correlation,
+          cwd: msg.cwd,
+          path: msg.path,
+          ok: true,
+          patch: diff.patch,
+          truncated: diff.truncated,
+          untracked: diff.untracked,
+        });
+        break;
+      }
+      case "turnFileDiff": {
+        const correlation = { requestId: msg.requestId, turnId: msg.turnId, cwd: msg.cwd, path: msg.path };
+        const reply = (body: Extract<HostMsg, { type: "turnFileDiffResult" }>) => {
+          if (requester) this.sendRemoteRequester(requester, body);
+          else this.post(body);
+        };
+        const fail = (reason: string) => reply({ type: "turnFileDiffResult", ...correlation, ok: false, reason });
+        const rootResult = this.resolveGitRoot(msg.cwd, origin, clientId);
+        if (!rootResult.ok) { fail(rootResult.reason); break; }
+        const baseline = this.turnDiffBaselines.get(msg.turnId);
+        if (!baseline?.sha || !pathsEqual(baseline.root, rootResult.root)) {
+          fail("This turn's diff is no longer available.");
+          break;
+        }
+        const baselineBlob = baseline.untracked?.get(msg.path);
+        let untracked = false;
+        if (!baselineBlob) {
+          // Paths absent from the host's blob map still need the live fence.
+          // A mapped path is already known: staging cannot change its base,
+          // and deletion must reach hash-object's ordinary failure response.
+          const status = await readGitStatus(rootResult.root);
+          if (!status.ok) { fail(status.reason); break; }
+          if (!isKnownChangedPath(status.snapshot, msg.path)) {
+            fail("That file is no longer changed. Refresh and try again.");
+            break;
+          }
+          untracked = status.snapshot.files.find((file) => file.path === msg.path)?.status === "?";
+        }
+        const diff = await readGitFileDiff(rootResult.root, msg.path, baselineBlob
+          ? { baselineBlob } : { baseline: baseline.sha, untracked });
+        if (!diff.ok) { fail(diff.reason); break; }
+        reply({ type: "turnFileDiffResult", ...correlation, ok: true, patch: diff.patch, truncated: diff.truncated });
+        break;
+      }
+      case "turnFileOpenDiff": {
+        const fail = (text: string) => this.post({ type: "error", text });
+        const rootResult = this.resolveGitRoot(msg.cwd, origin, clientId);
+        if (!rootResult.ok) { fail(rootResult.reason); break; }
+        const baseline = this.turnDiffBaselines.get(msg.turnId);
+        if (!baseline?.sha || !pathsEqual(baseline.root, rootResult.root)) {
+          fail("This turn's diff is no longer available.");
+          break;
+        }
+        const baselineBlob = baseline.untracked?.get(msg.path);
+        if (!baselineBlob) {
+          // Keep turnFileDiff's mapped-blob-or-live fence: staging a mapped
+          // file cannot revoke its baseline; other paths need fresh status.
+          const status = await readGitStatus(rootResult.root);
+          if (!status.ok) { fail(status.reason); break; }
+          if (!isKnownChangedPath(status.snapshot, msg.path)) {
+            fail("That file is no longer changed. Refresh and try again.");
+            break;
+          }
+        }
+        const before = await readGitTurnFileBefore(rootResult.root, msg.path, { sha: baseline.sha, untracked: baseline.untracked });
+        if (!before.ok) { fail(before.reason); break; }
+        const after = this.readTurnAfterSide(path.join(rootResult.root, msg.path));
+        if (after === undefined) {
+          // There is no region fallback here. A file we may not read, or one
+          // too big to hold twice, must not masquerade as a whole-file
+          // deletion in a review tab -- a real deletion is answered above.
+          fail("The current file could not be read for a diff. It may be too large.");
+          break;
+        }
+        // The turnId is a randomUUID, so naming it here would spend 36
+        // characters of tab label on something no human can read, and push the
+        // filename out of the visible width -- losing the one word that says
+        // which tab this is. The price is that two tabs from different turns on
+        // one file look alike in the tab bar; their contents do not.
+        await this.openDiffTexts(session, msg.path, before.text, after,
+          `Turn diff: ${path.basename(msg.path)}`);
+        break;
+      }
+      case "gitRun": {
+        const correlation = typeof msg.requestId === "string" ? { requestId: msg.requestId } : {};
+        const op = msg.op;
+        const reply = (body: Extract<HostMsg, { type: "gitRunResult" }>) => {
+          if (requester) this.sendRemoteRequester(requester, body);
+          else this.post(body);
+        };
+        const fail = (reason: string, detail?: string, snapshot?: Extract<HostMsg, { type: "gitRunResult"; ok: true }>["snapshot"]) =>
+          reply({ type: "gitRunResult", ...correlation, cwd: msg.cwd, op, ok: false, reason, ...(detail ? { detail } : {}), ...(snapshot ? { snapshot } : {}) });
+
+        const rootResult = this.resolveGitRoot(msg.cwd, origin, clientId);
+        if (!rootResult.ok) {
+          fail(rootResult.reason);
+          break;
+        }
+        const root = rootResult.root;
+        if (!this.gitRunGate.tryAcquire(root)) {
+          fail("Another git command is still running in this project.");
+          break;
+        }
+        try {
+          // Re-read before planning. Nothing in the message is trusted beyond
+          // the operation and its inputs: the plan is built from the host's own
+          // fresh snapshot, so a client that has been showing a stale list
+          // cannot commit a file that stopped being changed.
+          const status = await readGitStatus(root);
+          if (!status.ok) {
+            fail(status.reason);
+            break;
+          }
+          const plan = planGitOp(
+            {
+              op,
+              message: typeof msg.message === "string" ? msg.message : undefined,
+              push: !!msg.push,
+              paths: Array.isArray(msg.paths) ? msg.paths.filter((entry): entry is string => typeof entry === "string") : undefined,
+              branch: typeof msg.branch === "string" ? msg.branch : undefined,
+              path: typeof msg.path === "string" ? msg.path : undefined,
+            },
+            status.snapshot,
+          );
+          if (!plan.ok) {
+            fail(plan.reason, undefined, status.snapshot);
+            break;
+          }
+          this.host.appendLine(`[git] ${plan.display.split("\n").join(" ; ")}`);
+          const outcome = await runGitPlan(root, plan);
+          const after = await readGitStatus(root);
+          const snapshot = after.ok ? after.snapshot : undefined;
+          if (!outcome.ok) {
+            fail(describeGitFailure(op, outcome.stderr, plan.steps[outcome.failedStep]?.args[0]) || "That git command failed.", outcome.stderr, snapshot);
+            break;
+          }
+          if (!snapshot) {
+            // The command succeeded and the follow-up read did not. Saying so
+            // beats reporting a failure that did not happen.
+            fail("The command ran, but the status could not be read afterwards. Reopen Changes to see where things stand.");
+            break;
+          }
+          reply({ type: "gitRunResult", ...correlation, cwd: msg.cwd, op, ok: true, snapshot });
+        } finally {
+          this.gitRunGate.release(root);
+        }
+        break;
+      }
       case "voiceStart":
         await this.handleVoiceStart(session);
         break;
@@ -12095,6 +13099,64 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
     }
 
+  }
+
+  private startTurnDiffBaseline(session: Session, turn: object): void {
+    const root = this.sessionCwd(session);
+    const turnId = randomUUID();
+    const baseline: { root: string } & Partial<GitTurnBaseline> = { root };
+    this.turnDiffBaselines.set(turnId, baseline);
+    // Bound both completed and pending turns. Eviction must never resurrect on completion.
+    if (this.turnDiffBaselines.size > 100) {
+      this.turnDiffBaselines.delete(this.turnDiffBaselines.keys().next().value!);
+    }
+    this.emit(session, { type: "turnDiffBaseline", turnId, cwd: root });
+    // Skip a busy repo rather than queue a snapshot of a later working tree.
+    if (!this.gitRunGate.tryAcquire(root)) return;
+    const gen = session.gen;
+    this.pendingTurnDiffCaptures.add(turn);
+    void captureGitTurnBaseline(root).then((captured) => {
+      if (session.gen === gen && session.turnToken === turn
+        && this.pendingTurnDiffCaptures.has(turn) && this.turnDiffBaselines.get(turnId) === baseline) {
+        baseline.sha = captured?.sha;
+        baseline.untracked = captured?.untracked;
+      }
+    }).catch(() => {
+      // Capture is best effort; an unavailable baseline keeps the tool-row path.
+    }).finally(() => {
+      this.pendingTurnDiffCaptures.delete(turn);
+      this.gitRunGate.release(root);
+    });
+  }
+
+  /**
+   * Which repository a Changes request is allowed to touch.
+   *
+   * Deliberately the SAME fence as the file browse rather than a second root
+   * concept: one place decides what a remote may reach, and a git read is not
+   * a weaker claim than a file read. A local webview resolves to the workspace
+   * root; a remote resolves to its own tab's selected repository, checked
+   * against the live catalog.
+   */
+  private resolveGitRoot(
+    claimedCwd: string,
+    origin: MsgOrigin,
+    clientId?: string,
+  ): { ok: true; root: string } | { ok: false; reason: string } {
+    const selectedCwd = origin === "remote" && clientId ? this.remoteClients.cwd(clientId) : this.workspaceRoot();
+    const resolved = resolveRemoteFileRoot({
+      origin,
+      claimedCwd,
+      selectedCwd,
+      workspaceRoot: this.workspaceRoot(),
+      isKnownCwd: (cwd) => (origin === "remote" ? this.remoteTargetableCwd(cwd) : pathsEqual(cwd, this.workspaceRoot())),
+      sameCwd: pathsEqual,
+    });
+    if (!resolved.ok) {
+      this.host.appendLine(`[git] request rejected: ${resolved.reason}`);
+      return { ok: false, reason: resolved.reason };
+    }
+    return { ok: true, root: resolved.root };
   }
 
   /**
@@ -12143,20 +13205,35 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const store = this.connectedConnectorStore();
     return {
       type: "mcpConnectors",
+      remoteConnect: true,
       connectors: connectorViews(store, {
         connectingId: this.mcpConnectingId,
         errorId: this.mcpConnectError?.id,
         error: this.mcpConnectError?.message,
         keySet: new Set((this.mcpConnectorKeys ?? new Map()).keys()),
         lapsed: this.lapsedOAuthConnectors(store),
+        unavailable: connectorsWithUnavailableServer({ store }),
       }),
     };
+  }
+
+  private mcpConnectorAuthorizationMessage(): Extract<HostMsg, { type: "mcpConnectorAuthorization" }> | undefined {
+    const pending = this.mcpRemoteAuthorization;
+    return pending?.url ? {
+      type: "mcpConnectorAuthorization", id: pending.id, attemptId: pending.attemptId,
+      status: pending.status, url: pending.url,
+    } : undefined;
   }
 
   private postMcpConnectors(): void {
     const message = this.mcpConnectorsMessage();
     this.post(message);
     void this.settingsEditor?.webview.postMessage(message);
+    const authorization = this.mcpConnectorAuthorizationMessage();
+    if (authorization) {
+      this.post(authorization);
+      void this.settingsEditor?.webview.postMessage(authorization);
+    }
     // Same reasoning as postRoutines: the connector count feeds the tip pool and
     // has just changed. This is also the initial-state call site, so a fresh
     // webview gets its first tip frame here without a separate trigger.
@@ -12227,7 +13304,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return mergeReserved(...parts);
   }
 
-  private async hostMcpServersFor(session: Session) {
+  private async hostMcpServersFor(session: Session, onDispose: (dispose: () => void) => void) {
     // Shared record is refreshSync'd from disk; the PAT cache is not. Re-read
     // this host's own HostSecrets, then take the disk-fresh record. The
     // secret does not travel.
@@ -12237,13 +13314,33 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     for (const [id, token] of this.mcpConnectorKeys ?? []) {
       if (store[id]) keyAuth[id] = token;
     }
-    return hostMcpServers(
+    const servers = hostMcpServers(
       store,
       this.reservedMcpIdentityFor(session),
       persistConnectorOAuthClientMetadata(store),
       keyAuth,
       this.lapsedOAuthConnectors(store),
+      connectorsWithUnavailableServer({ store }),
     );
+    const files: { dispose: () => void }[] = [];
+    try {
+      for (const server of servers) {
+        const connector = connectorById(server.name);
+        if (!connector || isKeyConnector(connector)) continue;
+        const client = ownedMcpOAuthClient(store[connector.id].endpoint, this.relayUrl());
+        if (!client) continue;
+        const file = writeOAuthClientInfoFile(client);
+        files.push(file);
+        server.args.push(STATIC_OAUTH_CLIENT_INFO_FLAG, `@${file.path}`);
+      }
+      // Adapters may start/restart proxies after session/new has returned. Keep
+      // private files until their owning CLI exits, then remove every one.
+      if (files.length) onDispose(() => files.forEach((file) => file.dispose()));
+      return servers;
+    } catch (error) {
+      files.forEach((file) => file.dispose());
+      throw error;
+    }
   }
 
   /**
@@ -12283,14 +13380,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private async connectMcpConnector(
     id: string,
-    opts: { key?: string; readOnly?: boolean } = {},
+    opts: { key?: string; readOnly?: boolean; remote?: boolean } = {},
   ): Promise<void> {
     if (!isConnectorId(id)) return;
     if (this.mcpConnectingId) {
       this.mcpConnectError = {
         id,
+        // Actionable now that the pending link rides the connectors snapshot:
+        // whichever tab is asking has just been re-sent the sign-in it wants.
         message: this.mcpConnectingId === id
-          ? "Sign-in is already in progress. Finish the browser prompt, or wait for it to time out."
+          ? "Sign-in is already in progress. Finish it with the link above, or wait for it to time out."
           : `Already connecting ${this.mcpConnectingId}. Wait for that to finish.`,
       };
       this.postMcpConnectors();
@@ -12304,25 +13403,54 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       await this.connectKeyMcpConnector(connector, endpoint, opts);
       return;
     }
+    const retry = connectorsWithUnavailableServer({ store }).has(id)
+      && !this.lapsedOAuthConnectors(store).has(id);
+    // Remote Connect reserves a sign-in tab. Re-send the unavailable row before
+    // entering Connecting so Settings closes that placeholder; no OAuth follows.
+    if (retry && opts.remote) this.postMcpConnectors();
     this.mcpConnectingId = id;
     this.mcpConnectError = undefined;
-    this.postMcpConnectors();
     const npx = npxSpawnPlan(process.platform);
     let metadata: { path: string; dispose: () => void } | undefined;
+    let clientInfo: { path: string; dispose: () => void } | undefined;
+    const pending: NonNullable<GrokSidebar["mcpRemoteAuthorization"]> = { id, attemptId: randomUUID(), status: "waiting" };
+    this.mcpRemoteAuthorization = pending;
+    this.postMcpConnectors();
     try {
+      // A saved connector with an unavailable server needs a connection retry,
+      // not another consent flow. The headless probe cannot open a host browser.
+      const client = retry ? ownedMcpOAuthClient(endpoint, this.relayUrl()) : await authorizeMcpConnectorOAuth({
+        connector, endpoint, relayUrl: this.relayUrl(),
+        env: npx.env,
+        onAuthorization: async (url) => {
+          if (this.mcpRemoteAuthorization !== pending) return;
+          pending.url = url;
+          this.postMcpConnectors();
+          if (!opts.remote) await this.host.openExternal(url);
+        },
+      });
+      if (client) clientInfo = writeOAuthClientInfoFile(client);
       if (connector.oauthScope?.trim()) {
         metadata = writeOAuthClientMetadataFile(connector.oauthScope.trim());
       }
       const result = await authorizeMcpRemote({
         spawn,
         command: npx.command,
-        args: mcpRemoteArgs(endpoint, undefined, metadata?.path),
+        args: mcpRemoteArgs(endpoint, undefined, metadata?.path, undefined, clientInfo?.path),
         shell: npx.shell,
         env: npx.env,
+        headless: true,
       });
-      if (this.mcpConnectingId !== id) return;
+      if (this.mcpConnectingId !== id || this.mcpRemoteAuthorization !== pending) return;
+      recordMcpRemoteOutcome(endpoint, result);
       if (!result.ok) {
-        this.mcpConnectError = { id, message: result.message };
+        if (result.kind === "port-conflict" && store[id]) return;
+        // Let the fresh marker own this row so another host's successful retry
+        // clears it here too, instead of leaving an in-memory error behind.
+        if (result.kind === "server-unavailable" && connectorsWithUnavailableServer({ store }).has(id)) return;
+        this.mcpConnectError = { id, message: retry && result.kind === "timeout"
+          ? "The connection check timed out. The connector is still enabled for new conversations."
+          : result.message };
         return;
       }
       // Re-read rather than writing the pre-await snapshot. The browser flow
@@ -12336,11 +13464,22 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       );
       this.mcpConnectError = undefined;
     } catch (error) {
+      if (this.mcpRemoteAuthorization !== pending) return;
+      recordMcpRemoteOutcome(endpoint, undefined);
       this.mcpConnectError = { id, message: (error as Error).message || "Could not connect." };
     } finally {
       try { metadata?.dispose(); } catch { /* best-effort */ }
-      if (this.mcpConnectingId === id) this.mcpConnectingId = undefined;
-      this.postMcpConnectors();
+      clientInfo?.dispose();
+      if (this.mcpRemoteAuthorization === pending) {
+        this.mcpRemoteAuthorization = undefined;
+        const finished = {
+          type: "mcpConnectorAuthorization", id, attemptId: pending.attemptId, status: "finished",
+        } as const;
+        this.post(finished);
+        void this.settingsEditor?.webview.postMessage(finished);
+        if (this.mcpConnectingId === id) this.mcpConnectingId = undefined;
+        this.postMcpConnectors();
+      }
     }
   }
 
@@ -12358,7 +13497,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     const token = incoming || this.mcpConnectorKeys.get(id) || "";
     const store = this.connectedConnectorStore();
-    if (typeof opts.readOnly === "boolean" && !incoming && store[id] && this.mcpConnectorKeys.has(id)) {
+    const retry = connectorsWithUnavailableServer({ store }).has(id);
+    if (typeof opts.readOnly === "boolean" && !incoming && store[id] && this.mcpConnectorKeys.has(id)
+      && !retry) {
       await this.state.update(
         MCP_CONNECTORS_KEY,
         connectConnector(store, id, endpoint, opts.readOnly),
@@ -12389,8 +13530,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         auth: "key",
       });
       if (this.mcpConnectingId !== id) return;
+      recordMcpRemoteOutcome(endpoint, result);
       if (!result.ok) {
-        this.mcpConnectError = { id, message: result.message };
+        if (result.kind === "port-conflict" && store[id]) return;
+        if (result.kind === "server-unavailable" && connectorsWithUnavailableServer({ store }).has(id)) return;
+        this.mcpConnectError = { id, message: retry && result.kind === "timeout"
+          ? "The connection check timed out. The connector is still enabled for new conversations."
+          : result.message };
         return;
       }
       const header = bearerAuthorizationHeader(token);
@@ -12405,8 +13551,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         connectConnector(this.connectedConnectorStore(), id, endpoint, readOnly),
       );
       this.mcpConnectError = undefined;
-    } catch (error) {
-      this.mcpConnectError = { id, message: (error as Error).message || "Could not connect." };
+    } catch {
+      recordMcpRemoteOutcome(endpoint, undefined);
+      // Secret-store errors are not a response channel for credential values.
+      this.mcpConnectError = { id, message: "Could not save this connector's key. Try connecting again." };
     } finally {
       if (this.mcpConnectingId === id) this.mcpConnectingId = undefined;
       this.postMcpConnectors();
@@ -12629,7 +13777,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private postSessionsListNow(opts?: SessionsListOptions): void {
     const localCwd = this.historyCwdFor("local");
-    const local = this.buildSessionsList(localCwd, opts, undefined, "local");
+    const local = this.buildSessionsList(localCwd, opts, undefined);
     this.postLocal(local);
     this.postSessionName(this.focused);
     if (opts) return;
@@ -12659,11 +13807,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     cwd: string,
     opts?: SessionsListOptions,
     activeId: string | null | undefined = this.focused.activeSessionId,
-    scope: "local" | "remote" = "remote",
   ): Extract<HostMsg, { type: "sessions" }> {
     const offset = Math.max(0, opts?.offset ?? 0);
-    const authorized =
-      scope === "remote" ? this.remoteAuthorizedSessionCwds() : this.authorizedSessionCwds();
+    const authorized = this.authorizedSessionCwds();
     const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
     if (!listCwd) {
       return {
@@ -12686,7 +13832,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // listing is disk/buffer-truth and must not wait for a located grok binary.
     // Adapter rows come from session/list, so they legitimately require that CLI.
     if (!adapterProviders.length) {
-      return this.buildGrokSessionsList(cwd, opts, activeId, scope);
+      return this.buildGrokSessionsList(cwd, opts, activeId);
     }
 
     const query = opts?.query ?? "";
@@ -12694,7 +13840,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const providerCursor = opts?.providerCursor ?? { grokOffset: offset };
     const grok = this.buildGrokSessionsList(cwd, query
           ? { offset: 0, limit: Number.MAX_SAFE_INTEGER, query }
-          : { offset: providerCursor.grokOffset, limit, query }, activeId, scope);
+          : { offset: providerCursor.grokOffset, limit, query }, activeId);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const adapter: SessionListEntry[] = [];
     if (providers.includes("codex")) adapter.push(...(this.codexSessionCache.get(projectProviderKey(cwd)) ?? []));
@@ -12742,6 +13888,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private scheduleAdapterHistoryRefresh(provider: AcpProvider, cwd: string): void {
+    if (this.providerCliUpdate?.provider === provider) return;
     if (!isAdapterProvider(provider) || !this.connectedProviders().includes(provider)) return;
     const history = this.adapterHistory(provider);
     if (!history) return;
@@ -12767,6 +13914,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private async refreshAdapterHistory(provider: AcpProvider, cwd: string, key = projectProviderKey(cwd)): Promise<void> {
+    if (this.providerCliUpdate?.provider === provider) return;
     if (!isAdapterProvider(provider)) return;
     const history = this.adapterHistory(provider);
     const cliPath = this.locateProvider(provider);
@@ -12798,7 +13946,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         };
       }
       const entries = result.sessions.map((entry) => adapterListEntry(entry, stableOverrides, provider));
-      this.setProviderNeedsLogin(provider, false);
+      // Same reasoning as startSession's: listing sessions reads this machine's
+      // own files and succeeds with any token at all. On the owner's host a
+      // phone reconnect swept four project folders at 10:05:40, spawning an
+      // adapter per folder, and each success wiped the needs-login the failing
+      // conversation had just raised. The catch below still LOWERS the verdict
+      // from a listing -- a listing that fails with a credential error is real
+      // evidence -- but a listing that succeeds is evidence of nothing.
+      // (Kept on the grok/probe paths, which make a call the account must
+      // authorize; this one does not.)
       history.cache.set(key, entries);
       history.at.set(key, Date.now());
       await this.updateSessionMeta((current) => {
@@ -12835,19 +13991,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     cwd: string,
     opts?: GrokSessionsListOptions,
     activeId: string | null | undefined = this.focused.activeSessionId,
-    /** Whose list this is. Remote gets the narrower set — see
-     *  {@link remoteAuthorizedSessionCwds}. Defaults to the stricter answer so a
-     *  new caller that forgets to say is wrong in the safe direction. */
-    scope: "local" | "remote" = "remote",
   ): GrokSessionsListMessage {
     const offset = Math.max(0, opts?.offset ?? 0);
     const limit = opts?.limit ?? SESSION_PAGE_SIZE;
     const query = (opts?.query ?? "").trim().toLowerCase();
-    // Authorization at the point of build: stale per-tab / selected cwd must not
-    // scan a closed project's session catalog (round 12), and a remote must not
-    // list an archived one at all.
-    const authorized =
-      scope === "remote" ? this.remoteAuthorizedSessionCwds() : this.authorizedSessionCwds();
+    // Stale per-tab / selected cwds must not scan a closed project's catalog.
+    const authorized = this.authorizedSessionCwds();
     const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
     if (!listCwd) {
       return {
@@ -13378,9 +14527,18 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private reportProtectedSession(origin: MsgOrigin, clientId: string | undefined, action: "delete" | "clear"): void {
+    // Name only surfaces that EXIST here. A cloud machine has no VS Code view
+    // and no second screen, so the desk wording sent the owner hunting for a
+    // window that could not be there; what actually held the conversation was
+    // another browser tab or his phone. Same guard, an address he can act on.
+    const cloud = isCloudEnvironment();
     const text = action === "delete"
-      ? "This conversation is open in another tab or the VS Code view. Close it there before deleting it."
-      : "Open conversations were kept. Close them in their tabs or the VS Code view before clearing them.";
+      ? (cloud
+        ? "This conversation is open in another browser tab or on your phone. Close it there before deleting it."
+        : "This conversation is open in another tab or the VS Code view. Close it there before deleting it.")
+      : (cloud
+        ? "Open conversations were kept. Close them in their other browser tabs or on your phone before clearing them."
+        : "Open conversations were kept. Close them in their tabs or the VS Code view before clearing them.");
     if (origin === "remote" && clientId) {
       this.sendRemoteClient(clientId, { type: "error", text });
     } else {
@@ -13533,7 +14691,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       cwd,
       { limit: Number.MAX_SAFE_INTEGER },
       undefined,
-      origin === "local" ? "local" : "remote",
     ).entries;
     if (isAdapterProvider(provider)) {
       // A FAILED DELETE MUST STILL REMOVE THE ROW.
@@ -14011,6 +15168,26 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return undefined;
   }
 
+  /** Deliberately separate from the xAI resolver used by summarizeSpeech. */
+  private resolveSttApiKey(cwd: string, backend: SttBackend): string | undefined {
+    if (backend === "xai") return this.resolveVoiceApiKey(cwd);
+    return resolveOpenAiVoiceKey({
+      setting: this.voiceSetting(cwd, "voiceOpenAiApiKey", ""),
+      env: { ...process.env, ...this.readDotEnv(cwd) },
+    });
+  }
+
+  private voiceBackendState(cwd: string, provider: AcpProvider): VoiceBackendState {
+    const raw = this.voiceSetting<string>(cwd, "voiceBackend", "auto");
+    const preference: SttPreference = raw === "xai" || raw === "openai" ? raw : "auto";
+    const state = { provider, preference, hasXai: !!this.resolveSttApiKey(cwd, "xai"), hasOpenAi: !!this.resolveSttApiKey(cwd, "openai") };
+    return { ...state, backend: pickSttBackend(state), backends: {
+      grok: pickSttBackend({ ...state, provider: "grok" }) ?? null,
+      codex: pickSttBackend({ ...state, provider: "codex" }) ?? null,
+      claude: pickSttBackend({ ...state, provider: "claude" }) ?? null,
+    } };
+  }
+
   /** Tell the webview whether a voice API key is resolvable, so the mic button
    *  can show a "needs setup" hint up front instead of only failing on click. */
   /** Chat-panel zoom factor (1.0 = 100%). Clamped to the declared 60–300% range. */
@@ -14069,28 +15246,74 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return this.state.getOrCreate(INSTALL_ID_KEY, randomUUID);
   }
 
-  /** Fire the single `session_start` telemetry event for the first real user
+  /** Build from cached state and defer the POST. All events share gates and the
+   *  process's one-hour inactivity session; neither build nor send may throw. */
+  private reportTelemetry(build: (sys: SystemProps, sessionId: string, timestamp: string) => AptabaseEvent): void {
+    try {
+      if (!shouldSendTelemetry(
+        this.host.isTelemetryEnabled,
+        this.host.getConfiguration("grok").get<boolean>("telemetry.enabled", true),
+        this.context.extensionId === OFFICIAL_EXTENSION_ID,
+      )) return;
+      const now = Date.now();
+      const next = nextTelemetrySession(telemetrySession, now, randomUUID);
+      const event = build({
+        appVersion: this.context.extensionVersion,
+        osName: osNameFromPlatform(process.platform),
+        osVersion: os.release(),
+        locale: this.host.language || "",
+        isDebug: !this.context.isProduction,
+      }, next.id, new Date(now).toISOString());
+      setImmediate(() => {
+        try { postEvent(APTABASE_APP_KEY_PROD, event); } catch { /* Silent. */ }
+      });
+      telemetrySession = next;
+    } catch {
+      // Silent — a telemetry failure must never surface to or affect the user.
+    }
+  }
+
+  private reportRemotePortalOpened(withHint: boolean): void {
+    this.reportTelemetry((sys, sessionId, timestamp) => buildRemotePortalOpenedEvent({
+      installId: this.installId(),
+      hostKind: sessionStartHostKind(this.host.canSwitchWorkspaceFolder, isCloudEnvironment()),
+      withHint,
+    }, sys, sessionId, timestamp));
+  }
+
+  private reportRemoteMessage(session: Session, origin: MsgOrigin): void {
+    if (origin !== "remote" || session.remoteMessageReported) return;
+    // Latch even when opted out or a send fails: never retry/backfill a message.
+    session.remoteMessageReported = true;
+    this.reportTelemetry((sys, sessionId, timestamp) => {
+      const remoteClientId = this.remoteClients.clientsForActiveValue(session)[0];
+      const preferences = remoteClientId ? this.remoteClients.metadata(remoteClientId) : undefined;
+      return buildSessionRemoteStartedEvent({
+        installId: this.installId(),
+        hostKind: sessionStartHostKind(this.host.canSwitchWorkspaceFolder, isCloudEnvironment()),
+        clientDevice: sessionStartSurface("remote", preferences?.usesTouch).clientDevice,
+        sessionOrigin: session.telemetrySessionOrigin,
+        provider: session.provider,
+      }, sys, sessionId, timestamp);
+    });
+  }
+
+  /** Fire the `session_start` telemetry event for the first real user
    *  message of `session` (callers gate on isFirstSend, so empty sessions
    *  never reach here). Respects VS Code's global telemetry setting + our own
    *  `grok.telemetry.enabled`; fully fire-and-forget. Must not rediscover
    *  providers or resolve credentials — those flags come from the last
    *  providerState / voiceConfigured refresh. */
   private reportSessionStart(session: Session, origin: MsgOrigin): void {
+    session.telemetrySessionOrigin ??= origin;
     // Telemetry must NEVER affect the user's turn. Build the event synchronously
     // from already-cached session + settings + the last connection/voice snapshot
     // (so it captures THIS session's mode/model/effort — focus could move during
     // the turn's awaits), then fire it asynchronously off the send path and
     // swallow any error silently. The PROD project always (dev host / local
     // installs included — only the probe script uses DEV).
-    try {
-      const enabled = shouldSendTelemetry(
-        this.host.isTelemetryEnabled,
-        this.host.getConfiguration("grok").get<boolean>("telemetry.enabled", true),
-        this.context.extensionId === OFFICIAL_EXTENSION_ID,
-      );
-      if (!enabled) return;
+    this.reportTelemetry((sys, sessionId, timestamp) => {
       const cfg = this.host.getConfiguration("grok");
-      const appVersion = this.context.extensionVersion;
       const remoteClientId = origin === "remote"
         ? this.remoteClients.clientsForActiveValue(session)[0]
         : undefined;
@@ -14106,12 +15329,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // through to installId(), and only once ever.
       const existingInstallId = this.state.get<string>(INSTALL_ID_KEY);
       const returningInstall = existingInstallId !== undefined;
-      const event = buildSessionStartEvent(
+      return buildSessionStartEvent(
         {
           installId: existingInstallId ?? this.installId(),
           mode: this.displayMode(session),
           model: session.client?.currentModelId || cfg.get<string>("defaultModel", "") || "",
-          effort: session.client?.currentReasoningEffort || cfg.get<string>("defaultEffort", "") || "",
+          effort: session.client?.currentReasoningEffort || this.defaultEffortForProvider(session.provider),
           // Feature flags + host kind + connection snapshot. Config/enum values
           // only — the same class of anonymous property as mode/model/effort,
           // never content, paths, or free text. The builder allowlists every key.
@@ -14125,7 +15348,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           remoteReadRepliesAloud: remotePreferences?.readRepliesAloud,
           ...sessionStartSurface(origin, remotePreferences?.usesTouch),
           host: this.host.appName || undefined,
-          hostKind: sessionStartHostKind(this.host.canSwitchWorkspaceFolder),
+          hostKind: sessionStartHostKind(this.host.canSwitchWorkspaceFolder, isCloudEnvironment()),
           appPurpose: this.appPurpose(),
           voiceConfigured: this.lastVoiceConfiguredByCwd.get(normalizeRepoPath(cwd)),
           voiceStreaming: cfg.get<boolean>("voiceStreaming", true),
@@ -14138,33 +15361,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           worktree: !!session.worktree,
           returningInstall: returningInstall,
         },
-        {
-          appVersion,
-          osName: osNameFromPlatform(process.platform),
-          osVersion: os.release(),
-          locale: this.host.language || "",
-          isDebug: !this.context.isProduction,
-        },
-        randomUUID(),
-        new Date().toISOString(),
+        sys,
+        sessionId,
+        timestamp,
       );
-      // Off the send path entirely; postEvent is itself non-blocking + self-guarding.
-      setImmediate(() => postEvent(APTABASE_APP_KEY_PROD, event));
-    } catch {
-      // Silent — a telemetry failure must never surface to or affect the user.
-    }
+    });
   }
 
   private rememberVoiceConfigured(cwd: string, value: boolean): void {
     this.lastVoiceConfiguredByCwd.set(normalizeRepoPath(cwd), value);
   }
 
-  private voiceConfiguredMsg(cwd: string, value: boolean): Extract<HostMsg, { type: "voiceConfigured" }> {
+  private voiceConfiguredMsg(cwd: string, value: boolean, provider: AcpProvider = this.focused.provider): Extract<HostMsg, { type: "voiceConfigured" }> {
     return {
       type: "voiceConfigured",
       value,
       sendPhrase: this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE),
       keyterms: sanitizeVoiceKeyterms(this.voiceSetting(cwd, "voiceKeyterms", [])),
+      backendState: this.voiceBackendState(cwd, provider),
     };
   }
 
@@ -14199,14 +15413,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private postVoiceConfigured(): void {
     const cwd = this.sessionCwd(this.focused);
-    const configured = !!this.resolveVoiceApiKey(cwd);
-    const localMsg = this.voiceConfiguredMsg(cwd, configured);
+    const configured = !!this.voiceBackendState(cwd, this.focused.provider).backend;
+    const localMsg = this.voiceConfiguredMsg(cwd, configured, this.focused.provider);
     // Refresh = rebuild: only the cwds this pass actually resolved stay in the
     // map. Point-writes between refreshes (voice-start failure paths) are
     // fresh by definition; accumulation is what made stale `true` immortal.
     this.lastVoiceConfiguredByCwd.clear();
     this.rememberVoiceConfigured(cwd, configured);
-    this.deliverVoiceConfigured("local", localMsg, () => this.postLocal(localMsg));
+    this.deliverVoiceConfigured("local", localMsg, () => {
+      this.postLocal(localMsg);
+      void this.settingsEditor?.webview.postMessage(localMsg);
+    });
     for (const clientId of this.remoteClients.clients()) {
       // Scope = the project whose config we resolved. Classification is "scope"
       // so a closed/re-homed tab cannot receive the prior project's prefs.
@@ -14221,9 +15438,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         ? this.sessionCwd(active)
         : this.remoteClients.cwdIfPresent(clientId);
       if (!remoteCwd) continue;
-      const remoteConfigured = !!this.resolveVoiceApiKey(remoteCwd);
+      const provider = active?.provider ?? this.defaultProviderForProject(remoteCwd);
+      const remoteConfigured = !!this.voiceBackendState(remoteCwd, provider).backend;
       this.rememberVoiceConfigured(remoteCwd, remoteConfigured);
-      const remoteMsg = this.voiceConfiguredMsg(remoteCwd, remoteConfigured);
+      const remoteMsg = this.voiceConfiguredMsg(remoteCwd, remoteConfigured, provider);
       this.deliverVoiceConfigured(`remote:${clientId}`, remoteMsg, () => {
         this.sendRemoteClient(clientId, remoteMsg, remoteCwd);
       });
@@ -14267,25 +15485,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   /** Show actionable guidance for setting up the voice API key. */
   private async promptVoiceKeySetup(): Promise<void> {
-    if (!this.connectedProviders().includes("grok")) {
-      const pick = await this.host.showInformationMessage(
-        "Voice needs Grok connected. It uses the same xAI account for speech-to-text.",
-        "Connect Grok",
-      );
-      if (pick === "Connect Grok") {
-        if (this.host.canOpenSettingsEditor) await this.openSettingsEditor("providers");
-      }
-      return;
-    }
-    const pick = await this.host.showErrorMessage(
-      "Voice control needs an xAI Speech-to-Text key. Sign in with `grok login` and it reuses that token automatically — or set grok.voiceApiKey, or GROK_VOICE_API_KEY / XAI_API_KEY in your workspace .env for a dedicated console.x.ai key.",
+    const pick = await this.host.showInformationMessage(
+      "Voice needs a credential for the selected backend. Set an OpenAI API key (grok.voiceOpenAiApiKey / OPENAI_API_KEY), or use an xAI key / Grok sign-in. Codex and ChatGPT sign-in do not include transcription API access.",
       "Open Settings",
       "Get a Key",
     );
     if (pick === "Open Settings") {
-      await this.host.openSettings("grok.voiceApiKey");
+      if (this.host.canOpenSettingsEditor) await this.openSettingsEditor("voice");
+      else await this.host.openSettings("grok.voice");
     } else if (pick === "Get a Key") {
-      await this.host.openExternal("https://console.x.ai");
+      await this.host.openExternal("https://platform.openai.com/api-keys");
     }
   }
 
@@ -14352,11 +15561,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private async handleVoiceStart(session: Session = this.focused): Promise<void> {
-    const generation = ++this.voiceGeneration;
     const cwd = this.sessionCwd(session);
     const credentialCwd = this.sessionCwd(session);
-    const key = this.resolveVoiceApiKey(credentialCwd);
-    if (!key) {
+    const backend = this.voiceBackendState(credentialCwd, session.provider).backend;
+    const key = backend && this.resolveSttApiKey(credentialCwd, backend);
+    if (!key || !backend) {
       void this.promptVoiceKeySetup();
       this.postLocal({ type: "voiceError" });
       return;
@@ -14365,6 +15574,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.rejectVoiceStart();
       return;
     }
+    const generation = ++this.voiceGeneration;
     this.localVoiceCredentialCwd = credentialCwd;
     const cfg = this.host.getConfiguration("grok");
     // Resolve before spawning. A stripped GUI PATH, a Cellar directory pasted
@@ -14389,12 +15599,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const device = cfg.get<string>("voiceInputDevice", "") || undefined;
 
     // Streaming (default): live transcription over the STT WebSocket, so "grok
-    // send" can submit hands-free without a stop-click. Batch is the fallback.
+    // send" can submit hands-free without a stop-click. Batch is opt-in.
     if (cfg.get<boolean>("voiceStreaming", true)) {
-      await this.startVoiceStream(key, ffmpegPath, device, cwd, generation);
+      await this.startVoiceStream(key, ffmpegPath, device, cwd, generation, backend);
       return;
     }
 
+    this.voiceBatchCtx = { backend, key };
     const tmp = path.join(os.tmpdir(), `grok-voice-${Date.now()}.wav`);
     try {
       await this.voiceRecorder.start({ ffmpegPath, outputPath: tmp, device, log: (m) => this.host.appendLine(m) });
@@ -14437,6 +15648,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     device: string | undefined,
     cwd: string,
     generation: number,
+    backend: SttBackend,
   ): Promise<void> {
     const phrase = this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE);
     const keyterms = buildSttKeyterms(
@@ -14450,7 +15662,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       try { resolved = await resolveWindowsAudioDevice(ffmpegPath, (m) => this.host.appendLine(m)); } catch { /* streamer surfaces it */ }
     }
     if (generation !== this.voiceGeneration) return;
-    this.voiceStreamCtx = { key, ffmpegPath, device: resolved, phrase, keyterms, language, generation };
+    const model = this.voiceSetting(cwd, "voiceOpenAiModel", OPENAI_STT_MODEL);
+    this.voiceStreamCtx = { key, backend, model, ffmpegPath, device: resolved, phrase, keyterms, language, generation };
     this.voiceFinalizing = false;
     await this.openVoiceStream();
   }
@@ -14465,7 +15678,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // reusing a possibly-stale cached one (Codex #7). Keep the old key if the
     // fresh read comes back empty — it'll 401 with the source-aware guidance.
     const cwd = this.localVoiceCredentialCwd ?? this.workspaceRoot();
-    const fresh = this.resolveVoiceApiKey(cwd);
+    const fresh = this.resolveSttApiKey(cwd, ctx.backend);
     if (fresh) ctx.key = fresh;
     const streamer = new VoiceStreamer();
     this.voiceStreamer = streamer;
@@ -14493,7 +15706,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (!this.voiceFinalizing) {
         if (/\b(401|403)\b|rejected/i.test(e.message)) {
           void this.host.showErrorMessage(e.message, "Open Settings").then((pick) => {
-            if (pick === "Open Settings") void this.host.openSettings("grok.voiceApiKey");
+            if (pick === "Open Settings") void this.host.openSettings(ctx.backend === "openai" ? "grok.voiceOpenAiApiKey" : "grok.voiceApiKey");
           });
         } else {
           this.host.showErrorMessage(`Voice transcription failed: ${e.message}`);
@@ -14511,6 +15724,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       await streamer.start({
         ffmpegPath: ctx.ffmpegPath,
         apiKey: ctx.key,
+        backend: ctx.backend,
+        model: ctx.model,
         device: ctx.device,
         keyterms: ctx.keyterms,
         language: ctx.language,
@@ -14534,7 +15749,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // (re-login or set a dedicated key); offer the settings shortcut.
         const pick = await this.host.showErrorMessage(msg, "Open Settings");
         if (pick === "Open Settings") {
-          await this.host.openSettings("grok.voiceApiKey");
+          await this.host.openSettings(ctx.backend === "openai" ? "grok.voiceOpenAiApiKey" : "grok.voiceApiKey");
         }
       } else {
         this.host.showErrorMessage(msg);
@@ -14566,18 +15781,26 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.voiceFinalizing = true;
     const streamer = this.voiceStreamer;
     this.voiceStreamer = undefined;
+    const ctx = this.voiceStreamCtx;
     this.voiceStreamCtx = undefined;
     if (!streamer) { this.voiceFinalizing = false; return; }
+    this.voiceStoppingStreamer = streamer;
     this.postLocal({ type: "voiceState", status: "transcribing" });
     let finalText = "";
-    try { finalText = await streamer.stop(); } catch { finalText = streamer.transcript; }
+    let completed = true;
+    try { finalText = await streamer.stop(); } catch (err) {
+      completed = false;
+      finalText = streamer.transcript;
+      if (generation === this.voiceGeneration) void this.host.showErrorMessage((err as Error).message);
+    }
+    if (this.voiceStoppingStreamer === streamer) this.voiceStoppingStreamer = undefined;
     if (generation !== this.voiceGeneration) {
       this.voiceFinalizing = false;
       return;
     }
     const cwd = this.localVoiceCredentialCwd ?? this.workspaceRoot();
-    const phrase = this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE);
-    const { text, send } = parseVoiceCommand(finalText, phrase);
+    const phrase = ctx?.phrase ?? this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE);
+    const { text, send } = parseFinalVoiceCommand(finalText, completed ? streamer.finalizedTranscript : "", phrase);
     this.voiceFinalizing = false;
     this.releaseVoice(this.localVoiceCwd);
     this.localVoiceCwd = undefined;
@@ -14594,6 +15817,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private stopVoiceInput(session?: Session): void {
     if (!session || session === this.focused) {
       const wasActive =
+        !!this.localVoiceCwd ||
         !!this.voiceStreamer ||
         !!this.voiceStreamCtx ||
         this.voiceRecorder.active ||
@@ -14601,12 +15825,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         !!this.voiceTempPath;
       this.voiceGeneration += 1;
       this.voiceStreamer?.cancel();
+      this.voiceStoppingStreamer?.cancel();
+      this.voiceStoppingStreamer = undefined;
       this.voiceStreamer = undefined;
       this.voiceStreamCtx = undefined;
       this.voiceFinalizing = false;
       this.voiceRecorder.cancel();
       try { if (this.voiceTempPath) fs.unlinkSync(this.voiceTempPath); } catch { /* best effort */ }
       this.voiceTempPath = undefined;
+      this.voiceBatchCtx = undefined;
       this.releaseVoice(this.localVoiceCwd);
       this.localVoiceCwd = undefined;
       this.localVoiceCredentialCwd = undefined;
@@ -14621,7 +15848,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
   }
 
-  /** Stop recording, transcribe via xAI STT, and send the text to the composer. */
+  /** Stop recording, transcribe with the pinned backend, and fill the composer. */
   private async handleVoiceStop(): Promise<void> {
     const generation = this.voiceGeneration;
     // Streaming path: finalize the live stream.
@@ -14630,11 +15857,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       return;
     }
     if (!this.voiceRecorder.active) {
+      if (this.localVoiceCwd) this.stopVoiceInput();
       this.postLocal({ type: "voiceError" });
       return;
     }
     const cwd = this.localVoiceCredentialCwd ?? this.workspaceRoot();
-    const key = this.resolveVoiceApiKey(cwd);
+    const batch = this.voiceBatchCtx;
+    const key = batch && (this.resolveSttApiKey(cwd, batch.backend) || batch.key);
     if (!key) {
       this.voiceRecorder.cancel();
       this.releaseVoice(this.localVoiceCwd);
@@ -14663,7 +15892,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const tempPath = this.voiceTempPath;
     this.postLocal({ type: "voiceState", status: "transcribing" });
     try {
-      const raw = await transcribeAudio(wavPath, key, (m) => this.host.appendLine(m));
+      const raw = await transcribeAudio(wavPath, key, (m) => this.host.appendLine(m), batch?.backend);
       if (generation !== this.voiceGeneration) return;
       // Strip a trailing "grok send" (configurable) so dictation can submit
       // hands-free. The webview inserts `text` and, if `send`, fires the send.
@@ -14683,9 +15912,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     } finally {
       try { if (tempPath) fs.unlinkSync(tempPath); } catch { /* best effort */ }
       if (this.voiceTempPath === tempPath) this.voiceTempPath = undefined;
-      this.releaseVoice(this.localVoiceCwd);
-      this.localVoiceCwd = undefined;
-      this.localVoiceCredentialCwd = undefined;
+      if (this.voiceBatchCtx === batch) {
+        this.voiceBatchCtx = undefined;
+        this.releaseVoice(this.localVoiceCwd);
+        this.localVoiceCwd = undefined;
+        this.localVoiceCredentialCwd = undefined;
+      }
     }
   }
 
@@ -14693,9 +15925,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     clientId: string,
     entry: RemoteVoiceEntry,
   ): Promise<void> {
-    const key = this.resolveVoiceApiKey(entry.credentialCwd);
-    if (!key) throw new Error("Voice control needs an xAI Speech-to-Text key on the host.");
-    const streamer = new PcmVoiceStreamer();
+    const key = this.resolveSttApiKey(entry.credentialCwd, entry.backend) || entry.key;
+    entry.key = key;
+    const streamer = createPcmVoiceStreamer(entry.backend);
     entry.streamer = streamer;
     const current = () => this.remoteVoice.get(clientId) === entry && entry.streamer === streamer;
     streamer.on("partial", (ev: { text: string; speechFinal: boolean }) => {
@@ -14705,7 +15937,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         { type: "voicePartial", text: ev.text },
         entry.credentialCwd,
       );
-      if (ev.speechFinal && entry.phrase) {
+      if (!entry.finalizing && ev.speechFinal && entry.phrase) {
         const parsed = parseVoiceCommand(ev.text, entry.phrase);
         if (parsed.send) void this.commitRemoteVoice(clientId, parsed.text);
       }
@@ -14720,6 +15952,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     await streamer.start({
       apiKey: key,
+      model: entry.model,
       keyterms: entry.keyterms,
       language: entry.language,
       log: (m) => this.host.appendLine(`[remote] ${m}`),
@@ -14735,23 +15968,23 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         return;
       }
     }
-    this.sendRemoteClient(clientId, { type: "voiceState", status: "listening" });
+    if (!entry.finalizing) this.sendRemoteClient(clientId, { type: "voiceState", status: "listening" });
   }
 
   private async handleRemoteVoiceStart(clientId: string, session: Session): Promise<void> {
     const credentialCwd = this.sessionCwd(session);
-    if (!this.resolveVoiceApiKey(credentialCwd)) {
+    const backend = this.voiceBackendState(credentialCwd, session.provider).backend;
+    const key = backend && this.resolveSttApiKey(credentialCwd, backend);
+    if (!backend || !key) {
       this.rememberVoiceConfigured(credentialCwd, false);
-      const payload = this.voiceConfiguredMsg(credentialCwd, false);
+      const payload = this.voiceConfiguredMsg(credentialCwd, false, session.provider);
       this.deliverVoiceConfigured(`remote:${clientId}`, payload, () => {
         this.sendRemoteClient(clientId, payload, credentialCwd);
       });
       this.sendRemoteClient(clientId, { type: "voiceError" });
       this.sendRemoteClient(clientId, {
         type: "error",
-        text: this.connectedProviders().includes("grok")
-          ? "Voice control needs an xAI Speech-to-Text key on the host."
-          : "Voice needs Grok connected. It uses the same xAI account for speech-to-text.",
+        text: "Voice needs a credential for the selected backend on the host: an OpenAI API key, or an xAI key / Grok sign-in. Codex sign-in does not include transcription API access.",
       });
       return;
     }
@@ -14775,7 +16008,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     entry = {
       credentialCwd,
       session,
-      streamer: new PcmVoiceStreamer(),
+      streamer: createPcmVoiceStreamer(backend),
+      backend,
+      key,
+      model: this.voiceSetting(credentialCwd, "voiceOpenAiModel", OPENAI_STT_MODEL),
       ingress,
       phrase,
       keyterms,
@@ -14784,7 +16020,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     };
     this.remoteVoice.set(clientId, entry);
     try {
-      await this.startRemotePcm(clientId, entry);
+      await (entry.starting = this.startRemotePcm(clientId, entry));
     } catch (e) {
       if (this.remoteVoice.get(clientId) !== entry) return;
       this.failRemoteVoice(clientId, (e as Error).message);
@@ -14826,7 +16062,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       entry.credentialCwd,
     );
     try {
-      await this.startRemotePcm(clientId, entry);
+      await (entry.starting = this.startRemotePcm(clientId, entry));
     } catch (e) {
       if (this.remoteVoice.get(clientId) !== entry) return;
       this.failRemoteVoice(clientId, (e as Error).message);
@@ -14838,19 +16074,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // A cancelled stream can still emit an ended/error callback while its stop
     // promise is settling. Its entry identity is the generation guard; do not
     // turn that late completion into a new client-visible event.
-    if (!entry || entry.finalizing) return;
+    if (!entry) return;
+    if (cancel) { this.dropRemoteVoice(clientId); return; }
+    if (entry.finalizing) return;
     entry.finalizing = true;
-    entry.ingress.close();
-    this.sendRemoteClient(clientId, { type: "voiceState", status: cancel ? "idle" : "transcribing" });
+    this.sendRemoteClient(clientId, { type: "voiceState", status: "transcribing" });
     let transcript = "";
-    if (cancel) entry.streamer.cancel();
-    else {
-      try { transcript = await entry.streamer.stop(); } catch { transcript = entry.streamer.transcript; }
+    let completed = true;
+    try { await entry.starting; } catch { /* start path reports the failure */ }
+    if (this.remoteVoice.get(clientId) !== entry) return;
+    entry.ingress.close();
+    try { transcript = await entry.streamer.stop(); } catch (err) {
+      completed = false;
+      transcript = entry.streamer.transcript;
+      if (this.remoteVoice.get(clientId) === entry) this.sendRemoteClient(clientId, { type: "error", text: (err as Error).message });
     }
     if (this.remoteVoice.get(clientId) !== entry) return;
     this.remoteVoice.delete(clientId);
-    if (cancel) return;
-    const { text, send } = parseVoiceCommand(transcript, entry.phrase);
+    const { text, send } = parseFinalVoiceCommand(transcript, completed ? entry.streamer.finalizedTranscript : "", entry.phrase);
     if (!text && !send) {
       this.sendRemoteClient(clientId, { type: "voiceError" });
       return;
@@ -14902,7 +16143,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     replaceAll?: boolean,
     sites?: { oldText: string; newText: string; oldLine?: number; newLine?: number }[],
   ): Promise<void> {
-    const base = path.basename(filePath);
     // grok's diff block carries only the replaced region, which opens as a
     // context-free two-line tab. Expand it against the file on disk so the tab
     // shows the whole file and lands on the change (#66); a pending permission
@@ -14915,26 +16155,64 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       replaceAll,
       sites,
     });
+    await this.openDiffTexts(session, filePath, sides.oldText, sides.newText,
+      `Grok proposed: ${path.basename(filePath)}`, sides.firstChangedLine, requestId);
+  }
+
+  // Both callers own complete sides at this point. Turn diffs must bypass
+  // region expansion (and its second disk read), and carry no permission id:
+  // their tabs belong to the user, not a card's automatic cleanup lifecycle.
+  private async openDiffTexts(
+    session: Session,
+    filePath: string,
+    oldText: string,
+    newText: string,
+    title: string,
+    at = 0,
+    requestId?: number | string,
+  ): Promise<void> {
+    const base = path.basename(filePath);
     // Unique key per diff so sequential edits to the same file don't collide on
     // the content map. The trailing real filename gives VS Code the language.
     const key = String(this.diffSeq++);
     const left = Uri.from({ scheme: GROK_DIFF_SCHEME, path: `/${key}/before/${base}` });
     const right = Uri.from({ scheme: GROK_DIFF_SCHEME, path: `/${key}/after/${base}` });
-    this.diffProvider.set(left, sides.oldText);
-    this.diffProvider.set(right, sides.newText);
+    this.diffProvider.set(left, oldText);
+    this.diffProvider.set(right, newText);
     if (requestId !== undefined) {
       // Auto-open is per pending permission; remember the URIs so the matching
       // tab can be closed (and its content dropped) once the user decides (#21).
       const stale = this.openDiffsByRequest.set(session, requestId, { left, right });
       if (stale) this.closeDiffUris(stale);
     }
-    // preview:true reuses a single preview tab across grok's many small sequential
-    // edits; preserveFocus:true keeps focus on the chat so the permission card is
+    // preview:false, and the `false` is the fix for #167 — *"agent edits
+    // unexpectedly close open editor tabs"*.
+    //
+    // It used to be true, to reuse one preview tab across grok's many small
+    // sequential edits. But VS Code keeps exactly ONE preview slot per editor
+    // group — the italic tab a single click in the Explorer produces — so this
+    // diff took that slot and its occupant was gone at that instant.
+    // `closeDiffTabs` then destroyed our diff when the card was answered, and
+    // that part is correctly guarded (both sides must be `grok-diff:` URIs), so
+    // we never closed the user's file. We took its seat and then burned the
+    // chair, which is indistinguishable from the outside.
+    //
+    // It is also why the report read as intermittent: it needs a single-clicked
+    // tab (a double-clicked, edited or pinned one is never in the preview slot)
+    // AND a turn that emits a permission card — under auto-accept we return
+    // before a card exists and never open this at all. Same family as #132,
+    // fixed in 3.19.2, which stopped the diff RE-OPENING and left this untouched.
+    //
+    // The price, so it is not rediscovered: a turn with many edits now leaves a
+    // tab each instead of reusing one. `closeDiffTabs` removes each as its card
+    // is answered, so they only accumulate where cards go unanswered — which is
+    // the case where you wanted the tabs anyway.
+    //
+    // preserveFocus:true keeps focus on the chat so the permission card is
     // immediately clickable. `selection` opens a whole-file diff on the edit
     // instead of at line 1 (#66) — harmless at 0 when expansion fell back.
-    const at = sides.firstChangedLine;
-    await this.host.openDiff(left, right, `Grok proposed: ${base}`, {
-      preview: true,
+    await this.host.openDiff(left, right, title, {
+      preview: false,
       preserveFocus: true,
       selection: {
         start: { line: at, character: 0 },
@@ -14944,10 +16222,30 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   /**
-   * The file's current content, for whole-file diff expansion (#66). Undefined
-   * when it can't be read — a create whose file doesn't exist yet, a file
-   * deleted since, or one too big to hold twice — which leaves the diff at the
-   * region-only fallback rather than failing the open.
+   * The after side of a turn diff. A path the turn DELETED has no current
+   * content, and that is the diff rather than a failure: the before side comes
+   * from the baseline, so the tab can honestly show every line removed. Without
+   * this the native tab failed on every Deleted row -- the one shape where a
+   * 400-line inline cap makes the escape hatch necessary rather than optional.
+   *
+   * The split matters because {@link readFileForDiff} collapses three outcomes
+   * into one `undefined`: gone, too big to hold twice, and refused by desktop
+   * containment. Only the first may read as empty. A file nobody is allowed to
+   * read must still refuse, which is why the existence test comes first and the
+   * policy check stays inside the read.
+   */
+  private readTurnAfterSide(filePath: string): string | undefined {
+    if (!fs.existsSync(filePath)) return "";
+    return this.readFileForDiff(filePath);
+  }
+
+  /**
+   * The file's current content, for native diff readers. Undefined
+   * when it can't be read — a create whose file doesn't exist yet, or one too
+   * big to hold twice — which leaves the diff at the region-only fallback for a
+   * per-edit preview (#66). A turn diff has no trustworthy region to fall back
+   * to: it answers a deletion through {@link readTurnAfterSide} and reports
+   * only a genuinely failed read.
    */
   private readFileForDiff(filePath: string): string | undefined {
     try {
@@ -15002,6 +16300,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Host ownership begins only after the snapshot's generation check. Re-focus
     // can replay the card without consuming this pending request.
     session.pendingExitPlans.set(req.id, { planText: plan });
+    this.syncHumanWait(session);
     session.lastPlanText = "";
     this.emit(session, {
       type: "exitPlanRequest",
@@ -15075,8 +16374,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * because only the HOST knows whether files are at stake — hence the
    * round-trip.
    *
-   * Resolves false if the webview goes away before answering (reload, session
-   * teardown): a lost confirm must fail closed, never silently revert files.
+   * Session teardown/replacement resolves false: a lost confirm must fail
+   * closed, never silently revert files. The first answer from any surface
+   * holding the session dismisses the modal on every other surface.
    */
   private confirmInChat(
     session: Session,
@@ -15087,6 +16387,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.pendingConfirms.set(id, { session, resolve });
       this.emit(session, { type: "uiConfirmRequest", id, ...opts });
     });
+  }
+
+  private drainPendingConfirms(session: Session): void {
+    for (const [requestId, pending] of this.pendingConfirms) {
+      if (pending.session !== session) continue;
+      this.pendingConfirms.delete(requestId);
+      this.emit(session, { type: "uiConfirmResolved", requestId });
+      pending.resolve(false);
+    }
   }
 
   private async createPlanReviewSnapshot(plan: string, sessionId?: string): Promise<{ path: string; name: string }> {
@@ -15142,6 +16451,37 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const done = () => { this.pendingAttach.delete(tracked); };
     void tracked.then(done, done);
     return tracked;
+  }
+
+  /** Track a model/effort change committed when the picker closed, so the send
+   *  it was chosen for waits for it ("I would make it in the background without
+   *  blocking the user. This must happen before the message is sent" — owner,
+   *  2026-09-13). Message ordering alone does not give that: it guarantees only
+   *  that the change has STARTED handling, while its RPC or its restart can
+   *  still be mid-flight when handleSend runs, for the same reason trackAttach
+   *  exists.
+   *
+   *  What a send waits for is BOUNDED by releasePickerWaits. A restart prompt is
+   *  a question to the user, not work in flight, and a notification nobody
+   *  answers must never swallow the message queued behind it. The change itself
+   *  runs on regardless — the caller awaits all of it. */
+  private trackPickerChange(op: Promise<unknown>): Promise<void> {
+    let release!: () => void;
+    const asked = new Promise<void>((resolve) => { release = resolve; });
+    const tracked = Promise.race([op.then(() => undefined, () => undefined), asked]);
+    this.pickerRelease = release;
+    this.pickerChange = tracked;
+    const done = () => {
+      if (this.pickerChange === tracked) this.pickerChange = undefined;
+      if (this.pickerRelease === release) this.pickerRelease = undefined;
+    };
+    void tracked.then(done, done);
+    return op.then(() => undefined);
+  }
+
+  /** Stop a send waiting on a picker change that is now waiting on the USER. */
+  private releasePickerWaits(): void {
+    this.pickerRelease?.();
   }
 
   /** Resolve attachment ownership at commit time. Session transitions can
@@ -15564,6 +16904,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // turn ended while another was focused). Only the focused session may spawn
     // a client on demand; a background target without one has nothing to talk to.
     const session = target ?? this.focused;
+    // A model or effort change committed when the picker closed has started
+    // handling (message ordering), but its RPC or its restart can still be
+    // mid-flight. Settle the in-flight set BEFORE anything reads this session's
+    // readiness, so a restart the picker triggered is one waitForSessionStart
+    // below can see. One-shot snapshot on purpose: a change posted after this
+    // send belongs to the next turn.
+    // One promise, not a set: a second commit supersedes the first, and it was
+    // posted after it. Optional because handleSend runs against hand-built
+    // instances in the suite that never ran a constructor.
+    const picking = this.pickerChange;
+    if (picking) await picking;
     await this.waitForSessionStart(session);
     // Desk↔remote co-attach: the OTHER view only learns `busy` once the
     // mirrored agentStart crosses the relay, so a send can race through that
@@ -15747,6 +17098,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // One `session_start` per session, on the first real user message.
       this.reportSessionStart(session, origin);
     }
+    // A remote-first conversation deliberately emits BOTH events. This event
+    // counts every conversation ever driven remotely, including local starts.
+    this.reportRemoteMessage(session, origin);
     const sentChips = chips.filter((c) => !c.hidden);
     session.userMessageCount += 1;
     session.inUserMessage = false; // live send isn't part of the streamed-chunk count path
@@ -15755,6 +17109,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // The token, not the status, is what says a turn is running from here on —
     // and only whoever holds it may end this one.
     const turn = beginTurn(session);
+    this.startTurnDiffBaseline(session, turn);
     this.setStatus(session, "working");
     // The send IS the activity — the rail should not wait ~2s for the CLI to
     // write a transcript before admitting you are working in this conversation.
@@ -15821,6 +17176,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // the push that makes the row's position true rather than asserted.
       this.noteSessionActivity(session);
       session.authRecoveryTried = false; // a clean turn re-arms token auto-recovery
+      // A served turn is the only proof the account works that this app ever
+      // actually has. It is what now clears the flag the two sites above stopped
+      // clearing, and it is self-healing: the first reply after a sign-in takes
+      // the card down, and nothing takes it down before one arrives.
+      this.setProviderNeedsLogin(session.provider, false);
       this.maybeGenerateTitle(session);
       this.postSessionName(session);
     } catch (err) {
@@ -15888,15 +17248,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * disk token — exactly what re-login does, minus the sign-out — so we
    * transparently restart the owning session (`startSession` respawns +
    * `session/load`s to preserve history) and RE-SEND the failed prompt once.
-   * Guarded by `authRecoveryTried` (reset on any clean turn) so a genuine
-   * dead-auth / entitlement error can't loop. The resend's failure is the
-   * decision point (#58): only a CREDENTIAL failure (`isCredentialError` — the
-   * CLI's -32000 auth_required, or unambiguous credential wording) earns the
-   * sign-in overlay; billing/entitlement wording that a fresh process couldn't
-   * clear is NOT fixable by login (the CLI maps 403 to a plain error precisely
-   * because the credential was accepted) and shows the in-chat entitlement
-   * notice instead. Returns true when it handled the error (caller must not
-   * also show it).
+   * Guarded by `authRecoveryTried` (reset on any clean turn). Other access
+   * failures rebuild the process for the next turn but surface the original
+   * error without replay: a fresh token cannot fix an accepted credential's
+   * 403. Only a second credential failure earns the sign-in overlay (#58).
+   * Returns true when it handled the error (caller must not also show it).
    */
   private async recoverAuthAndResend(
     session: Session,
@@ -15906,9 +17262,22 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     promptBlocks: Parameters<AcpClient["prompt"]>[0],
   ): Promise<boolean> {
     const errorText = errorDetail(err);
-    if (!isAuthErrorText(errorText) && !session.client?.isCredentialError(err) && !isCredentialError(err)) return false;
+    const credential = session.client?.isCredentialError(err) === true || isCredentialError(err);
+    if (!credential && !isAuthErrorText(errorText)) return false;
     const resumeId = beginAuthRecovery(session);
-    if (!resumeId) return false;
+    if (!resumeId) {
+      // One recovery per failure streak, so every send after the first declines
+      // here -- and those are the ones a person makes while wondering why
+      // nothing works. Strict classification only: entitlement wording must
+      // never label an account signed-out, because a sign-in cannot fix it.
+      if (credential) this.setProviderNeedsLogin(session.provider, true);
+      return false;
+    }
+    if (!credential) {
+      this.host.appendLine(`[auth] reloading session without resending: ${errorText}`);
+      await this.startSession(resumeId, session);
+      return false;
+    }
     this.host.appendLine(`[auth] recoverable token error — reloading session + resending: ${errorText}`);
 
     // Fresh process, current disk token. Rebuild this same pool member and replay
@@ -15919,12 +17288,32 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const gen = session.gen;
     if (gen !== session.gen) return true;
 
-    session.userMessageCount += 1;
-    this.emit(session, { type: "userMessage", text: displayText, chips });
+    // The restart above wiped the transcript and replayed it from the agent's
+    // own record, so this bubble may already be back. Claude persists the user
+    // turn BEFORE the call it then refuses, and `session/load` republishes it as
+    // a user_message_chunk (the userMessageChunk handler forwards those while
+    // replaying, by design) -- so re-emitting unconditionally put the prompt on
+    // screen twice, which is what the owner saw as "doubling my prompts".
+    //
+    // `replayUserRaw` is the replay's own accumulator for the user message it
+    // is currently in, and `inUserMessage` is still true only if the transcript
+    // ENDED on a user turn -- a reply of any kind clears it. A transcript
+    // ending on our own text is precisely the refused turn.
+    //
+    // An inexact match re-emits, which is today's behaviour: the failure
+    // direction is a duplicated bubble, never a prompt the person cannot see.
+    const replayRestoredIt = session.inUserMessage
+      && session.replayUserRaw.trim() === displayText.trim();
+    if (!replayRestoredIt) {
+      // The replay already counted the turn it restored; only count ours.
+      session.userMessageCount += 1;
+      this.emit(session, { type: "userMessage", text: displayText, chips });
+    }
     this.emit(session, { type: "agentStart" });
     // The resend is a turn in its own right — it gets its own token, and the
     // outer turn's `finally` can no longer end it (the tokens differ).
     const turn = beginTurn(session);
+    this.startTurnDiffBaseline(session, turn);
     this.setStatus(session, "working");
     session.adapterTurnCallUsed = [];
     try {
@@ -15938,6 +17327,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.noteLiveTurnEnded(session);
       this.setStatus(session, "done");
       session.authRecoveryTried = false; // recovered — re-arm for a future expiry
+      this.setProviderNeedsLogin(session.provider, false); // and the token really is good
       this.maybeGenerateTitle(session);
       this.postSessionName(session);
     } catch (err2) {
@@ -15966,6 +17356,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.emit(session, { type: "agentError", text: errorDetail(e2) });
         this.noteLiveTurnEnded(session);
         this.setStatus(session, "error");
+        // The account flag, not only the overlay. The overlay is the empty-state
+        // card, and the renderer deliberately refuses to paint it over a live
+        // conversation (welcomeHoldActive) -- which is exactly where a mid-turn
+        // expiry happens, so on a phone the whole guidance was a red line of the
+        // vendor's own prose. This flag is what every view already reads to turn
+        // its affordances into a sign-in, and nothing was setting it here.
+        this.setProviderNeedsLogin(session.provider, true);
         this.post({ type: "onboarding", state: this.onboardingForSession(session) });
       } else {
         // Entitlement/billing wording (or anything else) on a fresh process is
@@ -16048,7 +17445,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return parseAppPurpose(this.state.get<string>(APP_PURPOSE_KEY));
   }
 
-  private buildInitialStateMsg(): Extract<HostMsg, { type: "initialState" }> {
+  private buildInitialStateMsg(session: Session = this.focused): Extract<HostMsg, { type: "initialState" }> {
     const cfg = this.host.getConfiguration("grok");
     const cwd = this.workspaceRoot();
     // Additive: older webviews ignore an unknown field; older hosts omit it
@@ -16056,7 +17453,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const commandLanguage = commandLanguageForDialect(resolvedTerminalShellDialect());
     return {
       type: "initialState",
-      effort: cfg.get("defaultEffort", ""),
+      effort: session.client?.currentReasoningEffort || this.defaultEffortForProvider(session.provider),
       cwd,
       useCtrlEnter: cfg.get("useCtrlEnterToSend", false),
       extVersion: this.context.extensionVersion,
@@ -16064,6 +17461,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       expandCommandOutputs: cfg.get("expandCommandOutputs", false),
       platform: process.platform,
       steerByDefault: cfg.get("steerByDefault", false),
+      expandDiffCard: cfg.get("expandDiffCard", false),
+      promptNav: cfg.get("promptNav", true),
       soundNotifications: cfg.get("soundNotifications", false),
       processingSound: cfg.get("processingSound", false),
       readRepliesAloud: cfg.get("readRepliesAloud", false),
@@ -16098,17 +17497,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         toggleDevTools: this.host.canToggleDevTools,
         // OPT-IN: absent/false hides Settings → Connectors.
         //
-        // A cloud environment withholds it. Connecting an MCP connector is a
-        // browser OAuth flow at the VENDOR, and there is no browser in a hosted
-        // machine — nor, unlike a desk, any computer to walk over to. Every
-        // other host-local capability re-homes to the remote client, which knows
-        // how to present a file or open a URL itself; this one genuinely cannot,
-        // until a connector offers a device-code flow.
-        //
-        // Withheld rather than shown-and-disabled: a control that explains why
-        // it will not work is still a control that does not work, and the page
-        // behind it would list servers nobody can connect.
-        ...(this.host.canShowMcpSettings && !isCloudEnvironment() ? { mcpSettings: true } : {}),
+        // OAuth consent happens in the requesting device's browser; the relay
+        // callback delivers its code to this host, including cloud machines.
+        ...(this.host.canShowMcpSettings ? { mcpSettings: true } : {}),
         // Sign OUT from a remote, cloud only. See HostUiCapabilities and the
         // CLOUD_DISPOSITION override in remote-policy.ts, which is the half that
         // actually admits the message — this flag only decides whether the page
@@ -16136,12 +17527,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // flags and keeps offering only the picker.
         createProject: this.canAddProjectFolder(),
         cloneProject: this.canAddProjectFolder(),
-        // The same ownership argument as addProjectFolder — a host that owns
-        // its folder set can drop one — but a SEPARATE flag, because the
-        // reach differs: capabilitiesForRemote withholds this from a remote
-        // driving a desk and keeps it on a cloud machine, where there is no
-        // desk to walk to.
-        removeProjectFolder: this.canAddProjectFolder(),
+        // Closing an open folder is meaningful only at a local desk.
+        removeProjectFolder: !isCloudEnvironment() && this.canAddProjectFolder(),
       },
     };
   }
@@ -16326,7 +17713,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private localPreviewChips(session: Session, webview: HostWebview): FileChip[] {
     return session.chips.map((chip) => isImageChip(chip)
       // Staging paths are genuine local disk (Uri.file roots).
-      ? { ...chip, previewSrc: webview.asWebviewUri(Uri.file(chip.path)) }
+      ? { ...chip, previewSrc: webview.asWebviewUri(Uri.file(chip.path)), fullId: this.registerFullImage(chip.path) }
       : chip);
   }
 
@@ -16334,7 +17721,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (message.type === "userMessage" && message.chips) {
       return { ...message, chips: message.chips.map((chip) => isImageChip(chip)
         ? { ...chip, ...(fs.existsSync(chip.path)
-          ? { previewSrc: webview.asWebviewUri(Uri.file(chip.path)) }
+          ? { previewSrc: webview.asWebviewUri(Uri.file(chip.path)), fullId: this.registerFullImage(chip.path) }
           : {}) }
         : chip) };
     }
@@ -16345,7 +17732,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           ...item,
           ...(item.chips ? { chips: item.chips.map((chip) => isImageChip(chip)
             ? { ...chip, ...(fs.existsSync(chip.path)
-              ? { previewSrc: webview.asWebviewUri(Uri.file(chip.path)) }
+              ? { previewSrc: webview.asWebviewUri(Uri.file(chip.path)), fullId: this.registerFullImage(chip.path) }
               : {}) }
             : chip) } : {}),
         })),
@@ -16355,7 +17742,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       return {
         ...message,
         images: message.images.map((image) => image.path && fs.existsSync(image.path)
-          ? { ...image, previewSrc: webview.asWebviewUri(Uri.file(image.path)) }
+          ? { ...image, previewSrc: webview.asWebviewUri(Uri.file(image.path)), fullId: this.registerFullImage(image.path) }
           : image),
       };
     }
@@ -16379,6 +17766,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  the mode picker on reconnect. */
   private static readonly TRANSIENT_TYPES = new Set([
     "restoreComposer", "focusInput", "findInSession", "openModePopover",
+    "uiConfirmRequest", "uiConfirmResolved",
+    "subscriptionUsage",
     // Replayed mid-buffer it would stamp the then-current footer, not the live
     // one. `sessionUiSnapshot` restores eligibility after historyReplay ends.
     "turnFeedbackAck",
@@ -16428,6 +17817,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     "clearAllSessions",
     "setRepoArchived",
     "setRepoColor",
+    "setRepoIcon",
     // Host-local by construction: it opens a native folder dialog. Reachable
     // from the rail because that is where the project list lives; a remote
     // cannot send it (remote-policy classifies it `host-local`).
@@ -16490,7 +17880,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     scopeCwd?: string,
   ): void {
     if (clientIds.length === 0) return;
-    const authorized = this.remoteAuthorizedSessionCwds();
+    const authorized = this.authorizedSessionCwds();
     const remoteMessage = this.messageForRemote(message);
     if (message.type === "repoSessions" && remoteMessage.type === "repoSessions"
       && remoteMessage.entries.length !== message.entries.length) {
@@ -16522,7 +17912,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (message.type === "repoSessions") {
       return repoSessionsMessageForRemote(
         message,
-        this.remoteAuthorizedSessionCwds(),
+        this.authorizedSessionCwds(),
         pathsEqual,
       );
     }
@@ -16556,7 +17946,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const scope = this.sessionCwd(session);
     // Belt: refuse before iterating so a disposed/closed-folder session cannot
     // drip transcript to any remaining holder.
-    if (!mayDeliverRemoteHostMsg(message, this.remoteAuthorizedSessionCwds(), scope, pathsEqual)) {
+    if (!mayDeliverRemoteHostMsg(message, this.authorizedSessionCwds(), scope, pathsEqual)) {
       this.host.appendLine(
         `[remote] dropped ${message.type} for session (cwd not authorized: ${scope})`,
       );
@@ -16579,7 +17969,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     const clientIds = this.remoteClients.clientsForActiveValue(session);
     if (clientIds.length === 0) return;
-    const snapshot = bracketRemoteSnapshot(session.buffer);
+    const snapshot = [
+      ...bracketRemoteSnapshot(session.buffer),
+      { type: "subscriptionUsage" as const, windows: session.subscriptionUsage?.snapshot() ?? [] },
+    ];
     for (const clientId of clientIds) {
       for (const message of snapshot) this.sendRemoteClient(clientId, message, scope);
     }
@@ -16731,7 +18124,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         session.cwd = cwd;
         session.activeSessionId = id;
         // sessionId is required for sessionReadyForPrompt (flush + send).
-        session.client = { dispose() {}, sessionId: id } as AcpClient;
+        session.client = { dispose() {}, setHumanWaitActive(_active: boolean) {}, sessionId: id } as AcpClient;
         session.hasHistory = hasHistory;
         session.chips = chips;
         session.buffer.push(...messages);
@@ -16742,7 +18135,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const session = this.newLocalSession();
         session.cwd = cwd;
         session.activeSessionId = id;
-        session.client = { dispose() {}, sessionId: id } as AcpClient;
+        session.client = { dispose() {}, setHumanWaitActive(_active: boolean) {}, sessionId: id } as AcpClient;
         session.hasHistory = true;
         this.pool.add(session);
       },
@@ -16768,7 +18161,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         session.cwd = cwd;
         session.activeSessionId = id;
         // Priming: client may exist without a session id (spawn window).
-        session.client = { dispose() {} } as AcpClient;
+        session.client = { dispose() {}, setHumanWaitActive(_active: boolean) {} } as AcpClient;
         session.priming = true;
         session.queuedSends = [{ text: queuedText, chips: [] }];
         session.queuedSendRequiresRelay = true;
@@ -16787,6 +18180,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           sessionId: id,
           availableCommands: [],
           dispose() {},
+          setHumanWaitActive(_active: boolean) {},
           prompt: async (blocks: Parameters<AcpClient["prompt"]>[0]) => {
             prompts += 1;
             lastBlocks = blocks;
@@ -16828,6 +18222,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           cancel: () => { cancelled = true; },
         } as PcmVoiceStreamer;
         this.remoteVoice.set(clientId, {
+          backend: "xai", key: "test", model: OPENAI_STT_MODEL,
           credentialCwd: this.sessionCwd(session),
           session,
           streamer,
@@ -17014,6 +18409,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * focused one, so this is behaviorally identical to `post`.)
    */
   private emit(session: Session, message: HostMsg): void {
+    // A capture still running when tools start may already contain their writes.
+    // Prefer the tool-row fallback to presenting that as the pre-turn file.
+    if (session.turnToken && (message.type === "toolCall" || message.type === "toolCallUpdate"
+      || message.type === "permissionRequest")) this.pendingTurnDiffCaptures.delete(session.turnToken);
     if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     if (message.type === "clearMessages") session.buffer = [];
     else if (!GrokSidebar.TRANSIENT_TYPES.has(message.type)) session.buffer.push(message);
@@ -17070,7 +18469,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Join an in-flight load rather than superseding it: session/load cannot
     // be aborted, and a second stream would interleave into the same buffer.
     // `replaying` stays a boolean so remotes still see "any replay in progress".
-    await runExclusiveHistoryLoad(session, load, {
+    await runExclusiveHistoryLoad(session, async () => {
+      await load();
+      // A saved id may still be an untouched shell. Only a successful replay
+      // can prove that; failed loads retain the provider lock.
+      session.hasHistory = session.historyEventCount > 0 || session.userMessageCount > 0;
+    }, {
       onStart: () => this.emit(session, { type: "historyReplay", active: true }),
       onFinish: () => {
         this.emit(session, { type: "historyReplay", active: false });
@@ -17304,6 +18708,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         { type: "clearMessages" },
         ...(identity ? [identity] : []),
         ...bracketRemoteSnapshot(session.buffer),
+        { type: "subscriptionUsage", windows: session.subscriptionUsage?.snapshot() ?? [] },
       ];
       for (const m of replay) {
         this.sendRemoteSession(session, m);
@@ -17682,6 +19087,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private detachClient(session: Session): AcpClient | undefined {
     const client = session.client;
     session.gen++;
+    this.clearPendingHumanRequests(session);
+    this.drainPendingConfirms(session);
     session.client = undefined;
     session.turnToken = undefined;
     // ITS COMMANDS GO WITH IT.
@@ -17806,10 +19213,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private refreshSessionOrderAfterTurn(session: Session): void {
     const cwd = this.sessionCwd(session);
     if (!cwd) return;
-    // Deliberately no archive bookkeeping here. Expiry is resolved when the
-    // catalog is built and nowhere else — see normalizeArchiveChoices for why
-    // hanging it off the session lifecycle kept producing holes, and why the
-    // lag it leaves instead is the right trade.
     for (const delay of [400, 1600]) {
       const timer = setTimeout(() => {
         this.turnOrderTimers.delete(timer);
@@ -17826,7 +19229,45 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Pending {@link refreshSessionOrderAfterTurn} timers, so dispose can clear them. */
   private turnOrderTimers = new Set<ReturnType<typeof setTimeout>>();
 
-  /** True when any live pool member is mid-turn or waiting on the user. */
+  private syncHumanWait(session: Session): void {
+    session.client?.setHumanWaitActive(
+      session.pendingQuestions.size > 0
+      || session.pendingPermissions.size > 0
+      || session.pendingExitPlans.size > 0,
+    );
+  }
+
+  private closeQuestionsForToolCall(
+    session: Session,
+    call: { toolCallId?: unknown; status?: unknown } | null | undefined,
+  ): void {
+    const toolCallId = call?.toolCallId;
+    if (typeof toolCallId !== "string" || !toolCallId
+      || (call?.status !== "completed" && call?.status !== "failed")) return;
+    let closed = false;
+    for (const [requestId, pendingToolCallId] of session.pendingQuestions) {
+      if (pendingToolCallId !== toolCallId) continue;
+      session.pendingQuestions.delete(requestId);
+      this.emit(session, { type: "questionResolved", requestId, outcome: "closed" });
+      closed = true;
+    }
+    if (!closed) return;
+    // Answers and CLI abandonment produce the same terminal status. It proves
+    // closure, not its reason; neither the tool's prose nor a timeout is needed.
+    this.syncHumanWait(session);
+    if (turnIsInFlight(session)) this.noteAnswered(session);
+  }
+
+  private clearPendingHumanRequests(session: Session): void {
+    for (const requestId of session.pendingQuestions.keys()) {
+      this.emit(session, { type: "questionResolved", requestId, outcome: "closed" });
+    }
+    session.pendingQuestions.clear();
+    session.pendingPermissions.clear();
+    session.pendingExitPlans.clear();
+    this.syncHumanWait(session);
+  }
+
   /**
    * The agent was waiting on a person and now it is not.
    *
@@ -17851,6 +19292,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.refreshKeepAwake();
   }
 
+  /** True when any live pool member is mid-turn or waiting on the user. */
   private anyTurnInFlight(): boolean {
     for (const s of this.pool) {
       if (hasLiveWork(s)) return true;
@@ -18172,6 +19614,65 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (usage) this.emit(session, { type: "contextUsage", used: usage.used, window: usage.window });
   }
 
+  private subscriptionUsageCaches?: Map<string, SubscriptionUsageCache>;
+
+  private bindSubscriptionUsage(session: Session, env: NodeJS.ProcessEnv): void {
+    const provider = session.provider;
+    const cwd = this.sessionCwd(session);
+    const key = subscriptionCredentialContext(provider, env);
+    const caches = this.subscriptionUsageCaches ??= new Map();
+    // Claude can authenticate via an opaque OS keychain. Keep its observations
+    // process-local so a replacement cannot inherit a different login's window.
+    // Grok and Codex both write their login to a file the key already hashes,
+    // so a swap changes the key and the shared cache is safe for them.
+    let cache = provider === "claude" ? new SubscriptionUsageCache() : caches.get(key);
+    if (!cache) caches.set(key, cache = new SubscriptionUsageCache());
+    session.subscriptionUsage = new SubscriptionUsageBinding(cache, key, () =>
+      subscriptionCredentialContext(provider, provider === "grok"
+        ? { ...process.env, ...this.readDotEnv(cwd) } : process.env));
+  }
+
+  private invalidateSubscriptionUsage(provider: AcpProvider): void {
+    for (const [key, cache] of this.subscriptionUsageCaches ?? []) {
+      if (key.startsWith(`${provider}:`)) {
+        cache.invalidate();
+        this.subscriptionUsageCaches!.delete(key);
+      }
+    }
+    const sessions = new Set([this.focused, ...(this.pool ?? []),
+      ...(this.remoteClients?.clients() ?? []).map((id) => this.remoteClients.active(id))]);
+    for (const session of sessions) {
+      if (session?.provider !== provider || !session.subscriptionUsage) continue;
+      session.subscriptionUsage.invalidate();
+      this.publishSubscriptionUsage(session);
+    }
+  }
+
+  private publishSubscriptionUsage(session: Session): void {
+    this.emit(session, { type: "subscriptionUsage", windows: session.subscriptionUsage?.snapshot() ?? [] });
+  }
+
+  private async refreshSubscriptionUsage(session: Session): Promise<void> {
+    const binding = session.subscriptionUsage;
+    const client = session.client;
+    this.publishSubscriptionUsage(session);
+    if (!binding) return;
+    // Claude has no pull at all: its windows arrive on the rate-limit event
+    // that rides a turn, so `observe()` is the only writer and there is
+    // nothing to refresh here.
+    if (session.provider === "codex") {
+      // A file read, not an RPC — Codex's adapter does not forward the account
+      // windows it receives, so the rollout is the only structured source.
+      await binding.refresh(async () => readCodexSubscriptionWindows({
+        codexHome: resolveCodexHome(process.env),
+      }));
+    } else if (session.provider === "grok") {
+      if (!client?.sessionId) return;
+      await binding.refresh(() => client.getSubscriptionUsage());
+    } else return;
+    if (session.client === client && session.subscriptionUsage === binding) this.publishSubscriptionUsage(session);
+  }
+
   /** Publish a control-plane session/info snapshot without touching accounting. */
   private emitSessionInfoContext(session: Session, info: SessionInfoContext): void {
     session.lastSessionInfoAt = Date.now();
@@ -18284,6 +19785,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   /** Start a brand-new session, keeping the current one alive in the background. */
   private async newFocusedSession(origin: MsgOrigin, requestedCwd?: string): Promise<void> {
+    // The answer to a CLI update belongs to the update, not to every
+    // conversation opened afterwards. This lives in the two session
+    // constructors rather than in `case "newSession"` because a remote's
+    // New and the IDE's own New Session command both reach a new session
+    // without passing through that case.
+    this.clearSettledCliUpdates();
     // Repo selection only changes history scope; New Session is the deliberate
     // second action that starts Grok in the selected cwd — deliberate only for
     // the client that can SEE the selection. That used to exclude VS Code,
@@ -18377,6 +19884,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private async newRemoteSession(clientId: string, notifyCatalog = true): Promise<void> {
+    this.clearSettledCliUpdates();
     const ownerTabToken = this.remoteClients.tabToken(clientId);
     const cwd = this.remoteClients.cwd(clientId);
     const leavingId = this.remoteClients.active(clientId)?.activeSessionId;
@@ -18581,7 +20089,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const clock = new OpenClock();
     const load = this.reserveSessionLoad(id, this.remoteClients.tabToken(clientId));
     if (!load) {
-      const selectedCwd = this.remoteClients.cwd(clientId);
+      const selectedCwd = this.remoteClients.cwdIfPresent(clientId) ?? "";
       this.host.appendLine(`[remote] dropped resumeSession (session load is reserved by another view)`);
       this.refuseRemoteResume(
         clientId,
@@ -18621,9 +20129,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     sessionCwd: string | undefined,
     overrides: SessionMetaOverrides,
   ): string {
-    const selectedCwd = this.remoteClients.cwd(clientId);
+    const selectedCwd = this.remoteClients.cwdIfPresent(clientId) ?? "";
     if (!sessionCwd) return selectedCwd;
-    if (sessionCwdBelongsToRepo(sessionCwd, this.sessionCwdsForRepo(selectedCwd, overrides), pathsEqual)) {
+    if (selectedCwd && sessionCwdBelongsToRepo(sessionCwd, this.sessionCwdsForRepo(selectedCwd, overrides), pathsEqual)) {
       return selectedCwd;
     }
     const owner = this.repoCatalog().find((repo) =>
@@ -18846,42 +20354,28 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * checkout under grok home). That is the v3.1.0 behaviour and must not regress.
    */
   private localTrustedSessionCwds(overrides: SessionMetaOverrides): string[] {
-    return this.localTrustedSessionEntries(overrides).map((e) => e.cwd);
-  }
-
-  /**
-   * The same set, each cwd carrying the PROJECT it came from.
-   *
-   * Provenance is recorded here because here is where it is known — every cwd
-   * below arrives by expanding a project — and re-deriving it later means
-   * resolving a worktree back to its owner on a path that runs for every remote
-   * message. It is also what lets the archive fence check the project rather
-   * than the exact cwd: matching cwds let a worktree the host learned about
-   * after the fence was built pass straight through it.
-   */
-  private localTrustedSessionEntries(overrides: SessionMetaOverrides): TrustedSessionCwd[] {
-    const out: TrustedSessionCwd[] = [];
+    const out: string[] = [];
     const seen = new Set<string>();
-    const add = (cwd: string | undefined, repoCwd: string | undefined) => {
+    const add = (cwd: string | undefined) => {
       if (!cwd) return;
       const key = normalizeRepoPath(cwd);
       if (!key || seen.has(key)) return;
       seen.add(key);
-      out.push({ cwd, repoCwd: repoCwd || cwd });
+      out.push(cwd);
     };
     if (this.host.canSwitchWorkspaceFolder) {
       for (const repoCwd of this.openWorkspaceFolders()) {
-        for (const c of this.sessionCwdsForRepo(repoCwd, overrides)) add(c, repoCwd);
+        for (const c of this.sessionCwdsForRepo(repoCwd, overrides)) add(c);
       }
       // Active root as a backstop if the folders list is empty mid-init.
-      add(this.workspaceRoot(), this.workspaceRoot());
+      add(this.workspaceRoot());
       return out;
     }
     // VS Code: full historical catalog.
-    add(this.workspaceRoot(), this.workspaceRoot());
-    if (this.selectedRepoCwd) add(this.selectedRepoCwd, this.selectedRepoCwd);
+    add(this.workspaceRoot());
+    if (this.selectedRepoCwd) add(this.selectedRepoCwd);
     for (const repo of this.repoCatalog()) {
-      for (const c of this.sessionCwdsForRepo(repo.cwd, overrides)) add(c, repo.cwd);
+      for (const c of this.sessionCwdsForRepo(repo.cwd, overrides)) add(c);
     }
     return out;
   }
@@ -19243,7 +20737,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private readonly fullImagePaths = new Map<string, string>();
   private readonly fullImageHandles = new Map<string, string>();
 
-  /** Mint (or reuse) the handle for a path we are about to show a remote. */
+  /** Mint (or reuse) the handle for a path we are about to show a reader. */
   private registerFullImage(imagePath: string): string {
     const existing = this.fullImageHandles.get(imagePath);
     if (existing) return existing;
@@ -19262,26 +20756,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return handle;
   }
 
-  /** Fetch-time revalidation for remote image handles (open-set + session media). */
-  private isImagePathAuthorizedNow(
-    imagePath: string,
-    /** Whose request this is. A remote gets the archive-narrowed set: an image
-     *  handle minted before the project was archived must not outlive it, the
-     *  same way one minted before a folder was closed does not. Handles are
-     *  opaque and long-lived, so this is the only place that can say no —
-     *  the outbound gate scopes the reply to the client's CURRENT project,
-     *  which by then is an allowed one. Defaults to the stricter answer. */
-    scope: "local" | "remote" = "remote",
-  ): boolean {
-    const authorized =
-      scope === "remote" ? this.remoteAuthorizedSessionCwds() : this.authorizedSessionCwds();
+  /** Fetch-time revalidation for image handles (open-set + session media). */
+  private isImagePathAuthorizedNow(imagePath: string, session?: Session): boolean {
+    const authorized = this.authorizedSessionCwds();
     let home: string | undefined;
     try {
       home = resolveGrokHome(process.env);
     } catch {
       home = undefined;
     }
-    return imagePathStillAuthorized(imagePath, authorized, {
+    if (imagePathStillAuthorized(imagePath, authorized, {
       grokHome: home,
       sameCwd: pathsEqual,
       isTrustedGeneratedMedia: (p) => {
@@ -19291,7 +20775,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           return false;
         }
       },
-    });
+    })) return true;
+    // Pasted attachments live in global storage, outside the project. Require
+    // both canonical staging containment and a reference in the asking session;
+    // trusting the whole staging directory would expose other sessions' images.
+    if (!session || !this.isAuthorizedCwd(this.sessionCwd(session))) return false;
+    try {
+      if (!pathBoundToClosedFolder(fs.realpathSync(imagePath), fs.realpathSync(this.imageStagingDir()), pathsEqual)) return false;
+    } catch { return false; }
+    const owns = (images: readonly { path?: string }[]) => images.some((image) => image.path === imagePath);
+    return owns(session.chips)
+      || session.queuedSends.some((item) => owns(item.chips))
+      || session.buffer.some((m) =>
+        m.type === "userMessage" ? owns(m.chips ?? [])
+          : m.type === "userMessageChunk" ? owns(m.images ?? []) : false);
   }
 
   /** Render a bigger version for a remote's tap. Undefined when the source is
@@ -19305,6 +20802,22 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         return undefined;
       }
       return `data:${thumbnailMime(thumb)};base64,${Buffer.from(thumb).toString("base64")}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async readOriginalImage(imagePath: string): Promise<string | undefined> {
+    try {
+      const mime = guessMediaMime(imagePath);
+      if (!/^image\/(png|jpeg|gif|webp|bmp)$/.test(mime)) return undefined;
+      // Match the remote media budget; never resize to meet it because that
+      // would silently break the clipboard's full-resolution promise.
+      const limit = 25 * 1024 * 1024;
+      if ((await fs.promises.stat(imagePath)).size > limit) return undefined;
+      const bytes = await fs.promises.readFile(imagePath);
+      if (!bytes.length || bytes.length > limit) return undefined;
+      return `data:${mime};base64,${bytes.toString("base64")}`;
     } catch {
       return undefined;
     }
@@ -19364,14 +20877,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             type: "repoSessions", cwd: m.cwd, entries: [], dots: {}, total: 0,
             error: "project-unavailable",
           });
+        } else if (m.type === "resumeSession") {
+          this.sendRemoteClient(clientId, {
+            type: "error",
+            text: "That conversation's project folder is no longer open on the desktop. Select another project to continue.",
+            resumeFailed: { id: m.id },
+          });
         }
         return;
       }
-      // Messages with no cwd still act on a bound session / client-selected
-      // repo. A closed folder must revoke those ops even when allowRemoteRepoTarget
-      // returns true (its default branch). selectRepo is the escape hatch to a
-      // still-authorized target and is gated only by the message cwd above.
-      if (m.type !== "selectRepo" && m.type !== "listRepoSessions") {
+      // An explicit, authorized destination can leave a stale binding. Messages
+      // acting on the existing conversation (send/cancel/etc.) still require it.
+      const resumesAuthorizedCwd = m.type === "resumeSession" && !!m.cwd;
+      if (m.type !== "selectRepo" && m.type !== "listRepoSessions" && !resumesAuthorizedCwd) {
         const active = this.remoteClients.active(clientId);
         const boundCwd = active
           ? this.sessionCwd(active)
@@ -19380,21 +20898,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // it has a client cwd (after ready), that cwd must remain authorized.
         if (
           boundCwd !== undefined &&
-          !remoteBoundCwdStillAuthorized(boundCwd, this.remoteAuthorizedSessionCwds(), pathsEqual)
+          !remoteBoundCwdStillAuthorized(boundCwd, this.authorizedSessionCwds(), pathsEqual)
         ) {
           this.host.appendLine(
             `[remote] dropped ${m.type} (bound cwd no longer authorized: ${boundCwd})`,
           );
-          // Two different things end up here and they deserve different words.
-          // Archiving is something the user just DID and can undo; a closed
-          // folder is a state of the desk. Telling someone their project is
-          // closed when they archived it sends them looking for the wrong fix.
-          const archived = this.isAuthorizedCwd(boundCwd);
           this.sendRemoteClient(clientId, {
             type: "error",
-            text: archived
-              ? "That project is archived, so it is not available from here. Un-archive it on the desktop to carry on."
-              : "That project folder is no longer open on the desktop. Select another project to continue.",
+            text: "That project folder is no longer open on the desktop. Select another project to continue.",
+            ...(m.type === "resumeSession" ? { resumeFailed: { id: m.id } } : {}),
           });
           return;
         }
@@ -19465,8 +20977,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // remoteVoice, so reconnect cannot resurrect a host-only listening state.
     this.dropRemoteVoice(clientId);
     this.remoteClients.ready(clientId);
-    // Empty default cwd (no desktop project yet) is not a bound repo. The
-    // snapshot still goes out unbound; adopting/starting here would throw.
+    // A reconnect can restore a selection/session saved while the folder was
+    // still open. Revalidate before adopting or starting any provider process.
+    const selectedCwd = this.remoteClients.cwdIfPresent(clientId);
+    const active = this.remoteClients.active(clientId);
+    const authorized = this.authorizedSessionCwds();
+    if ((selectedCwd && !authorizedListCwd(selectedCwd, authorized, pathsEqual)) ||
+        (active && !authorizedListCwd(this.sessionCwd(active), authorized, pathsEqual))) {
+      this.remoteClients.deleteActive(clientId);
+      this.remoteClients.select(clientId, this.defaultRemoteCwd());
+    }
+    // With no open project the snapshot stays unbound.
     if (!this.remoteClients.cwdIfPresent(clientId)) return;
     // A tab that lost this conversation to another tab's claim must not
     // adopt the desk session or mint a blank one on reconnect. The snapshot
@@ -19554,9 +21075,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // Socket-level project gate — also covers the catch-up snapshot path,
       // which never enters deliverRemote.
       auth: {
-        // The narrowed set on purpose: this is the socket-level gate, and it is
-        // the last thing standing between an archived project and the wire.
-        authorizedCwds: () => this.remoteAuthorizedSessionCwds(),
+        authorizedCwds: () => this.authorizedSessionCwds(),
         scopeCwdForClient: (clientId) => {
           const active = this.remoteClients.active(clientId);
           if (active) return this.sessionCwd(active);
@@ -19812,9 +21331,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private buildRemoteSnapshot(clientId: string): HostMsg[] {
     const cwd = this.remoteClients.cwdIfPresent(clientId) ?? "";
     // Live authorized set for this host — not "whatever the tab last selected".
-    // Remote-narrowed, so a tab reconnecting into a project archived while it
-    // was away comes back unbound rather than resuming inside it.
-    const authorized = this.remoteAuthorizedSessionCwds();
+    const authorized = this.authorizedSessionCwds();
     const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
     const demoted = this.remoteClients.requiresExplicitSession(clientId)
       && !this.remoteClients.active(clientId);
@@ -19826,7 +21343,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Catalog is already open-folder-filtered on desktop; still the sole source.
     const entries = this.localRepoCatalogEntries();
     // Never put a closed cwd on the wire (choke point rejects it); empty = unbound.
-    const initial = this.messageForRemote({ ...this.buildInitialStateMsg(), cwd: listCwd ?? "" });
+    const initial = this.messageForRemote({ ...this.buildInitialStateMsg(session), cwd: listCwd ?? "" });
     const sessionCwd = session ? this.sessionCwd(session) : "";
     const sessionCwdOk = !!session && !!authorizedListCwd(sessionCwd, authorized, pathsEqual);
     const snap: HostMsg[] = [];
@@ -19834,6 +21351,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     snap.push(this.providerStateMessage());
     snap.push(this.githubStateMessage());
     snap.push(this.mcpConnectorsMessage());
+    const authorization = this.mcpConnectorAuthorizationMessage();
+    if (authorization) snap.push(authorization);
     snap.push(this.mcpServersMessage());
     // SIXTH hand-written registry, and it is not the same one as
     // DEVICE_GLOBAL_REMOTE_TYPES. That set decides how a frame is ROUTED once
@@ -19870,9 +21389,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       snap.push({ type: "submitQueuedSend", ...session.queuedSendDispatch });
     }
     const voiceCwd = sessionCwdOk ? sessionCwd : this.workspaceRoot();
-    const voiceConfigured = !!this.resolveVoiceApiKey(voiceCwd);
+    const voiceProvider = sessionCwdOk && session ? session.provider : this.defaultProviderForProject(voiceCwd);
+    const voiceConfigured = !!this.voiceBackendState(voiceCwd, voiceProvider).backend;
     this.rememberVoiceConfigured(voiceCwd, voiceConfigured);
-    const voicePayload = this.voiceConfiguredMsg(voiceCwd, voiceConfigured);
+    const voicePayload = this.voiceConfiguredMsg(voiceCwd, voiceConfigured, voiceProvider);
     this.seedPostedVoiceConfigured(`remote:${clientId}`, voicePayload);
     snap.push(voicePayload);
     const activeVoice = this.remoteVoice.get(clientId);
@@ -19910,7 +21430,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // remote is answered HERE and never reaches onMessage's switch, so anything
     // pushed from there would simply never arrive on a fresh tab or a reconnect.
     // buildPinnedSessions filters to the live authorized set.
-    snap.push({ type: "pinnedSessions", ...this.buildPinnedSessions("remote") });
+    snap.push({ type: "pinnedSessions", ...this.buildPinnedSessions(), pinRequests: true });
     const out: HostMsg[] = [];
     for (const m of snap) {
       const t = transformHostMsgForRemote(m, this.remoteMediaDeps);
@@ -19933,6 +21453,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 <meta charset="UTF-8" />
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} data:; font-src ${webview.cspSource}; script-src 'nonce-${nonce}';" />
+<style>
+  /* The same cold-start gap the chat webview guards against — see getHtml.
+     Cheaper here because the rail is nearly empty before its script runs: a
+     search box and a scroll region, which unstyled is a full-width native
+     input on a white page. projects-rail.css re-reveals. */
+  html, body { background: var(--vscode-sideBar-background, var(--vscode-editor-background)); }
+  body { visibility: hidden; }
+</style>
 <link rel="stylesheet" href="${mediaUri("projects-rail.css")}" />
 </head>
 <body>
@@ -19946,6 +21474,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     <div id="rail-scroll" class="rail-scroll"></div>
   </aside>
   <script nonce="${nonce}" src="${mediaUri("webview-helpers.js")}"></script>
+  <!-- Project marks. Data, then picker, then rail: each reads the previous
+       one's global at load time, and a missing one degrades to the folder. -->
+  <script nonce="${nonce}" src="${mediaUri("repo-icons.js")}"></script>
+  <script nonce="${nonce}" src="${mediaUri("repo-icon-picker.js")}"></script>
   <script nonce="${nonce}" src="${mediaUri("projects-rail.js")}"></script>
 </body>
 </html>`;
@@ -20016,21 +21548,22 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         showThinking: cfg.get("showThinking", false),
         expandCommandOutputs: cfg.get("expandCommandOutputs", false),
         steerByDefault: cfg.get("steerByDefault", false),
+        expandDiffCard: cfg.get("expandDiffCard", false),
+        promptNav: cfg.get("promptNav", true),
         fontScale: this.chatFontScale(),
         soundNotifications: cfg.get("soundNotifications", false),
         processingSound: cfg.get("processingSound", false),
         readRepliesAloud: cfg.get("readRepliesAloud", false),
         summarizeRepliesAloud: cfg.get("summarizeRepliesAloud", true),
-        voiceConfigured: this.lastVoiceConfiguredByCwd.get(
-          normalizeRepoPath(this.workspaceRoot() || ""),
-        ) === true,
+        voiceConfigured: !!this.voiceBackendState(this.sessionCwd(this.focused), this.focused.provider).backend,
+        voiceBackendState: this.voiceBackendState(this.sessionCwd(this.focused), this.focused.provider),
         voiceSendPhrase: this.voiceSetting(
-          this.workspaceRoot(),
+          this.sessionCwd(this.focused),
           "voiceSendPhrase",
           DEFAULT_SEND_PHRASE,
         ),
         voiceKeyterms: sanitizeVoiceKeyterms(
-          this.voiceSetting(this.workspaceRoot(), "voiceKeyterms", []),
+          this.voiceSetting(this.sessionCwd(this.focused), "voiceKeyterms", []),
         ),
         telemetryEnabled: cfg.get("telemetry.enabled", true),
         thumbsFeedback: cfg.get("thumbsFeedback", false),
@@ -20062,6 +21595,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           showOutput: this.host.canShowOutput,
           toggleDevTools: this.host.canToggleDevTools,
           settingsEditor: true,
+          editProviderConfigFiles: HOST_CAPABILITIES.editProviderConfigFiles,
+          editProjectFiles: HOST_CAPABILITIES.editProjectFiles,
           ...(this.host.canShowMcpSettings ? { mcpSettings: true } : {}),
         },
       },
@@ -20073,18 +21608,27 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 <meta charset="UTF-8" />
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} data:; font-src ${webview.cspSource}; script-src 'nonce-${nonce}';" />
+<style>
+  /* Background only, not the visibility pair the chat and rail webviews use:
+     this page's body holds one empty div until settings.js mounts into it, so
+     there is no unstyled content to hide — only an unpainted page, which
+     without this is white on a dark theme. */
+  html, body { background: var(--vscode-editor-background, var(--vscode-sideBar-background)); }
+</style>
 <link rel="stylesheet" href="${mediaUri("settings.css")}" />
 <title>Grok Settings</title>
 </head>
 <body class="settings-page">
   <div id="settings-root"></div>
   <script nonce="${nonce}">window.__grokSettingsBoot = ${bootJson};</script>
+  <script nonce="${nonce}" src="${mediaUri("webview-helpers.js")}"></script>
   <script nonce="${nonce}" src="${mediaUri("settings.js")}"></script>
   <script nonce="${nonce}">
     (function () {
       var vscode = acquireVsCodeApi();
       var boot = window.__grokSettingsBoot || {};
       var tts = !!(window.speechSynthesis && window.SpeechSynthesisUtterance);
+      window.GrokVoiceSettings.install(window.GrokSettings);
       var surface = window.GrokSettings.mount(document.getElementById("settings-root"), {
         snapshot: boot.snapshot,
         env: Object.assign({ ttsAvailable: tts }, boot.env || {}),
@@ -20096,6 +21640,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       window.addEventListener("message", function (e) {
         var msg = e.data;
         if (!msg || !msg.type || !surface) return;
+        if (msg.type === "voiceConfigured") {
+          surface.update({ voiceConfigured: !!msg.value, voiceBackendState: msg.backendState,
+            voiceSendPhrase: msg.sendPhrase, voiceKeyterms: msg.keyterms });
+        }
         if (msg.type === "grokUpdateStatus") {
           var next = { grokUpdate: {
             current: msg.current, latest: msg.latest,
@@ -20210,16 +21758,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   body.desk.has-rail .desk-ft-shell { display: flex; flex: 1 1 auto; flex-direction: row; min-width: 0; min-height: 0; height: 100%; }
   body.desk.has-rail .desk-ft-chat { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }`
       : "";
-    // The shared file-panel asset is desktop-only in this generated document.
-    // Remote browsers load it from the relay's own web/chat.html; VS Code gets
-    // neither the tag nor the bytes, making the no-file-panel decision structural.
-    const filePanelStyle = this.host.canSwitchWorkspaceFolder
+    // VS Code also uses the shared panel for the three provider configs. Its
+    // project explorer remains native; only the config menu mounts this panel.
+    const filePanelStyle = this.host.canSwitchWorkspaceFolder || HOST_CAPABILITIES.editProviderConfigFiles
       ? `<link rel="stylesheet" href="${mediaUri("file-panel.css")}" />`
       : "";
     // The highlighter rides the same gate and MUST precede the panel: the panel
     // reads `GrokSyntaxHighlight` at render time, and a missing global there
     // silently degrades every file to plain text rather than failing loudly.
-    const filePanelScript = this.host.canSwitchWorkspaceFolder
+    const filePanelScript = this.host.canSwitchWorkspaceFolder || HOST_CAPABILITIES.editProviderConfigFiles
       ? `<script nonce="${nonce}" src="${mediaUri("syntax-highlight.js")}"></script>\n` +
         `  <script nonce="${nonce}" src="${mediaUri("file-panel.js")}"></script>`
       : "";
@@ -20233,12 +21780,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 <style>
   /* Critical pre-stylesheet paint. VS Code serves chat.css through its webview
      service worker, which can cold-start a beat after the HTML renders — that
-     gap otherwise flashes the welcome screen unstyled on a white background.
-     Paint the theme background immediately and hold the welcome invisible;
-     chat.css re-reveals it (visibility: visible on .welcome). */
+     gap otherwise paints the panel with no stylesheet at all. It was the welcome
+     screen on a white background; on a restored session it is skeleton bars as
+     white rectangles, the composer as a bare textarea and the context meter as
+     raw text. Same gap, and whichever one shows depends only on what the panel
+     happened to open with, so hold the WHOLE body rather than one screen of it.
+     html keeps its background, so the gap shows the theme colour rather than
+     white, and chat.css re-reveals (visibility: visible on body). */
   html, body { background: var(--vscode-sideBar-background, var(--vscode-editor-background)); }
   body { color: var(--vscode-foreground); font-family: var(--vscode-font-family); }
-  .welcome { visibility: hidden; }
+  body { visibility: hidden; }
 ${firstFrameLayout}
 </style>
 <link rel="stylesheet" href="${mediaUri("chat.css")}" />
@@ -20286,13 +21837,13 @@ ${fileShellOpen}
       <div class="composer-input-wrap">
         <div id="input-highlight" class="input-highlight" aria-hidden="true" dir="auto"></div>
         <textarea id="input" placeholder="Ask Grok..." rows="2" dir="auto"></textarea>
-        <button id="mic-btn" class="mic-btn" title="Voice control"></button>
       </div>
       <button id="sandbox-btn" class="toolbar-btn sandbox-btn" title="Sandbox profile" hidden style="display:none"></button>
       <div class="composer-toolbar">
         <div class="toolbar-left">
           <button id="add-btn" class="icon-btn" title="Add context"></button>
-          <button id="gear-btn" class="icon-btn" title="Settings"></button>
+          <button id="mic-btn" class="icon-btn mic-btn" title="Voice control"></button>
+          <button id="gear-btn" class="toolbar-btn model-chip" title="Model and effort"></button>
           <div class="context-donut" id="donut" title="Context usage">
             <svg width="16" height="16" viewBox="0 0 16 16">
               <circle cx="8" cy="8" r="6" fill="none" stroke="var(--vscode-editorWidget-border,#444)" stroke-width="3"/>
@@ -20340,6 +21891,10 @@ ${closeMain}
   <script nonce="${nonce}" src="${mediaUri("mathjax/tex-svg-full.js")}"></script>
   <script nonce="${nonce}" src="${mediaUri("mermaid/mermaid.min.js")}"></script>
   <script nonce="${nonce}" src="${mediaUri("webview-helpers.js")}"></script>
+  <!-- Project marks. Before the file panel AND before chat.js: both read these
+       globals at render time, and a missing one degrades to the folder. -->
+  <script nonce="${nonce}" src="${mediaUri("repo-icons.js")}"></script>
+  <script nonce="${nonce}" src="${mediaUri("repo-icon-picker.js")}"></script>
   <script nonce="${nonce}" src="${mediaUri("settings.js")}"></script>
   ${filePanelScript}
   <script nonce="${nonce}" src="${mediaUri("chat.js")}"></script>

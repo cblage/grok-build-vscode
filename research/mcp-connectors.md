@@ -44,10 +44,10 @@ Theirs wins. grok.com managed Canva is the load-bearing case.
 `authorizeMcpRemote` is a one-shot `mcp-remote` spawn. A live Grok session
 already running that endpoint holds the OAuth callback port pinned in
 `client_info.json` (Windows skips mcp-remote's lockfile, so a second instance
-cannot see the first). `EADDRINUSE` is retried once with a free loopback port
-as `mcp-remote <url> <port>`, which forces re-registration. The first failure
-never reaches the UI. `buildMcpRemoteEntry` does not pin a port — a specified
-port on `session/new` would re-register on every conversation.
+cannot see the first). `EADDRINUSE` is reported as already signed in and in
+use; it is never retried on a different port. Changing ports would delete
+the shared registration and force every host to re-authorize. Neither
+Connect nor `buildMcpRemoteEntry` overrides the registered port.
 
 Stripe is the only catalog vendor that rejects mcp-remote's default DCR
 scopes (`openid, email, profile`). Its `oauthScope` is `"mcp"` — measured
@@ -75,12 +75,81 @@ read from (`mcpServersCwd` / `mcpSettingsServersForCwd` → `mcpNameCatalogFor`
 focused session's cwd or provider. The classified global-only view is
 stored (`mcpServersView`) and rendered anywhere; project-file rows
 never enter it.
-`connectMcpConnector` / `disconnectMcpConnector` are host-local:
-OAuth needs a browser on the machine that owns `~/.mcp-auth`; key-auth
-pastes a secret into HostSecrets. A remote may see that a key connector
-is connected and may not set, read, or clear the key. Settings →
-Connectors on a remote shows the desk-owned catalog read-only, the live Grok
-inventory, and a grok.com/connectors Open in the grok.com section header.
+`connectMcpConnector` and `disconnectMcpConnector` are inbound `full`, without
+a bound-session requirement. Keys remain write-only. `remoteConnect: true`
+enables remote controls; older hosts leave the catalog read-only.
+
+## Relay OAuth
+
+`mcp-connector-oauth.ts` owns the one-time authorization-code flow. It discovers
+protected-resource metadata (the challenge URL, then well-known path/root) and
+OAuth/OIDC authorization-server metadata, registers a client with the host's
+resolved relay origin plus `/mcp/oauth/callback`, and generates independent
+32-byte base64url state and S256 PKCE material. Discovery/DCR use the startup
+budget; presenting consent starts `MCP_REMOTE_AUTHORIZATION_TIMEOUT_MS` (15 min).
+Scope comes from the challenge/resource metadata, with the catalog's explicit
+Stripe `mcp` override. Resource indicators accompany authorization and exchange
+([MCP authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)).
+
+The returned registration, including any client secret (Atlassian), is written
+0600 beside the tokens it owns, as `<hash>_afkpilot-client.json` in the same
+measured store. It belongs there rather than in SecretStorage because the
+tokens are machine-global and SecretStorage is per install: a host that could
+not see the registration would omit `--static-oauth-client-info`, refresh with
+a different client ID, and the SDK would answer the rejection by deleting the
+token file. The relay origin is enforced by content — a registration whose
+`redirect_uris` do not carry the current callback is not ours. An inactive
+registration
+is reusable after cancelled consent, but cannot change a legacy proxy's client
+ID. Successful exchange seeds the measured `<hash>_tokens.json` with the complete
+token response plus `expires_at: Date.now() + expires_in * 1000`, then activates
+the registration. If activation fails, the previous token file is restored.
+
+The desk opens consent externally. A phone's Connect tap reserves a tab, then
+navigates it when `mcpConnectorAuthorization` arrives; the visible link handles
+blocked popups and reloads. The frame remains device-global (`mirror`, project
+auth `none`) and is replayed in snapshots. `attemptId` prevents an ended attempt
+from clearing a newer link. Status is `waiting` or `finished`. The host polls
+`/mcp/oauth/result?state=...`: 204 means wait, 200 delivers a code or provider
+error once, and 400 ends the attempt. Transport errors are not blindly retried
+because delivery may already have consumed the code. Authorization and token
+exchange use the identical callback URI; no browser callback is pasted.
+
+Owned registrations supply `--static-oauth-client-info @<private-temp-file>`
+on Connect and every session spawn. The file is 0600 inside a private temp
+directory, never inline JSON/argv. Connect disposes it after its probe; ACP keeps
+session files until the owning CLI exits because adapters can initialize or
+restart proxies after session/new returns. It also disposes files created during
+an overlapping shutdown. Legacy connectors receive their original argv until
+reconnected. mcp-remote owns refresh: no host refresh loop and no OAuth access
+token injected as a fixed header. Both measured version constants stay pinned.
+
+Registration and tokens now share a directory, a hash and a lifetime, so every
+host on the machine reads the same answer and a store the proxy abandons on a
+version bump orphans both together — correct, because re-registration issues a
+client the old tokens do not belong to. mcp-remote only globs
+`<hash>_code_verifier*`, so the extra file survives its housekeeping. What is
+still shared per endpoint and not per relay is the token file itself: pointing
+one host at dev and another at production replaces one origin's token with the
+other's, and the remedy is to reconnect.
+
+`mcp-remote-headless.ts` remains as a guard on the post-seeding probe. Its
+NODE_OPTIONS preload suppresses only mcp-remote's bundled browser launcher;
+seeded tokens should make that path unreachable. The temporary preload works
+outside Electron's app.asar and is removed when the probe ends.
+
+The removed paste RPC/`submitted` status/module first appeared in `ab19ebc`,
+after `v4.1.8`; `0303a30` added its numbered UI. Neither commit is contained in
+a release tag as checked for this change. No protocol-version bump is needed
+for removing an unreleased wire member. Relay routes are implemented separately;
+this host does not add policy or credentials to that relay.
+
+Disconnect removes our connected record and a key connector's HostSecrets
+entry. It does not revoke vendor access, clear `~/.mcp-auth`, or remove tools
+from already running sessions. Settings states these limits on every surface.
+
+Settings also retains the live Grok inventory and a grok.com/connectors Open
+in the grok.com section header.
 Local Grok connectors show a header Open on the desk (`openGlobalConfig`,
 even when the section is empty) and a sentence on remote; there is no
 per-row Open. A host-injected echo is omitted from Local. `listMcpServers` is inbound view

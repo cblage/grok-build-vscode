@@ -337,6 +337,19 @@ function tokenizeReadOnlyCommand(
   return stages;
 }
 
+/** The same fail-closed grammar as Plan, without its read-only argv policy.
+ * Keep the literal executable token: basename/alias/wildcard matching would
+ * grant programs the user never named on the card. */
+export function commandProgramsForGrant(command: string, dialect: ShellDialect): string[] | undefined {
+  if (!command.trim() || /[\r\n]/.test(command)) return undefined;
+  const stages = tokenizeReadOnlyCommand(command, dialect);
+  if (!stages?.length || stages.some(([head]) => !head?.value || head.activeGlob ||
+    // The tokenizer leaves argv policy to its caller. An assignment prefix
+    // isn't an executable: granting FOO=1 would otherwise cover FOO=1 rm.
+    (dialect === "posix" && /^[A-Za-z_][A-Za-z0-9_]*=/.test(head.value)))) return undefined;
+  return stages.map((tokens) => tokens[0].value);
+}
+
 const READONLY_HEADS = new Set([
   // POSIX
   "ls", "dir", "pwd", "cd", "echo", "cat", "type", "head", "tail", "less", "more",

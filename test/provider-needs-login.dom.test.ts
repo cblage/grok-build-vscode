@@ -11,13 +11,18 @@ import { describe, expect, it } from "vitest";
 import { bootWebview, click, dispatch, type Posted } from "./webview-harness";
 
 const $ = (doc: Document, id: string) => doc.getElementById(id) as HTMLElement;
-const modelBtn = (doc: Document) => doc.querySelector(".model-name-btn") as HTMLButtonElement;
+const modelBtn = (doc: Document) => doc.querySelector(".model-picker-row") as HTMLButtonElement;
 const popoverText = (doc: Document) => doc.getElementById("gear-popover")!.textContent || "";
 const items = (doc: Document) => [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")];
 const types = (posted: Posted[]) => posted.map((p) => p.type);
 
 function bootSignedOutCodex(opts: { remote?: boolean } = {}) {
-  const h = bootWebview({ remote: opts.remote });
+  const h = bootWebview({ remote: opts.remote, beforeScripts: (w) => {
+    const rail = w.document.createElement("aside"); rail.id = "projects-rail";
+    rail.innerHTML = '<div id="rail-scroll"></div><div class="rail-foot"></div>';
+    w.document.body.appendChild(rail);
+  } });
+  dispatch(h.window, { type: "initialState", capabilities: {} });
   dispatch(h.window, {
     type: "providerState",
     providers: [{ id: "codex", connected: true, needsLogin: true }],
@@ -35,6 +40,7 @@ function bootSignedOutCodex(opts: { remote?: boolean } = {}) {
       { provider: "codex", modelId: "", name: "Codex default", defaultImplied: true },
     ],
   });
+  dispatch(h.window, { type: "repos", entries: [], selectedCwd: "/repo", activeCwd: "/repo" });
   h.posted.length = 0;
   return h;
 }
@@ -46,18 +52,15 @@ function bootSignedOutCodex(opts: { remote?: boolean } = {}) {
 // because the host refuses `runGrokLogin` from a remote. Manage providers at the
 // bottom is the single way back, for every provider and every surface.
 describe("model picker for an agent that needs a sign-in", () => {
-  it("locks the selector when nothing can answer, rather than opening an unusable list", () => {
-    // Signed-out Codex is the only provider here, so there is nothing to choose
-    // between and the picker does not open at all (owner, 2026-08-17: "when no
-    // provider is available disable model selector"). The omission of a
-    // signed-out provider FROM a list is covered by the next test, where another
-    // agent is healthy and the list therefore exists.
+  it("opens while signed out and keeps Manage providers actionable", () => {
     const h = bootSignedOutCodex();
     click(h.window, $(h.doc, "gear-btn"));
-    expect(modelBtn(h.doc).className).toContain("disabled");
-
-    click(h.window, modelBtn(h.doc));
-    expect(popoverText(h.doc)).not.toContain("Sign in to load models");
+    expect($(h.doc, "gear-popover").hidden).toBe(false);
+    expect(h.doc.querySelectorAll(".model-picker-row")).toHaveLength(0);
+    const manage = h.doc.querySelector(".model-manage-providers") as HTMLButtonElement;
+    expect(manage.disabled).toBe(false);
+    click(h.window, manage);
+    expect(h.doc.querySelector('[data-category="providers"].active')).toBeTruthy();
   });
 
   it("keeps a healthy agent's models and drops the signed-out one's heading", () => {
@@ -80,7 +83,6 @@ describe("model picker for an agent that needs a sign-in", () => {
       ],
     });
     click(h.window, $(h.doc, "gear-btn"));
-    click(h.window, modelBtn(h.doc));
 
     expect(popoverText(h.doc)).toContain("Grok Build");
     expect(popoverText(h.doc)).not.toContain("GPT-5.6 Sol");
@@ -93,7 +95,6 @@ describe("model picker for an agent that needs a sign-in", () => {
   it("shows a remote the same absence, never a button the host would refuse", () => {
     const h = bootSignedOutCodex({ remote: true });
     click(h.window, $(h.doc, "gear-btn"));
-    click(h.window, modelBtn(h.doc));
 
     expect(popoverText(h.doc)).not.toContain("Sign in at the desk to load models");
     // `runGrokLogin` is host-local; the host would refuse it, so the phone must
@@ -110,7 +111,7 @@ describe("the Accounts cluster for an agent that needs a sign-in", () => {
   // state is still visible without a second word for one action.
   it("offers Connect, not signing out, and never says Sign in again", () => {
     const h = bootSignedOutCodex();
-    click(h.window, $(h.doc, "gear-btn"));
+    click(h.window, $(h.doc, "rail-gear-btn"));
 
     expect(popoverText(h.doc)).toContain("Connect");
     expect(popoverText(h.doc)).not.toContain("Sign in again");
@@ -129,13 +130,7 @@ describe("the Accounts cluster for an agent that needs a sign-in", () => {
     });
     click(h.window, $(h.doc, "gear-btn"));
     expect(popoverText(h.doc)).not.toContain("Sign out");
-    const settings = items(h.doc).find((el) =>
-      /(^|\s)Settings$/.test((el.textContent || "").replace(/\s+/g, " ").trim()),
-    );
-    click(h.window, settings!);
-    const providers = [...h.doc.querySelectorAll("#settings-overlay .settings-nav-item")]
-      .find((el) => (el.textContent || "").trim() === "Providers")!;
-    click(h.window, providers);
+    click(h.window, h.doc.querySelector(".model-manage-providers")!);
     expect(h.doc.querySelector('[data-id="providerCodex"]')!.textContent).toContain("Sign out");
     expect(h.doc.querySelector('[data-id="providerCodex"]')!.textContent).not.toContain("Connect");
   });

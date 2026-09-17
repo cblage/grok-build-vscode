@@ -83,9 +83,9 @@ export function sessionBoundToClosedFolder(
  * Remote messages that carry no cwd still act on a **bound** session or
  * client-selected repo. Refuse when that binding is no longer authorized.
  *
- * `selectRepo` is excluded by the caller: its target cwd is checked via
- * {@link allowRemoteRepoTarget} / the authorized catalog, so a tab can leave a
- * revoked binding.
+ * `selectRepo` and `resumeSession` with an explicit cwd are excluded by the
+ * caller: their destination is checked via {@link allowRemoteRepoTarget} and
+ * session resolution, so a tab can leave a revoked binding.
  */
 export function remoteBoundCwdStillAuthorized(
   boundCwd: string | undefined,

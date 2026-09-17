@@ -86,12 +86,28 @@
   const GITHUB_REPO_URL = "https://github.com/phuryn/grok-build-vscode";
   const GROK_CONNECTORS_URL = "https://grok.com/connectors";
   const CONNECTOR_SECTION_HERE = "On this computer";
+  // A phone is not the computer these live on. The desk-written heading
+  // sitting directly above the remote-written blurb named two different
+  // machines on one screen, which is most of why the section read as
+  // confusing. "Workspace machine" is true of a laptop and of a cloud
+  // machine, so one word covers both remote cases.
+  const CONNECTOR_SECTION_HERE_REMOTE = "On the workspace machine";
   const CONNECTOR_SECTION_GROK = "Grok.com connectors";
   const CONNECTOR_SECTION_LOCAL = "Local Grok connectors";
   const CONNECTOR_BLURB_HERE =
-    "These apps are available to Grok, Codex, and Claude. Most open a browser to sign in; GitHub uses a personal access token you paste here. Tokens stay on this machine.";
+    "These apps are available to Grok, Codex, and Claude. Most open a browser to sign in; GitHub takes a token you paste here. Credentials stay on this machine.";
+  // Remote, and allowed to connect. The old copy put three referents in
+  // two sentences — "the machine running this workspace", "this device",
+  // "here" — so "approve access on this device" read as the host when it
+  // means the phone. Sign-in genuinely opens in the browser you are
+  // holding (openConnectorConsent calls window.open here); only the
+  // credential travels.
+  const CONNECTOR_BLURB_HERE_REMOTE_CONNECT =
+    "These apps are available to Grok, Codex, and Claude on the machine running this workspace. Sign-in opens in this browser; GitHub takes a token you paste here. The credentials are saved on that machine, not on this one.";
   const CONNECTOR_BLURB_HERE_REMOTE =
-    "These apps are connected on the machine running this workspace. Sign-in happens there — it cannot be changed from this page.";
+    "These apps are connected on the machine running this workspace. Connecting and disconnecting are done there, not from this page.";
+  const CONNECTOR_DISCONNECT_COPY =
+    "Disconnect affects future conversations and reopened ones. Tools in already running sessions remain available. It does not revoke access at the vendor or clear saved OAuth sign-ins.";
   const CONNECTOR_BLURB_GROK =
     "These follow your Grok account, so they are shared across every Grok session on every machine.";
   const CONNECTOR_BLURB_LOCAL =
@@ -427,6 +443,83 @@
     return "—";
   }
 
+  function cliUpdateRows(provider) {
+    const name = provider === "codex" ? "Codex CLI" : "Claude Code CLI";
+    const suffix = provider === "codex" ? "Codex" : "Claude";
+    const entry = (s) => provider === "codex" ? codexProvider(s) : claudeProvider(s);
+    const update = (s) => ((s.providers || []).find((p) => p.id === provider) || {}).cliUpdate;
+    return [{
+      // The id keeps its "about" prefix: it is what the DOM suite addresses and
+      // it records where this row used to live.
+      id: "aboutUpdate" + suffix,
+      // Providers, not About. This is a fact about a provider's CLI, so it
+      // belongs beside that provider's account rather than under the extension
+      // version and the trademark notice.
+      category: "providers",
+      title: name,
+      kind: "action",
+      actionLabel: "Update " + name,
+      keepOpen: true,
+      // The version rides along, because a bare Update button on this page
+      // would be asking someone to act with nothing to act on. `latestCliVersion`
+      // is sent for Codex only, so Claude states the installed version and stops
+      // rather than claiming an up-to-date it cannot know.
+      describe: (s) => {
+        const p = entry(s) || {};
+        const newer = p.updateAvailable && p.latestCliVersion
+          ? "v" + p.latestCliVersion + " is available. "
+          : "";
+        // Two bare version numbers side by side leave the reader to work out
+        // which one is theirs -- rendered, "v0.152.1 · v0.153.4 is available"
+        // can be read as a range. The label settles it. A middot rather than a
+        // full stop between them for the same reason: "v0.152.1. v0.153.4 is
+        // available" reads as one broken sentence.
+        const installed = p.cliVersion
+          ? "Installed v" + p.cliVersion + (newer ? " · " : ". ")
+          : "";
+        return installed + newer
+          + "Runs its updater on the connected machine. This stops this provider’s "
+          + "running sessions, then resumes visible conversations.";
+      },
+      // Only when there is something to take. Offering to update software that
+      // is already current is noise, and this particular offer costs minutes
+      // and stops your running sessions.
+      //
+      // One rule for both providers. Claude briefly had an exception -- it was
+      // always offered, on the grounds that nothing told us what its current
+      // version was -- and the owner caught it offering to update a CLI whose
+      // own "Update completed" line was directly underneath. The host pins a
+      // Claude version now, exactly as it always has for Codex, so the
+      // exception is gone rather than narrowed.
+      //
+      // A running update keeps its row so it cannot vanish mid-operation, and
+      // a failed one keeps it so the retry is where the failure is. A SUCCEEDED
+      // one does not: the version is current now, so the offer goes and the
+      // separate status row carries "Update completed" until the next
+      // conversation clears it.
+      //
+      // An older HOST sends no `updateAvailable` for Claude, so its row simply
+      // does not appear there. That is the safe direction: this app cannot
+      // update a CLI on a host that predates the feature anyway, and the
+      // `cliUpdate` test above is what advertises support in the first place.
+      visible: (s) => {
+        const p = entry(s) || {};
+        if (!p.cliUpdate) return false;
+        if (p.cliUpdate.status === "running" || p.cliUpdate.status === "failed") return true;
+        return !!p.updateAvailable;
+      },
+      enabled: (s) => !(s.providers || []).some((p) => p.cliUpdate && p.cliUpdate.status === "running"),
+      message: () => ({ type: "update" + suffix }),
+    }, {
+      id: "about" + suffix + "UpdateStatus",
+      category: "providers",
+      title: name + " updates",
+      kind: "status",
+      visible: (s) => !!(update(s) && update(s).message),
+      describe: (s) => update(s).message,
+    }];
+  }
+
   /** One sentence, one control. Visibility is decided separately. */
   const ROWS = [
     {
@@ -490,6 +583,19 @@
       message: (value) => ({ type: "setExpandCommandOutputs", value }),
     },
     {
+      id: "expandDiffCard",
+      category: "general",
+      title: "Expand diff card",
+      description: "Open each turn's Changed-files card by default instead of showing only its header.",
+      kind: "toggle",
+      defaultValue: false,
+      visible: (s) => purposeOf(s) === "coding",
+      get: (s) => !!(s && s.expandDiffCard),
+      // VS Code Settings is a separate webview; only a remote applies locally.
+      localOnly: (s, env) => !!(env && env.isRemote),
+      message: (value) => ({ type: "setExpandDiffCard", value }),
+    },
+    {
       id: "steerByDefault",
       category: "general",
       title: "Steer by default",
@@ -535,6 +641,21 @@
         const state = known ? (s.telemetryEnabled ? "On. " : "Off. ") : "";
         return state + TELEMETRY_COPY;
       },
+    },
+    {
+      id: "promptNav",
+      category: "general",
+      title: "Previous prompt button",
+      description: "Show a button above the message box that jumps back to your previous prompt and highlights it. This device only.",
+      kind: "toggle",
+      defaultValue: true,
+      get: (s) => !!(s && s.promptNav),
+      // Client-local on a remote, host-backed on a desk. Not a nicety: VS
+      // Code opens Settings as its own webview, so a localOnly row there
+      // has no `apply` to call and no message to post, and the switch would
+      // flip while nothing happened.
+      localOnly: (s, env) => !!(env && env.isRemote),
+      message: (value) => ({ type: "setPromptNav", value }),
     },
     {
       id: "thumbsFeedback",
@@ -918,6 +1039,14 @@
       local: "githubToken",
     },
     {
+      id: "providerConfigFiles",
+      category: "providers",
+      title: "Provider config files",
+      description: "~/.grok/config.toml · ~/.codex/config.toml · ~/.claude/settings.json",
+      kind: "providerConfigs",
+      visible: (s, env) => !!(env && env.hostCaps && env.hostCaps.editProviderConfigFiles && env.hostCaps.editProjectFiles),
+    },
+    {
       id: "continueRemotely",
       category: "account",
       title: "Continue remotely",
@@ -984,16 +1113,6 @@
       actionLabel: "Open",
       visible: (s, env) => !!(env && env.isRemote),
       local: "openDeviceManager",
-    },
-    {
-      id: "openGlobalConfig",
-      category: "advanced",
-      title: "Open global config",
-      description: "Open the user-level Grok config file on this machine.",
-      kind: "action",
-      actionLabel: "Open",
-      hostLocal: true,
-      message: () => ({ type: "openGlobalConfig" }),
     },
     {
       id: "openProjectConfig",
@@ -1146,6 +1265,7 @@
         return versionLabel(p && p.cliVersion);
       },
     },
+    ...cliUpdateRows("codex"),
     {
       id: "aboutClaudeCli",
       category: "about",
@@ -1157,17 +1277,14 @@
         return versionLabel(p && p.cliVersion);
       },
     },
-    // Deliberately absent: "Codex ACP adapter", "Claude ACP adapter" and
-    // "Codex updates". The two adapters are pinned dependencies of THIS
+    ...cliUpdateRows("claude"),
+    // Deliberately absent: "Codex ACP adapter" and "Claude ACP adapter".
+    // The two adapters are pinned dependencies of THIS
     // extension (@agentclientprotocol/codex-acp, @agentclientprotocol/
     // claude-agent-acp, exact versions in package.json) and ship inside the
     // vsix, so they move only when the extension does — a version the reader
-    // cannot act on reads as one more thing to keep current. And "Codex
-    // updates are managed at its install source" was true only when the user
-    // installed Codex themselves; when they let us install it the source is
-    // us, pinned at CODEX_MANAGED_TAG, and there is nowhere for them to go.
-    // One sentence, two meanings. Grok is the only CLI this extension
-    // actually updates, so it is the only one with an update row.
+    // cannot act on reads as one more thing to keep current. All three CLIs
+    // have explicit update actions; only Grok is updated automatically by us.
     {
       id: "aboutGrokUpdateStatus",
       category: "about",
@@ -1265,8 +1382,10 @@
     return !!(env && env.hostCaps && env.hostCaps.mcpSettings);
   }
 
-  function connectorSection(row) {
-    if (row.id === "connectorsCatalog") return CONNECTOR_SECTION_HERE;
+  function connectorSection(row, env) {
+    if (row.id === "connectorsCatalog") {
+      return env && env.isRemote ? CONNECTOR_SECTION_HERE_REMOTE : CONNECTOR_SECTION_HERE;
+    }
     return "";
   }
 
@@ -1335,7 +1454,7 @@
           ...snapshot.mcpServers.map((s) => [s.displayName, s.name, s.scopeName, s.configFile].filter(Boolean).join(" ")),
         ].join(" ")
       : "";
-    const section = connectorSection(row);
+    const section = connectorSection(row, env);
     return [
       rowTitle(row, snapshot, env),
       rowDescription(row, snapshot, env),
@@ -1418,6 +1537,12 @@
       case "steerByDefault":
         next.steerByDefault = !!value;
         break;
+      case "expandDiffCard":
+        next.expandDiffCard = !!value;
+        break;
+      case "promptNav":
+        next.promptNav = !!value;
+        break;
       case "readRepliesAloud":
         next.readRepliesAloud = !!value;
         if (!next.readRepliesAloud) next.summarizeRepliesAloud = false;
@@ -1480,6 +1605,8 @@
       voiceKeyterms: [],
       telemetryEnabled: true,
       thumbsFeedback: false,
+      expandDiffCard: false,
+      promptNav: true,
       providers: [],
       // Host-owned, never latched locally: an older host that ignores
       // refreshProviders leaves this false and the button stays idle rather
@@ -1628,7 +1755,7 @@
     const parent = container.parentElement;
     if (!parent) return;
     for (const sibling of Array.from(parent.children)) {
-      if (sibling === container) continue;
+      if (sibling === container || sibling.id === "host-wait-strip") continue;
       if (on) {
         // Track ownership for BOTH attributes: cleanup must not strip an
         // inert some other surface set before settings opened.
@@ -1872,14 +1999,18 @@
     return !!(connector && connector.auth === "key");
   }
 
-  function connectorDescription(connector, env) {
+  function canManageConnectors(snapshot, env) {
+    return !(env && env.isRemote) || snapshot.mcpRemoteConnect === true;
+  }
+
+  function connectorDescription(connector, env, snapshot) {
     if (connector.status === "connecting") {
       return isKeyConnectorView(connector)
         ? "Checking the token…"
         : "Waiting for the browser sign-in to finish…";
     }
     if (connector.status === "error" && connector.error) return connector.error;
-    if (env && env.isRemote) {
+    if (env && env.isRemote && !canManageConnectors(snapshot, env)) {
       if (isKeyConnectorView(connector) && connector.connected && connector.keySet !== true) {
         return connector.description + " Connected, but no key on the desk.";
       }
@@ -1962,8 +2093,9 @@
     el.dataset.id = "connectorsCatalog";
     const warning = document.createElement("div");
     warning.className = "settings-mcp-warning";
+    const canManage = canManageConnectors(snapshot, env);
     warning.textContent = env && env.isRemote
-      ? CONNECTOR_BLURB_HERE_REMOTE
+      ? (canManage ? CONNECTOR_BLURB_HERE_REMOTE_CONNECT : CONNECTOR_BLURB_HERE_REMOTE)
       : CONNECTOR_BLURB_HERE;
     el.appendChild(warning);
     const connectors = sortConnectorsForDisplay(
@@ -1995,13 +2127,14 @@
       name.appendChild(document.createTextNode(connector.name));
       const desc = document.createElement("div");
       desc.className = "settings-row-desc";
-      desc.textContent = connectorDescription(connector, env);
+      desc.textContent = connectorDescription(connector, env, snapshot);
       copy.append(name, desc);
       const control = document.createElement("div");
       control.className = "settings-row-control";
       const connecting = connector.status === "connecting";
+      const authorization = snapshot.mcpConnectorAuthorization;
       const formOpen = !!(keyForm && keyForm.id === connector.id);
-      if (!(env && env.isRemote)) {
+      if (canManage) {
         if (isKeyConnectorView(connector) && connector.connected && !formOpen) {
           const replace = document.createElement("button");
           replace.type = "button";
@@ -2018,6 +2151,7 @@
         btn.dataset.id = connector.id;
         btn.dataset.auth = isKeyConnectorView(connector) ? "key" : "oauth";
         btn.dataset.connected = connector.connected ? "true" : "false";
+        if (connector.connected) btn.title = CONNECTOR_DISCONNECT_COPY;
         if (isKeyConnectorView(connector) && !connector.connected) {
           btn.textContent = connecting ? "Connecting…" : (formOpen ? "Cancel" : "Connect");
           btn.dataset.action = formOpen ? "cancel" : "open";
@@ -2034,7 +2168,7 @@
         control.appendChild(span);
       }
       row.append(copy, control);
-      if (!(env && env.isRemote) && isKeyConnectorView(connector) && connector.connected && connector.keySet === true && !formOpen) {
+      if (canManage && isKeyConnectorView(connector) && connector.connected && connector.keySet === true && !formOpen) {
         const readonly = document.createElement("label");
         readonly.className = "settings-connector-readonly settings-connector-readonly-live";
         const box = document.createElement("input");
@@ -2048,8 +2182,24 @@
         readonly.appendChild(document.createTextNode("Read-only (the agent can look, not write)"));
         row.appendChild(readonly);
       }
-      if (!(env && env.isRemote) && isKeyConnectorView(connector) && formOpen && !connecting) {
+      if (canManage && isKeyConnectorView(connector) && formOpen && !connecting) {
         row.appendChild(renderConnectorKeyForm(connector, keyForm));
+      }
+      if (canManage && authorization && authorization.id === connector.id) {
+        const form = document.createElement("div");
+        form.className = "settings-connector-key settings-connector-oauth";
+        if (authorization.error) form.appendChild(renderMcpSectionState(authorization.error, true));
+        if (authorization.status === "waiting" && authorization.url) {
+          const link = document.createElement("a");
+          link.className = "settings-action is-primary settings-connector-oauth-link";
+          link.href = authorization.url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = "Open sign-in";
+          form.appendChild(link);
+          form.appendChild(renderMcpSectionState("Approve access, then return here. Connection completes automatically."));
+        }
+        row.appendChild(form);
       }
       list.appendChild(row);
     }
@@ -2767,6 +2917,15 @@
   }
 
   function renderRow(row, snapshot, env, keyForm, githubTokenForm, githubCliStarted) {
+    if (row.kind === "providerConfigs") {
+      const el = document.createElement("details");
+      el.className = "settings-row settings-provider-configs";
+      el.dataset.id = row.id;
+      el.innerHTML = `<summary class="settings-row-title">Provider config files</summary>` +
+        [["grok", "Grok", "~/.grok/config.toml"], ["codex", "Codex", "~/.codex/config.toml"], ["claude", "Claude", "~/.claude/settings.json"]]
+          .map(([provider, name, path]) => `<div class="settings-provider-config"><div class="settings-row-copy"><div class="settings-row-title">${name}</div><div class="settings-row-desc">${path}</div></div><button type="button" class="settings-action" data-provider="${provider}" aria-label="Open ${path}">Open</button></div>`).join("");
+      return el;
+    }
     if (row.kind === "mcp") return renderMcpCatalog(snapshot, env);
     if (row.kind === "connectors") return renderConnectorsCatalog(snapshot, env, keyForm);
     if (row.kind === "routines") return renderRoutines(snapshot, env);
@@ -2774,6 +2933,13 @@
     el.className = "settings-row";
     el.dataset.id = row.id;
     el.dataset.kind = row.kind || "";
+    if (snapshot.pendingPreferences && snapshot.pendingPreferences[row.id]) {
+      el.setAttribute("aria-busy", "true");
+      const pending = document.createElement("span");
+      pending.className = "settings-pending";
+      pending.textContent = snapshot.pendingPreferences[row.id] + " — pending";
+      el.appendChild(pending);
+    }
     const enabled = rowEnabled(row, snapshot);
     if (!enabled) el.classList.add("is-disabled");
     const title = document.createElement("div");
@@ -2953,8 +3119,10 @@
     let categoryId = opts.category || "general";
     let query = "";
     let keyForm = { id: "", value: "", readOnly: false };
+    let oauthWindow;
     let githubTokenForm = { open: false, value: "" };
     let githubCliStarted = false;
+    let providerConfigsOpen = false;
     let pendingRestore = null;
     let aboutChecked = false;
     let providersChecked = false;
@@ -2996,7 +3164,10 @@
       snapshot = applyValue(row, value, snapshot);
       const message = rowMessage(row, value, snapshot);
       const localOnly = isLocalOnly(row, previous, env);
-      if (apply) apply(row.id, value, localOnly ? null : message, snapshot);
+      if (apply) {
+        const applied = apply(row.id, value, localOnly ? null : message, snapshot);
+        if (applied && applied.pending) snapshot = applied.snapshot;
+      }
       else if (message && !localOnly) post(message);
       if (pendingRestore) pendingRestore = null;
       paint();
@@ -3042,6 +3213,44 @@
         return;
       }
       post({ type: "openUrl", url });
+    }
+
+    function openConnectorConsent(id) {
+      if (!env.isRemote) return;
+      const current = snapshot.mcpConnectorAuthorization;
+      if (current && current.id === id && current.status === "waiting" && current.url) {
+        openExternalHref(current.url);
+        return;
+      }
+      // Reserve the tab inside the user's tap, before asynchronous discovery.
+      // No opener reaches the provider; a blocked popup leaves the visible link.
+      try {
+        if (oauthWindow) oauthWindow.tab.close();
+        const tab = window.open("", "_blank");
+        if (tab) {
+          tab.opener = null;
+          tab.document.title = "Connecting…";
+          tab.document.body.textContent = "Opening sign-in…";
+          oauthWindow = { id, tab };
+        }
+      } catch { oauthWindow = undefined; }
+    }
+
+    function updateConnectorConsent() {
+      if (!oauthWindow) return;
+      const authorization = snapshot.mcpConnectorAuthorization;
+      const row = (snapshot.mcpConnectors || []).find((c) => c.id === oauthWindow.id);
+      try {
+        if (authorization && authorization.id === oauthWindow.id && authorization.status === "waiting" && authorization.url) {
+          const url = new URL(authorization.url);
+          if (url.protocol === "https:") oauthWindow.tab.location.replace(url.href);
+          else oauthWindow.tab.close();
+          oauthWindow = undefined;
+        } else if (row && row.status === "error") {
+          oauthWindow.tab.close();
+          oauthWindow = undefined;
+        }
+      } catch { oauthWindow = undefined; }
     }
 
     function maybeCheckAbout() {
@@ -3176,6 +3385,7 @@
     }
 
     function paint() {
+      updateConnectorConsent();
       reconcileProviderPending(snapshot);
       reconcileProviderTerminal(snapshot);
       const chrome = describeChrome(container);
@@ -3385,7 +3595,7 @@
       } else {
         let lastSection = "";
         for (const row of rows) {
-          const section = connectorSection(row);
+          const section = connectorSection(row, env);
           if (section && section !== lastSection) {
             lastSection = section;
             const heading = document.createElement("h2");
@@ -3444,12 +3654,28 @@
       body.querySelectorAll(".settings-row").forEach((el) => {
         const row = ROWS.find((r) => r.id === el.dataset.id);
         if (!row) return;
-        if (row.kind === "toggle") {
+        if (row.kind === "providerConfigs") {
+          el.open = providerConfigsOpen;
+          el.ontoggle = () => { providerConfigsOpen = el.open; };
+          el.querySelectorAll("[data-provider]").forEach((btn) => {
+            btn.onclick = () => {
+              // The standalone Settings webview owns no chat panel. Choose
+              // by this mount, never settingsEditor on the connected host:
+              // a browser driving VS Code still needs its own panel.
+              if (opts.standalone) post({ type: "openProviderConfig", provider: btn.dataset.provider });
+              else {
+                if (onClose) onClose();
+                if (onLocal) onLocal("providerConfig:" + btn.dataset.provider);
+              }
+            };
+          });
+        } else if (row.kind === "toggle") {
           const sw = el.querySelector(".settings-switch");
           if (!sw || sw.disabled) return;
           sw.onclick = (e) => {
             e.stopPropagation();
-            commit(row, !rowValue(row, snapshot));
+            const pending = snapshot.pendingPreferenceValues || {};
+            commit(row, !(Object.prototype.hasOwnProperty.call(pending, row.id) ? pending[row.id] : rowValue(row, snapshot)));
           };
         } else if (row.kind === "select") {
           const select = el.querySelector("select");
@@ -3543,7 +3769,7 @@
       body.querySelectorAll(".settings-connector-action").forEach((btn) => {
         btn.addEventListener("click", (e) => {
           e.stopPropagation();
-          if (env.isRemote || btn.disabled) return;
+          if (!canManageConnectors(snapshot, env) || btn.disabled) return;
           const id = btn.dataset.id;
           if (!id) return;
           if (btn.dataset.auth === "key" && btn.dataset.connected !== "true") {
@@ -3554,8 +3780,10 @@
             }
             return;
           }
+          const disconnect = btn.dataset.connected === "true";
+          if (!disconnect) openConnectorConsent(id);
           post({
-            type: btn.dataset.connected === "true" ? "disconnectMcpConnector" : "connectMcpConnector",
+            type: disconnect ? "disconnectMcpConnector" : "connectMcpConnector",
             id,
           });
         });
@@ -3563,7 +3791,7 @@
       body.querySelectorAll(".settings-connector-key-open").forEach((btn) => {
         btn.addEventListener("click", (e) => {
           e.stopPropagation();
-          if (env.isRemote || btn.disabled) return;
+          if (!canManageConnectors(snapshot, env) || btn.disabled) return;
           const id = btn.dataset.id;
           if (!id) return;
           const row = snapshot.mcpConnectors.find((c) => c && c.id === id);
@@ -3579,7 +3807,7 @@
       body.querySelectorAll(".settings-connector-key-submit").forEach((btn) => {
         btn.addEventListener("click", (e) => {
           e.stopPropagation();
-          if (env.isRemote || btn.disabled) return;
+          if (!canManageConnectors(snapshot, env) || btn.disabled) return;
           const id = btn.dataset.id;
           if (!id) return;
           const form = btn.closest(".settings-connector-key");
@@ -3757,7 +3985,9 @@
           const card = btn.closest(".settings-routine");
           const id = card && card.dataset.routine;
           if (!id) return;
-          post({ type: "setRoutinePaused", id, paused: !btn.dataset.paused });
+          const pending = snapshot.pendingPreferenceValues || {};
+          const key = "routine:" + id;
+          post({ type: "setRoutinePaused", id, paused: Object.prototype.hasOwnProperty.call(pending, key) ? !pending[key] : !btn.dataset.paused });
         });
       });
       body.querySelectorAll(".settings-routine-run-now").forEach((btn) => {
@@ -3799,7 +4029,7 @@
       });
       body.querySelectorAll(".settings-connector-readonly-input").forEach((box) => {
         box.addEventListener("change", () => {
-          if (env.isRemote || box.disabled) return;
+          if (!canManageConnectors(snapshot, env) || box.disabled) return;
           const id = box.dataset.id;
           if (!id) return;
           if (keyForm.id === id) keyForm.readOnly = box.checked;
@@ -3814,6 +4044,12 @@
           e.stopPropagation();
           const url = link.dataset.href || link.href;
           if (url) openExternalHref(url);
+        });
+      });
+      body.querySelectorAll(".settings-connector-oauth-link").forEach((link) => {
+        link.addEventListener("click", (e) => {
+          e.preventDefault();
+          openExternalHref(link.href);
         });
       });
       body.querySelectorAll(".settings-mcp-web").forEach((btn) => {
@@ -3835,7 +4071,8 @@
 
     function trapTab(e) {
       if (!modal || e.key !== "Tab") return false;
-      const items = focusableControls(container);
+      const strip = document.getElementById("host-wait-strip");
+      const items = focusableControls(container).concat(strip && !strip.hidden ? focusableControls(strip) : []);
       if (!items.length) {
         e.preventDefault();
         e.stopPropagation();
@@ -3845,13 +4082,13 @@
       const last = items[items.length - 1];
       const active = container.ownerDocument && container.ownerDocument.activeElement;
       if (e.shiftKey) {
-        if (active === first || !container.contains(active)) {
+        if (active === first || !items.includes(active)) {
           e.preventDefault();
           e.stopPropagation();
           last.focus();
           return true;
         }
-      } else if (active === last || !container.contains(active)) {
+      } else if (active === last || !items.includes(active)) {
         e.preventDefault();
         e.stopPropagation();
         first.focus();
@@ -3969,6 +4206,10 @@
         paint();
       },
       dispose() {
+        if (oauthWindow) {
+          try { oauthWindow.tab.close(); } catch { /* already closed */ }
+          oauthWindow = undefined;
+        }
         document.removeEventListener("keydown", onKey, true);
         if (phoneMq) {
           if (typeof phoneMq.removeEventListener === "function") phoneMq.removeEventListener("change", onPhoneNavChange);
@@ -3994,10 +4235,12 @@
     CONNECTOR_LOGO_IDS,
     sortConnectorsForDisplay,
     CONNECTOR_SECTION_HERE,
+    CONNECTOR_SECTION_HERE_REMOTE,
     CONNECTOR_SECTION_GROK,
     CONNECTOR_SECTION_LOCAL,
     CONNECTOR_BLURB_HERE,
     CONNECTOR_BLURB_HERE_REMOTE,
+    CONNECTOR_BLURB_HERE_REMOTE_CONNECT,
     CONNECTOR_BLURB_GROK,
     CONNECTOR_BLURB_LOCAL,
     CONNECTOR_BLURB_LOCAL_REMOTE,

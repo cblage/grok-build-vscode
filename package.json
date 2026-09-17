@@ -2,7 +2,7 @@
   "name": "grok-vscode-phuryn",
   "displayName": "Grok Build for VS Code (Community)",
   "description": "GUI for Grok Build CLI (incl. Grok 4.6). Remote Control from your phone, voice control, multiple sessions, images and videos, Mermaid diagrams, and LaTeX. Works with SuperGrok, X Premium+, and xAI API key. Fair Source (FSL-1.1-MIT). Not affiliated with or endorsed by SpaceXAI (formerly xAI).",
-  "version": "4.1.9-sandbox.1",
+  "version": "4.9.1-sandbox.1",
   "publisher": "PawelHuryn",
   "author": {
     "name": "Paweł Huryn",
@@ -136,7 +136,7 @@
       },
       {
         "command": "grok.sendFile",
-        "title": "Grok: Send File"
+        "title": "Add to Grok chat"
       },
       {
         "command": "grok.insertAtMention",
@@ -340,12 +340,12 @@
           ],
           "enumDescriptions": [
             "CLI default (no flag passed to grok agent stdio)",
-            "None",
-            "Minimal",
-            "Low — faster, lighter reasoning",
-            "Medium",
-            "High",
-            "XHigh — deepest reasoning, slowest"
+            "None — no extra reasoning",
+            "Minimal — least reasoning",
+            "Low — fast, lightweight reasoning",
+            "Medium — balanced",
+            "High — deeper reasoning",
+            "Extra high — deepest reasoning, slowest"
           ],
           "default": "",
           "description": "Reasoning effort passed as --reasoning-effort to grok agent stdio. Values match the grok CLI's accepted set (none, minimal, low, medium, high, xhigh). Applies live on recent CLIs (grok 0.2.101+); older CLIs, and resetting to the model default, restart the session."
@@ -384,10 +384,20 @@
           "default": false,
           "markdownDescription": "Expand tool details by default — each shell command's IN/OUT block (full command text + captured output) and each edit's inline diff (useful for auditing Auto-accept sessions). With this setting on, groups containing command or edit details (such as \"Ran N commands\" or \"Edited N files\") open too; read/explore-only groups stay collapsed, and a lone command outside a group opens its details. Off: click a row or group header (›) to expand it — edit rows always show a `+N −M` change count, even when their diff is closed. Also toggleable live from the gear menu → **Config & debug → Expand tool details**."
         },
+        "grok.expandDiffCard": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Open each turn's Changed-files card by default instead of showing only its header. Independent of Expand tool details. On a phone or browser this is a per-device preference."
+        },
         "grok.steerByDefault": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Send straight into Grok's running turn instead of queueing it. Off (default): a message you send while Grok is working waits, and is sent as one prompt when the turn ends — you can still steer it on demand with the **Steer** button on the pending message. On: sending while Grok works **skips the queue** and injects the message into the turn immediately, so Grok changes course mid-answer. Steering never cancels the turn and never discards in-flight tool work — it is not a Stop. It carries plain text only: no attached files, no editor context, and no `/commands`. Needs a recent Grok Build CLI; where it's unsupported, messages fall back to the queue. Also toggleable live from the gear menu → **Config & debug → Steer by default**."
+          "markdownDescription": "Send straight into the running turn instead of queueing it. Off (default): a message you send while the agent is working waits, and is sent as one prompt when the turn ends — you can still steer it on demand with the **Steer** button on the pending message. On: sending while it works **skips the queue** and injects the message into the turn immediately, so the agent changes course mid-answer. Steering never cancels the turn and never discards in-flight tool work — it is not a Stop. It carries your text and the files you attached to that message, but not the ambient editor selection. **Grok** and **OpenAI Codex** take a mid-turn correction; **Claude Code** does not, and there a message always falls back to the queue. Images are the one thing that can still be refused: an older Grok Build CLI ignores them, so a message carrying pictures is queued whole rather than arriving without them. Also toggleable live from the gear menu → **Config & debug → Steer by default**."
+        },
+        "grok.promptNav": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show a **Previous prompt** button above the message box: it jumps back to the prompt before the one you are reading and highlights it, so you can find what you asked without scrolling. On a phone or browser this is a per-device preference and this setting does not apply."
         },
         "grok.soundNotifications": {
           "type": "boolean",
@@ -434,7 +444,7 @@
         "grok.voiceApiKey": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Optional override key for voice Speech-to-Text (`api.x.ai/v1/stt`). **Leave empty and it just works** — the extension reuses your `grok login` token automatically. Set this (or `GROK_VOICE_API_KEY` / `XAI_API_KEY` in your workspace `.env`) only to use a dedicated [console.x.ai](https://console.x.ai) developer key instead. Setup + costs: [docs/voice-setup.md](https://github.com/PawelHuryn/grok-vscode/blob/main/docs/voice-setup.md)."
+          "markdownDescription": "Optional xAI override key for speech-to-text. Empty uses `GROK_VOICE_API_KEY`, `XAI_API_KEY`, or the cached `grok login` token. For OpenAI dictation use `grok.voiceOpenAiApiKey` or `OPENAI_API_KEY`. See [voice setup](https://github.com/PawelHuryn/grok-vscode/blob/main/docs/voice-setup.md)."
         },
         "grok.ffmpegPath": {
           "type": "string",
@@ -462,12 +472,38 @@
         "grok.voiceLanguage": {
           "type": "string",
           "default": "",
-          "description": "Optional language code for streaming voice text formatting (for example, \"en\", \"fr\", \"de\", or \"ja\"). When set, xAI converts spoken numbers, currencies, and units to written forms. Leave empty to keep Inverse Text Normalization off and preserve spoken-form text. Supports User and Workspace scope."
+          "description": "Optional recognition language code (for example en, pl, fr). OpenAI uses it as a language hint; xAI also enables written formatting of numbers, currencies and units. Empty uses the backend default. Supports User and Workspace scope."
         },
         "grok.voiceStreaming": {
           "type": "boolean",
           "default": true,
-          "description": "Stream voice transcription live as you speak (words appear in the composer in real time, and \"grok send\" can submit without a second click). Disable to use one-shot batch mode (click to start, click to stop, then transcribe). Streaming costs $0.20/hr of audio vs $0.10/hr batch."
+          "description": "Stream transcription as you speak, with hands-free send on finalized text. Disable for local one-shot batch transcription after Stop. Browser dictation always streams. API costs depend on the backend and model."
+        },
+        "grok.voiceBackend": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "xai",
+            "openai"
+          ],
+          "default": "auto",
+          "description": "Speech-to-text backend. Auto prefers OpenAI for Codex and xAI for Grok or Claude, using the other when only its credential is available. An explicit choice requires its credential. Applies to the next recording."
+        },
+        "grok.voiceOpenAiApiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "OpenAI API-platform key for dictation. Empty uses `OPENAI_API_KEY` from the workspace `.env` or host environment. Codex / ChatGPT sign-in does not include transcription API access. API usage is billed separately."
+        },
+        "grok.voiceOpenAiModel": {
+          "type": "string",
+          "enum": [
+            "gpt-live-transcribe",
+            "gpt-4o-transcribe",
+            "gpt-4o-mini-transcribe",
+            "whisper-1"
+          ],
+          "default": "gpt-live-transcribe",
+          "description": "OpenAI Realtime transcription model. Dictionary terms become model-specific vocabulary hints. The explicit batch mode uses gpt-4o-transcribe."
         }
       }
     }
@@ -485,15 +521,20 @@
     "desktop": "npm run compile && node scripts/run-desktop.cjs",
     "desktop-dev": "npm run compile && node scripts/run-desktop.cjs --relay-dev --open-devtools --remote-debugging-port=9333",
     "test:desktop": "npm run compile && vitest run --config vitest.desktop.config.ts",
+    "e2e:composer": "node scripts/composer-layout-check.mjs",
     "e2e:screens": "npm run compile && node scripts/desk-screens-check.mjs",
     "e2e:open-timing": "npm run compile && node scripts/open-timing-check.mjs",
     "e2e:hc-colour": "node scripts/hc-colour-screens.mjs",
+    "e2e:changes": "node scripts/changes-view-screens.mjs",
+    "e2e:panel-flow": "node scripts/panel-flow-screens.mjs",
+    "e2e:turn-diff": "node scripts/turn-diff-screens.mjs",
     "e2e:welcome-tip": "node scripts/ide-welcome-tip-screens.mjs",
     "e2e:gh-unauth": "npm run compile && node scripts/gh-unauth-check.mjs",
     "marketplace:login": "node scripts/marketplace-session.mjs",
     "marketplace:publish": "node scripts/marketplace-publish.mjs",
     "e2e:lifecycle-host": "npm run compile && node scripts/lifecycle-host.mjs",
     "smoke:live": "npm run compile && node scripts/live-smoke.mjs",
+    "smoke:acp": "npm run compile && node scripts/acp-smoke.mjs",
     "telemetry:probe": "tsc -p . && node scripts/telemetry-probe.cjs",
     "check:relay": "node scripts/check-production-relay.mjs",
     "check:vsix": "npm run compile && node scripts/check-vsix-requires.mjs",
@@ -523,8 +564,8 @@
     "vitest": "^1.6.0"
   },
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "0.69.0",
-    "@agentclientprotocol/codex-acp": "1.1.14",
+    "@agentclientprotocol/claude-agent-acp": "0.76.0",
+    "@agentclientprotocol/codex-acp": "1.11.0",
     "electron-updater": "^6.6.4",
     "jpeg-js": "^0.4.4",
     "ws": "^8.21.0"

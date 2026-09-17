@@ -1,16 +1,11 @@
 # Running in a cloud environment
 
-A **cloud environment** is a machine AFK Pilot runs for you, rather than one you
-own. The same host runs there as on your desk — this repository's code, the same
-agent CLIs, the same projects and routines — reached from a phone or browser
-through [the relay](https://github.com/phuryn/grok-remote).
+A **cloud environment** — a **Cloud machine**, in the product — is a machine AFK
+Pilot runs for you, rather than one you own. The same host runs there as on your
+desk: this repository's code, the same agent CLIs, the same projects and
+routines, reached from a phone or any browser.
 
-This page is about what the *host* does differently when it is hosted. The
-user-facing half lives in the relay repo's
-[cloud environments](https://github.com/phuryn/grok-remote/blob/main/docs/cloud-environments.md).
-
-> **Status: the host side is built and tested. Provisioning is not.** You cannot
-> create one yet.
+This page is about what the *host* does differently when it is hosted.
 
 ## How the host knows
 
@@ -53,99 +48,82 @@ Best-effort. A relay that is unreachable or older than the endpoint gets silence
 because a failure here **delays** a routine and never loses one — catch-up is
 arithmetic, so a missed window still runs when the machine next comes up.
 
-### Connectors are hidden
+### Connectors work here, and it is worth saying why
 
-`mcpSettings` is withheld. Connecting an MCP connector is a browser OAuth flow at
-the vendor, and a hosted machine has no browser — nor, unlike a desk, any
-computer to walk over to.
+It reads like they could not. Connecting an MCP connector is a browser OAuth
+flow at the vendor, and a hosted machine has no browser — nor, unlike a desk,
+any computer to walk over to.
 
-This is the **one** host-local capability that does not re-home. The rest of them
-— opening a file, a diff, a URL, settings — are all things the remote client can
-do itself, because in a cloud environment it is the only client there is. That
-one genuinely cannot: nobody can complete somebody else's OAuth on their behalf.
+But the consent does not happen *here*. It happens in the browser of whoever
+asked, and the relay callback hands the code back to this host. Nobody is
+completing somebody else's OAuth: the person doing it is the one holding the
+phone.
 
-Hidden rather than shown-and-disabled: a control that explains why it will not
-work is still a control that does not work.
+So nothing is withheld. `mcpSettings` is advertised exactly as on a desk —
+`canShowMcpSettings` is true on both hosts and has no cloud branch — and
+`connectMcpConnector` / `disconnectMcpConnector` are `full` for any capable
+remote.
 
-### Signing in works; signing out is the interesting case
+### Signing in, and signing out
 
 Connecting an agent uses the device-code flow that any remote client uses
 (shipped 3.19.0 — see [Signing agents in](provider-login.md)). It has to work:
 there is no desk to fall back to, so a cloud environment with nothing connected
 could otherwise never be made usable.
 
-Signing **out** is currently `host-local`, and that classification was reasoned
-about a desk: revoking a credential affects every other surface using it. In a
-cloud environment, that environment *is* the only surface, so the argument
-inverts. Not yet changed, and recorded here because it is a real difference
-rather than an oversight.
+Signing **out** was classified `host-local` by reasoning about a desk: revoking
+a credential affects every other surface using it. Here the environment *is* the
+only surface, so the argument inverts — and `CLOUD_DISPOSITION` in
+[`src/remote-policy.ts`](../src/remote-policy.ts) now says so: `logout` and
+`githubSignOut` are `full` on a cloud host and `host-local` everywhere else.
+`refreshProviders`, `setTelemetryEnabled` and `setThumbsFeedback` re-home for
+the same reason — each is withheld from a desk because the desk owner has
+another surface, and meaningless to withhold where the browser is the only one.
 
 ## What does not change
 
-Everything else. The host is the same binary running the same code: chat,
-sessions, projects, file browse and edit, worktrees, routines, permission
-prompts and the capability policy all behave exactly as they do on a desk,
-because none of them ever depended on who owned the machine.
+Almost everything. The host is the same binary running the same code: chat,
+sessions, projects, file browse and edit, routines and permission prompts all
+behave exactly as they do on a desk, because none of them ever depended on who
+owned the machine.
 
-Two things are worth knowing anyway:
+The capability policy is the exception, and `CLOUD_DISPOSITION` is the whole of
+it. Three things are worth knowing:
 
-- **`keep-awake.ts` is inert.** It holds an OS wake lock so an idle laptop does
-  not drop the uplink; there is no lid to close in a container, and
-  `systemd-inhibit` is unavailable. It fails silently, which is what that module
-  does by design.
+- **Worktrees do not re-home.** `newWorktreeSession`, `applyWorktree` and
+  `removeWorktree` stay `host-local` and are absent from that table, and the
+  rail hides apply and remove on a remote. On a cloud machine the remote is the
+  only client there is, so those controls are not reachable by the person using
+  it at all. `removeProjectFolder` is host-local here for the same reason.
+- **`keep-awake.ts` never starts.** `shouldKeepAwake` returns false as soon as
+  the host is a cloud one, so the OS wake lock is skipped rather than attempted.
+  That is deliberate and not a failure: a wake lock cannot stop a hypervisor
+  pausing the machine, and what holds a cloud environment up is the uplink's
+  `working` heartbeat. Silent spawn-failure is the desk path, not this one.
 - **Your agent credentials live in the environment.** Sign-in completes there,
   against the vendor, and nothing transits the relay. That is required for Claude
   and good practice for the rest — a token that never moves cannot leak in
   transit — and it means the environment is a credential store.
 
-## How a cloud machine gets this app
+## The Linux AppImage
 
-Not from an image. The hosted environments run on Fly Sprites, which hand you a
-stock Ubuntu box with a writable overlay and offer no way to supply a base image
-of your own — so a fresh machine has Node, git and a couple of agent CLIs, and
-none of a display server, Chromium's libraries, or this app. It installs itself.
+This repo publishes a **Linux AppImage** that serves two audiences. A cloud
+machine has nobody to walk up to and install anything, so it fetches a built
+artifact rather than compiling one: building this app from source on such a
+machine was measured at 25 minutes, against seconds to download. It is
+unsigned, because there is nothing to sign it for.
 
-That install is why this repo publishes a **Linux AppImage** that no download
-page offers. Building from source on one of these machines was measured at 25
-minutes end to end — `apt` 58s, clone 77s, `npm ci` 20 minutes (I/O-bound on the
-VM's writable overlay, which is pathological for `node_modules`), compile 4.6
-minutes. Downloading a built artifact is seconds. The AppImage exists for
-machines nobody can walk up to, and for nothing else; it is unsigned, because
-there is nothing to sign it for.
+The same file is the Linux desktop download offered at
+`https://afkpilot.com/desktop`. The two uses do not collide, because a cloud
+machine **extracts** the AppImage and execs `squashfs-root` while a desk runs
+the file itself — and `electron-updater`'s `AppImageUpdater` refuses to run
+unless `process.env.APPIMAGE` is set, which only the second case has. So a
+cloud machine never touches the update feed and cannot self-update out from
+under the relay's refresh tooling, while a desk user gets real in-place
+updates. There is deliberately no cloud check in the updater path: the
+property is structural, and a check would be one more thing to keep true.
 
-The bootstrap script is served by the relay rather than baked in, and prefers the
-published AppImage with a build-from-source fallback — so a release that is
-missing one still produces working machines, slowly.
-
-The relay keeps a pool of these built ahead of demand, so the 25 minutes is paid
-where nobody is waiting. Someone waits for a real build only when the pool is
-empty, and the picker says so with a clock rather than calling the machine
-offline. The pool, the claim and the token handover are the relay's side; see
-`docs/cloud-environments.md` in the relay repo.
-
-## Running one yourself
-
-`cloud/Dockerfile` in the relay repo is a **container** version of the same idea,
-and it is a spike rather than what production runs — it predates the move to
-Sprites and cannot be used as a sprite's base image. It is still the clearest
-single statement of what a cloud machine needs: a Linux container with Node, git,
-the agent CLIs and a display server, running this repo's desktop host under
-`Xvfb` with `--no-sandbox`, given `GROK_RELAY_URL`, `GROK_RELAY_DEVICE_TOKEN` and
-`GROK_CLOUD_ENVIRONMENT=1`.
-
-Two things that will bite anyone reproducing it, both fixed here but worth
-knowing:
-
-- The desktop app could not start on Linux unpackaged at all until `ebdc6b8` —
-  `electron-updater` builds `AppImageUpdater` on first read of `autoUpdater`, and
-  its constructor rejects the `"0.0"` version an unpackaged app reports.
-- `xvfb-run` cannot authenticate Electron to its own X server in a container, and
-  fails in the worst way: the node process vanishes while `xvfb-run` stays alive,
-  so the container looks healthy and hosts nothing. Start `Xvfb` directly with
-  `-ac`.
-- `npm ci` can report success and still leave a broken Electron. The download in
-  its postinstall failed silently on a sprite and the first sign of it was
-  `Error: Electron failed to install correctly` twenty-five minutes later, at
-  startup. Re-running `node node_modules/electron/install.js` afterwards is cheap
-  and is the difference between a machine that works and one that boots into a
-  stack trace.
+There is **exactly one AppImage per release**, and the relay's boot script,
+`refresh-sprite-hosts.mjs` and `patch-sprite-host.mjs` all select it by the
+`.AppImage` extension alone. Attaching a second one would make every one of
+those selectors ambiguous — do not add a variant without changing them first.
