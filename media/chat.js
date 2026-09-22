@@ -11397,6 +11397,14 @@
     }
   }
 
+  // Does this host capture per-turn baselines at all? A desk always agrees
+  // with its own renderer; a remote is served the current client against
+  // whatever extension its desk has installed, and every released extension
+  // (the card shipped in v4.4.0, baselines did not) answers no here.
+  function hostKeepsTurnBaselines() {
+    return !!(state.hostCaps && state.hostCaps.turnDiffBaselines);
+  }
+
   function refreshTurnDiffSummaryUi() {
     const agg = aggregateTurnEdits(state.turnEditsByToolCallId.values());
     if (!agg.files.length) {
@@ -11452,7 +11460,22 @@
     for (const f of agg.files) {
       const isDel = f.action === "deleted";
       const revealId = lastCallByPath.get(normalizeTurnEditPathKey(f.path || ""));
-      const clickable = !!el._turnDiffBaseline || (!isDel && !!revealId);
+      // Clickable while this turn's baseline is still on the host — or on a
+      // host too old to have baselines at all.
+      //
+      // With a baseline the row opens the turn's merged diff. Without one it
+      // used to fall back to revealing the LAST tool call that touched the file
+      // — which on a file edited three times in a turn is edit #3 of 3, while
+      // the row's own `+/−` counts describe all three merged. The row and the
+      // thing it opened actively disagreed, and the counts were the honest
+      // half, so on a host that keeps baselines that fallback is gone and the
+      // foot explains the absence.
+      //
+      // On an OLDER host it stays, because there the absence means something
+      // else entirely and the reveal is the only thing the card ever had.
+      // `revealId` is wired below in both cases for a third one: a baseline
+      // exists and the host's git capture failed.
+      const clickable = !!el._turnDiffBaseline || (!hostKeepsTurnBaselines() && !isDel && !!revealId);
       const diffPath = turnEditDisplayPath(f.path, el._turnDiffBaseline && el._turnDiffBaseline.cwd);
       const row = document.createElement(clickable ? "button" : "div");
       row.className = "turn-diff-file"
@@ -11483,17 +11506,41 @@
     }
     el.appendChild(list);
 
+    // The foot: what the card cannot do, then the way out of it.
+    const foot = document.createElement("div");
+    foot.className = "turn-diff-summary-foot";
+
+    // Why the rows above are not clickable, said out loud.
+    //
+    // `turnDiffBaselines` is a Map on the host, filled at turn START and never
+    // persisted, so reloading the window leaves every turn already in the
+    // transcript without one. Making those rows inert was the fix; making them
+    // inert SILENTLY was not, and the owner said so: "explain not available
+    // after session reload instead of silently disabling. Maybe at the bottom
+    // of the card?" A row that opened a diff yesterday and does nothing today
+    // with nothing said is the #160 complaint over again — the note is what
+    // makes the absence a fact about the session rather than a fault in the
+    // card. The counts stay either way: those come from the tool calls in the
+    // transcript, which history does restore.
+    if (!el._turnDiffBaseline && hostKeepsTurnBaselines() && agg.files.length) {
+      const note = document.createElement("div");
+      note.className = "turn-diff-summary-note";
+      note.textContent =
+        "File diffs aren't available for this turn — they're kept only while the session stays open.";
+      foot.appendChild(note);
+    }
+
     // The way OUT of the card, and into the whole picture.
     //
     // The card answers "what did this turn touch"; the next question is almost
     // always "what is uncommitted now", and until this link the only route was
     // to find the panel and press a glyph. Offered only where the panel exists
     // AND has a repository to talk about — a dead link on a knowledge-work
-    // session would be worse than no link, and both are ordinary states.
+    // session would be worse than no link, and both are ordinary states. It is
+    // also the one thing a reloaded turn can still offer, which is why the note
+    // above sits beside it rather than instead of it.
     const panel = filePanelController();
     if (panel && typeof panel.canShowChanges === "function" && panel.canShowChanges()) {
-      const foot = document.createElement("div");
-      foot.className = "turn-diff-summary-foot";
       const open = document.createElement("button");
       open.type = "button";
       open.className = "turn-diff-open-changes";
@@ -11503,8 +11550,8 @@
         panel.showChanges();
       };
       foot.appendChild(open);
-      el.appendChild(foot);
     }
+    if (foot.childElementCount) el.appendChild(foot);
 
     setTurnDiffSummaryExpanded(el, el.classList.contains("expanded"));
     appendTranscriptChild(el); // live: always ride at the end of the turn

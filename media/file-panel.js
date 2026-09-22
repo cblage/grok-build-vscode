@@ -1572,6 +1572,24 @@
      */
     async function setScope(scope) {
       if (destroyed) return;
+      // "The host did not say which project is current" is not "there is no
+      // project". A remote's wake snapshot can arrive before the host has
+      // rebound its workspace, and every field the scope is built from
+      // coerces absent to "" on the way here (chat.js: `msg.cwd || ""`,
+      // `msg.activeCwd || ""`), so a momentary silence used to arrive as a
+      // null scope indistinguishable from a closed folder.
+      //
+      // Below, that read as a project SWITCH, which leaves Changes and resets
+      // to Folders; and the switch replaced the scope-state object, which
+      // fenced the answer to any read in flight. The owner hit exactly that on
+      // a phone while his machine woke: thrown out of Changes, and an open
+      // diff stuck on "Reading the diff..." that nothing would ever finish.
+      //
+      // Keeping the last scope is the honest degradation: the panel has
+      // nothing better to show, and the cwd arrives a frame later. The price,
+      // stated plainly: close the last project and the panel keeps listing it
+      // until a real scope replaces it or the page is refreshed.
+      if (!scope && currentScope) return;
       const nextState = scope ? scopeState(scope) : null;
       const switched = currentState !== nextState;
       if (switched) { cancelOperations(); abortPending(); }
@@ -2328,6 +2346,15 @@
       // on entry; it is two cheap commands and the whole point of the view is
       // that the number is true.
       void loadChanges({});
+      // And the same argument for the file you were reading when you left. It
+      // was only ever applied to the list, so re-entering Changes on an open
+      // diff showed whatever the last connection left there — including a
+      // "Reading the diff..." belonging to a read that died with that socket.
+      // This is the whole of the owner's workaround: he had to go back to all
+      // changes and open the file a second time to make this request happen.
+      // Status and diff are different request keys, so neither waits on the
+      // other.
+      if (currentState.changes.diffPath) void openChangeDiff(currentState.changes.diffPath, false);
     }
 
     async function loadChanges(opts) {
@@ -2405,8 +2432,14 @@
       } catch (err) {
         result = { ok: false, reason: String((err && err.message) || err || "Could not read the diff.") };
       }
+      // `diffSeq` still ours means no NEWER read has taken the flag over, so
+      // whatever happens next this read is the one that owns it and must put
+      // it down. Returning with it raised is what made the subview say
+      // "Reading the diff..." with nothing in flight behind it, and the
+      // suppression in refreshDisplayed then read that flag as proof a request
+      // was still coming.
+      if (seq === state.changes.diffSeq) state.changes.diffLoading = false;
       if (destroyed || seq !== state.changes.diffSeq || currentState !== state || state.changes.diffPath !== path) return;
-      state.changes.diffLoading = false;
       finishOperation(operation, result, () => openChangeDiff(path));
       if (result && result.ok) {
         state.changes.diffPatch = result.patch || "";

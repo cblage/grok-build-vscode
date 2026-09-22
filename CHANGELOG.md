@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.9.1-sandbox.1 — 2026-09-17
+## 4.9.1-sandbox.1 — 2026-09-22
 
 ### Added
 
@@ -22,7 +22,7 @@
 
 ---
 
-## 4.9.0 — 2026-09-17
+## 4.9.0 — 2026-09-18
 
 **This release is about being asked less and being told more.** A turn that edited five files made you open five tool rows to see what happened to one of them; a permission card asked the same question forty times a session because answering "don't ask again" granted almost nothing; and a workflow reported its progress as a percentage that was really a count of agents spent. Each of those is a place where the app had the information and handed you something else.
 
@@ -49,6 +49,16 @@
   One consequence worth knowing: a turn with many edits now leaves a diff tab each rather than reusing one. They close as you answer each card, so they only accumulate where cards go unanswered — which is the case where you wanted the tabs anyway.
 
 - **A workflow no longer reports how much of its budget it has spent as though it were progress (#163).** A deep-research or workflow run drew `agents used / agent budget` as a percentage, in the same place a Goal card draws real completion — so "2%" meant "one agent of fifty gone", and a run doing an hour of useful work inside a single agent sat at the same number the whole time. It now reads `3/50 agents`: the same fact, in a form that cannot be mistaken for a finish line. The card also shows elapsed time while a run is working, so a long quiet stretch is visibly *working* rather than possibly wedged.
+
+- **Pausing or stopping a workflow now changes the card that reports it.** Pause printed its confirmation and the card carried on as though nothing had happened: the button still said Pause, the phase still named the step it had stopped in, and the three dots kept pulsing beside a run that was no longer running. A run reports its lifecycle (`active`, paused, cancelled) separately from its position within that lifecycle, and the card was reading only the position — which a pause never changes. It now says **paused**, offers **Resume**, stops the dots, and keeps the step name on the line below, because where a paused run will resume from is worth knowing. A stopped run is marked ended and its controls are taken away.
+
+- **The run card says words, not the machine's vocabulary.** Labels like `phase_entered` and `user_paused` reached the card exactly as the CLI spells them internally. Anything it sends is now shown as ordinary English, including names we have never seen, and an event that only repeats what the card already says is dropped instead of printed twice. The liveness dots also moved off the end of the run's name, where they were indistinguishable from the "…" of a name too long to fit.
+
+- **Controls that could not work are no longer offered on a phone (#160).** An "open diff" on a tool row posted a request only a desk machine can answer, so on a phone or in a browser it did nothing at all — while the diff it would have opened was already on screen directly above it.
+
+- **A turn from a reloaded conversation explains itself instead of opening the wrong edit.** The per-turn diff baseline lives in memory and does not survive reloading the window, and those rows were quietly falling back to whichever single edit touched the file last — so a file the turn changed three times offered you the third change while the row's own `+/−` counts described all three. Those rows are now plain text, with a line at the bottom of the card saying the diffs are kept only while the session stays open. Hosts without per-turn baselines keep the behaviour they have always had, and say nothing.
+
+- **Waking your machine no longer strands the Changes view on a phone.** A reconnect snapshot that arrives before the machine has rebound its project reached the panel as "no project", which it read as a project *switch*: it left Changes for Folders, and the file diff you were reading was left saying "Reading the diff…" for a request that had died with the old connection and would never be asked again. The panel now keeps the project it had until a real one replaces it, and entering Changes re-reads the open diff the same way it already re-reads the file list.
 
 ## 4.8.0 — 2026-09-17
 

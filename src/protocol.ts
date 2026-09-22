@@ -333,6 +333,21 @@ export type HostUiCapabilities = {
    */
   showInFolder?: boolean;
   /**
+   * Whether this host captures a per-turn git baseline and emits
+   * `turnDiffBaseline`, so a turn's merged file diff can be opened from the
+   * summary card. OPT-IN: absent/false = the host predates the baseline, and
+   * the card keeps its original behaviour of revealing the tool call that made
+   * the edit. Present = the host does keep baselines, so a card WITHOUT one is
+   * a turn whose baseline is gone (the map is in memory and dies with the
+   * window) and the card says so instead of offering a diff it cannot show.
+   *
+   * A remote is the whole reason this flag exists: it is served the current
+   * client against whatever extension its desk has installed, and the two
+   * absences — "your host is old" and "your session reloaded" — need
+   * different words on screen.
+   */
+  turnDiffBaselines?: boolean;
+  /**
    * Open View-all text and proposed diffs in the shared in-app preview
    * overlay instead of a host editor or bare window. OPT-IN: absent/false
    * keeps the current path (VS Code tabs, older desktop windows, remote

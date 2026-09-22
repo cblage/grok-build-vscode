@@ -17512,6 +17512,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // metadata preload; every other host keeps the lazy default.
         servesMediaRanges: this.host.canServeMediaRanges,
         showInFolder: this.host.canShowInFolder,
+        // Not a host-kind capability: every host running THIS code captures
+        // turn baselines. It is a host-VERSION fact, and the only client that
+        // can disagree with its host about it is a remote (see protocol.ts).
+        turnDiffBaselines: true,
         // OPT-IN: desktop only. View all / proposed diffs open the in-app
         // overlay instead of a host editor or bare window. Remotes never
         // receive this (DESK_ONLY_CAPABILITIES).

@@ -652,6 +652,108 @@ describe("turn-level file change summary", () => {
 });
 
 
+// A turn whose baseline is gone, which after a window reload is every turn in
+// the transcript. `turnDiffBaselines` is a Map on the host, filled at turn
+// START and never persisted, so a restored turn has no baseline and never will.
+//
+// The rows used to stay clickable and reveal the LAST tool call that touched
+// the file — edit #3 of 3 on a thrice-edited file, while the row's own counts
+// describe all three merged. The owner asked for the honest version and named
+// where it goes: *"Don't offer it but explain not available after session
+// reload instead of silently disabling. Maybe at the bottom of the card?"*
+describe("a turn whose diffs are gone says so", () => {
+  const NOTE = /File diffs aren't available for this turn/;
+  const note = (doc: Document) => doc.querySelector(".turn-diff-summary-note");
+
+  /** A finished edit turn. `caps` decides which world the host lives in. */
+  function turn(caps: Record<string, unknown> | null, baseline: boolean) {
+    const h = bootWebview();
+    if (caps) dispatch(h.window, { type: "initialState", capabilities: caps });
+    dispatch(h.window, { type: "agentStart" });
+    if (baseline) dispatch(h.window, { type: "turnDiffBaseline", turnId: "t1", cwd: "/repo" });
+    // Edited twice, which is the case the reveal used to get wrong: the row
+    // sums both, the last tool call is only the second.
+    dispatch(h.window, editCall("e1", "src/a.ts"));
+    dispatch(h.window, editUpdate("e1", "src/a.ts", "one", "two"));
+    dispatch(h.window, editCall("e2", "src/a.ts"));
+    dispatch(h.window, editUpdate("e2", "src/a.ts", "two", "three"));
+    dispatch(h.window, { type: "agentEnd" });
+    return h;
+  }
+
+  it("makes the row inert rather than opening the wrong edit", () => {
+    const { window, doc, posted } = turn({ turnDiffBaselines: true }, false);
+    const row = rowByPath(doc, /a\.ts/)!;
+    expect(row.tagName).toBe("DIV");
+    expect(row.className).not.toMatch(/has-diff/);
+    click(window, row);
+    // Nothing asked for, and nothing quietly unfolded elsewhere in the
+    // transcript either — the silent tool-call expansion was the half of the
+    // old behaviour that made the dead row look alive.
+    expect(posted.filter((m: any) => m.type === "turnFileDiff" || m.type === "openDiff")).toHaveLength(0);
+    expect(doc.querySelector(".tool-item.expanded, .tool-item-flat.expanded")).toBeNull();
+    // The counts survive: they come from the tool calls in the transcript,
+    // which a restore does bring back. +2 −2 across the two edits.
+    expect(row.querySelector(".diff-stat-add")!.textContent).toBe("+2");
+  });
+
+  it("explains the absence at the bottom of the card, next to the way out", () => {
+    const { doc } = turn({ turnDiffBaselines: true }, false);
+    const foot = doc.querySelector(".turn-diff-summary-foot")!;
+    expect(note(doc)).not.toBeNull();
+    expect(note(doc)!.textContent).toMatch(NOTE);
+    expect(note(doc)!.textContent).toMatch(/only while the session stays open/);
+    // In the foot, below the file list — not floating above the rows it is
+    // about, and first in the foot so it reads before the button.
+    expect(foot.contains(note(doc)!)).toBe(true);
+    expect(foot.firstElementChild).toBe(note(doc));
+    expect(doc.querySelector(".turn-diff-summary-list")!.compareDocumentPosition(foot)
+      & 4 /* DOCUMENT_POSITION_FOLLOWING */).toBeTruthy();
+  });
+
+  it("folds the explanation away with the card", () => {
+    // It explains why the ROWS do nothing, so it belongs to the same region
+    // they do: a collapsed card has no rows to explain.
+    const { window, doc } = turn({ turnDiffBaselines: true }, false);
+    const card = doc.querySelector(".turn-diff-summary")!;
+    const foot = () => doc.querySelector(".turn-diff-summary-foot") as HTMLElement;
+    const header = card.querySelector(".turn-diff-summary-header") as HTMLElement;
+    const open = card.classList.contains("expanded");
+    expect(foot().hidden).toBe(!open);
+    click(window, header);
+    expect(foot().hidden).toBe(open);
+  });
+
+  it("says nothing while the baseline is still there", () => {
+    const { window, doc, posted } = turn({ turnDiffBaselines: true }, true);
+    expect(note(doc)).toBeNull();
+    const row = rowByPath(doc, /a\.ts/)!;
+    expect(row.tagName).toBe("BUTTON");
+    click(window, row);
+    expect(posted.at(-1)).toMatchObject({ type: "turnFileDiff", turnId: "t1", path: "src/a.ts" });
+  });
+
+  // THE REGRESSION THIS PAIRS WITH, and the first attempt shipped it.
+  //
+  // The card shipped in v4.4.0 and baselines only landed in 4.9.0, and a
+  // remote is served the current chat.js against whatever extension its desk
+  // has installed. So on every RELEASED host no baseline ever arrives — and
+  // "kept only while the session stays open" would be a flat lie to a phone
+  // whose session never left. There the reveal is the only thing the card has
+  // ever had, and it keeps it.
+  it("keeps the old reveal, and stays quiet, on a host without baselines", () => {
+    for (const caps of [null, {}, { turnDiffBaselines: false }]) {
+      const { window, doc, posted } = turn(caps as any, false);
+      const row = rowByPath(doc, /a\.ts/)!;
+      expect(row.tagName, JSON.stringify(caps)).toBe("BUTTON");
+      click(window, row);
+      expect(posted.filter((m: any) => m.type === "turnFileDiff")).toHaveLength(0);
+      expect(doc.querySelector(".tool-item.expanded, .tool-item-flat.expanded")).toBeTruthy();
+      expect(note(doc), JSON.stringify(caps)).toBeNull();
+    }
+  });
+});
+
 describe("independent diff-card expansion", () => {
   function turn(h: ReturnType<typeof bootWebview>, id: string) {
     dispatch(h.window, { type: "agentStart" });
