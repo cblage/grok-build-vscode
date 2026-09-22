@@ -45,8 +45,8 @@ function makeSidebar(connections: Record<string, boolean>): AnySidebar {
   return sidebar;
 }
 
-const refresh = (sidebar: AnySidebar): Promise<void> =>
-  (GrokSidebar.prototype as AnySidebar).refreshProviderStates.call(sidebar);
+const refresh = (sidebar: AnySidebar, opts?: { credentials?: boolean }): Promise<void> =>
+  (GrokSidebar.prototype as AnySidebar).refreshProviderStates.call(sidebar, opts);
 
 describe("Settings → Providers refresh", () => {
   it("probes every INSTALLED agent, not just the ones marked connected", async () => {
@@ -174,6 +174,87 @@ describe("Settings → Providers refresh", () => {
     for (const tier of ["read-only", "propose", "full"] as const) {
       expect(allowFromRemote("refreshProviders", tier)).toBe(false);
     }
+  });
+});
+
+/**
+ * #171 — "opening the settings page starts Claude Code and talks to Anthropic".
+ *
+ * The reporter was right about the mechanism and it was worse than they knew:
+ * every INSTALLED agent was proved this way, including accounts they had never
+ * connected to this extension. Proving one is not a lightweight ping — it
+ * starts the vendor's ACP adapter, which starts the vendor's binary and creates
+ * a real session (measured: ~14 connections to api.anthropic.com, 5 to
+ * mcp-proxy.anthropic.com, one to telemetry, ~3s, the person's MCP connectors
+ * started along with it). No prompt is sent, so nothing is billed — but none of
+ * that was asked for.
+ *
+ * Re-reading what is INSTALLED is the cheap half and stays on page open. The
+ * expensive half now needs someone to have pressed something.
+ */
+describe("Providers refresh: the local half never contacts anybody (#171)", () => {
+  it("proves no accounts when the page merely opened", async () => {
+    const sidebar = makeSidebar({ grok: false, codex: false, claude: false });
+    await refresh(sidebar, { credentials: false });
+    expect(sidebar.reprobeProviderCredentials).not.toHaveBeenCalled();
+  });
+
+  it("still re-runs the locators, so a CLI installed since boot appears", async () => {
+    const sidebar = makeSidebar({ grok: true });
+    await refresh(sidebar, { credentials: false });
+    expect([sidebar.cliPath, sidebar.codexCliPath, sidebar.claudeCliPath])
+      .toEqual([undefined, undefined, undefined]);
+  });
+
+  it("still re-reads the versions — a spawn, and nothing on the wire", async () => {
+    const sidebar = makeSidebar({ grok: true });
+    // Same seam the version tests above use: one level below
+    // reprobeProviderVersion, so this asserts the real path runs.
+    const seen: string[] = [];
+    sidebar.probeProviderVersion = vi.fn(async (provider: string) => {
+      seen.push(provider);
+      return "9.9.9";
+    });
+    await refresh(sidebar, { credentials: false });
+    expect(seen.sort()).toEqual(["claude", "codex"]);
+  });
+
+  it("promotes nothing, because it learned nothing", async () => {
+    const sidebar = makeSidebar({ grok: false, codex: false, claude: false });
+    // Would have said yes to all three. It is never asked.
+    sidebar.reprobeProviderCredentials = vi.fn(async () => true);
+    await refresh(sidebar, { credentials: false });
+    expect(sidebar.setProviderConnected).not.toHaveBeenCalled();
+    expect(sidebar.providerConnectionState).toEqual({ grok: false, codex: false, claude: false });
+  });
+
+  it("demotes nothing either — a row keeps what the last real probe found", async () => {
+    const sidebar = makeSidebar({ grok: true, codex: true, claude: true });
+    await refresh(sidebar, { credentials: false });
+    expect(sidebar.providerConnectionState).toEqual({ grok: true, codex: true, claude: true });
+    expect(sidebar.setProviderConnected).not.toHaveBeenCalled();
+  });
+
+  it("still ends idle, so the button cannot be left spinning", async () => {
+    const sidebar = makeSidebar({ grok: true });
+    await refresh(sidebar, { credentials: false });
+    expect(sidebar.providerRefreshInFlight).toBe(false);
+    expect(sidebar.postedChecking.at(-1)).toBe(false);
+  });
+
+  // The direction of the default is load-bearing. An older client — a relay
+  // still serving a vendored client from before this change — sends no field at
+  // all, and its Refresh button has to keep proving accounts. The cost of that
+  // pairing is only that the fix arrives with the client, which is the
+  // fast-moving surface anyway.
+  it.each([
+    ["no options at all", undefined],
+    ["an empty options object", {}],
+    ["credentials: true", { credentials: true }],
+  ])("proves accounts on %s", async (_label, opts) => {
+    const sidebar = makeSidebar({ grok: true, codex: true, claude: true });
+    await refresh(sidebar, opts as { credentials?: boolean } | undefined);
+    expect(sidebar.reprobeProviderCredentials).toHaveBeenCalledTimes(3);
   });
 });
 

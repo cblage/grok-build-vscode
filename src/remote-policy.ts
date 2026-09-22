@@ -528,6 +528,11 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // Same class as the other General host prefs: the desk owns the switch,
   // remotes receive the live value and honour it for thumbs.
   setThumbsFeedback: "host-local",
+  // The tray belongs to the machine the window is on. A phone has no window
+  // there to keep, and a cloud machine has no tray at all, so unlike the other
+  // General prefs this one is not merely desk-owned -- it is desk-only, and a
+  // remote is never offered the row.
+  setDesktopTray: "host-local",
   // Machine-global disclosure preference in ~/.grok/client-state — the web
   // client inherits and may set it (host-owned store, not VS Code settings).
   setAppPurpose: "propose",
@@ -703,6 +708,7 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   configureOpenAiVoice: false,
   setTelemetryEnabled: false,
   setThumbsFeedback: false,
+  setDesktopTray: false,
   setAppPurpose: false,
   summarizeSpeech: true,
   requestImageFull: true,
@@ -753,6 +759,12 @@ const CLOUD_DISPOSITION: Partial<Record<WebviewMsg["type"], InboundDisposition>>
   // there is no desk, so read-only means never (owner, 2026-08-31).
   setTelemetryEnabled: "full",
   setThumbsFeedback: "full",
+  // setDesktopTray is deliberately NOT promoted. The others are read-only on a
+  // remote only because a desk owner could set them at the desk, so a cloud
+  // machine -- which has no desk -- would otherwise never be able to. The tray
+  // is different: it is about a window someone is looking at, and nobody sits
+  // at a cloud machine's window. Promoting it would offer a phone a switch over
+  // a tray that machine has no use for (#174).
 };
 
 /** May this WebviewMsg type, arriving from a remote connection of `tier`, be

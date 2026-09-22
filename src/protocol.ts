@@ -428,6 +428,20 @@ export type HostMsg =
        * from this field; `feedbackAvailability` remains the affordance gate.
        */
       thumbsFeedback?: boolean;
+      /**
+       * Whether this machine can keep the app in a tray when the window closes
+       * (#174) — desktop app on Windows or Linux, and nothing else. The settings
+       * row keys its visibility off this rather than off `isDesktop`, because a
+       * macOS desktop already keeps the app alive without one and a cloud
+       * machine has no tray at all.
+       *
+       * Absent on older hosts, which is read as "no": a switch that posts a
+       * message the host has never heard of is worse than no switch.
+       */
+      traySupported?: boolean;
+      /** Current value of `grok.desktop.tray`. Only meaningful beside
+       *  `traySupported`. */
+      desktopTray?: boolean;
       capabilities: HostUiCapabilities }
   /** Live retraction of `capabilities.moveViewHint`, sent the moment the user
    *  opens the host's move-view picker. `initialState` is not re-sent on a
@@ -1252,6 +1266,10 @@ export type WebviewMsg =
   | { type: "setTelemetryEnabled"; value: boolean }
   /** Persist `grok.thumbsFeedback`. Host-owned; remotes honour the desk value. */
   | { type: "setThumbsFeedback"; value: boolean }
+  /** Desktop only: keep running in the tray when the window is closed.
+   *  A tray belongs to the machine the window is on, so a remote never
+   *  sends this and VS Code has no tray to configure (#174). */
+  | { type: "setDesktopTray"; value: boolean }
   /**
    * Attach a user-selected file. VS Code posts a `path` (file URI or absolute)
    * from the webview drag-drop surface. Desktop posts only a host-minted
@@ -1295,8 +1313,20 @@ export type WebviewMsg =
   /** Re-observe every account without asserting anything about it. Unlike
    *  `recheckConnection` this never marks a provider connected — it re-runs the
    *  CLI locators and re-probes the credentials of accounts already connected,
-   *  so Settings → Providers can be made to tell the truth on demand. */
-  | { type: "refreshProviders" }
+   *  so Settings → Providers can be made to tell the truth on demand.
+   *
+   *  `credentials: false` asks for the LOCAL half only: re-run the locators and
+   *  re-read `--version`, and contact nobody. Proving an account means starting
+   *  the agent's ACP adapter and creating a session against its vendor, which
+   *  is real network traffic to an account the person may never have connected
+   *  to this extension — #171, where opening the page did it unasked.
+   *
+   *  Absent, the field means `true`, which is what this message has always
+   *  done. That direction is deliberate: a client older than the host keeps its
+   *  Refresh button working, and the only cost of the older pairing is that the
+   *  fix arrives with the client rather than the host. The client is the
+   *  fast-moving surface here, so that is the better half to carry it. */
+  | { type: "refreshProviders"; credentials?: boolean }
   | { type: "retryProviderSession"; provider?: "grok" | "codex" | "claude" }
   | { type: "listSessions"; offset?: number; limit?: number; providerCursor?: { grokOffset: number; codexHighWater?: { updatedAt: number; id: string } }; query?: string }
   // Preview rows for a repo the client is NOT currently in — the projects rail
@@ -1548,7 +1578,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   openProjectConfig: true, listMcpServers: true, connectMcpConnector: true, disconnectMcpConnector: true,
   listRoutines: true, saveRoutine: true, deleteRoutine: true, setRoutinePaused: true, runRoutineNow: true, showLogs: true, toggleDevTools: true, openSettings: true, openSettingsSurface: true, closeSettingsSurface: true, dismissWelcomeTip: true, welcomeTipShown: true, moveView: true,
   setShowThinking: true, setAppPurpose: true, setExpandCommandOutputs: true, setSteerByDefault: true, setPromptNav: true, setExpandDiffCard: true,
-  setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, setVoiceSendPhrase: true, setVoiceKeyterms: true, setTelemetryEnabled: true, setThumbsFeedback: true, summarizeSpeech: true, requestImageFull: true, requestImageOriginal: true, composerFocus: true,
+  setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, setVoiceSendPhrase: true, setVoiceKeyterms: true, setTelemetryEnabled: true, setThumbsFeedback: true, setDesktopTray: true, summarizeSpeech: true, requestImageFull: true, requestImageOriginal: true, composerFocus: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
   questionCancel: true, setModel: true, installCodex: true, cancelCodexInstall: true, runInstallCmd: true, runGrokLogin: true,
   cancelDeviceLogin: true, submitDeviceLoginCode: true,

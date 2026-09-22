@@ -144,6 +144,11 @@
   const TELEMETRY_COPY =
     "Anonymous usage stats only: a single session-start event with an anonymous install id — never prompts, code, file paths or names, and no identity. The IP address is discarded, never stored.";
 
+  // Says what the OFF state does as well as the ON state: the whole point of
+  // the row is that closing the window no longer means quitting, and a person
+  // looking for "why didn't it quit" needs to recognise this row as the answer.
+  const TRAY_COPY = "Closing the window leaves the app running in the tray, so your agent "
+    + "and any linked phone keep working. Turn this off to quit on close.";
   const THUMBS_COPY =
     "Show thumbs on a finished Grok turn so you can send a rating to SpaceXAI. Off by default. On, thumbs appear only when this Grok session supports feedback — never on Codex or Claude.";
 
@@ -667,6 +672,22 @@
       visible: (s, env) => !env || !env.isRemote || hostIsCloud(env),
       get: (s) => !!(s && s.thumbsFeedback),
       message: (value) => ({ type: "setThumbsFeedback", value }),
+    },
+    {
+      id: "desktopTray",
+      category: "general",
+      title: "Keep running in the tray",
+      description: TRAY_COPY,
+      kind: "toggle",
+      defaultValue: true,
+      // Keyed off traySupported, not isDesktop: macOS has no tray because a
+      // tray is not its answer, a cloud machine has no tray, and an older host
+      // says nothing at all -- in each case the switch would have nothing
+      // behind it. `!env.isRemote` because the tray belongs to the machine the
+      // window is on, and a phone has no window there to keep.
+      visible: (s, env) => !!(s && s.traySupported === true && env && !env.isRemote),
+      get: (s) => !s || s.desktopTray !== false,
+      message: (value) => ({ type: "setDesktopTray", value }),
     },
     {
       id: "thumbsFeedbackRemote",
@@ -1568,6 +1589,9 @@
       case "thumbsFeedback":
         next.thumbsFeedback = !!value;
         break;
+      case "desktopTray":
+        next.desktopTray = !!value;
+        break;
       default:
         break;
     }
@@ -1605,6 +1629,10 @@
       voiceKeyterms: [],
       telemetryEnabled: true,
       thumbsFeedback: false,
+      // Defaults to NOT supported: an older host says nothing about a tray,
+      // and the row must stay hidden rather than appear and do nothing (#174).
+      traySupported: false,
+      desktopTray: true,
       expandDiffCard: false,
       promptNav: true,
       providers: [],
@@ -3271,15 +3299,28 @@
       return !env.isRemote || hostIsCloud(env);
     }
 
-    function requestProvidersRefresh() {
+    /** `credentials` decides whether the desk may prove the ACCOUNTS as well as
+     *  re-read what is installed. Proving one starts the agent's ACP adapter and
+     *  creates a session against the vendor — real traffic, for an account the
+     *  person may never have connected here (#171). Pass true only where a
+     *  person pressed something. */
+    function requestProvidersRefresh(credentials) {
       if (!canRefreshProviders()) return;
-      post({ type: "refreshProviders" });
+      post({ type: "refreshProviders", credentials: credentials === true });
     }
 
     /**
-     * Opening the page is itself the request. What the rows claim comes from a
-     * persisted flag and a cached CLI path, so arriving here without asking is
-     * the most common way to read something that stopped being true.
+     * Opening the page is itself the request — for what is INSTALLED. What the
+     * rows claim about the local machine comes from a cached CLI path, so
+     * arriving here without asking is the most common way to read something
+     * that stopped being true, and re-running the locators costs a spawn.
+     *
+     * It is NOT a request to contact anybody. Opening a settings page is not
+     * consent to start Claude Code and hold a session open against Anthropic,
+     * which is what this used to do for every installed agent, connected or not
+     * (#171). A lapsed account therefore keeps its row until Refresh or the
+     * row's own Check — the page can be a little stale about a sign-in that
+     * happened elsewhere, and that is the cheaper of the two wrongs.
      *
      * Latched like maybeCheckAbout: paint() runs on every repaint and every
      * host update, and this must fire once per visit, not once per frame.
@@ -3288,7 +3329,7 @@
       if (providersChecked || categoryId !== "providers" || query.trim()) return;
       if (!canRefreshProviders()) return;
       providersChecked = true;
-      requestProvidersRefresh();
+      requestProvidersRefresh(false);
     }
 
     function requestMcpRefresh() {
@@ -3513,7 +3554,8 @@
         refresh.textContent = checking ? "Checking…" : "Refresh";
         refresh.disabled = checking;
         if (checking) refresh.setAttribute("aria-busy", "true");
-        refresh.onclick = (e) => { e.stopPropagation(); requestProvidersRefresh(); };
+        // A person pressed it, so this is the one that may prove the accounts.
+        refresh.onclick = (e) => { e.stopPropagation(); requestProvidersRefresh(true); };
         headActions.appendChild(refresh);
       }
       if (!searching && page && page.id === "connectors") {
@@ -3845,7 +3887,10 @@
       body.querySelectorAll(".settings-github-flow-recheck").forEach((btn) => {
         btn.addEventListener("click", (e) => {
           e.stopPropagation();
-          post({ type: "refreshProviders" });
+          // This asks "did my GitHub sign-in land?" — the host answers it from
+          // refreshGithubState, which runs either way. Starting Claude Code and
+          // Codex to answer a question about GitHub is #171 in miniature.
+          requestProvidersRefresh(false);
         });
       });
       body.querySelectorAll(".settings-provider-recheck").forEach((btn) => {

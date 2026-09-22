@@ -2729,7 +2729,9 @@ describe("settings: the GitHub token path matches what the host will accept", ()
     expect(root.querySelector(".settings-github-flow-cancel")?.textContent).toBe("Cancel");
     posted.length = 0;
     recheck.click();
-    expect(posted).toContainEqual({ type: "refreshProviders" });
+    // The local half only: this asks about GitHub, and proving the agents to
+    // answer it is #171 (see the Providers-page describe at the end of this file).
+    expect(posted).toContainEqual({ type: "refreshProviders", credentials: false });
     // And ONLY that. The row binder claims any `.settings-action` inside a row
     // as its primary control, so while this button carried that class it fired
     // Connect first and opened a second sign-in terminal behind the refresh.
@@ -3006,5 +3008,158 @@ describe("Expand diff card across settings surfaces", () => {
     seedChat(h, { expandDiffCard: false });
     dispatch(h.window, { type: "expandDiffCard", value: false });
     expect(h.doc.querySelector('.turn-diff-summary-header')?.getAttribute('aria-expanded')).toBe('true');
+  });
+});
+
+/**
+ * #171 — opening Settings → Providers used to ask the desk to prove every
+ * installed account, which means starting each vendor's ACP adapter and
+ * creating a real session against that vendor. The reporter watched their
+ * machine talk to Anthropic because they opened a settings page, for an account
+ * they had never connected here.
+ *
+ * The page still asks on arrival — for what is INSTALLED, which is a locator
+ * and a `--version` and costs nobody anything. Proving an ACCOUNT now needs a
+ * person to have pressed something.
+ */
+describe("Providers page: arriving is not consent to contact anyone (#171)", () => {
+  const providers = [
+    { id: "grok", connected: true },
+    { id: "codex", connected: false },
+    { id: "claude", connected: false },
+  ];
+  const refreshes = (h: { posted: Array<{ type: string }> }) =>
+    h.posted.filter((msg) => msg.type === "refreshProviders") as Array<
+      { type: string; credentials?: boolean }
+    >;
+
+  it("asks for the local half only when the page opens", () => {
+    const h = mountAt("providers", { snapshot: { providers } });
+    expect(refreshes(h)).toEqual([{ type: "refreshProviders", credentials: false }]);
+  });
+
+  it("asks for both halves when a person presses Refresh", () => {
+    const h = mountAt("providers", { snapshot: { providers } });
+    const refresh = [...h.root.querySelectorAll("button.settings-refresh")]
+      .find((btn) => btn.textContent?.trim() === "Refresh") as HTMLElement;
+    expect(refresh).toBeTruthy();
+    click(h.window, refresh);
+    expect(refreshes(h).at(-1)).toEqual({ type: "refreshProviders", credentials: true });
+  });
+
+  // The field is always present, never left to a default. An older host reads
+  // an absent field as "prove everything" — which is right for an older CLIENT
+  // and wrong as a thing this client relies on.
+  it("always says which half it means", () => {
+    const h = mountAt("providers", { snapshot: { providers } });
+    const refresh = [...h.root.querySelectorAll("button.settings-refresh")]
+      .find((btn) => btn.textContent?.trim() === "Refresh") as HTMLElement;
+    click(h.window, refresh);
+    for (const msg of refreshes(h)) expect(typeof msg.credentials).toBe("boolean");
+  });
+
+  // Not a hypothetical: this button sits in the GitHub sign-in flow and means
+  // "did my GitHub login land?". Answering it by starting Claude Code and Codex
+  // is the reported defect wearing a different hat.
+  it("does not prove the agents to answer a question about GitHub", () => {
+    const at = settingsSrc.indexOf('querySelectorAll(".settings-github-flow-recheck")');
+    expect(at).toBeGreaterThan(-1);
+    const handler = settingsSrc.slice(at, settingsSrc.indexOf("settings-provider-recheck", at));
+    expect(handler).toContain("requestProvidersRefresh(false)");
+    expect(handler).not.toMatch(/post\(\{\s*type:\s*"refreshProviders"/);
+  });
+
+  // Every surface that posts this message, not just the one the reporter was
+  // looking at. The Add-project form has its own GitHub re-check and it posted
+  // the unqualified message, which a new host reads as "prove everything".
+  it("leaves no caller sending the unqualified message", () => {
+    const chatSrc = readFileSync(
+      fileURLToPath(new URL("../media/chat.js", import.meta.url)),
+      "utf8",
+    );
+    for (const src of [settingsSrc, chatSrc]) {
+      expect(src).not.toMatch(/\{\s*type:\s*"refreshProviders"\s*\}/);
+    }
+  });
+});
+
+/**
+ * #174 — the tray row exists only where there is a tray.
+ *
+ * The switch posts `setDesktopTray`, which a host that predates this feature
+ * has never heard of and silently drops. So the row keys off what the HOST
+ * says it can do (`traySupported`) rather than off `isDesktop`, which is true
+ * on macOS, on a cloud machine and on every older desktop build alike.
+ */
+describe("the tray row appears only where a tray does (#174)", () => {
+  const row = (root: HTMLElement) => root.querySelector('[data-id="desktopTray"]');
+
+  it("appears on a desktop that reports a tray", () => {
+    const h = mountAt("general", {
+      env: { isDesktop: true },
+      snapshot: { traySupported: true, desktopTray: true },
+    });
+    expect(row(h.root)).not.toBeNull();
+    expect(h.root.textContent).toContain("Keep running in the tray");
+  });
+
+  it.each([
+    ["an older host that says nothing", { traySupported: undefined }],
+    ["a host that says it has none — macOS", { traySupported: false }],
+  ])("stays away from %s", (_label, snapshot) => {
+    const h = mountAt("general", { env: { isDesktop: true }, snapshot });
+    expect(row(h.root)).toBeNull();
+  });
+
+  // The tray belongs to the machine the window is on, and a phone has no window
+  // there to keep. The relay would refuse the message anyway (host-local), so a
+  // row here would be a switch that does nothing.
+  it("stays away from a remote, even one driving a desktop that has a tray", () => {
+    const h = mountAt("general", {
+      env: { isDesktop: true, isRemote: true },
+      snapshot: { traySupported: true },
+    });
+    expect(row(h.root)).toBeNull();
+  });
+
+  const switchState = (root: HTMLElement) =>
+    root.querySelector('[data-id="desktopTray"] [role="switch"]')?.getAttribute("aria-checked");
+
+  it("is on unless the host says it was turned off", () => {
+    // Including when the host said nothing — an absent value is the state of a
+    // config file written before the key existed, and it must read as on.
+    for (const desktopTray of [undefined, true]) {
+      const h = mountAt("general", {
+        env: { isDesktop: true },
+        snapshot: { traySupported: true, desktopTray },
+      });
+      expect(switchState(h.root), String(desktopTray)).toBe("true");
+    }
+    const off = mountAt("general", {
+      env: { isDesktop: true },
+      snapshot: { traySupported: true, desktopTray: false },
+    });
+    expect(switchState(off.root)).toBe("false");
+  });
+
+  it("posts the desk-only message when flipped", () => {
+    const h = mountAt("general", {
+      env: { isDesktop: true },
+      snapshot: { traySupported: true, desktopTray: true },
+    });
+    h.posted.length = 0;
+    (h.root.querySelector('[data-id="desktopTray"] [role="switch"]') as HTMLElement).click();
+    expect(h.posted).toContainEqual({ type: "setDesktopTray", value: false });
+  });
+
+  it("explains the off state too, not only the on state", () => {
+    const h = mountAt("general", {
+      env: { isDesktop: true },
+      snapshot: { traySupported: true, desktopTray: true },
+    });
+    const text = (row(h.root) as HTMLElement).textContent || "";
+    // Someone hunting for "why didn't closing quit it" has to recognise this
+    // row as the answer.
+    expect(text).toMatch(/quit on close/i);
   });
 });

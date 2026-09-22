@@ -3386,7 +3386,15 @@ body.hide-turn-diff-summary .turn-diff-summary { display: none; }
      can mute the latter, and code should read at editor contrast. */
   color: var(--vscode-editor-foreground, var(--vscode-foreground));
 }
-.code-copy-btn {
+/* Prose in a fence wraps; real code scrolls. `anywhere` rather than
+   `break-word` so a long unbroken token (a URL, a path) still yields instead of
+   pushing the block wide and reintroducing the clipping this fixes. */
+.code-block.wrap pre code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.code-copy-btn,
+.code-wrap-btn {
   position: absolute;
   top: 6px;
   right: 6px;
@@ -3413,23 +3421,33 @@ body.hide-turn-diff-summary .turn-diff-summary { display: none; }
   z-index: 1;
   line-height: 1;
 }
-.code-copy-btn svg { width: 16px; height: 16px; }
-.code-copy-btn .code-copy-glyph {
+/* Left of Copy, so Copy keeps the corner it has always occupied. */
+.code-wrap-btn { right: 38px; }
+.code-copy-btn svg, .code-wrap-btn svg { width: 16px; height: 16px; }
+.code-copy-btn .code-copy-glyph,
+.code-wrap-btn .code-wrap-glyph {
   display: inline-flex;
   align-items: center;
 }
-.code-block:hover .code-copy-btn { opacity: 1; }
+.code-block:hover .code-copy-btn,
+.code-block:hover .code-wrap-btn { opacity: 1; }
 .code-copy-btn:hover,
-.code-copy-btn:focus-visible {
+.code-copy-btn:focus-visible,
+.code-wrap-btn:hover,
+.code-wrap-btn:focus-visible {
   opacity: 1;
   background: color-mix(in srgb, var(--vscode-foreground) 12%, var(--vscode-sideBar-background));
   color: var(--vscode-foreground);
 }
-.code-copy-btn:focus-visible {
+.code-copy-btn:focus-visible,
+.code-wrap-btn:focus-visible {
   outline: 2px solid var(--vscode-focusBorder);
   outline-offset: -2px;
 }
 .code-copy-btn.copied { color: var(--vscode-charts-green, #4ec9b0); }
+/* Wrapping is the non-default state for code, so say so on the control rather
+   than leaving the reader to infer it from the text reflowing. */
+.code-wrap-btn[aria-pressed="true"] { color: var(--vscode-foreground); }
 .code-block.diff pre { padding: 8px 0; }
 .diff-code { display: block; }
 /* A ```diff fence in Grok's MESSAGE text (renderDiffCode) shares the same visual
@@ -3927,26 +3945,33 @@ textarea#input {
   font-size: 12px; z-index: 50;
 }
 .composer-effort-notice:empty { display: none; }
-/* The donut's own numbers are the FIRST rung, above the mode word: they are the
-   one readout here that nothing in the message depends on, and the donut's
-   tooltip and its popover both still carry them in full. Wide surfaces keep
-   them — the chip's width pressure is real at 334px, not at 640px. */
+/* The donut's numbers are the LAST rung, not the first.
+   They used to go first, on the reasoning that nothing in the message depends
+   on them and the tooltip still carries them. True, and beside the point: the
+   context figure is the readout people actually watch, and the model name —
+   which survived every rung — is the one they already know, because they
+   picked it. #172, reported independently by two people: "the priority should
+   be to ensure the context is displayed first, and then the model name", and
+   "I check the context window size much more than the model name."
+   So the ladder now sheds the chip's own text first and keeps the number. */
 @container composer-card (max-width: 470px) {
-  .context-donut #donut-label { display: none; }
+  .model-chip-effort { display: none; }
 }
 @container composer-card (max-width: 430px) {
   #mode-btn .btn-label { display: none; }
 }
 @container composer-card (max-width: 300px) {
-  .model-chip-effort { display: none; }
-}
-@container composer-card (max-width: 272px) {
   .model-chip-name { max-width: 66px; }
 }
-/* The name is the chip's whole content now, so the narrowest rung trims it
-   rather than hiding it -- the glyph that used to stand in its place is gone. */
-@container composer-card (max-width: 224px) {
+/* The name is the chip's whole content now, so these rungs trim it rather than
+   hiding it -- the glyph that used to stand in its place is gone. */
+@container composer-card (max-width: 272px) {
   .model-chip-name { max-width: 44px; }
+}
+/* Only here, with the name already down to a stub, is there nothing cheaper
+   left to spend than the figure itself. */
+@container composer-card (max-width: 224px) {
+  .context-donut #donut-label { display: none; }
 }
 @media (hover: none), (pointer: coarse) {
   /* min-width, not just height: the mode word is the first rung of the collapse
@@ -5896,9 +5921,12 @@ body.vscode-light .preview-overlay {
   #donut-label { display: none; }
   /* Six controls at a 36px tap floor need 224px of pure button and this rung
      has less. The donut goes rather than something shrinking below the floor:
-     it is the readout the ladder already drops first, its numbers live in its
-     own tooltip and popover, and a control too small to hit is worse than one
-     that is honestly not there. */
+     a control too small to hit is worse than one that is honestly not there,
+     and the figure survives one tap away in the context popover.
+     This is a tap-target argument, NOT the desktop ladder's priority argument —
+     which since #172 keeps the context figure longest, not shortest. The two
+     read as if they contradict each other and do not: they answer different
+     questions, and `test/composer-collapse-ladder.test.ts` holds them apart. */
   @container composer-card (max-width: 250px) {
     .context-donut { display: none; }
   }

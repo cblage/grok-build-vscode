@@ -284,6 +284,8 @@ Standalone app for **macOS** (Apple Silicon + Intel), **Windows** (x64) and **Li
 
 **Linux ships as a single AppImage** — nothing to install. `chmod +x` it and run it; it needs FUSE (`libfuse2` on Debian and Ubuntu). It updates itself in place from then on.
 
+**Closing the window keeps the app running** on Windows and Linux: it hides to a tray icon so the agent — and any phone linked to this machine — keeps working. **Quit** from the tray menu to stop it, or turn the behaviour off in Settings → General. There is no tray on macOS, where closing the window still quits the app — the macOS answer is its own convention, the dock rather than a menu-bar item, and that is a separate change.
+
 Details, build-from-source, and signing notes: **[docs/desktop.md](docs/desktop.md)**.
 
 ---

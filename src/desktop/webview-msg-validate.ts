@@ -168,7 +168,6 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "updateClaude":
     case "refreshContextDetails":
     case "refreshSubscriptionUsage":
-    case "refreshProviders":
     case "pickFile":
     case "voiceStart":
     case "remoteVoiceStart":
@@ -255,6 +254,7 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "setPromptNav":
     case "setExpandDiffCard":
     case "setTelemetryEnabled":
+    case "setDesktopTray":
     case "setThumbsFeedback":
     case "composerFocus":
       if (type === "composerFocus") {
@@ -506,6 +506,12 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       break;
     case "openRemotePortal":
       if (!opt(raw.withHint, isBoolean)) return null;
+      break;
+    // `credentials: false` asks for the local half only -- locators and
+    // `--version`, contacting nobody. Absent means both halves, which is what
+    // this message has always done and what an older client still sends (#171).
+    case "refreshProviders":
+      if (!opt(raw.credentials, isBoolean)) return null;
       break;
     default:
       return null;

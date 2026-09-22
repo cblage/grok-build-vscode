@@ -1276,8 +1276,11 @@ describe("context donut (token usage)", () => {
     const { window, doc } = boot();
     dispatch(window, { type: "contextUsage", used: 29088, window: 200000 });
     expect($(doc, "donut-label").textContent).toBe("29K/200K");
+    // The percentage rides in the tooltip as of #172: the arc encodes it only to
+    // the eye and the label has no room for it, so without this the only place a
+    // reader could read the number was the popover, a click away.
     expect($(doc, "donut").title).toBe(
-      `Context usage — ${(29088).toLocaleString()} / ${(200000).toLocaleString()} tokens`,
+      `Context usage — ${(29088).toLocaleString()} / ${(200000).toLocaleString()} tokens (15%)`,
     );
   });
 

@@ -398,6 +398,11 @@ describe("ACP integration (real subprocess, fake CLI)", () => {
     expect(blocked).toHaveLength(1);
     expect(blocked[0].kind).toBe("write");
     expect(blocked[0].target).toBe("relative-file.ts");
+    // `mutationBlocked` fires host-side; the CLI's WRITE_RESPONSE still has to
+    // come back down the pipe and be flushed. Asserting straight off `blocked`
+    // is a race, and it is the sibling test above that shows the wait is the
+    // point rather than a formality.
+    await waitForStderr(stderr, /WRITE_RESPONSE.*"error"/);
     expect(stderr.join("")).toMatch(/WRITE_RESPONSE.*"error"/);
     expect(fs.existsSync(path.join(workspace, "relative-file.ts"))).toBe(false);
   });

@@ -17,10 +17,13 @@ import {
   dialog,
   ipcMain,
   Menu,
+  nativeImage,
   net,
+  Notification,
   protocol,
   safeStorage,
   shell,
+  Tray,
   type Menu as ElectronMenu,
   type ProtocolRequest,
 } from "electron";
@@ -37,6 +40,18 @@ import { GrokSidebar } from "../sidebar";
 import { Uri } from "../host";
 import type { HostContext, HostDisposable } from "../host";
 import { ConfigStore, SensitiveConfigStore } from "./config-store";
+import {
+  shouldHideWindowOnClose,
+  trayEnabled,
+  trayIconSize,
+  trayIsSupported,
+  trayMenuTemplate,
+  trayNoticeContent,
+  trayTooltip,
+  TRAY_CONFIG_FULL_KEY,
+  TRAY_CONFIG_KEY,
+  TRAY_NOTICE_CONFIG_KEY,
+} from "./tray";
 import { createAppResourceHandler } from "./app-resource-handler";
 import type { DesktopOpenFileContext } from "./desktop-policy";
 import { createElectronHost, ensureWorkspaceRoot, type ElectronRemoteActions } from "./electron-host";
@@ -284,6 +299,114 @@ let mainWindow: BrowserWindow | null = null;
 let mainWindowReadyToShow = false;
 let sidebar: GrokSidebar | null = null;
 let webview: ElectronWebview | null = null;
+let tray: Tray | null = null;
+/**
+ * Set by `before-quit` and by the window's `session-end`, read by the window's
+ * `close` handler.
+ *
+ * Most real exits — the tray's Quit, the app menu, the updater's relaunch —
+ * are a `before-quit` followed by a window close. Without this flag the close
+ * handler would cancel that close and the app could not be quit at all except
+ * from Task Manager, which is much worse than the problem the tray solves.
+ *
+ * A Windows shutdown, restart or logout is the exception, and it needs the
+ * second setter: Electron does not emit `before-quit` for it at all. See the
+ * `session-end` handler next to the `close` one.
+ */
+let appIsQuitting = false;
+/** Set in createApp; the tray's decisions and the one-shot notice read it. */
+let desktopConfig: ConfigStore | null = null;
+/** The app icon on disk, resized per platform when the Tray is built. */
+let trayIconPath: string | undefined;
+
+function trayConfigured(): unknown {
+  return desktopConfig?.getConfiguration("grok").get(TRAY_CONFIG_KEY, true);
+}
+
+/** Bring the window back — from the tray, or from a second launch. */
+function showMainWindow(): void {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  // Never surface a window that has not reached ready-to-show — the unsettled
+  // frame `show: false` hides must not be painted.
+  if (!win.isVisible() && mainWindowReadyToShow) win.show();
+  win.focus();
+}
+
+function destroyTray(): void {
+  if (!tray) return;
+  try {
+    if (!tray.isDestroyed()) tray.destroy();
+  } catch {
+    /* best-effort */
+  }
+  tray = null;
+}
+
+/**
+ * Bring the tray into line with the setting. Safe to call repeatedly: it is
+ * both the initial build and the response to the setting being toggled.
+ */
+function syncTray(): void {
+  if (!trayEnabled({ platform: process.platform, configured: trayConfigured() })) {
+    destroyTray();
+    // Turning the tray off while the window is hidden would strand it with
+    // nothing left to restore it. Only reachable by editing config.json by
+    // hand — the setting itself lives in a window that has to be visible —
+    // but it is the invisible-app trap and costs one line to close.
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) showMainWindow();
+    return;
+  }
+  if (tray && !tray.isDestroyed()) return;
+  try {
+    const image = trayIconPath
+      ? nativeImage.createFromPath(trayIconPath).resize(trayIconSize(process.platform))
+      : nativeImage.createEmpty();
+    const next = new Tray(image);
+    next.setToolTip(trayTooltip());
+    next.setContextMenu(
+      Menu.buildFromTemplate(
+        trayMenuTemplate({ onShow: showMainWindow, onQuit: () => app.quit() }),
+      ),
+    );
+    // A left click on the icon means "open" to everyone who has used a Windows
+    // tray app, and the context menu does not cover it.
+    next.on("click", showMainWindow);
+    tray = next;
+    log("tray icon created");
+  } catch (e) {
+    // A Linux session with no StatusNotifier host throws here. The app still
+    // runs; closing simply quits, exactly as it did before the tray existed.
+    tray = null;
+    log(`tray unavailable, closing will quit: ${(e as Error)?.message ?? String(e)}`);
+  }
+}
+
+/**
+ * Explain the new behaviour the first time it happens, and never again.
+ *
+ * The window disappearing while the process stays alive is the whole feature
+ * and also the whole confusion: without a word it reads as "the app is stuck
+ * in the background". Said once, at the moment it first happens, it is an
+ * explanation rather than a nag — which is why the flag is persisted and not
+ * per-run.
+ */
+function announceTrayOnce(): void {
+  const cfg = desktopConfig?.getConfiguration("grok");
+  // Explicitly typed: `get` infers the literal type of the default, so an
+  // untyped call here narrows to `false` and the comparison is dead code.
+  if (!cfg || cfg.get<boolean>(TRAY_NOTICE_CONFIG_KEY, false) === true) return;
+  void cfg.update(TRAY_NOTICE_CONFIG_KEY, true, "global");
+  try {
+    if (!Notification.isSupported()) return;
+    const { title, body } = trayNoticeContent();
+    new Notification({ title, body, icon: trayIconPath }).show();
+  } catch (e) {
+    // A notice nobody can show is not worth failing a window close over.
+    log(`tray notice not shown: ${(e as Error)?.message ?? String(e)}`);
+  }
+}
 
 /** View-menu zoom → renderer `window.__grokFontScale` (CSS path). */
 function applyDesktopCssZoom(kind: "in" | "out" | "reset"): void {
@@ -318,11 +441,10 @@ if (!gotSingleInstanceLock) {
   app.on("second-instance", (_event, commandLine) => {
     const win = mainWindow;
     if (!win || win.isDestroyed()) return;
-    if (win.isMinimized()) win.restore();
-    // Never surface a window that has not reached ready-to-show — a double
-    // launch during boot must not paint the unsettled frame show:false hides.
-    if (!win.isVisible() && mainWindowReadyToShow) win.show();
-    win.focus();
+    // Shared with the tray's Open, which has to restore from exactly the same
+    // states — including the hidden-to-tray one this launch is most likely
+    // answering.
+    showMainWindow();
     if (
       secondInstanceShouldOpenDevTools({
         isPackaged: app.isPackaged,
@@ -347,6 +469,7 @@ async function createApp(): Promise<void> {
   // Construct first, then attach encryption — same production sequence tests pin.
   // Never delete a legacy plaintext credential when encrypt is unavailable.
   const config = new ConfigStore(configPath);
+  desktopConfig = config;
   try {
     config.setSensitiveStore(
       new SensitiveConfigStore(path.join(userData, "sensitive.enc.json"), safeStorage),
@@ -607,6 +730,7 @@ async function createApp(): Promise<void> {
     ? roundIcon
     : path.join(extensionRoot, "resources", "grok-icon.png");
   const iconOpt = fs.existsSync(iconPath) ? iconPath : undefined;
+  trayIconPath = iconOpt;
 
   // Packaged builds hard-disable DevTools at the webPreferences layer too —
   // menu-only gating would leave openDevTools() / F12-style hooks reachable.
@@ -684,8 +808,53 @@ async function createApp(): Promise<void> {
     });
   }
 
+  /**
+   * Closing the window used to quit the process, which meant "get this off my
+   * screen" and "stop being reachable from my phone" were the same gesture and
+   * only the destructive reading was available (#174).
+   *
+   * Every guard that decides otherwise lives in `shouldHideWindowOnClose`, and
+   * each one is a way this could strand the app: a real quit must pass through,
+   * and a tray that failed to appear must not swallow the window.
+   */
+  mainWindow.on("close", (event) => {
+    if (!shouldHideWindowOnClose({
+      platform: process.platform,
+      configured: trayConfigured(),
+      quitting: appIsQuitting,
+      trayPresent: !!tray && !tray.isDestroyed(),
+    })) return;
+    event.preventDefault();
+    mainWindow?.hide();
+    announceTrayOnce();
+  });
+
+  /**
+   * The gap `before-quit` does not cover. Electron's own note on that event:
+   * "On Windows, this event will not be emitted if the app is closed due to a
+   * shutdown/restart of the system or a user logout." So on the one platform
+   * where the tray is on by default, the flag the close handler reads would
+   * still say false while Windows was trying to shut down — the close would be
+   * cancelled, the window would hide, and the machine would sit waiting on an
+   * app the person had already closed.
+   *
+   * `session-end` is the Windows-only signal for exactly that case, and it
+   * fires before the window is closed, so setting the same flag is the whole
+   * fix. The tray goes with it: nothing should be left in the notification
+   * area of a session that is ending.
+   */
+  mainWindow.on("session-end", () => {
+    appIsQuitting = true;
+    destroyTray();
+  });
+
   mainWindow.on("closed", () => {
     mainWindow = null;
+  });
+
+  syncTray();
+  config.onDidChange((e) => {
+    if (e.affectsConfiguration(TRAY_CONFIG_FULL_KEY)) syncTray();
   });
 
   ipcMain.on("webview-to-host", (event, message: unknown) => {
@@ -837,6 +1006,10 @@ if (gotSingleInstanceLock) {
   });
 
   app.on("before-quit", () => {
+    // Before anything else: the window's close handler reads this, and a quit
+    // that arrives while it still says false cannot complete at all.
+    appIsQuitting = true;
+    destroyTray();
     try {
       sidebar?.dispose();
     } catch {

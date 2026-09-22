@@ -796,7 +796,9 @@ describe("add project", () => {
     expect(recheck.textContent).toBe("Re-check connection");
     h.posted.length = 0;
     click(h.window, recheck);
-    expect(h.posted).toContainEqual({ type: "refreshProviders" });
+    // Local half only -- this is a question about GitHub, and answering it by
+    // starting Claude Code and Codex is #171.
+    expect(h.posted).toContainEqual({ type: "refreshProviders", credentials: false });
   });
 
   it("does not offer Re-check on a remote clone-form device-code wait", () => {

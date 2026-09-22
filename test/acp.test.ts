@@ -321,6 +321,40 @@ describe("AcpClient subscription usage", () => {
     expect(log).toHaveBeenCalledWith("[billing] CLI does not support _x.ai/billing");
   });
 
+  /**
+   * Same latch as billing above, and it earns it harder: `refreshWorktreeCache()`
+   * runs on every `listSessions()`, so before this a CLI without the method paid
+   * a round trip and wrote a log line every time the session list was built. The
+   * owner saw the desktop log filling with identical "CLI does not support"
+   * lines, several per millisecond (2026-09-21).
+   */
+  it("asks for the worktree list once and latches unsupported quietly", async () => {
+    const { client } = clientWithFakeProc();
+    const log = vi.fn();
+    (client as any).opts.log = log;
+    const request = vi.fn().mockRejectedValue({ code: -32601, message: "Method not found" });
+    (client as any).request = request;
+    await expect(client.listWorktrees({})).resolves.toBe("unsupported");
+    await expect(client.listWorktrees({})).resolves.toBe("unsupported");
+    await expect(client.listWorktrees({})).resolves.toBe("unsupported");
+    expect(request).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * The latch must not swallow a real failure: only -32601 settles the
+   * question. A transport error is a this-time problem and the next call has to
+   * ask again, or one blip would hide worktrees for the life of the process.
+   */
+  it("does not latch on a non -32601 failure", async () => {
+    const { client } = clientWithFakeProc();
+    const request = vi.fn().mockRejectedValue({ code: -32603, message: "Internal error" });
+    (client as any).request = request;
+    await expect(client.listWorktrees({})).rejects.toMatchObject({ code: -32603 });
+    await expect(client.listWorktrees({})).rejects.toMatchObject({ code: -32603 });
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
   it("returns no measurement for malformed billing without inventing zero", async () => {
     const { client } = clientWithFakeProc();
     (client as any).request = vi.fn().mockResolvedValue({ config: {} });

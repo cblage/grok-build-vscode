@@ -32,6 +32,21 @@ pattern needs both spellings. There is exactly one AppImage per release — see
 [Running in a cloud environment](cloud-environments.md) for why adding a second
 would break the fleet tooling.
 
+## Closing the window
+
+On **Windows and Linux** the app hides to a tray icon instead of quitting, so
+the agent — and any phone linked to this machine — keeps working after the
+window is gone. **Quit** in the tray menu ends the process; Settings → General
+turns the behaviour off (`grok.desktop.tray`). If the tray icon cannot be
+created at all — a Linux session with no StatusNotifier host, say — closing
+quits, because hiding a window nothing can bring back is worse than the problem
+it solves.
+
+**macOS is not covered yet.** There is no tray icon there, and closing the
+window still quits the app. The answer on macOS is its own convention — the app
+outliving its last window, with the dock icon bringing it back — rather than a
+menu-bar item, and that is a separate change this release does not make.
+
 ## Build commands
 
 ```bash

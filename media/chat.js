@@ -13,6 +13,7 @@
       setVoiceBackend: ["voiceBackend", "the transcription backend to “" + message.value + "”"],
       setTelemetryEnabled: ["telemetryEnabled", "anonymous analytics to " + (message.value ? "on" : "off")],
       setThumbsFeedback: ["thumbsFeedback", "feedback buttons to " + (message.value ? "on" : "off")],
+      setDesktopTray: ["desktopTray", "the tray to " + (message.value ? "on" : "off")],
     };
     if (fields[message.type]) {
       const [field, target] = fields[message.type];
@@ -608,6 +609,10 @@
     voiceKeyterms: [],
     telemetryEnabled: undefined,
     thumbsFeedback: false,
+    // #174. Absent on an older host, which the settings row reads as "no" --
+    // it must not offer a switch that posts a message nothing handles.
+    traySupported: false,
+    desktopTray: true,
     // Client-owned zoom (remote + desktop). VS Code uses hostFontScale only.
     remoteFontScale: CLIENT_OWNS_FONT_SCALE
       ? clampClientFontScale(storedNumber(CLIENT_FONT_SCALE_KEY, 1))
@@ -1028,6 +1033,14 @@
   // cannot drift.
 
   // ---------- icons ----------
+
+  // Fences whose body is prose rather than code: no language at all, or one of
+  // the text/markdown ids. The agent proposes AGENTS.md, READMEs and instruction
+  // files inside a fence constantly, and there a sentence sheared off at the
+  // right edge is simply lost (#181) — whereas wrapped code only loses its
+  // alignment. So prose wraps by default and real code keeps its horizontal
+  // scroll, and the per-block toggle covers whichever default is wrong here.
+  const PROSE_FENCES = new Set(["", "md", "markdown", "text", "txt", "plain", "plaintext"]);
 
   const ICON = {
     eye: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>`,
@@ -1927,11 +1940,17 @@
         return `\x00B${i}\x00`;
       }
       const isDiff = lang === "diff";
+      // A diff's alignment IS its content, so it never wraps and gets no toggle.
+      const wraps = !isDiff && PROSE_FENCES.has(lang || "");
       const inner = isDiff
         ? renderDiffCode(code)
         : `<code>${escapeHtml(code).trimEnd()}</code>`;
       codeBlocks.push(
-        `<div class="code-block${isDiff ? " diff" : ""}">` +
+        `<div class="code-block${isDiff ? " diff" : ""}${wraps ? " wrap" : ""}">` +
+          (isDiff ? "" :
+            `<button class="code-wrap-btn" type="button" title="Toggle word wrap" aria-label="Toggle word wrap" aria-pressed="${wraps}">` +
+              `<span class="code-wrap-glyph">${ICON.cornerDownRight}</span>` +
+            `</button>`) +
           `<button class="code-copy-btn" type="button" title="Copy code" aria-label="Copy code">` +
             `<span class="code-copy-glyph">${ICON.copy}</span>` +
           `</button>` +
@@ -3293,6 +3312,8 @@
       voiceBackendState: state.voiceBackendState,
       telemetryEnabled: state.telemetryEnabled,
       thumbsFeedback: !!state.thumbsFeedback,
+      traySupported: !!state.traySupported,
+      desktopTray: state.desktopTray !== false,
       promptNav: !!state.promptNav,
       expandDiffCard: !!state.expandDiffCard,
       providers: state.providers || [],
@@ -3405,6 +3426,9 @@
         break;
       case "thumbsFeedback":
         state.thumbsFeedback = !!value;
+        break;
+      case "desktopTray":
+        state.desktopTray = !!value;
         break;
       default:
         break;
@@ -7723,7 +7747,10 @@
       githubState: state.githubState || undefined,
       repos: state.githubRepos,
       terminalSignIn: !IS_REMOTE,
-      onRecheck: () => vscode.postMessage({ type: "refreshProviders" }),
+      // "Did my GitHub sign-in land?" — answered by the host's GitHub state,
+      // which this refresh carries either way. `credentials: false` keeps it
+      // from also starting Claude Code and Codex to find out (#171).
+      onRecheck: () => vscode.postMessage({ type: "refreshProviders", credentials: false }),
       touch: remoteUsesTouchComposer() || (typeof window.matchMedia === "function"
         && window.matchMedia("(hover: none), (pointer: coarse)").matches),
       onCancel: closeAddProjectForm,
@@ -16294,8 +16321,12 @@
     donutArc.setAttribute("stroke-dasharray", `${arc} ${circumference}`);
     donutArc.setAttribute("stroke", contextFullnessColor(pct));
     donutLabel.textContent = `${toK(used)}/${toK(max)}`;
-    donutLabel.title = `${used.toLocaleString()} / ${max.toLocaleString()} tokens`;
-    donutEl.title = `Context usage — ${used.toLocaleString()} / ${max.toLocaleString()} tokens`;
+    // The percentage belongs here too. The label has no room for it, and the
+    // arc encodes it only to the eye — so the one place a reader can get the
+    // number was the popover, a click away (#172).
+    const reading = `${used.toLocaleString()} / ${max.toLocaleString()} tokens (${pct}%)`;
+    donutLabel.title = reading;
+    donutEl.title = `Context usage — ${reading}`;
     // Occupancy can move without a contextUsage frame (promptComplete,
     // modelChanged). Re-paint, then re-fetch session/info while the popover
     // is open so the group stays and catches up instead of vanishing.
@@ -18239,6 +18270,8 @@
         }
         if (typeof msg.telemetryEnabled === "boolean") state.telemetryEnabled = msg.telemetryEnabled;
         if (typeof msg.thumbsFeedback === "boolean") state.thumbsFeedback = msg.thumbsFeedback;
+        if (typeof msg.traySupported === "boolean") state.traySupported = msg.traySupported;
+        if (typeof msg.desktopTray === "boolean") state.desktopTray = msg.desktopTray;
         applyThinkingVisibility();
         applyExpandCommandOutputs();
         syncGearPlacement();
@@ -21084,6 +21117,17 @@
         else if (act === "download" && IS_REMOTE) void exportExprBrowser(host, exprBtn);
         else if (act === "download" || act === "open") void exportExpr(host, act);
       }
+      return;
+    }
+    const wrapBtn = e.target.closest(".code-wrap-btn");
+    if (wrapBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const block = wrapBtn.closest(".code-block");
+      // Per block and not a setting: one transcript mixes proposed prose with
+      // real code, and the right answer differs between two blocks on screen.
+      const on = block ? block.classList.toggle("wrap") : false;
+      wrapBtn.setAttribute("aria-pressed", String(on));
       return;
     }
     const copyBtn = e.target.closest(".code-copy-btn");

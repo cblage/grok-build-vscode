@@ -46,6 +46,10 @@ export const CONFIG_DEFAULTS: Readonly<Record<string, unknown>> = {
   "grok.remote.keepAwake": true,
   "grok.thumbsFeedback": false,
   "grok.telemetry.enabled": true,
+  // Desktop-only, so deliberately NOT in package.json contributes: VS Code
+  // has no tray and must not show a setting that does nothing there (#174).
+  "grok.desktop.tray": true,
+  "grok.desktop.trayNoticeShown": false,
   "grok.chatFontScale": 100,
   "grok.voiceApiKey": "",
   "grok.ffmpegPath": "",

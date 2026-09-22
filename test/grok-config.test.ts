@@ -4,6 +4,7 @@ import {
   collectAvailableSandboxProfileOptions,
   collectAvailableSandboxProfiles,
   configDisablesBypassPermissions,
+  ALWAYS_APPROVE_NOTICE_KEY,
   configForcesAlwaysApprove,
   ensureConfigToml,
   globalConfigPath,
@@ -21,6 +22,7 @@ import {
   readUiPermissionMode,
   resolveNewSessionSandboxProfile,
   resolveSandboxProfile,
+  shouldShowAlwaysApproveNotice,
 } from "../src/grok-config";
 
 // A realistic grok config.toml, mirroring the on-disk shape.
@@ -447,6 +449,22 @@ describe("listSandboxProfilesFromToml / collectAvailableSandboxProfiles", () => 
     })).toBe(false);
     expect(isProjectOnlySandboxProfile({ name: "workspace" })).toBe(false);
     expect(isProjectOnlySandboxProfile({ name: "devbox" })).toBe(false);
+  });
+});
+
+describe("shouldShowAlwaysApproveNotice", () => {
+  it("explains a global standing choice exactly once", () => {
+    expect(shouldShowAlwaysApproveNotice({ source: "global", shown: false })).toBe(true);
+    expect(shouldShowAlwaysApproveNotice({ source: "global", shown: true })).toBe(false);
+  });
+
+  it("does not nag for a project-supplied config (that has its own consent dialog)", () => {
+    expect(shouldShowAlwaysApproveNotice({ source: "project", shown: false })).toBe(false);
+    expect(shouldShowAlwaysApproveNotice({ source: undefined, shown: false })).toBe(false);
+  });
+
+  it("uses a host-local one-shot key, not a client-state file", () => {
+    expect(ALWAYS_APPROVE_NOTICE_KEY).toBe("grok.alwaysApproveNoticeShown");
   });
 });
 

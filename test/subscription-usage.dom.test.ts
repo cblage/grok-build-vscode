@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { bootWebview, click, dispatch } from "./webview-harness";
 
+// Relative to now, deliberately. The note says "Resets" for a period still
+// running and "Reported reset" for one already past, so fixed dates make the
+// wording flip the day the clock passes them — which is exactly how the
+// two-lines-of-one-note test below started failing on a diff that never touched
+// it. A window that is always mid-flight keeps these tests about structure.
+const day = 86_400_000;
 const windowUsage = {
   usedPercent: 3, label: "Weekly", periodType: "USAGE_PERIOD_TYPE_WEEKLY",
-  periodStart: "2026-09-12T00:00:00.000Z", periodEnd: "2026-09-19T00:00:00.000Z",
-  observedAt: "2026-09-14T00:00:00.000Z",
+  periodStart: new Date(Date.now() - 5 * day).toISOString(),
+  periodEnd: new Date(Date.now() + 2 * day).toISOString(),
+  observedAt: new Date(Date.now() - day).toISOString(),
 };
 const open = (h: ReturnType<typeof bootWebview>) => {
   click(h.window, h.doc.getElementById("donut")!);
