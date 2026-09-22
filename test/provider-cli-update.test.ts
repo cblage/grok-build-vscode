@@ -53,6 +53,9 @@ function harness(provider: "codex" | "claude") {
   };
   Object.assign(host, {
     focused: local, pool: new Set([local, phone, background, other]),
+    // Shared per-provider history process: the update path tears it down
+    // before replacing the binary, the way it drains the throwaway probes.
+    adapterHistoryClients: new Map(), adapterHistoryQueue: new Map(),
     providerCliVersions: { [provider]: "0.149.0" }, providerCliUpdates: {},
     [`${provider}VersionProbe`]: Promise.resolve("0.149.0"),
     providerConnections: () => ({ [provider]: true }),

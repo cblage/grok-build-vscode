@@ -1,3 +1,4 @@
+import type { AcpProvider } from "./acp-backend";
 // Single source of truth for the host <-> webview message contract.
 //
 // Two directions, two discriminated unions:
@@ -534,7 +535,7 @@ export type HostMsg =
    * `checking` is a re-observation in flight (Settings → Providers Refresh). It
    * is the ONLY source of that spinner: a client must never latch it locally,
    * or an older host that ignores `refreshProviders` would spin forever. */
-  | { type: "providerState"; providers: { id: "grok" | "codex" | "claude"; connected: boolean; needsLogin?: boolean; cliVersion?: string; adapterVersion?: string; latestCliVersion?: string; updateAvailable?: boolean; cliUpdate?: { status: "idle" | "running" | "succeeded" | "failed"; message?: string } }[]; checking?: boolean }
+  | { type: "providerState"; providers: { id: AcpProvider; connected: boolean; unavailableReason?: string; needsLogin?: boolean; cliVersion?: string; adapterVersion?: string; latestCliVersion?: string; updateAvailable?: boolean; cliUpdate?: { status: "idle" | "running" | "succeeded" | "failed"; message?: string } }[]; checking?: boolean }
   /** Grok's grok.com + user-level MCP inventory (`_x.ai/mcp/list`; project-file
    *  servers omitted). The desk keeps launch recipes and `configFile`; remotes
    *  receive `projectMcpServerForRemote` (page fields only — no `tag`).
@@ -623,10 +624,10 @@ export type HostMsg =
   | { type: "updateAvailable"; version: string; url: string }
   /** Desktop in-app update is downloaded and waiting for restart. Host-local. */
   | { type: "updateReady"; version: string }
-  | { type: "initialized"; info: { cliPath: string; cwd: string; version: string | null; provider?: "grok" | "codex" | "claude"; steeringSupported?: boolean; init: { protocolVersion?: unknown } } }
+  | { type: "initialized"; info: { cliPath: string; cwd: string; version: string | null; provider?: AcpProvider; steeringSupported?: boolean; init: { protocolVersion?: unknown } } }
   | { type: "cliUpdating" }
   // `worktree` gates the gear's Apply/Remove worktree items to worktree sessions.
-  | { type: "session"; sessionId: string; models: ModelInfo[]; currentModelId: string | undefined; effort?: string; worktree?: boolean; provider?: "grok" | "codex" | "claude" }
+  | { type: "session"; sessionId: string; models: ModelInfo[]; currentModelId: string | undefined; effort?: string; worktree?: boolean; provider?: AcpProvider }
   // The focused conversation's display name, using the same precedence as a
   // history row. It is separate from `sessions` because VS Code does not keep
   // that browser-only list populated while the history popover is closed.
@@ -887,10 +888,10 @@ export type HostMsg =
   // itself and a terminal is the better affordance, so nothing changes there.
   | {
       type: "onboarding";
-      state: "connect-agent" | "missing-cli" | "auth-required" | "missing-codex" | "codex-login" | "missing-claude" | "claude-login" | "provider-connected" | "no-project";
+      state: "connect-agent" | "missing-cli" | "auth-required" | "missing-codex" | "codex-login" | "missing-claude" | "claude-login" | "missing-muse" | "muse-login" | "provider-connected" | "no-project";
       platform?: string;
       reason?: string;
-      provider?: "grok" | "codex" | "claude";
+      provider?: AcpProvider;
       launched?: boolean;
       device?: {
         /** starting: spawned, nothing printed yet. waiting: URL and code are on
@@ -1289,27 +1290,27 @@ export type WebviewMsg =
   // before the switch beside it had written one. A host too old to read the
   // field applies the model and ignores the level — the picker then reconciles
   // to what the session runs at, and changing effort alone still works.
-  | { type: "setModel"; modelId: string; provider?: "grok" | "codex" | "claude"; effort?: string }
+  | { type: "setModel"; modelId: string; provider?: AcpProvider; effort?: string }
   | { type: "installCodex" }
   | { type: "cancelCodexInstall" }
   | { type: "runInstallCmd" }
-  | { type: "runGrokLogin"; provider?: "grok" | "codex" | "claude" }
+  | { type: "runGrokLogin"; provider?: AcpProvider }
   // Stop a headless sign-in the host is running. Only reachable while one is in
   // flight, and it kills a child process this same user started moments ago.
   // `github` is the clone-form / Settings `gh auth login --web` child, not an
   // agent; an older host that does not know the value no-ops rather than
   // cancelling Grok.
-  | { type: "cancelDeviceLogin"; provider?: "grok" | "codex" | "claude" | "github" }
+  | { type: "cancelDeviceLogin"; provider?: AcpProvider | "github" }
   // Paste-code half of a headless sign-in: the person typed the vendor's code
   // into the card and we write it to the CLI's stdin. Additive — an older host
   // simply has no handler, and an older client never posts it.
-  | { type: "submitDeviceLoginCode"; provider?: "grok" | "codex" | "claude"; code: string }
-  | { type: "logout"; provider?: "grok" | "codex" | "claude" }
+  | { type: "submitDeviceLoginCode"; provider?: AcpProvider; code: string }
+  | { type: "logout"; provider?: AcpProvider }
   | { type: "checkGrokUpdate" }
   | { type: "updateGrok" }
   | { type: "updateCodex" }
   | { type: "updateClaude" }
-  | { type: "recheckConnection"; provider?: "grok" | "codex" | "claude" }
+  | { type: "recheckConnection"; provider?: AcpProvider }
   /** Re-observe every account without asserting anything about it. Unlike
    *  `recheckConnection` this never marks a provider connected — it re-runs the
    *  CLI locators and re-probes the credentials of accounts already connected,
@@ -1327,7 +1328,7 @@ export type WebviewMsg =
    *  fix arrives with the client rather than the host. The client is the
    *  fast-moving surface here, so that is the better half to carry it. */
   | { type: "refreshProviders"; credentials?: boolean }
-  | { type: "retryProviderSession"; provider?: "grok" | "codex" | "claude" }
+  | { type: "retryProviderSession"; provider?: AcpProvider }
   | { type: "listSessions"; offset?: number; limit?: number; providerCursor?: { grokOffset: number; codexHighWater?: { updatedAt: number; id: string } }; query?: string }
   // Preview rows for a repo the client is NOT currently in — the projects rail
   // shows a few sessions per repo without switching to it. `cwd` is matched
@@ -1393,7 +1394,7 @@ export type WebviewMsg =
       stamp: { mtimeMs: number; size: number };
       expectedAbsPath: string;
     }
-  | { type: "restartProviderSession"; provider: "grok" | "codex" | "claude"; sessionId: string }
+  | { type: "restartProviderSession"; provider: AcpProvider; sessionId: string }
   /**
    * Remote file browse: list one directory under the tab's selected repo
    * (`cwd` must be that scope — see `resolveRemoteFileRoot`). `relPath`

@@ -23,8 +23,16 @@ vi.mock("../src/codex-model-cache", () => ({
 
 vi.mock("../src/acp", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/acp")>();
-  class ListRefusingAcpClient {
-    constructor(readonly options: unknown) {}
+  // Imported INSIDE the factory: vi.mock is hoisted above the import block, so
+  // a top-level EventEmitter binding is not initialised when this runs.
+  const { EventEmitter } = await import("node:events");
+  // EventEmitter because the real client is one, and the history path now
+  // subscribes to `exit` so a dead shared process is dropped rather than
+  // reused. A double omitting it turns that subscribe into a TypeError — and a
+  // TypeError is not a credential error, so this very test would report "no
+  // sign-in needed" for an account that is signed out.
+  class ListRefusingAcpClient extends EventEmitter {
+    constructor(readonly options: unknown) { super(); }
     async start(): Promise<void> {}
     async listSessions(): Promise<never> { throw probe.error; }
     async dispose(): Promise<void> {}
@@ -49,6 +57,10 @@ function makeSidebar(cwd = "/repo"): any {
   sidebar.codexSessionCache = new Map();
   sidebar.codexSessionCacheAt = new Map();
   sidebar.codexSessionRefresh = new Map();
+  // The shared per-provider history process and its queue. Listings reuse one
+  // process across repos now, so a double that reaches them needs both.
+  sidebar.adapterHistoryClients = new Map();
+  sidebar.adapterHistoryQueue = new Map();
   sidebar.state = { get: vi.fn((_key: string, fallback: unknown) => fallback), update: vi.fn(async () => {}) };
   sidebar.host = {
     appendLine: vi.fn(),

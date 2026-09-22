@@ -1,4 +1,19 @@
 (function (root) {
+  // Kept set-equal to INTERNAL_PROVIDERS by provider-enumerations.test.ts.
+  const PROVIDER_ACTIONS = {
+    grok: { label: "Grok", deleteHistory: true, compact: true },
+    codex: { label: "Codex", deleteHistory: true, compact: true },
+    claude: { label: "Claude", deleteHistory: true, compact: true },
+    muse: { label: "Muse Code", deleteHistory: false, compact: false },
+  };
+  function providerSupports(provider, action) {
+    return Object.hasOwn(PROVIDER_ACTIONS, provider || "grok")
+      && PROVIDER_ACTIONS[provider || "grok"][action] === true;
+  }
+  function clearHistoryConfirmation(cwd) {
+    const names = Object.values(PROVIDER_ACTIONS).filter(p => p.deleteHistory).map(p => p.label);
+    return `Deletes ${names.join(", ")} conversations for:\n${cwd}\n\nOpen conversations are kept. This cannot be undone.`;
+  }
   // Both the standalone VS Code Settings webview and the chat mount this
   // catalog extension. Rows stay hidden until the host supplies availability.
   root.GrokVoiceSettings = {
@@ -3131,10 +3146,12 @@
   function turnDiffSummaryTitle(agg) {
     const n = agg && Array.isArray(agg.files) ? agg.files.length : 0;
     if (n <= 0) return "";
-    return n === 1 ? "Changed 1 file" : `Changed ${n} files`;
+    return n === 1 ? "Changed 1 file" : `Changed ${n.toLocaleString("en-US")} files`;
   }
 
   const api = { WELCOME_TIPS, welcomeTipById, welcomeTipsFor, welcomeTipCopy, splitWelcomeTipCopy, addProjectMenuItems, addProjectFolderPreview, addProjectForm, parseCloneQuery, filterGithubRepos, githubRepoNameParts, formatWaitElapsed, FILE_EXTS, HOST_MESSAGE_TYPES, WEBVIEW_MESSAGE_TYPES, isKnownHostMessage, composerHasSendIntent, explicitVisibleChips, normalizeQueuedSends, queuedSendsText, queuedSendsChips, contextOverheadTokens, nextContextBreakdown, contextBreakdownIsCurrent, createPendingOverlay, getMentionQuery, applyMentionPick, looksLikeFileRef, formatRelativeTime, modelPickerLabel, modelDisplayName, MIC_STATES, nextMicState, trailingSendPhrase, versionedSiblingUrl, buildQuestionAnswers, isFreeTextOptionLabel, isSubagentToolCall, subagentLabel, cleanSubagentOutput, parseSubagentTaskResult, shouldStickToBottom, stickThresholdPx, splitMath, stripUnsupportedTex, toolFailureText, isMediaGenToolCall, mediaGenZeroRetentionHint, TOOL_LABEL_MAX, middleElide, isAdvertisedSkill, getSlashQuery, applySlashPick, filterCommands, highlightQueryParts, appendHighlightedText, commandProgramLabel, commandTextPreview, MAX_COMMAND_OUTPUT_CHARS, capCommandOutput, extractToolResultOutput, commandOutputWasCancelled, commandOutputTruncationNote, computeLineDiff, normalizeTurnEditPathKey, parseShellDeletePaths, aggregateTurnEdits, turnDiffSummaryTitle, parseAttachmentContext, parseSelectionBlocks, parseImageTags, orderPermissionOptions, defaultPermissionIndex, shouldFocusPermissionCard, isTypeThroughKey, isInterjectionText, stripInterjectionEnvelope, spokenTextFromMarkdown, isRelaySendRejection, panelReclampOnResizeAllowed, wireFullscreenSafeReclamp, distributeSidePanelWidths, chatZoomFactor, unzoomClientPx, exportSessionMarkdown, exportSessionFilename, isExportableSessionEvent, replayedUserBubbleVerdict, truncateExportEvents, flattenHistoryMessages, splitHistoryWindow, countHistoryReplayCounters, partitionHistoryCards, GITHUB_FINE_GRAINED_TOKEN_URL, fillFineGrainedTokenHint };
+
+  Object.assign(api, { PROVIDER_ACTIONS, providerSupports, clearHistoryConfirmation });
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;

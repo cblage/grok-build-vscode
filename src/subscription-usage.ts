@@ -207,7 +207,7 @@ export class SubscriptionUsageBinding {
 /** Opaque, memory-only key. Neither credentials nor their digest leave the host.
  * File contents also detect an external login; unreadable stores fail closed.
  * Keychain-only Claude logins are bounded by process lifetime and host sign-out. */
-const CREDENTIAL_ENV_KEYS: Record<AcpProvider, string[]> = {
+const CREDENTIAL_ENV_KEYS: Partial<Record<AcpProvider, string[]>> = {
   grok: ["GROK_CODE_XAI_API_KEY", "XAI_API_KEY", "GROK_CODE_BASE_URL"],
   claude: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL",
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"],
@@ -215,21 +215,22 @@ const CREDENTIAL_ENV_KEYS: Record<AcpProvider, string[]> = {
 };
 
 /** The file each CLI writes its login to, relative to that CLI's home. */
-const CREDENTIAL_FILES: Record<AcpProvider, string> = {
+const CREDENTIAL_FILES: Partial<Record<AcpProvider, string>> = {
   grok: "auth.json",
   claude: ".credentials.json",
   codex: "auth.json",
 };
 
 export function subscriptionCredentialContext(provider: AcpProvider, env: NodeJS.ProcessEnv): string {
+  if (provider === "muse") return "muse:cli-owned";
   const home = env.HOME || env.USERPROFILE || homedir();
   const root = provider === "grok" ? env.GROK_HOME || path.join(home, ".grok")
     : provider === "codex" ? env.CODEX_HOME || path.join(home, ".codex")
       : env.CLAUDE_CONFIG_DIR || path.join(home, ".claude");
-  const keys = CREDENTIAL_ENV_KEYS[provider];
+  const keys = CREDENTIAL_ENV_KEYS[provider] ?? [];
   const effectiveEnv: NodeJS.ProcessEnv = { ...env, GROK_CODE_XAI_API_KEY: env.GROK_CODE_XAI_API_KEY || env.XAI_API_KEY };
   const hash = createHash("sha256").update(JSON.stringify([provider, root, keys.map((key) => effectiveEnv[key] ?? null)]));
-  try { hash.update(readFileSync(path.join(root, CREDENTIAL_FILES[provider]))); }
+  try { hash.update(readFileSync(path.join(root, CREDENTIAL_FILES[provider]!))); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") return `${provider}:unreadable:${randomUUID()}`;
     hash.update("absent");

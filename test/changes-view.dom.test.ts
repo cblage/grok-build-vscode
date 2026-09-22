@@ -979,9 +979,9 @@ describe("bounded rendering with the complete change list", () => {
     const h = harness({ snapshot });
     await h.open();
     expect(h.qq(".gfp-change-row")).toHaveLength(200);
-    expect(h.q(".gfp-changes-more")?.textContent).toBe("and 1005 more");
-    expect(h.q(".gfp-changes-headline")?.textContent).toBe("1205 files not committed");
-    expect(h.q(".gfp-changes-btn")?.title).toContain("1205 files not committed");
+    expect(h.q(".gfp-changes-more")?.textContent).toBe("and 1,005 more");
+    expect(h.q(".gfp-changes-headline")?.textContent).toBe("1,205 files not committed");
+    expect(h.q(".gfp-changes-btn")?.title).toContain("1,205 files not committed");
     expect(h.panel._scopes.get("/work/app").changes.snapshot.files).toBe(files);
     expect(files).toHaveLength(1205);
     h.q(".gfp-change-row")!.click();

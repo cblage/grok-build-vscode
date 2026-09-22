@@ -13,6 +13,7 @@
  * finishes.
  */
 import { spawn as nodeSpawn } from "node:child_process";
+import { grokCliNeedsShell } from "./cli-process";
 import {
   classifyDeviceLoginFailure,
   deviceLoginEnv,
@@ -120,6 +121,7 @@ export function runDeviceLogin(
       // opens the pipe.
       stdio: [needsCode ? "pipe" : "ignore", "pipe", "pipe"],
       env: opts.rawEnv ? runEnv : deviceLoginEnv(runEnv, { needsCode }),
+      shell: grokCliNeedsShell(cliPath),
       windowsHide: true,
     });
   } catch (error) {

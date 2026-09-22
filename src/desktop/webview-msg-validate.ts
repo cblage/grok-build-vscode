@@ -26,6 +26,7 @@ import {
 import { MAX_CONNECTOR_KEY_CHARS } from "../mcp-connectors";
 import { MAX_GITHUB_TOKEN_CHARS } from "../github-auth";
 import { ROUTINE_PROMPT_MAX } from "../routines";
+import { isInternalProvider } from "../acp-backend";
 
 /** Generous next to {@link ROUTINE_PROMPT_MAX}: this gate rejects the absurd,
  *  and validateRoutine does the real trimming once past the boundary. */
@@ -183,16 +184,15 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "logout":
     case "recheckConnection":
     case "retryProviderSession":
-      if (raw.provider !== undefined && raw.provider !== "grok" && raw.provider !== "codex" && raw.provider !== "claude") return null;
+      if (!opt(raw.provider, isInternalProvider)) return null;
       break;
     case "cancelDeviceLogin":
       if (raw.provider !== undefined
-        && raw.provider !== "grok" && raw.provider !== "codex"
-        && raw.provider !== "claude" && raw.provider !== "github") return null;
+        && !isInternalProvider(raw.provider) && raw.provider !== "github") return null;
       break;
     case "submitDeviceLoginCode":
       if (!isString(raw.code)) return null;
-      if (raw.provider !== undefined && raw.provider !== "grok" && raw.provider !== "codex" && raw.provider !== "claude") return null;
+      if (!opt(raw.provider, isInternalProvider)) return null;
       break;
     case "setMode":
       if (raw.modeId !== "agent" && raw.modeId !== "plan" && raw.modeId !== "yolo") {
@@ -299,7 +299,7 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       break;
     case "setModel":
       if (!isString(raw.modelId)) return null;
-      if (raw.provider !== undefined && raw.provider !== "grok" && raw.provider !== "codex" && raw.provider !== "claude") return null;
+      if (!opt(raw.provider, isInternalProvider)) return null;
       break;
     case "listSessions":
       if (!opt(raw.offset, isNumber) || !opt(raw.limit, isNumber) || !opt(raw.query, isString)) {
@@ -391,14 +391,14 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       break;
     case "openProviderConfig":
     case "readProviderConfig":
-      if (!["grok", "codex", "claude"].includes(raw.provider as string)) return null;
+      if (!isInternalProvider(raw.provider)) return null;
       if (!opt(raw.requestId, isString)) return null;
       break;
     case "restartProviderSession":
-      if (!["grok", "codex", "claude"].includes(raw.provider as string) || !isString(raw.sessionId) || !raw.sessionId) return null;
+      if (!isInternalProvider(raw.provider) || !isString(raw.sessionId) || !raw.sessionId) return null;
       break;
     case "writeProviderConfig":
-      if (!["grok", "codex", "claude"].includes(raw.provider as string)
+      if (!isInternalProvider(raw.provider)
         || !opt(raw.requestId, isString) || !isString(raw.text) || !isString(raw.expectedAbsPath)
         || !isObject(raw.stamp) || !isNumber(raw.stamp.mtimeMs) || !isNumber(raw.stamp.size)) return null;
       break;

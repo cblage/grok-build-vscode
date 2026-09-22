@@ -110,6 +110,20 @@ const DONE_PHASES = new Set([
   "success",
 ]);
 
+export interface WorkflowPhase {
+  id?: string;
+  title: string;
+  state?: string;
+}
+
+export interface WorkflowAgent {
+  id?: string;
+  label: string;
+  phase?: string;
+  state?: string;
+  tokensUsed?: number;
+}
+
 export interface RunProgressUpdate {
   kind: RunProgressKind;
   /** Stable id for the card (run_id / goal_id / display name). */
@@ -128,20 +142,27 @@ export interface RunProgressUpdate {
    * Deliberately absent for workflows. A workflow's only fraction on the wire
    * is `agents_used / agent_budget`, which is money spent, not work finished
    * (#163: *"Grok tells me the progress is never accurate"* — it was right).
-   * The renderer prints this as a bare `%` beside the phase, in the same slot
-   * for both kinds, so a spend fraction here reads as a finish line. The spend
-   * still reaches the card, as {@link agentsUsed} / {@link agentBudget} and a
-   * labelled `N/M agents` in {@link detail} — a number that says what it is.
+   * The renderer also rejects workflow percentages supplied by older hosts.
+   * Spend reaches the card as {@link agentsUsed} / {@link agentBudget} and a
+   * labelled `N of M agents used` in {@link detail}.
    */
   progress?: number;
   /** Workflow agent spend, when the run reports it. Never a completion ratio. */
   agentsUsed?: number;
   agentBudget?: number;
+  /** Observed workflow fields; absence means the host/wire did not supply them. */
+  phases?: WorkflowPhase[];
+  currentPhase?: string;
+  currentPhaseId?: string;
+  agents?: WorkflowAgent[];
+  activeAgents?: number;
+  elapsedMs?: number;
+  revision?: number;
   /** True when the run is finished (success, fail, cancel, clear). */
   done: boolean;
   failed: boolean;
   cancelled: boolean;
-  /** Display name for /workflow pause|resume|stop (workflows only). */
+  /** Observed handle for /workflow pause|resume|stop; never inferred from id. */
   displayName?: string;
   /** Raw sessionUpdate for debugging / tests. */
   sessionUpdate: string;
@@ -283,12 +304,12 @@ function parseWorkflow(u: Record<string, unknown>, sessionUpdate: string): RunPr
   // become `progress` here, which the card then drew as a percentage in the
   // same place the Goal card draws real completion — so "strategy 2%" meant
   // "one agent of fifty gone", and a run doing long work inside one agent sat
-  // at the same number for an hour (#163). Reported as `N/M agents` instead:
+  // at the same number for an hour (#163). Reported as `N of M agents used`:
   // the same fact, in a form that cannot be read as a finish line.
   const agentsUsed = num(u.agents_used ?? u.agentsUsed);
   const agentBudget = num(u.agent_budget ?? u.agentBudget);
   if (agentsUsed != null && agentBudget != null && agentBudget > 0) {
-    detailParts.push(`${agentsUsed}/${agentBudget} agents`);
+    detailParts.push(`${agentsUsed.toLocaleString("en-US")} of ${agentBudget.toLocaleString("en-US")} agents used`);
   }
 
   const done = DONE_PHASES.has(phase) || /completed|failed|cancelled|stopped/.test(sessionUpdate);
@@ -298,16 +319,33 @@ function parseWorkflow(u: Record<string, unknown>, sessionUpdate: string): RunPr
   return {
     kind: "workflow",
     id: runId,
-    title: displayName || runId,
+    title: displayName || "Workflow",
     subtitle: objective,
     phase,
     detail: detailParts.join(" · ") || undefined,
     agentsUsed,
     agentBudget,
+    phases: Array.isArray(u.phases) ? u.phases.flatMap((value) => {
+      const p = asRecord(value);
+      const title = p && (str(p.title) || str(p.name) || str(p.label));
+      return p && title ? [{ id: str(p.id) || str(p.phase_id) || str(p.phaseId), title, state: str(p.state) }] : [];
+    }) : undefined,
+    currentPhase: positionRaw,
+    currentPhaseId: str(u.current_phase_id) || str(u.currentPhaseId),
+    agents: Array.isArray(u.agents) ? u.agents.flatMap((value) => {
+      const a = asRecord(value);
+      if (!a) return [];
+      const id = str(a.agent_id) || str(a.agentId) || str(a.id);
+      const label = str(a.label) || str(a.name) || id;
+      return label ? [{ id, label, phase: str(a.phase), state: str(a.state), tokensUsed: num(a.tokens_used ?? a.tokensUsed) }] : [];
+    }) : undefined,
+    activeAgents: num(u.active_agents ?? u.activeAgents),
+    elapsedMs: num(u.elapsed_ms ?? u.elapsedMs),
+    revision: num(u.revision),
     done: done || failed || cancelled,
     failed,
     cancelled,
-    displayName: displayName || runId,
+    displayName,
     sessionUpdate,
   };
 }
@@ -338,7 +376,7 @@ function parseGoal(u: Record<string, unknown>, sessionUpdate: string): RunProgre
   }
 
   const detailParts: string[] = [];
-  if (total != null && completed != null) detailParts.push(`${completed}/${total} deliverables`);
+  if (total != null && completed != null) detailParts.push(`${completed.toLocaleString("en-US")}/${total.toLocaleString("en-US")} deliverables`);
   if (curTitle) detailParts.push(curTitle);
 
   const done =
@@ -376,7 +414,7 @@ export function workflowControlCommand(
   action: "pause" | "resume" | "stop",
   displayName: string | undefined,
 ): string | null {
-  const name = (displayName || "").trim();
+  const name = displayName || "";
   if (!name) return null;
   // Display names are session-unique handles (review-changes, deep-research-2).
   // Don't shell-quote — slash dispatch is plain text, and names are [a-z0-9-].

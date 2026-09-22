@@ -1,3 +1,4 @@
+import { isInternalProvider } from "./acp-backend";
 // Extension <-> relay wire contract (Phase 1, topology B — the extension dials
 // OUT to a relay; browsers connect to the same relay; the relay ferries the
 // existing HostMsg/WebviewMsg protocol between them).
@@ -346,7 +347,7 @@ function parseRemoteWebviewMsg(msg: unknown): WebviewMsg | null {
     case "readProviderConfig":
       return ["grok", "codex", "claude"].includes(value.provider as string) ? msg as WebviewMsg : null;
     case "restartProviderSession":
-      return ["grok", "codex", "claude"].includes(value.provider as string) && isRemoteSessionId(value.sessionId)
+      return isInternalProvider(value.provider) && isRemoteSessionId(value.sessionId)
         ? msg as WebviewMsg : null;
     case "writeProviderConfig":
     case "writeProjectFile": {

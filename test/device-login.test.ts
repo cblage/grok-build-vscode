@@ -52,6 +52,12 @@ const CLAUDE_REAL = [
 ].join("\n");
 
 describe("reading what the CLI printed", () => {
+  it("reads the measured Muse login URL and code without a paste-code prompt", () => {
+    expect(parseDeviceLoginPrompt(
+      "Open this page to sign in:  https://auth.meta.com/oauth/device/?code=FLVM-CRRJ\n"
+      + "confirm this code matches:  FLVM-CRRJ\nWaiting for approval…",
+    )).toEqual({ url: "https://auth.meta.com/oauth/device/?code=FLVM-CRRJ", code: "FLVM-CRRJ" });
+  });
   it("finds the URL and code in real grok output", () => {
     expect(parseDeviceLoginPrompt(GROK_REAL)).toEqual({
       url: "https://accounts.x.ai/oauth2/device?user_code=SDCN-9XZS",
@@ -117,6 +123,10 @@ describe("reading what the CLI printed", () => {
 });
 
 describe("which providers have a headless flow", () => {
+  it("uses Muse's login subcommand, which skips workspace trust and polls on pipes", () => {
+    expect(deviceLoginPlan("muse")).toEqual({ args: ["login"] });
+    expect(deviceLoginPlan("muse")?.needsCode).toBeUndefined();
+  });
   it("offers one for grok and codex", () => {
     expect(deviceLoginPlan("grok")).toEqual({ args: ["login", "--device-auth"] });
     expect(deviceLoginPlan("codex")).toEqual({ args: ["login", "--device-auth"] });
@@ -224,6 +234,37 @@ function fakeIo(): { io: DeviceLoginIo; child: FakeChild; calls: unknown[][] } {
   };
   return { io, child, calls };
 }
+
+describe("device login shell policy", () => {
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+  afterEach(() => Object.defineProperty(process, "platform", platformDescriptor));
+
+  it.each([
+    ["win32", String.raw`C:\Users\Dell\AppData\Local\Programs\muse\muse.cmd`, true],
+    ["win32", String.raw`C:\muse\muse.BAT`, true],
+    ["win32", String.raw`C:\muse\muse.exe`, false],
+    ["linux", "/home/u/.local/bin/muse", false],
+    ["darwin", "/home/u/.local/bin/muse", false],
+    ["linux", "/home/u/.local/bin/muse.cmd", false],
+  ] as const)("on %s launches %s with shell=%s", (platform, executable, shell) => {
+    Object.defineProperty(process, "platform", { value: platform });
+    const { io, child, calls } = fakeIo();
+    runDeviceLogin(executable, ["login"], { onPrompt: vi.fn(), onDone: vi.fn() }, io, {});
+    child.emit("close", 0);
+    expect(calls[0]).toEqual([executable, ["login"], expect.objectContaining({ shell })]);
+  });
+
+  it("keeps Claude paste-code stdin piped through the win32 shell", () => {
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const { io, child, calls } = fakeIo();
+    const handle = runDeviceLogin(String.raw`C:\claude\claude.cmd`, ["auth", "login"],
+      { onPrompt: vi.fn(), onDone: vi.fn() }, io, {}, { needsCode: true });
+    handle.submitCode("  paste-me-now  ");
+    child.emit("close", 0);
+    expect(calls[0][2]).toMatchObject({ shell: true, stdio: ["pipe", "pipe", "pipe"] });
+    expect(child.stdin.writes).toEqual(["paste-me-now\n"]);
+  });
+});
 
 describe("running one", () => {
   beforeEach(() => vi.useFakeTimers());

@@ -6,6 +6,7 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { Window } from "happy-dom";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { INTERNAL_PROVIDERS, supportsHistoryDeletion } from "../src/acp-backend";
 
 const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
 const railSrc = read("../media/projects-rail.js");
@@ -44,6 +45,7 @@ function bootRail() {
     </aside>
   `;
   window.eval(marksSrc);
+  window.eval(read("../media/webview-helpers.js"));
   window.eval(pickerSrc);
   window.eval(railSrc);
   return { window, doc, posted };
@@ -107,6 +109,30 @@ function loadSessions(
     query: "",
   });
 }
+
+it.each(INTERNAL_PROVIDERS)("offers row deletion only when implemented for %s", provider => {
+  const { window, doc, posted } = bootRail();
+  const api = railApi(window);
+  api.onMessage({ type: "providerState", providers: INTERNAL_PROVIDERS.map(id => ({ id, connected: true })) });
+  loadCatalog(api);
+  loadSessions(api, [{ ...row("s", "/work/alpha", "Conversation"), provider } as any]);
+  expect(doc.querySelector(`.rail-session .provider-${provider}`)).not.toBeNull();
+  (doc.querySelector('.rail-session .rail-action-btn[title="Session actions"]') as HTMLElement).click();
+  const labels = [...doc.querySelectorAll(".rail-menu-item")].map(el => el.textContent?.trim());
+  expect(labels.includes("Delete")).toBe(supportsHistoryDeletion(provider));
+  expect(posted.some(m => m.type === "deleteSession")).toBe(false);
+  window.happyDOM.abort();
+});
+
+it("scopes the rail clear-history confirmation to supported providers", () => {
+  const { window, doc } = bootRail();
+  loadCatalog(railApi(window));
+  (doc.querySelector('.rail-action-btn[title="Project actions"]') as HTMLElement).click();
+  ([...doc.querySelectorAll(".rail-menu-item")].find(el => el.textContent?.trim() === "Clear all history") as HTMLElement).click();
+  expect(doc.body.textContent).toContain("Deletes Grok, Codex, Claude conversations for:");
+  expect(doc.body.textContent).not.toContain("Every conversation in this project is deleted");
+  window.happyDOM.abort();
+});
 
 /**
  * The contract that makes 95 icons possible: the CHEVRON is the disclosure and

@@ -32,6 +32,20 @@ const card = (h: Harness) => h.doc.getElementById("provider-signin-card");
 const lapsed = (id: string) => ({ id, connected: true, needsLogin: true });
 
 describe("the lapsed-account offer above the composer", () => {
+  it("gates Muse renewal on the host advertisement, including a retained button", () => {
+    const h = boot({ remote: true });
+    providers(h, [lapsed("muse")]);
+    session(h, "muse");
+    const button = card(h)!.querySelector("button")!;
+    h.posted.length = 0;
+    click(h.window, button);
+    expect(h.posted).toEqual([{ type: "runGrokLogin", provider: "muse" }]);
+    providers(h, [lapsed("claude")]);
+    h.posted.length = 0;
+    click(h.window, button);
+    expect(h.posted).toEqual([]);
+  });
+
   it("names the agent and posts the same sign-in the accounts row posts", () => {
     const h = boot();
     session(h, "claude");

@@ -107,6 +107,25 @@ describe("VSIX excludes desktop app", () => {
     scripts: Record<string, string>;
   };
 
+  it("ships the standalone Muse ESM entry and directly pinned SDK runtimes", () => {
+    const builder = read("electron-builder.yml");
+    const manifest = JSON.parse(read("package.json"));
+    expect(manifest.dependencies["@muse-code/sdk"]).toBe("1.3.0");
+    expect(manifest.dependencies["@agentclientprotocol/sdk"]).toBe("1.4.0");
+    expect(pkg.scripts.compile).toContain("compile:muse-adapter");
+    expect(pkg.scripts["compile:muse-adapter"]).toContain("tsconfig.muse-adapter.json");
+    expect(JSON.parse(read("tsconfig.json")).compilerOptions.module).toBe("commonjs");
+    expect(JSON.parse(read("tsconfig.muse-adapter.json")).compilerOptions.module).toBe("NodeNext");
+    expect(vscodeignore).toContain("!out/muse-adapter/*.mjs");
+    expect(builder).toContain("- out/muse-adapter/*.mjs");
+    for (const runtime of ["@muse-code/sdk/package.json", "@muse-code/sdk/dist/src/**/*.js",
+      "@agentclientprotocol/sdk/package.json", "@agentclientprotocol/sdk/dist/**"]) {
+      expect(vscodeignore).toContain(`!node_modules/${runtime}`);
+      expect(builder).toContain(`node_modules/${runtime}`);
+    }
+    expect(read("scripts/check-vsix-requires.mjs")).toContain('checkEsmPackageGraph(root, packed, ["out/muse-adapter/main.mjs"])');
+  });
+
   it(".vscodeignore excludes desktop sources, launcher, and dist output", () => {
     expect(vscodeignore).toMatch(/^\s*out\/desktop\/\*\*/m);
     expect(vscodeignore).toMatch(/^\s*src\/desktop\/\*\*/m);

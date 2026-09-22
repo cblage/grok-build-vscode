@@ -1,3 +1,4 @@
+import type { AcpProvider } from "./acp-backend";
 // Pure helpers for the voice-input feature. No I/O, no process spawning — every
 // function here is deterministic so it can be unit-tested without a microphone,
 // ffmpeg, or a network call. The impure orchestration (spawning ffmpeg, the STT
@@ -17,7 +18,7 @@ export type SttPreference = "auto" | SttBackend;
 
 /** An explicit choice is strict. Automatic fallback is credential-based only. */
 export function pickSttBackend(opts: {
-  provider: "grok" | "codex" | "claude";
+  provider: AcpProvider;
   hasXai: boolean;
   hasOpenAi: boolean;
   preference?: SttPreference;
@@ -39,12 +40,12 @@ export function resolveOpenAiVoiceKey(opts: {
 }
 
 export interface VoiceBackendState {
-  provider: "grok" | "codex" | "claude";
+  provider: AcpProvider;
   preference: SttPreference;
   backend?: SttBackend;
   hasXai: boolean;
   hasOpenAi: boolean;
-  backends: Record<"grok" | "codex" | "claude", SttBackend | null>;
+  backends: Record<AcpProvider, SttBackend | null>;
 }
 
 /** Hard cap on a single recording (seconds). ffmpeg self-terminates at this, so

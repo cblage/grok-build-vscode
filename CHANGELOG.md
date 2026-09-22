@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.10.1-sandbox.1 — 2026-09-22
+## 4.11.1-sandbox.1 — 2026-09-22
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.10.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.11.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,44 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.11.0 — 2026-09-21
+
+**A fourth agent to talk to, and a workflow card you can read at a glance.** Muse Code joins Grok, Codex and Claude Code. The workflow card stops saying everything it knows all the time. And the conversation list no longer starts a process per repository to build itself.
+
+### Added
+
+- **Muse Code is a fourth provider.** Meta's coding agent now appears alongside Grok, Codex and Claude Code: sign in through Muse's own CLI, hold a conversation with streaming replies and tool approvals, resume from history, and pick a model. It does not speak the protocol the other three share, so the extension ships a small adapter that translates — the same arrangement Codex and Claude Code already run under, with the difference that this one is ours rather than a third party's.
+
+  **The platform that decides is the one the agent runs on**, not the one you are looking at — so a Windows browser driving a Mac offers Muse normally.
+
+  **Sign in from wherever you are.** `muse login` turns out to be an ordinary device-code flow, so Muse connects the same way the other three do: the machine running the agent starts the login, and Meta's link and short code arrive on whichever screen asked for them — a phone, a browser, or the editor at your desk.
+
+  Two of the models Muse offers are marked *contributor*, and one of them is Muse's own default. Muse's description is passed through to the picker exactly as Meta writes it: "Your content, including inter-session messages, may be used for product improvement." Worth reading before you pick one.
+
+  Deleting history and compacting a conversation are **not** implemented for Muse, and are hidden rather than offered and failing.
+
+  About names Muse's installed CLI version beside the other three, once the host has read it.
+
+### Changed
+
+- **The workflow card was rebuilt around what you actually need mid-run (#163).** It used to draw the same run three times over — a tool line, a card in the transcript, and a pinned card identical to it — and hedge its liveness three times in a row in the headline. On a phone the pinned copy alone took about half the screen.
+
+  There are two surfaces now and each has one job. **In the transcript** a running workflow is one line, the name and its status, which does not expand; when the run finishes it becomes the report and opens, because there is finally something fixed to read. **Pinned above the composer**, the card is collapsed by default: the name, one dot per reported step with the current one marked, the phase, elapsed, and a single freshness line. Tap it for the labelled phase strip, the agent budget, and one row per agent — each of which opens for its own detail. Pause, Resume and Stop stay reachable either way, because the transcript card scrolls out of reach, which was the original complaint.
+
+  **Agents that are failed, cancelled, or waiting on a permission prompt are named on the collapsed card.** They are the one thing a quiet card cannot hide: a stuck agent still arrives inside frames, so the freshness line goes on reading "updated 3s ago" while nothing actually moves.
+
+  Where the wire cannot establish that something is alive, the card still says so rather than implying it. A frame arriving is "updated 20s ago". A token moving is attributable activity and sits on the agent row it describes. "Reported running" is neither, and says that too. Nothing animates — a pulsing indicator on a local timer would be the same kind of lie as the percentage this card lost in 4.9.0.
+
+- **Counts read as counts.** `19,638` rather than `19638`, wherever a number is drawn — the workflow card, the file panel's change counts, the settings routine counts, the turn summary.
+
+- **Opening the app no longer spawns a process per repository.** With five projects on the rail, starting one session used to spawn ten adapter processes in 400ms — one Codex and one Claude per repo — each alive for about 25 seconds, each re-arming for as long as the rail was on screen, and every one of them existing to make a single history request. It is two processes now, reused across every project, so the opening burst is a few cheap round trips instead of ten process launches.
+
+### Fixed
+
+- **A closed project folder can be deleted again on Windows.** The shared history process above outlives the project that first asked for it, and a process born inside a folder holds that folder open — so after closing a project, Explorer would refuse to delete or rename it, with nothing on screen explaining why. The process now starts in your home directory, which is never a project. It makes no difference to what history you get back: that was measured against both CLIs, not assumed.
+
+- **Clear all history no longer promises more than it does.** The confirmation names the providers it will actually clear, and says what it kept. A provider that cannot delete its history no longer shows a Delete that silently does nothing.
 
 ## 4.10.0 — 2026-09-21
 

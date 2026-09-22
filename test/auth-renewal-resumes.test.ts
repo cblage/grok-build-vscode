@@ -106,6 +106,22 @@ function loginSidebar(needsLogin: Record<string, boolean>) {
 }
 
 describe("signing in from a conversation that is being refused", () => {
+  it("routes remote Muse sign-in to the shared device flow", async () => {
+    const { sidebar, session } = loginSidebar({});
+    sidebar.locateProvider.mockReturnValue("/usr/bin/muse");
+    await sidebar.onMessage({ type: "runGrokLogin", provider: "muse" }, "remote");
+    expect(sidebar.startDeviceLogin).toHaveBeenCalledWith("muse", "/usr/bin/muse", undefined);
+    expect(sidebar.host.createTerminal).not.toHaveBeenCalled();
+  });
+
+  it("opens the workspace-free Muse login subcommand at the desk", async () => {
+    const { sidebar, session } = loginSidebar({});
+    sidebar.locateProvider.mockReturnValue("/usr/bin/muse");
+    await sidebar.onMessage({ type: "runGrokLogin", provider: "muse" }, "local");
+    expect(sidebar.host.createTerminal).toHaveBeenCalledWith({
+      name: "Muse Code Login", shellPath: "/usr/bin/muse", shellArgs: ["login"],
+    });
+  });
   it("keeps that conversation instead of parking it for a panel", async () => {
     const { sidebar, session } = loginSidebar({ claude: true });
 

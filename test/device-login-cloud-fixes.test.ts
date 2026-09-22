@@ -13,10 +13,16 @@
 import { describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import { Window } from "happy-dom";
 import { shouldKeepAwake } from "../src/keep-awake";
 import { GrokSidebar } from "../src/sidebar";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, existsSync: vi.fn(actual.existsSync), readFileSync: vi.fn(actual.readFileSync) };
+});
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sidebar = fs.readFileSync(path.join(root, "src", "sidebar.ts"), "utf8").replace(/\r\n/g, "\n");
@@ -39,10 +45,9 @@ describe("device login: announce only what is verified", () => {
     expect(start).toContain("needsCode: !!plan.needsCode");
 
     const confirm = methodBody("private async confirmDeviceLoginInner(");
-    expect(confirm).toContain("reprobeProviderCredentials(");
     expect(confirm).toContain("deviceLoginCredentialReady(");
     expect(confirm).toContain('status: "done"');
-    expect(confirm.indexOf("reprobeProviderCredentials(")).toBeLessThan(
+    expect(confirm.indexOf("deviceLoginCredentialReady(")).toBeLessThan(
       confirm.indexOf('status: "done"'),
     );
     // And a verdict either way: exhausting the probes must tell the user.
@@ -70,6 +75,50 @@ describe("device login: announce only what is verified", () => {
     const registration = body.indexOf("this.deviceLogins.set(");
     expect(settledCheck).toBeGreaterThan(-1);
     expect(registration).toBeGreaterThan(settledCheck);
+  });
+});
+
+describe("Muse device login completion", () => {
+  it.each([true, false])("checks only credential presence after CLI success (present=%s)", async present => {
+    const instance = Object.create(GrokSidebar.prototype) as any;
+    instance.reprobeProviderCredentials = vi.fn();
+    const exists = vi.spyOn(fs, "existsSync").mockReturnValue(present);
+    const read = vi.spyOn(fs, "readFileSync");
+    read.mockClear();
+    try {
+      expect(await instance.deviceLoginCredentialReady("muse")).toBe(present);
+      expect(exists).toHaveBeenCalledTimes(1);
+      expect(exists).toHaveBeenCalledWith(path.join(os.homedir(), ".config", "muse", "auth.json"));
+      expect(read).not.toHaveBeenCalled();
+      expect(instance.reprobeProviderCredentials).not.toHaveBeenCalled();
+    } finally {
+      exists.mockRestore();
+      read.mockRestore();
+    }
+  });
+
+  it("does not call a catalog response proof of authentication", async () => {
+    const instance = Object.create(GrokSidebar.prototype) as any;
+    expect(await instance.reprobeProviderCredentials("muse")).toBe(false);
+  });
+
+  it("promotes the account and adopts the requesting session after a credential lands", async () => {
+    const instance = Object.create(GrokSidebar.prototype) as any;
+    instance.deviceLoginCredentialReady = vi.fn(async () => true);
+    instance.reprobeProviderCredentials = vi.fn();
+    instance.host = { appendLine: vi.fn() };
+    instance.setProviderNeedsLogin = vi.fn();
+    instance.setProviderConnected = vi.fn(async () => {});
+    instance.deviceLoginSession = vi.fn(() => "requesting-session");
+    instance.adoptSessionsForConnectedProvider = vi.fn(async () => {});
+    const send = vi.fn();
+    await instance.confirmDeviceLoginInner("muse", send, "Muse Code", () => ({ clientId: "phone" }));
+    expect(instance.deviceLoginCredentialReady).toHaveBeenCalledWith("muse");
+    expect(instance.reprobeProviderCredentials).not.toHaveBeenCalled();
+    expect(instance.setProviderNeedsLogin).toHaveBeenCalledWith("muse", false);
+    expect(instance.setProviderConnected).toHaveBeenCalledWith("muse", true);
+    expect(send).toHaveBeenCalledWith({ status: "done" });
+    expect(instance.adoptSessionsForConnectedProvider).toHaveBeenCalledWith("muse", "requesting-session");
   });
 });
 
@@ -249,7 +298,7 @@ describe("every provider configuration a remote can be in", () => {
     }
   });
 
-  it("asks the client to open the wizard, and still posts the sign-in message", () => {
+  it.each(["codex", "muse"])("opens the wizard and posts the sign-in message for %s", provider => {
     // Connect must do BOTH: post `runGrokLogin` (the capability) and open the
     // wizard (where the flow reports). A local action used to return before
     // the message, so the dialog opened with nothing on its way to it.
@@ -258,17 +307,17 @@ describe("every provider configuration a remote can be in", () => {
     const { container, window } = mountSettings({
       isRemote: true, isDesktop: false, providersKnown: true, hostCaps: CLOUD,
     }, {
-      snapshotOverrides: { providers: NONE },
+      snapshotOverrides: { providers: [...NONE, { id: "muse", connected: false }] },
       post: (m: unknown) => posted.push(m),
       onLocal: (name: string) => locals.push(name),
       closeOnAction: true,
       onClose: () => { throw new Error("settings must stay open behind the wizard"); },
     });
-    const row = container.querySelector('[data-id="providerCodexRemote"]')!;
-    const btn = row.querySelector(".settings-action") as HTMLElement;
+    const row = container.querySelector(`[data-id="provider${provider === "muse" ? "Muse" : "Codex"}Remote"]`)!;
+    const btn = row.querySelector(".settings-action:not(.settings-provider-recheck)") as HTMLElement;
     btn.dispatchEvent(new (window as unknown as { MouseEvent: typeof MouseEvent }).MouseEvent("click", { bubbles: true }));
-    expect(posted).toContainEqual({ type: "runGrokLogin", provider: "codex" });
-    expect(locals).toContain("connectWizard:codex");
+    expect(posted).toContainEqual({ type: "runGrokLogin", provider });
+    expect(locals).toContain(`connectWizard:${provider}`);
   });
 
   it("says it is disconnecting, because the answer is 10-15 seconds away", () => {

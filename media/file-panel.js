@@ -427,15 +427,15 @@
     const files = Array.isArray(snap.files) ? snap.files : [];
     const conflicts = files.filter((file) => file && file.status === "U").length;
     if (conflicts) {
-      return { tone: "warn", text: conflicts === 1 ? "1 file has conflicts" : conflicts + " files have conflicts" };
+      return { tone: "warn", text: conflicts === 1 ? "1 file has conflicts" : conflicts.toLocaleString("en-US") + " files have conflicts" };
     }
     if (files.length) {
       // Deliberately NOT the warning tone — see the note on .gfp-changes-warn.
-      return { tone: "note", text: files.length === 1 ? "1 file not committed" : files.length + " files not committed" };
+      return { tone: "note", text: files.length === 1 ? "1 file not committed" : files.length.toLocaleString("en-US") + " files not committed" };
     }
     const ahead = Number(snap.ahead) || 0;
     if (ahead > 0) {
-      const noun = ahead === 1 ? "1 commit" : ahead + " commits";
+      const noun = ahead === 1 ? "1 commit" : ahead.toLocaleString("en-US") + " commits";
       return { tone: "note", text: noun + " saved here but not pushed" };
     }
     if (snap.unborn) return { tone: "ok", text: "Nothing committed yet" };
@@ -506,7 +506,7 @@
     }
     const ahead = Number(snap.ahead) || 0;
     if (ahead > 0 && canPush) {
-      return { op: "push", label: ahead === 1 ? "Push 1 commit" : "Push " + ahead + " commits", disabled: false, hint: "" };
+      return { op: "push", label: ahead === 1 ? "Push 1 commit" : "Push " + ahead.toLocaleString("en-US") + " commits", disabled: false, hint: "" };
     }
     if (ahead > 0) {
       const hint = !snap.hasRemote
@@ -648,8 +648,8 @@
     const deleted = typeof entry.deleted === "number" ? entry.deleted : null;
     if (added === null && deleted === null) return "";
     const parts = [];
-    if (added) parts.push("+" + added);
-    if (deleted) parts.push("\u2212" + deleted);
+    if (added) parts.push("+" + added.toLocaleString("en-US"));
+    if (deleted) parts.push("\u2212" + deleted.toLocaleString("en-US"));
     return parts.join(" ");
   }
 
@@ -2284,7 +2284,7 @@
       changesCount.hidden = !count;
       changesCount.textContent = count > 99 ? "99+" : String(count);
       changesBtn.title = count
-        ? (count === 1 ? "Changes — 1 file not committed" : "Changes — " + count + " files not committed")
+        ? (count === 1 ? "Changes — 1 file not committed" : "Changes — " + count.toLocaleString("en-US") + " files not committed")
         : "Changes";
       // Same number, same rule, on the panel toggle — and gone with the
       // Changes button when there is no repository to count.
@@ -2537,7 +2537,7 @@
       if (request.op === "commit") {
         if (request.push) return "Committed and pushed.";
         return ahead > 0
-          ? "Committed. " + (ahead === 1 ? "1 commit is" : ahead + " commits are") + " still only on this machine."
+          ? "Committed. " + (ahead === 1 ? "1 commit is" : ahead.toLocaleString("en-US") + " commits are") + " still only on this machine."
           : "Committed.";
       }
       if (request.op === "push") return "Pushed.";
@@ -2740,7 +2740,7 @@
         if (files.length > rowLimit) {
           const more = doc.createElement("p");
           more.className = "gfp-changes-more";
-          more.textContent = "and " + (files.length - rowLimit) + " more";
+          more.textContent = "and " + (files.length - rowLimit).toLocaleString("en-US") + " more";
           list.appendChild(more);
         }
         changesEl.appendChild(list);

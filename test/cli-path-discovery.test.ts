@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { locateClaudeCli } from "../src/claude-cli-locator";
 import { locateCodexCli } from "../src/codex-cli-locator";
+import { locateMuseCli } from "../src/muse-cli-locator";
 import { findCliOnPath, isCliFile } from "../src/cli-path";
 
 vi.mock("node:child_process", async (importOriginal) => ({
@@ -20,7 +21,7 @@ afterEach(() => {
 });
 
 describe("CLI PATH discovery without a shell (#151)", () => {
-  it.each(["grok", "claude", "codex"])("expands PATHEXT for bare %s on win32 and skips non-files", (name) => {
+  it.each(["grok", "claude", "codex", "muse"])("expands PATHEXT for bare %s on win32 and skips non-files", (name) => {
     const binary = `C:\\bin\\${name}.cmd`;
     const checked: string[] = [];
     expect(findCliOnPath(name, { PATH: "C:\\gone;C:\\directory;C:\\bin", PATHEXT: ".CMD;.EXE" }, "win32", (p) => {
@@ -30,6 +31,51 @@ describe("CLI PATH discovery without a shell (#151)", () => {
     })).toBe(binary);
     expect(checked).toContain(`C:\\directory\\${name}.cmd`);
     expect(execSync).not.toHaveBeenCalled();
+  });
+
+  it.each(["grok", "claude", "codex", "muse"])("holds the Windows where fallback for %s to PATHEXT names", (name) => {
+    const env = { PATH: "C:\\missing", PathExt: ".CMD;.CUSTOM" };
+    const lookup = () => findCliOnPath(name, env, "win32", candidate => candidate.startsWith("C:\\shell\\"));
+    for (const suffix of ["", ".exe", ".cmd.extra"]) {
+      vi.mocked(execSync).mockReturnValue(`C:\\shell\\${name}${suffix}\r\n`);
+      expect(lookup()).toBeUndefined();
+    }
+    for (const suffix of [".CMD", ".CuStOm"]) {
+      const binary = `C:\\shell\\${name.toUpperCase()}${suffix}`;
+      vi.mocked(execSync).mockReturnValue(`${binary}\r\n`);
+      expect(lookup()).toBe(binary);
+    }
+  });
+
+  it.each(["grok.cmd", "codex.exe", "claude.exe"])("retains explicitly suffixed Windows fallback lookup for %s", name => {
+    const binary = `C:\\shell\\${name}`;
+    vi.mocked(execSync).mockReturnValue(`${binary}\r\n`);
+    expect(findCliOnPath(name, { PATH: "", PATHEXT: ".CUSTOM" }, "win32", candidate => candidate === binary)).toBe(binary);
+  });
+
+  it("finds Muse on the Windows PATH and through the where fallback", () => {
+    const binary = "C:\\bin\\muse.exe";
+    const options = { platform: "win32" as const, env: { PATH: "C:\\bin" }, isExecutable: (file: string) => file === binary };
+    expect(locateMuseCli(options)).toBe(binary);
+    expect(execSync).not.toHaveBeenCalled();
+    vi.mocked(execSync).mockReturnValue(`${binary}\r\n`);
+    expect(locateMuseCli({ ...options, env: { PATH: "C:\\missing" } })).toBe(binary);
+    expect(execSync).toHaveBeenCalledWith("where muse", expect.objectContaining({ windowsHide: true }));
+  });
+
+  it("rejects an extensionless Muse launcher on the Windows PATH even when where returns it", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "muse-path-"));
+    dirs.push(home);
+    const bin = path.join(home, ".local", "bin");
+    mkdirSync(bin, { recursive: true });
+    const launcher = path.join(bin, "muse");
+    writeFileSync(launcher, "#!/bin/bash\n", { mode: 0o755 });
+    expect(isCliFile(launcher, "win32")).toBe(true);
+    vi.mocked(execSync).mockReturnValue(`${launcher}\r\n`);
+    expect(locateMuseCli({
+      platform: "win32", home, env: { PATH: bin, PATHEXT: ".COM;.EXE;.BAT;.CMD" },
+    })).toBeUndefined();
+    expect(execSync).toHaveBeenCalledWith("where muse", expect.objectContaining({ windowsHide: true }));
   });
 
   it.each(["claude", "codex"] as const)("finds a Windows %s.cmd and ignores an earlier directory with that name", (provider) => {

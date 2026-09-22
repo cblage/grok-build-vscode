@@ -34,10 +34,11 @@ describe("grok CLI process invocation", () => {
     // Pinned so a NEW one-shot invocation has to be noticed rather than slipped
     // in. The tenth is the shared headless Codex/Claude updater; the eleventh is
     // grok's freshness re-read, which runs at the moment an update would start
-    // tearing the pool down.
-    expect(sidebar.match(/execGrokCli\s*\(/g)).toHaveLength(11);
+    // tearing the pool down. The twelfth reads Muse's installed CLI version.
+    expect(sidebar.match(/execGrokCli\s*\(/g)).toHaveLength(12);
     expect(sidebar).toMatch(/execGrokCli\(cliPath, \["--version"\],[\s\S]*parseCodexVersionOutput/);
     expect(sidebar).toMatch(/execGrokCli\(cliPath, \["--version"\],[\s\S]*parseClaudeVersionOutput/);
+    expect(sidebar).toMatch(/execGrokCli\(cliPath, \["--version"\],[\s\S]*parseMuseVersionOutput/);
   });
 
   it("shares the same shim predicate with the ACP spawn path", () => {

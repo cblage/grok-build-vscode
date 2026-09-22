@@ -58,6 +58,12 @@
     codex: "M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z",
     // Four-point sparkle — distinct from the Grok/Codex marks, currentColor.
     claude: "M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z",
+    // Meta's mark, from the same Lobe set as the three above -- Muse Code is
+    // Meta's agent, and a bare letter beside three real marks read as a
+    // placeholder because it was one. Its two loops are drawn with holes, so
+    // this is the mark that actually needs the evenodd rule; Lobe ships all
+    // four with it and the other three render the same either way.
+    muse: "M6.897 4c1.915 0 3.516.932 5.43 3.376l.282-.373c.19-.246.383-.484.58-.71l.313-.35C14.588 4.788 15.792 4 17.225 4c1.273 0 2.469.557 3.491 1.516l.218.213c1.73 1.765 2.917 4.71 3.053 8.026l.011.392.002.25c0 1.501-.28 2.759-.818 3.7l-.14.23-.108.153c-.301.42-.664.758-1.086 1.009l-.265.142-.087.04a3.493 3.493 0 01-.302.118 4.117 4.117 0 01-1.33.208c-.524 0-.996-.067-1.438-.215-.614-.204-1.163-.56-1.726-1.116l-.227-.235c-.753-.812-1.534-1.976-2.493-3.586l-1.43-2.41-.544-.895-1.766 3.13-.343.592C7.597 19.156 6.227 20 4.356 20c-1.21 0-2.205-.42-2.936-1.182l-.168-.184c-.484-.573-.837-1.311-1.043-2.189l-.067-.32a8.69 8.69 0 01-.136-1.288L0 14.468c.002-.745.06-1.49.174-2.23l.1-.573c.298-1.53.828-2.958 1.536-4.157l.209-.34c1.177-1.83 2.789-3.053 4.615-3.16L6.897 4zm-.033 2.615l-.201.01c-.83.083-1.606.673-2.252 1.577l-.138.199-.01.018c-.67 1.017-1.185 2.378-1.456 3.845l-.004.022a12.591 12.591 0 00-.207 2.254l.002.188c.004.18.017.36.04.54l.043.291c.092.503.257.908.486 1.208l.117.137c.303.323.698.492 1.17.492 1.1 0 1.796-.676 3.696-3.641l2.175-3.4.454-.701-.139-.198C9.11 7.3 8.084 6.616 6.864 6.616zm10.196-.552l-.176.007c-.635.048-1.223.359-1.82.933l-.196.198c-.439.462-.887 1.064-1.367 1.807l.266.398c.18.274.362.56.55.858l.293.475 1.396 2.335.695 1.114c.583.926 1.03 1.6 1.408 2.082l.213.262c.282.326.529.54.777.673l.102.05c.227.1.457.138.718.138.176.002.35-.023.518-.073.338-.104.61-.32.813-.637l.095-.163.077-.162c.194-.459.29-1.06.29-1.785l-.006-.449c-.08-2.871-.938-5.372-2.2-6.798l-.176-.189c-.67-.683-1.444-1.074-2.27-1.074z",
   };
 
   /**
@@ -80,7 +86,7 @@
   function providerLogoMarkup(id) {
     const path = PROVIDER_LOGO_PATHS[id];
     if (!path) return "";
-    return `<svg class="provider-logo" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="${path}"></path></svg>`;
+    return `<svg class="provider-logo" viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd" aria-hidden="true"><path d="${path}"></path></svg>`;
   }
 
   const GITHUB_REPO_URL = "https://github.com/phuryn/grok-build-vscode";
@@ -389,6 +395,10 @@
 
   function claudeProvider(snapshot) {
     return ((snapshot && snapshot.providers) || []).find((p) => p && p.id === "claude" && p.connected);
+  }
+
+  function museProvider(snapshot) {
+    return ((snapshot && snapshot.providers) || []).find((p) => p && p.id === "muse" && p.connected);
   }
 
   function legacyProviders(env) {
@@ -1009,6 +1019,36 @@
       },
     },
     {
+      id: "providerMuse", category: "providers", logo: "muse", provider: "muse",
+      title: "Muse Code", vendor: "Meta", description: "", kind: "action", keepOpen: true,
+      visible: (s, env) => !!(env && !env.isRemote && env.providersKnown
+        && (s.providers || []).some(p => p.id === "muse")),
+      enabled: (s) => !providerOf(s, "muse").unavailableReason,
+      describe: (s) => providerOf(s, "muse").unavailableReason || providerDescription(providerOf(s, "muse")),
+      actionLabel: (s) => providerAction(providerOf(s, "muse")),
+      message: (s) => ({ type: providerConnectedNow(s, "muse") ? "logout" : "runGrokLogin", provider: "muse" }),
+    },
+    {
+      id: "providerMuseStatus", category: "providers", logo: "muse", provider: "muse",
+      title: "Muse Code", vendor: "Meta", description: "", kind: "status",
+      visible: (s, env) => !!(env && env.isRemote && env.providersKnown
+        && (s.providers || []).some(p => p.id === "muse")
+        && !remoteProviderActionable(s, env, "muse")),
+      describe: (s, env) => providerOf(s, "muse").unavailableReason || providerRemoteDescribe(s, env, "muse"),
+    },
+    {
+      id: "providerMuseRemote", category: "providers", logo: "muse", provider: "muse",
+      title: "Muse Code", vendor: "Meta", description: "", kind: "action", keepOpen: true,
+      visible: (s, env) => !!(env && env.isRemote && env.providersKnown
+        && (s.providers || []).some(p => p.id === "muse")
+        && remoteProviderActionable(s, env, "muse")),
+      enabled: (s) => !providerOf(s, "muse").unavailableReason,
+      local: (s) => !providerConnectedNow(s, "muse") ? "connectWizard:muse" : "",
+      describe: (s, env) => providerOf(s, "muse").unavailableReason || providerRemoteDescribe(s, env, "muse"),
+      actionLabel: (s) => providerAction(providerOf(s, "muse")),
+      message: (s) => ({ type: providerConnectedNow(s, "muse") ? "logout" : "runGrokLogin", provider: "muse" }),
+    },
+    {
       id: "githubConnection",
       category: "providers",
       icon: "github",
@@ -1299,6 +1339,18 @@
       },
     },
     ...cliUpdateRows("claude"),
+    {
+      id: "aboutMuseCli",
+      category: "about",
+      title: "Muse Code CLI",
+      kind: "value",
+      // Older hosts advertise Muse without its CLI version.
+      visible: (s) => !!(museProvider(s) && museProvider(s).cliVersion),
+      get: (s) => {
+        const p = museProvider(s);
+        return versionLabel(p && p.cliVersion);
+      },
+    },
     // Deliberately absent: "Codex ACP adapter" and "Claude ACP adapter".
     // The two adapters are pinned dependencies of THIS
     // extension (@agentclientprotocol/codex-acp, @agentclientprotocol/
@@ -2281,7 +2333,7 @@
   }
   const NEW_ROUTINE = "__new__";
 
-  const PROVIDER_LABELS = { grok: "Grok", codex: "Codex", claude: "Claude" };
+  const PROVIDER_LABELS = { grok: "Grok", codex: "Codex", claude: "Claude", muse: "Muse Code" };
   function providerLabel(provider) {
     return PROVIDER_LABELS[provider] || provider;
   }
@@ -2304,7 +2356,7 @@
 
   function blankRoutineDraft(snapshot) {
     const projects = Array.isArray(snapshot.routineProjects) ? snapshot.routineProjects : [];
-    const models = Array.isArray(snapshot.routineModels) ? snapshot.routineModels : [];
+    const models = (Array.isArray(snapshot.routineModels) ? snapshot.routineModels : []).filter(m => m.provider !== "muse" || (snapshot.providers || []).some(p => p.id === "muse" && !p.unavailableReason));
     const project = projects[0];
     const pick = defaultModelFor(models, project && project.defaultProvider);
     return {
@@ -2416,7 +2468,7 @@
     const count = document.createElement("span");
     count.className = "settings-routine-count";
     const health = routine.health || { ran: 0, total: 0 };
-    count.textContent = health.total ? health.ran + "/" + health.total : "no runs yet";
+    count.textContent = health.total ? health.ran.toLocaleString("en-US") + "/" + health.total.toLocaleString("en-US") : "no runs yet";
     const wrap = document.createElement("span");
     wrap.className = "settings-routine-strip-wrap";
     wrap.append(strip, count);
@@ -2484,7 +2536,7 @@
     }
     pair.appendChild(labelledField("Project", project));
 
-    const models = Array.isArray(snapshot.routineModels) ? snapshot.routineModels : [];
+    const models = (Array.isArray(snapshot.routineModels) ? snapshot.routineModels : []).filter(m => m.provider !== "muse" || (snapshot.providers || []).some(p => p.id === "muse" && !p.unavailableReason));
     const model = document.createElement("select");
     model.className = "settings-routine-input";
     model.dataset.field = "model";
@@ -2593,7 +2645,7 @@
     const head = document.createElement("div");
     head.className = "settings-routine-runs-head";
     head.textContent = routine.runs.length
-      ? "Last " + routine.runs.length + (routine.runs.length === 1 ? " run" : " runs")
+      ? "Last " + routine.runs.length.toLocaleString("en-US") + (routine.runs.length === 1 ? " run" : " runs")
       : "No runs yet";
     wrap.appendChild(head);
     for (const run of routine.runs) {
@@ -3158,7 +3210,12 @@
     let routinesChecked = false;
     let lastPaintedCategory = "";
     let lastPaintedQuery = "";
-    const post = typeof opts.post === "function" ? opts.post : () => {};
+    const post = message => {
+      const mentionsMuse = value => value && typeof value === "object" && Object.entries(value).some(([key, child]) =>
+        key === "provider" && child === "muse" || mentionsMuse(child));
+      if (mentionsMuse(message) && !(snapshot.providers || []).some(p => p.id === "muse" && !p.unavailableReason)) return;
+      if (typeof opts.post === "function") opts.post(message);
+    };
     const apply = typeof opts.apply === "function" ? opts.apply : null;
     const onLocal = typeof opts.onLocal === "function" ? opts.onLocal : null;
     const onClose = typeof opts.onClose === "function" ? opts.onClose : null;
@@ -3771,7 +3828,7 @@
             input.onchange = () => addTerm(input.value);
           }
         } else if (row.kind === "action") {
-          const btn = el.querySelector(".settings-action");
+          const btn = el.querySelector(".settings-action:not(.settings-provider-recheck)");
           if (!btn) return;
           if (btn.classList.contains("settings-github-token-submit")
             || btn.classList.contains("settings-github-token-cancel")) {
@@ -3971,7 +4028,7 @@
           // previous project's model across is rarely what was meant.
           if (input.dataset.field === "cwd" && ROUTINE_UI.draft) {
             const projects = Array.isArray(snapshot.routineProjects) ? snapshot.routineProjects : [];
-            const models = Array.isArray(snapshot.routineModels) ? snapshot.routineModels : [];
+            const models = (Array.isArray(snapshot.routineModels) ? snapshot.routineModels : []).filter(m => m.provider !== "muse" || (snapshot.providers || []).some(p => p.id === "muse" && !p.unavailableReason));
             const project = projects.find((x) => x.cwd === ROUTINE_UI.draft.cwd);
             const pick = defaultModelFor(models, project && project.defaultProvider);
             if (pick) {

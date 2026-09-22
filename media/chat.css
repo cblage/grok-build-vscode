@@ -2641,12 +2641,13 @@ body.thinking-hidden .msg.thinking { display: none; }
 /* Workflow / Goal / Deep-research progress (P2-10) ÔÇö teal accent to distinguish
    from purple subagent cards. Same density as subagent rows. */
 .run-progress-card {
+  --run-progress-fill: var(--vscode-textBlockQuote-background, rgba(55, 148, 255, 0.08));
   font-size: var(--vscode-font-size);
   color: var(--vscode-descriptionForeground);
   padding: 5px 10px;
   margin: 4px var(--pad);
   border-left: 2px solid var(--vscode-charts-blue, #3794ff);
-  background: var(--vscode-textBlockQuote-background, rgba(55, 148, 255, 0.08));
+  background: var(--run-progress-fill);
   border-radius: 0 6px 6px 0;
 }
 .run-progress-card.run-progress-failed {
@@ -2715,6 +2716,153 @@ body.thinking-hidden .msg.thinking { display: none; }
 }
 .run-progress-card .run-progress-btn:hover {
   background: var(--vscode-button-secondaryHoverBackground, rgba(127, 127, 127, 0.35));
+}
+
+/* Workflows report evidence, never perpetual animation. The pin participates
+   in the same flex column as the transcript and composer on every host. */
+.workflow-pin {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 34vh;
+  display: flex;
+  flex-direction: column;
+  /* No rule and no fill of its own: the card below carries the chrome, and the
+     composer this now sits inside already supplies the side gutter. */
+  padding: 0 0 var(--pad);
+}
+.workflow-pin.is-expanded { max-height: 45vh; }
+.workflow-pin-toggle {
+  min-width: 0;
+  text-align: left;
+  flex: none;
+  align-self: flex-start;
+  border: 0;
+  background: none;
+  color: var(--vscode-foreground);
+  font: inherit;
+  font-weight: 600;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+.workflow-pin-runs { min-height: 0; overflow: auto; overscroll-behavior: contain; }
+/* The pinned card's own numbers. `.run-progress-card` gives every progress
+   card a fill, a left accent rail and a radius at the transcript's tighter
+   density; a card sitting on top of the composer gets room to breathe. */
+.workflow-pin-run {
+  margin: 0 0 6px;
+  padding: 10px 11px;
+  border-left-width: 3px;
+  border-radius: 6px;
+  overflow: clip;
+  /* Composite the card tint over its surface once; the sticky header inherits
+     this opaque fill so scrolling text cannot show through or darken it. */
+  background: linear-gradient(var(--run-progress-fill), var(--run-progress-fill)), var(--vscode-sideBar-background);
+}
+.workflow-pin-run:last-child { margin-bottom: 0; }
+.workflow-expanded[hidden], .workflow-dots[hidden], .workflow-phases[hidden], .workflow-roster[hidden], .workflow-agent-detail[hidden], .workflow-blocked[hidden] { display: none; }
+/* Reads immediately under the receipt, because it is what qualifies it. */
+.workflow-blocked { color: var(--vscode-editorWarning-foreground, #cca700); }
+.workflow-tool-marker[hidden] { display: none; }
+.workflow-card .run-progress-row,
+.workflow-pin-run .run-progress-row { flex-wrap: wrap; align-items: baseline; }
+.workflow-card .run-progress-title,
+.workflow-pin-run .run-progress-title {
+  font-weight: 600;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.workflow-card .run-progress-phase,
+.workflow-pin-run .run-progress-phase { flex: 0 1 auto; overflow-wrap: anywhere; }
+.workflow-receipt, .workflow-agent-activity { font-size: 0.9em; opacity: 0.8; }
+.workflow-phases {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  padding: 0;
+  margin: 7px 0;
+  list-style: none;
+}
+.workflow-phase {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  padding: 2px 5px;
+  border-bottom: 2px solid var(--vscode-editorWidget-border, #777);
+}
+.workflow-phase::before { content: "○ "; }
+.workflow-phase[data-state="unknown"]::before { content: "? "; }
+.workflow-phase[data-state="active"] { color: var(--vscode-foreground); border-color: var(--vscode-charts-blue, #3794ff); }
+.workflow-phase[data-state="active"]::before { content: "› "; }
+.workflow-phase[data-state="done"]::before,
+.workflow-phase[data-state="completed"]::before { content: "✓ "; }
+.workflow-phase[data-state="done"],
+.workflow-phase[data-state="completed"] { border-color: var(--vscode-charts-green, #4ec9b0); }
+/* Name, steps and stage on the left; elapsed and the chevron on the right; the
+   controls on their OWN row at the foot of the card. Pause and Stop used to
+   share this row, which clipped "Stop" off the right edge of a phone, and the
+   chevron hung below it on top of the receipt line. */
+.workflow-heading { display: block; }
+.workflow-pin-run > .workflow-heading {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  margin: 0 -11px;
+  padding: 0 11px;
+  background: inherit;
+}
+/* Keep the reported stage available to assistive technology without repeating
+   the expanded phase strip visually or taking up space in the heading. */
+.workflow-pin-run.is-expanded > .workflow-heading .run-progress-phase {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.workflow-heading > .workflow-pin-toggle { display: flex; width: 100%; margin: 0; padding: 0; }
+.workflow-heading .run-progress-row { align-items: center; gap: 9px; }
+.workflow-chevron { flex: none; opacity: 0.7; font-size: 0.9em; }
+.workflow-chevron::before { content: "⌄"; }
+.is-expanded > .workflow-heading .workflow-chevron::before { content: "⌃"; }
+.workflow-pin .workflow-receipt { margin-top: 3px; }
+/* The composer is directly below, so the controls need a real target and air
+   above them rather than the transcript card's 6px. */
+.workflow-pin .run-progress-actions { margin-top: 9px; gap: 7px; }
+.workflow-pin .run-progress-btn { padding: 5px 12px; border-radius: 6px; }
+/* Wraps because a phase list is not always four steps — a long one would
+   otherwise run the heading off a 320px screen. */
+.workflow-dots { display: inline-flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.workflow-dot { width: 7px; height: 7px; border: 1px solid currentColor; border-radius: 50%; opacity: 0.45; }
+.workflow-dot[data-state="unknown"] { border-style: dashed; }
+.workflow-dot[data-state="done"], .workflow-dot[data-state="completed"] { background: var(--vscode-charts-green, #4ec9b0); border-color: var(--vscode-charts-green, #4ec9b0); opacity: 1; }
+.workflow-dot[aria-current="step"] { border: 2px solid var(--vscode-charts-blue, #3794ff); opacity: 1; }
+/* A row, so the icon sits beside the name the way a tool line's does, and
+   the ellipsis lands on the text rather than clipping the icon off. */
+.workflow-marker { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.workflow-marker > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.workflow-card:not(.run-progress-done) { border: 0; padding: 4px 0; background: none; }
+.workflow-report-toggle { cursor: pointer; font-weight: 600; }
+.workflow-report-body { margin-top: 6px; }
+.workflow-agent-toggle { display: flex; align-items: baseline; gap: 6px; width: 100%; border: 0; padding: 4px 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; white-space: nowrap; }
+.workflow-agent-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.workflow-agent-state { flex: 0 0 auto; }
+.workflow-agent-toggle::after { content: "⌄"; margin-left: auto; }
+.workflow-agent-toggle[aria-expanded="true"]::after { content: "⌃"; }
+.workflow-agent-detail { padding: 4px 0; }
+.workflow-roster { overflow-x: auto; list-style: none; padding: 0; margin: 8px 0 2px; }
+.workflow-agent { padding: 5px 0; border-top: 1px solid var(--vscode-editorWidget-border, #555); overflow-wrap: anywhere; }
+.workflow-agent[data-state*="fail"], .workflow-agent[data-state*="error"] { color: var(--vscode-errorForeground, #f48771); }
+.workflow-agent[data-state*="permission"], .workflow-agent[data-state*="blocked"] { color: var(--vscode-charts-orange, #d7ba7d); }
+.workflow-agent[data-state="cancelled"] { opacity: 0.8; }
+.workflow-control-reason { flex-basis: 100%; font-size: 0.9em; }
+.run-progress-card .run-progress-btn:disabled { opacity: 0.55; cursor: default; }
+.workflow-pin-toggle:focus-visible, .workflow-agent-toggle:focus-visible, .workflow-report-toggle:focus-visible, .run-progress-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
+@media (hover: none), (pointer: coarse) {
+  .workflow-pin-toggle, .workflow-agent-toggle, .workflow-pin .run-progress-btn { min-height: 36px; }
 }
 
 .tool-group {
@@ -6546,3 +6694,6 @@ body.host-wait-visible .gfp-panel.gfp-overlay { bottom: var(--host-wait-height, 
   .repo-icon-tab { min-height: 32px; }
   .repo-icon-grid { grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); }
 }
+
+.model-picker-row:has(.model-picker-description) { flex-wrap: wrap; }
+.model-picker-description { flex-basis: 100%; white-space: normal; text-align: left; font-size: 12px; line-height: 1.4; color: var(--muted); }

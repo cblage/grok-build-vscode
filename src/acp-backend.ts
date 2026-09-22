@@ -1,16 +1,84 @@
 import type { EffortLevel, PromptContentBlock } from "./acp";
 
 export const ACP_PROVIDERS = ["grok", "codex", "claude"] as const;
-export type AcpProvider = (typeof ACP_PROVIDERS)[number];
+// The legacy wire vocabulary above stays frozen for older receivers.
+export const INTERNAL_PROVIDERS = [...ACP_PROVIDERS, "muse"] as const;
+export type LegacyAcpProvider = (typeof ACP_PROVIDERS)[number];
+export type AcpProvider = (typeof INTERNAL_PROVIDERS)[number];
 
-export function isAcpProvider(value: unknown): value is AcpProvider {
-  return value === "grok" || value === "codex" || value === "claude";
+export function isInternalProvider(value: unknown): value is AcpProvider {
+  return typeof value === "string" && (INTERNAL_PROVIDERS as readonly string[]).includes(value);
+}
+
+// Exhaustive: each new provider must explicitly opt into implemented actions.
+const PROVIDER_ACTIONS: Record<AcpProvider, {
+  deleteHistory: boolean;
+  compact: boolean;
+  adapterHistory: boolean;
+  modeSwitching: boolean;
+  perCallContext: boolean;
+  clientMcp: boolean;
+}> = {
+  grok: { deleteHistory: true, compact: true, adapterHistory: false, modeSwitching: true, perCallContext: false, clientMcp: true },
+  codex: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, perCallContext: true, clientMcp: true },
+  claude: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, perCallContext: true, clientMcp: true },
+  muse: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, perCallContext: false, clientMcp: false },
+};
+
+/**
+ * A provider's row, total on purpose.
+ *
+ * `session.client` is not always a live `AcpClient`. The host parks stubs --
+ * `{ dispose() {}, setHumanWaitActive() {} } as AcpClient` -- on sessions a
+ * remote tab owns, and a stub carries no `provider` at all. Until 4.10.0 the
+ * only capability question was `isAdapterProvider`, written as a comparison,
+ * so an absent provider answered `false` and `sessionDisplayName` fell through
+ * to its ordinary branch. Indexing this table turned the same call into
+ * "Cannot read properties of undefined", and because the name is posted from
+ * `postSessionsListNow` and `focusSession`, it took `selectRepo` and
+ * `resumeSession` down with it -- a phone could not join a conversation at all.
+ *
+ * Grok's row is the fallback because it is already what the rest of the wire
+ * does with a provider it does not recognise (`isAcpProvider(p) ? p : "grok"`).
+ */
+function actionsFor(provider: AcpProvider): (typeof PROVIDER_ACTIONS)[AcpProvider] {
+  return PROVIDER_ACTIONS[provider] ?? PROVIDER_ACTIONS.grok;
+}
+
+export function supportsHistoryDeletion(provider: AcpProvider): boolean {
+  return actionsFor(provider).deleteHistory;
+}
+
+export function supportsCompaction(provider: AcpProvider): boolean {
+  return actionsFor(provider).compact;
+}
+
+export function supportsSessionDeletion(provider: AcpProvider): boolean {
+  return usesAdapterHistory(provider) && supportsHistoryDeletion(provider);
+}
+
+export function supportsModeSwitching(provider: AcpProvider): boolean {
+  return actionsFor(provider).modeSwitching;
+}
+
+export function usesPerCallContextOccupancy(provider: AcpProvider): boolean {
+  return actionsFor(provider).perCallContext;
+}
+
+export function supportsClientMcpServers(provider: AcpProvider): boolean {
+  return actionsFor(provider).clientMcp;
+}
+
+export function isAcpProvider(value: unknown): value is LegacyAcpProvider {
+  return typeof value === "string" && (ACP_PROVIDERS as readonly string[]).includes(value);
 }
 
 /** Providers whose conversations live in an adapter catalog, not ~/.grok. */
-export function isAdapterProvider(provider: AcpProvider): boolean {
-  return provider === "codex" || provider === "claude";
+export function usesAdapterHistory(provider: AcpProvider): boolean {
+  return actionsFor(provider).adapterHistory;
 }
+
+export const isAdapterProvider = usesAdapterHistory;
 
 export interface BackendSpawnOptions {
   cliPath: string;
@@ -42,6 +110,8 @@ export interface BackendUpdate {
   meta?: any;
   sessionTitle?: string;
   contextWindow?: number;
+  /** Direct occupancy reported by a backend, including an empty context. */
+  contextUsed?: number;
   /**
    * Ordinary `usage_update.used` is billed per model call (includes output).
    * Compact's getContextUsage is the exception — the host only adopts this
@@ -56,6 +126,10 @@ export interface BackendSessionListEntry {
   cwd: string;
   title?: string;
   updatedAt?: string | number;
+  createdAt?: string | number;
+  turnCount?: number;
+  modelId?: string;
+  branch?: string;
 }
 
 export interface BackendSessionListResult {
@@ -73,8 +147,8 @@ export interface BackendSteeringOptions {
   grokVersionVerified?: boolean;
 }
 
-export interface AcpBackend {
-  readonly provider: AcpProvider;
+export interface AcpBackend<Provider extends string = AcpProvider> {
+  readonly provider: Provider;
   readonly processName: string;
   readonly usesClientPlanGate: boolean;
   spawn(options: BackendSpawnOptions): BackendSpawnSpec;

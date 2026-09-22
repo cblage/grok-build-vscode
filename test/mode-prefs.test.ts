@@ -41,7 +41,7 @@ describe("remembered effort by provider (#151)", () => {
 });
 
 describe("effort picker persistence", () => {
-  function picker(provider: "grok" | "claude" | "codex") {
+  function picker(provider: "grok" | "claude" | "codex" | "muse") {
     const sidebar = Object.create(GrokSidebar.prototype) as any;
     const session = new Session();
     session.provider = provider;
@@ -85,7 +85,7 @@ describe("effort picker persistence", () => {
     return { sidebar, session, cfg, values };
   }
 
-  it.each(["grok", "claude", "codex"] as const)("remembers a successful live %s change without changing another provider", async (provider) => {
+  it.each(["grok", "claude", "codex", "muse"] as const)("remembers a successful live %s change without changing another provider", async (provider) => {
     const { sidebar, session, cfg, values } = picker(provider);
     await sidebar.onMessage({ type: "setEffort", level: "low" }, "local");
     expect(session.client!.setReasoningEffort).toHaveBeenCalledWith("low");
@@ -102,6 +102,30 @@ describe("effort picker persistence", () => {
     // own transcript. The chip is optimistic and reconciles on the next real
     // `initialState`, which is what the effort dots did before it.
     expect(sidebar.emit).not.toHaveBeenCalled();
+  });
+
+  it("applies a Muse picker change live and reads back its own saved effort", async () => {
+    const { sidebar, session, cfg, values } = picker("muse");
+    values["grok.defaultEffortByProvider"] = { codex: "medium", claude: "low" };
+    await sidebar.onMessage({ type: "setEffort", level: "ultra" }, "local");
+    expect(session.client!.setReasoningEffort).toHaveBeenCalledWith("ultra");
+    expect(values["grok.defaultEffortByProvider"]).toEqual({ codex: "medium", claude: "low", muse: "ultra" });
+    expect(sidebar.defaultEffortForProvider("muse")).toBe("ultra");
+    expect(cfg.update).not.toHaveBeenCalled();
+    expect(sidebar.startSession).not.toHaveBeenCalled();
+    expect(sidebar.restartSession).not.toHaveBeenCalled();
+    expect(sidebar.pickRestartMode).not.toHaveBeenCalled();
+  });
+
+  it("remembers a Muse picker change before restarting an empty session", async () => {
+    const { sidebar, session } = picker("muse");
+    session.hasHistory = false;
+    sidebar.startSession.mockImplementation(async () => {
+      expect(sidebar.defaultEffortForProvider("muse")).toBe("max");
+    });
+    await sidebar.onMessage({ type: "setEffort", level: "max" }, "local");
+    expect(sidebar.startSession).toHaveBeenCalledWith(undefined, session);
+    expect(session.client!.setReasoningEffort).not.toHaveBeenCalled();
   });
 
   it.each([false, true])("remembers an adapter reset for the restart path (empty=%s)", async (empty) => {

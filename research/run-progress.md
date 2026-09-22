@@ -46,7 +46,20 @@ From CLI binary symbols (0.2.111) + session_notification family:
 | `media/chat.js` | Upsert teal progress cards; Pause/Resume/Stop → `workflowControl` → `/workflow …` |
 
 Cards are buffered on the session like subagent rows, so a warm re-focus
-replays them. No nested inspector for child agents (same non-goal as subagents).
+replays them. Workflow agent rows expand to show dated activity evidence. Expansion is held
+in memory per run, with every new run collapsed; it is never a host setting.
+
+A live transcript entry is a non-expandable name/status marker. The pinned card
+shows static dots from the reported phases, current phase, reported elapsed time,
+and `updated Ns ago` from frame arrival. Its expanded view adds labelled phases,
+agent budget and single-line agent summaries. Pause/Resume and Stop stay outside
+the disclosure. A finished run replaces its marker with an expandable report.
+
+Receipt arrival, token increases and reported state transitions remain separate
+facts. Duplicate frames refresh only receipt age. Zero tokens do not establish
+activity, and even a state transition retains the absence of observed token
+activity in agent detail. Missing fields hide their dependent affordances.
+Counts use thousands separators; names and control handles never use run ids.
 
 ## Probes
 

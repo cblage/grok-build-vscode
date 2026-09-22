@@ -1,6 +1,6 @@
 # Grok Build (Community)
 
-[![License: FSL-1.1-MIT](https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg)](LICENSE) ![Agents](https://img.shields.io/badge/Agents-Grok%20Build%20%C2%B7%20Codex%20%C2%B7%20Claude%20Code-000000) [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com) [![Cursor](https://badgen.net/badge/Cursor/Extension/007ACC)](https://cursor.com) [![Companion](https://img.shields.io/badge/Companion-AFK%20Pilot-0E639C)](https://afkpilot.com) [![The Product Compass](https://img.shields.io/badge/The%20Product%20Compass-productcompass.pm-FF6B35)](https://www.productcompass.pm)
+[![License: FSL-1.1-MIT](https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg)](LICENSE) ![Agents](https://img.shields.io/badge/Agents-Grok%20Build%20%C2%B7%20Codex%20%C2%B7%20Claude%20Code%20%C2%B7%20Muse%20Code-000000) [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com) [![Cursor](https://badgen.net/badge/Cursor/Extension/007ACC)](https://cursor.com) [![Companion](https://img.shields.io/badge/Companion-AFK%20Pilot-0E639C)](https://afkpilot.com) [![The Product Compass](https://img.shields.io/badge/The%20Product%20Compass-productcompass.pm-FF6B35)](https://www.productcompass.pm)
 
 > **GUI for Grok Build CLI (incl. Grok 4.6)** — not affiliated with or endorsed by SpaceXAI (formerly xAI). *Grok*, *Grok Build*, and *xAI* are trademarks of xAI; this project uses those names only to describe what it's compatible with.
 
@@ -12,7 +12,7 @@ Two ways to use the same agent UI on top of the **Grok Build CLI**:
 | **Get it** | [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=PawelHuryn.grok-vscode-phuryn) · [Open VSX](https://open-vsx.org/extension/PawelHuryn/grok-vscode-phuryn) | [afkpilot.com/desktop](https://afkpilot.com/desktop) (see [Desktop install](#grok-build-desktop)) |
 | **Best when** | You already live in the editor | You want the agent as its own window |
 
-Both speak JSON-RPC to `grok agent stdio` (and to other ACP agents — **Codex** and **Claude Code** included), share chat history under `~/.grok`, and support **Remote Control** via **[AFK Pilot](https://afkpilot.com)** — pair once and watch, approve, and steer from your phone or any browser. Drop files in as `@`-context, run **multiple sessions**, generate **images & video inline**, and dictate by **voice**.
+Both speak JSON-RPC to `grok agent stdio` (and to **Codex**, **Claude Code** and **Muse Code**), share chat history under `~/.grok`, and support **Remote Control** via **[AFK Pilot](https://afkpilot.com)** — pair once and watch, approve, and steer from your phone or any browser. Drop files in as `@`-context, run **multiple sessions**, generate **images & video inline**, and dictate by **voice**.
 
 No manual setup on either host: onboarding **walks you through installing the `grok` CLI and signing in** — with a **SuperGrok or X Premium+ subscription**, or an **xAI API key**.
 
@@ -149,9 +149,11 @@ Hover a message you sent → **Rewind** (or **Grok: Rewind Conversation**), conf
 </details>
 
 <details>
-<summary><strong>Deep Research / Workflow progress</strong> — a live progress card with Pause / Resume / Stop</summary>
+<summary><strong>Deep Research / Workflow progress</strong> — a card that pins above the composer, with Pause / Resume / Stop</summary>
 
 When Grok runs a Deep Research, Workflow, or Goal task, a progress card streams its steps live and gives you **Pause**, **Resume**, and **Stop** controls, so long autonomous runs stay visible and interruptible.
+
+A running **workflow** pins itself just above the composer so it cannot scroll out of reach, and leaves a one-line marker in the transcript rather than a second copy of itself. Collapsed it shows the name, one dot per reported step with the current one marked, the phase, elapsed time and how long ago the last frame arrived; agents that have failed, been cancelled, or are waiting on a permission prompt are named there too, because a stuck run keeps its frames arriving. Tap it for the labelled phase strip, the agent budget and one row per agent, each of which opens for what that agent has actually done. When the run finishes the pin goes and the transcript marker becomes the report.
 
 </details>
 
@@ -208,9 +210,9 @@ Click the model chip in the composer to open the model picker. The list comes fr
 </details>
 
 <details>
-<summary><strong>Multi-provider</strong> — built for Grok Build, works with other ACP agents</summary>
+<summary><strong>Multi-provider</strong> — built for Grok Build, works with Codex, Claude Code and Muse Code</summary>
 
-The host talks **ACP** (JSON-RPC over stdio), not a Grok-specific protocol, so the same UI drives any agent that speaks it — **OpenAI Codex** and **Claude Code** included. Connect them in **Settings → Providers**; each signs in through its own CLI. Grok Build is the default and the one everything is tuned against, but every connected agent shares one model picker, and each conversation keeps the agent it started with, so all three can run side by side with the same chat, diffs, permission cards, and history. Providers also offers to **update each CLI in place** when yours is older than the version this app is built against — installed the way you installed it (npm, Homebrew, or the vendor's own installer), never switching you to a different one — and the conversations you had open reopen when it finishes.
+The host talks **ACP** (JSON-RPC over stdio), not a Grok-specific protocol, so the same UI drives any agent that speaks it — **OpenAI Codex** and **Claude Code** included. **Muse Code** speaks Meta's own protocol instead, and reaches the same UI through a small adapter this extension ships. Connect them in **Settings → Providers**; each signs in through its own CLI. Grok Build is the default and the one everything is tuned against, but every connected agent shares one model picker, and each conversation keeps the agent it started with, so all four can run side by side with the same chat, diffs, permission cards, and history. Providers also offers to **update each CLI in place** when yours is older than the version this app is built against — installed the way you installed it (npm, Homebrew, or the vendor's own installer), never switching you to a different one — and the conversations you had open reopen when it finishes.
 
 **Settings → Connectors** has three sections: apps you connect here (Connect / Disconnect — available to Grok, Codex, and Claude), grok.com connectors that follow your Grok account, and local Grok connectors declared in this machine's config files. Connecting an app is not desk-only: it works from a phone, and on a cloud machine where there is no desk at all. Project-file servers stay off this page. grok.com connectors are edited at [grok.com/connectors](https://grok.com/connectors).
 
@@ -325,7 +327,7 @@ Open **Settings** from **+** in VS Code or the rail gear in Desktop and AFK Pilo
 | `grok.expandDiffCard` | `false` | Open each coding turn's Changed-files card by default. Click a header to toggle that card; changing this preference updates all existing cards. Independent of Expand tool details and Expand/Collapse All. Host-backed on desktop and IDEs; stored per device on a phone or browser. |
 | `grok.steerByDefault` | `false` | Send straight into the running turn instead of queueing. Off: a message sent mid-turn waits and flushes when the turn ends (steer it on demand with the **Steer** button). On: it skips the queue and redirects the agent immediately. Applies wherever that agent takes a mid-turn correction — **Grok** and **OpenAI Codex** do, **Claude Code** does not and keeps queueing. Never cancels the turn or discards work in progress; carries your text and its attachments, not the ambient editor selection. Toggle live from Settings → **Steer by default**. |
 | `grok.soundNotifications` | `false` | Play a short tone when Grok finishes a turn or errors — a rising chime for done, a lower tone for errors — but **only when the Grok panel isn't focused**, so it notifies you when you've stepped away. Toggle live from Settings → **Sound notifications**. |
-| `grok.thumbsFeedback` | `false` | Show thumbs on a finished Grok turn so you can send a rating to SpaceXAI. Off by default. On, thumbs appear only when this Grok session supports feedback — never on Codex or Claude. Toggle from Settings → General → **Thumbs feedback to SpaceXAI**. |
+| `grok.thumbsFeedback` | `false` | Show thumbs on a finished Grok turn so you can send a rating to SpaceXAI. Off by default. On, thumbs appear only when this Grok session supports feedback — never on Codex, Claude or Muse. Toggle from Settings → General → **Thumbs feedback to SpaceXAI**. |
 | `grok.telemetry.enabled` | `true` | Send anonymous, privacy-first usage telemetry (see [Privacy](#privacy)). Also honors VS Code's global `telemetry.telemetryLevel`. |
 | `grok.chatFontScale` | `100` | Zoom for the chat panel only, as a percent (`150`, `200`, …). Scales the whole chat UI without rescaling the rest of VS Code (unlike `Ctrl/Cmd+Shift+=`). Applies live; supports User (global) and Workspace (local) scope. |
 | `grok.voiceBackend` | `"auto"` | Prefer the agent vendor when its credential is available, otherwise use the other. Explicit `xai` / `openai` choices require that credential. |

@@ -232,12 +232,47 @@ describe("multi-provider review regressions", () => {
   });
 
   it("freezes adapter listing time on first discovery for Codex and Claude", () => {
-    const body = methodBody("private async refreshAdapterHistory(");
+    // The listing moved out of `refreshAdapterHistory` when history stopped
+    // spawning a process per repo: that method now only queues, and this is
+    // the half that reads the catalog. The assertions are unchanged — no
+    // provider carve-out on the pin — only the method that must satisfy them.
+    const body = methodBody("private async listAdapterHistory(");
     expect(body).toContain("if (typeof previous.activeAt === \"number\") continue");
     expect(body).toContain("activeAt: adapterListEntry(entry, {}, provider, Date.now()).updatedAt");
     // No provider carve-out — Claude restamps on load, same pin Codex already had.
     expect(body).not.toContain('if (provider === "codex")');
     expect(body).not.toContain("...(provider === \"codex\"");
+  });
+
+  it("starts the shared history process in the home directory, never in a project", () => {
+    // The spawn cwd carries no meaning — codex sends no cwd on the wire and
+    // claude takes it per call — so a process born in whichever project
+    // listed first would hold that folder for nothing. It now OUTLIVES the
+    // project, and on Windows that is a folder the user cannot delete after
+    // closing it. Home is the one directory that is never a project.
+    const body = methodBody("private async adapterHistoryClient(");
+    expect(body).toContain("cwd: this.projectHomeDir()");
+    // The listing cwd still reaches `session/list` as an argument; only the
+    // process's own birthplace changed.
+    expect(methodBody("private async listAdapterHistory(")).toContain("client.listSessions(cwd, process.platform)");
+  });
+
+  it("gives every provider the same teardown budget, and bounds the muse child wait", () => {
+    // One provider waiting longer than the others buys nothing: the ceiling is
+    // only reached by a process that will not exit, and then it is the user's
+    // app-quit that hangs. Muse's slow half is its `muse serve` child, so the
+    // wait is bounded inside the adapter that knows about it — not paid for by
+    // every teardown out here.
+    const acp = fs.readFileSync(path.join(root, "src", "acp.ts"), "utf8").replace(/\r\n/g, "\n");
+    expect(acp).toContain("dispose(timeoutMs = 3000): Promise<void> {");
+    expect(acp).not.toMatch(/dispose\(timeoutMs = this\.provider/);
+
+    const session = fs.readFileSync(path.join(root, "adapters", "muse", "session.mts"), "utf8").replace(/\r\n/g, "\n");
+    expect(session).toContain("Promise.race([handshake.exited, childExitTimeout()])");
+    // And the host's own ceiling must stay the outer bound of the adapter's.
+    expect(session).toMatch(/CHILD_EXIT_BUDGET_MS = (\d+)/);
+    const budget = Number(/CHILD_EXIT_BUDGET_MS = (\d+)/.exec(session)![1]);
+    expect(budget).toBeLessThan(3000);
   });
 
   it("puts minimal provider state in every remote client snapshot", () => {
@@ -247,6 +282,7 @@ describe("multi-provider review regressions", () => {
     expect(instance.providerStateMessage()).toEqual({
       type: "providerState",
       providers: [
+        { id: "muse", connected: false },
         { id: "grok", connected: true },
         { id: "codex", connected: false },
         { id: "claude", connected: false },

@@ -1,3 +1,5 @@
+import { supportsCompaction, type AcpProvider } from "./acp-backend";
+
 export interface SlashCmd {
   name: string;
   description?: string;
@@ -133,4 +135,9 @@ export function matchSlashCommand(text: string, commandNames: string[]): string 
   if (!m) return null;
   if (commandNames.length === 0) return m[1];
   return commandNames.includes(m[1]) ? m[1] : null;
+}
+
+export function matchProviderSlashCommand(provider: AcpProvider, text: string, commandNames: string[]): string | null {
+  const command = matchSlashCommand(text, commandNames);
+  return command === "compact" && !supportsCompaction(provider) ? null : command;
 }

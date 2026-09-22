@@ -1,3 +1,4 @@
+import { supportsSessionDeletion } from "./acp-backend";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface, Interface } from "node:readline";
 import { EventEmitter } from "node:events";
@@ -762,7 +763,7 @@ export class AcpClient extends EventEmitter {
   }
 
   async deleteSession(sessionId: string): Promise<void> {
-    if (this.provider === "grok") throw new Error("This backend does not support ACP session deletion.");
+    if (!supportsSessionDeletion(this.provider)) throw new Error("This backend does not support ACP session deletion.");
     await this.request("session/delete", { sessionId });
   }
 
@@ -1384,7 +1385,7 @@ export class AcpClient extends EventEmitter {
         if (model) model.totalContextTokens = normalized.contextWindow;
       }
     }
-    if (normalized.update === undefined && normalized.usageUpdateUsed === undefined && normalized.contextWindow === undefined) {
+    if (normalized.update === undefined && normalized.usageUpdateUsed === undefined && normalized.contextWindow === undefined && normalized.contextUsed === undefined) {
       return;
     }
     if (normalized.update !== undefined) {
@@ -1400,7 +1401,7 @@ export class AcpClient extends EventEmitter {
       if (normalized.usageUpdateUsed !== undefined) {
         this.emit("adapterUsageUpdate", normalized.usageUpdateUsed, this.lastContextWindow);
       }
-      const contextUsed = contextUsedFromUpdateEnvelope(meta);
+      const contextUsed = normalized.contextUsed ?? contextUsedFromUpdateEnvelope(meta);
       const usedChanged = contextUsed !== null && contextUsed !== this.lastContextUsed;
       if (usedChanged) this.lastContextUsed = contextUsed;
       if (usedChanged || normalized.contextWindow !== undefined) {

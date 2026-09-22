@@ -40,6 +40,7 @@ files:
   - package.json
   - LICENSE
   - out/**/*
+  - out/muse-adapter/*.mjs
   - media/**/*
   - resources/**/*
   - node_modules/ws/**/*
@@ -53,6 +54,9 @@ files:
   - node_modules/@agentclientprotocol/sdk/package.json
   - node_modules/@agentclientprotocol/sdk/dist/**/*
   - node_modules/@agentclientprotocol/sdk/LICENSE-APACHE
+  - node_modules/@muse-code/sdk/package.json
+  - node_modules/@muse-code/sdk/dist/src/**/*.js
+  - node_modules/@muse-code/sdk/LICENSE*
   - node_modules/@anthropic-ai/claude-agent-sdk/package.json
   - node_modules/@anthropic-ai/claude-agent-sdk/*.mjs
   - node_modules/@anthropic-ai/claude-agent-sdk/*.js

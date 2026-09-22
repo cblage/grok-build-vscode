@@ -58,7 +58,7 @@ describe("parseRunProgressUpdate — workflow", () => {
     expect(u?.progress).toBeUndefined();
     expect(u?.agentsUsed).toBe(4);
     expect(u?.agentBudget).toBe(128);
-    expect(u?.detail).toMatch(/4\/128 agents/);
+    expect(u?.detail).toMatch(/4 of 128 agents used/);
   });
 
   it("omits the agent count when the run reports no budget", () => {
@@ -147,28 +147,28 @@ describe("parseRunProgressUpdate — workflow", () => {
     // produced, with the phase it arrived alongside.
     it("drops `phase_entered`, because the row already shows the phase", () => {
       expect(detailOf({ current_phase: "Research", last_event: "phase_entered", last_event_detail: "Research" }))
-        .toBe("4/128 agents");
+        .toBe("4 of 128 agents used");
     });
 
     it("keeps a phase_entered detail that is NOT the phase on screen", () => {
       // Same event, different content: only the duplicate is noise.
       expect(detailOf({ current_phase: "Research", last_event: "phase_entered", last_event_detail: "Verify" }))
-        .toBe("Verify · 4/128 agents");
+        .toBe("Verify · 4 of 128 agents used");
     });
 
     it("prints a `log` message without its own name in front of it", () => {
       expect(detailOf({
         current_phase: "Plan", last_event: "log",
         last_event_detail: "research plan: 3 question(s), capped at 4",
-      })).toBe("research plan: 3 question(s), capped at 4 · 4/128 agents");
+      })).toBe("research plan: 3 question(s), capped at 4 · 4 of 128 agents used");
     });
 
     it("says nothing for a lifecycle event the phase slot already carries", () => {
       // `workflow_started` beside a row reading `· active`, and
       // `workflow_cancelled` beside one reading `· cancelled`: in both the
       // event name is the row's job, so the detail is the spend alone.
-      expect(detailOf({ status: "active", last_event: "workflow_started" })).toBe("4/128 agents");
-      expect(detailOf({ status: "cancelled", last_event: "workflow_cancelled" })).toBe("4/128 agents");
+      expect(detailOf({ status: "active", last_event: "workflow_started" })).toBe("4 of 128 agents used");
+      expect(detailOf({ status: "cancelled", last_event: "workflow_cancelled" })).toBe("4 of 128 agents used");
     });
 
     it("keeps a lifecycle event's prose, and drops its bare reason token", () => {
@@ -177,24 +177,24 @@ describe("parseRunProgressUpdate — workflow", () => {
       expect(detailOf({
         status: "budget_exceeded", last_event: "workflow_failed",
         last_event_detail: "maximum agent budget reached; start a new run",
-      })).toBe("maximum agent budget reached; start a new run · 4/128 agents");
+      })).toBe("maximum agent budget reached; start a new run · 4 of 128 agents used");
       expect(detailOf({
         status: "user_paused", current_phase: "Plan",
         last_event: "workflow_paused", last_event_detail: "user",
-      })).toBe("Plan · 4/128 agents");
+      })).toBe("Plan · 4 of 128 agents used");
     });
 
     it("sentence-cases a name nobody predicted, rather than shipping Rust", () => {
       expect(detailOf({ current_phase: "Verify", last_event: "verification_failed" }))
-        .toBe("Verification failed · 4/128 agents");
+        .toBe("Verification failed · 4 of 128 agents used");
     });
 
     it("leaves a pause message and a result summary to speak for themselves", () => {
       // These outrank last_event and are already prose from the CLI.
       expect(detailOf({ last_event: "log", pause_message: "Waiting for your review" }))
-        .toBe("Waiting for your review · 4/128 agents");
+        .toBe("Waiting for your review · 4 of 128 agents used");
       expect(detailOf({ last_event: "log", result_summary: "3 sources agreed" }))
-        .toBe("3 sources agreed · 4/128 agents");
+        .toBe("3 sources agreed · 4 of 128 agents used");
     });
   });
 
@@ -230,6 +230,35 @@ describe("parseRunProgressUpdate — workflow", () => {
 
   it("returns null without an id / name", () => {
     expect(parseRunProgressUpdate({ sessionUpdate: "workflow_updated" })).toBeNull();
+  });
+
+  it("never promotes a run id to a control handle", () => {
+    const u = parseRunProgressUpdate({ sessionUpdate: "workflow_updated", run_id: "opaque-run-id" });
+    expect(u).toMatchObject({ id: "opaque-run-id", title: "Workflow" });
+    expect(u?.displayName).toBeUndefined();
+    expect(workflowControlCommand("pause", u?.displayName)).toBeNull();
+  });
+
+  it.each(["display_name", "displayName", "name", "run_name", "runName"])("preserves the observed %s handle", (field) => {
+    const u = parseRunProgressUpdate({ sessionUpdate: "workflow_updated", run_id: "opaque", [field]: "deep-research-2" });
+    expect(u?.displayName).toBe("deep-research-2");
+  });
+
+  it("keeps optional capabilities absent and normalizes fields only when supplied", () => {
+    const minimal = parseRunProgressUpdate({ sessionUpdate: "workflow_updated", run_id: "r" });
+    for (const field of ["phases", "agents", "elapsedMs", "currentPhase", "revision"] as const) {
+      expect(minimal?.[field]).toBeUndefined();
+    }
+    expect(parseRunProgressUpdate({
+      sessionUpdate: "workflow_updated", runId: "r", currentPhase: "Research", currentPhaseId: "p2",
+      phases: [{ phase_id: "p2", title: "Research", state: "active" }],
+      agents: [{ agentId: "a1", label: "Researcher", phase: "Research", state: "permission_blocked", tokensUsed: 0 }],
+      elapsedMs: 728000, activeAgents: 1, revision: 3,
+    })).toMatchObject({
+      currentPhase: "Research", currentPhaseId: "p2", elapsedMs: 728000, activeAgents: 1, revision: 3,
+      phases: [{ id: "p2", title: "Research", state: "active" }],
+      agents: [{ id: "a1", label: "Researcher", phase: "Research", state: "permission_blocked", tokensUsed: 0 }],
+    });
   });
 
   it("falls back to display name as id", () => {
@@ -287,6 +316,7 @@ describe("workflowControlCommand", () => {
     expect(workflowControlCommand("pause", "")).toBeNull();
     expect(workflowControlCommand("pause", "a b")).toBeNull();
     expect(workflowControlCommand("pause", "foo;rm -rf")).toBeNull();
+    expect(workflowControlCommand("pause", " deep-research ")).toBeNull();
   });
 });
 

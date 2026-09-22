@@ -551,6 +551,8 @@ describe("session rows (regression: only the label was clickable)", () => {
     expect(okBtn).not.toBeNull();
     expect(doc.querySelector(".confirm-title")?.textContent).toContain("project");
     expect(doc.querySelector(".confirm-body")?.textContent).toContain("/work/project");
+    expect(doc.querySelector(".confirm-body")?.textContent).toContain("Deletes Grok, Codex, Claude conversations");
+    expect(doc.querySelector(".confirm-body")?.textContent).not.toContain("every session");
     click(window, okBtn);
     await Promise.resolve();
 

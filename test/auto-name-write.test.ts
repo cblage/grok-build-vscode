@@ -79,6 +79,10 @@ function makeSidebar(cwd: string): any {
   sidebar.codexSessionCache = new Map();
   sidebar.codexSessionCacheAt = new Map();
   sidebar.codexSessionRefresh = new Map();
+  // The shared per-provider history process and its queue. Listings reuse one
+  // process across repos now, so a double that reaches them needs both.
+  sidebar.adapterHistoryClients = new Map();
+  sidebar.adapterHistoryQueue = new Map();
   sidebar.claudeSessionCache = new Map();
   sidebar.claudeSessionCacheAt = new Map();
   sidebar.claudeSessionRefresh = new Map();

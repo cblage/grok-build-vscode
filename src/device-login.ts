@@ -27,6 +27,9 @@
  *                 build. OpenAI documents it, and it is additionally gated on
  *                 an account setting ("Allow device code login") that a
  *                 workspace admin can withhold.
+ *   muse 1.3.0   `muse login`                works on pipes, prints Meta's URL
+ *                 and code, then polls. The login subcommand loads no workspace;
+ *                 the bare binary hits the workspace-trust gate instead.
  *
  * So this module does NOT hardcode "grok works, the others don't". It asks the
  * CLI and believes the answer: {@link deviceLoginPlan} says which command to
@@ -51,7 +54,7 @@ export const DEVICE_LOGIN_PROMPT_TIMEOUT_MS = 25_000;
 export interface DeviceLoginPlan {
   /** Argv after the CLI path. */
   args: string[];
-  /** The person must paste a code back into the CLI's stdin. Grok and Codex
+  /** The person must paste a code back into the CLI's stdin. Grok, Codex and Muse
    *  print a code and poll on their own; Claude's paste-code flow does not.
    *  Explicit on the plan, not inferred from a missing printed code. */
   needsCode?: boolean;
@@ -62,7 +65,7 @@ export interface DeviceLoginPlan {
  * of none to try.
  *
  * The plan is the argv and the flow shape. Claude is paste-code (`needsCode`);
- * Grok and Codex are device-code (the CLI polls). A provider without a command
+ * Grok, Codex and Muse are device-code (the CLI polls). A provider without a command
  * we know to try stays undefined, and {@link deviceLoginUnavailable} /
  * {@link noRemoteSignInMessage} explain that to the panel.
  */
@@ -70,6 +73,7 @@ export function deviceLoginPlan(provider: AcpProvider): DeviceLoginPlan | undefi
   if (provider === "grok") return { args: ["login", "--device-auth"] };
   if (provider === "codex") return { args: ["login", "--device-auth"] };
   if (provider === "claude") return { args: ["auth", "login"], needsCode: true };
+  if (provider === "muse") return { args: ["login"] };
   return undefined;
 }
 

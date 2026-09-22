@@ -1,3 +1,4 @@
+import type { AcpProvider } from "./acp-backend";
 import * as nodeFs from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
@@ -27,6 +28,7 @@ export interface SessionListEntry {
   createdAt: number;
   numMessages: number;
   modelId?: string;
+  branch?: string;
   /** grok's `session_kind` when it marks a non-user session — a `spawn_subagent`
    *  delegation persists its child as a top-level session dir with
    *  `session_kind: "subagent"`; the history list hides those. */
@@ -37,12 +39,12 @@ export interface SessionListEntry {
    *  the projects rail's Pinned group; absent means unpinned. */
   pinnedAt?: number;
   /** Agent that owns this immutable session. Absent means Grok for compatibility. */
-  provider?: "grok" | "codex" | "claude";
+  provider?: AcpProvider;
 }
 
 export interface SessionMetaOverride {
   /** Agent that owns the session. Existing records omit it and therefore mean Grok. */
-  provider?: "grok" | "codex" | "claude";
+  provider?: AcpProvider;
   /** Provider-reported cwd for stores that are not laid out under the Grok home. */
   providerCwd?: string;
   /**
@@ -400,7 +402,7 @@ export interface RepoListEntry {
   updatedAt: number;
   /** Provider a fresh conversation in this project will use. Optional so older
    * hosts keep rendering their existing provider-neutral New-session row. */
-  defaultProvider?: "grok" | "codex" | "claude";
+  defaultProvider?: AcpProvider;
   worktreeLabel?: string;
   /**
    * Archive choice flattened for the wire. **Present when the host supports
