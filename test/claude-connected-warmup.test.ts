@@ -27,6 +27,7 @@ vi.mock("../src/claude-model-cache", () => ({
 
 function makeSidebar(): any {
   const sidebar = Object.create(GrokSidebar.prototype) as any;
+  sidebar.providerConnectionState = { claude: true };
   sidebar.providerNeedsLogin = {};
   sidebar.locateProvider = vi.fn(() => "C:\\Users\\someone\\.local\\bin\\claude.exe");
   sidebar.cacheProviderModels = vi.fn();

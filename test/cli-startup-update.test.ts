@@ -49,7 +49,7 @@ describe("CLI startup compatibility", () => {
   it("keeps the original once-per-extension-upgrade update trigger", () => {
     expect(update).toContain("if (this.cliUpdateChecked) return");
     expect(update).toContain("extensionWasUpgraded(lastSeen, current)");
-    expect(update).toContain("execGrokCli(cliPath, args");
+    expect(update).toContain('execProviderCli("grok", cliPath, args');
     // Same store, different accessor: CLI_UPDATE_VERSION_KEY is not one of the
     // keys that moved to ~/.grok, so it still lands in globalState. See
     // persisted-state.ts.
@@ -64,7 +64,7 @@ describe("CLI startup compatibility", () => {
     // binary lock (instant, free to retry), pathological for an unreachable
     // x.ai, where a no-op `grok update` costs ~68s and the retry re-charged it
     // on every window forever (funkpopo, PR #129).
-    expect(update).toContain("execGrokCli(cliPath, args, { timeout: 20_000 })");
+    expect(update).toContain('execProviderCli("grok", cliPath, args, { timeout: 20_000 })');
     // No conditional around the marker write: a failed attempt still counts.
     expect(update).not.toContain("updateFailed");
     const finallyBlock = update.slice(update.indexOf("} finally {"));
@@ -79,6 +79,7 @@ describe("CLI startup compatibility", () => {
     expect(compatibility).toContain("CLI_VERSION_CACHE_KEY");
     expect(compatibility).not.toContain("runGrokUpdate");
     expect(compatibility).not.toContain("execGrokCli");
+    expect(compatibility).not.toContain("execProviderCli");
     expect(compatibility).not.toContain("this.pool");
   });
 

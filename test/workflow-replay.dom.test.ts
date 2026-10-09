@@ -70,7 +70,10 @@ async function coldReplay(h: Harness, history: (client: AcpClient) => void) {
   Object.assign(sidebar, {
     focused: session, pool: new Set<Session>(), remoteClients: new RemoteClientState<Session>(cwd),
     providerNeedsLogin: {}, providerCliVersions: {}, sessionCache: new Map(),
-    loginReprobeTimers: new Map(), turnOrderTimers: new Set(), pendingConfirms: new Map(),
+    // Starting the adapter runs the vendor binary, so the saved consent has to
+    // agree with connectedProviders below (#171).
+    providerConnectionState: { grok: true },
+    turnOrderTimers: new Set(), pendingConfirms: new Map(),
     fullImagePaths: new Map(), pendingAttach: new Set(),
     state: { get: (_key: string, fallback: unknown) => fallback, update: vi.fn(async () => {}) },
     host: { canSwitchWorkspaceFolder: false, append: vi.fn(), appendLine: vi.fn(),

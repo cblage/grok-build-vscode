@@ -10,7 +10,7 @@ export function grokCliNeedsShell(
 
 export type GrokCliExecOptions = Pick<
   ExecFileOptions,
-  "cwd" | "env" | "timeout" | "windowsHide"
+  "cwd" | "env" | "timeout" | "windowsHide" | "signal"
 > & { closeStdin?: boolean };
 
 /**

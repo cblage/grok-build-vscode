@@ -1308,7 +1308,7 @@
       githubState: state.githubState || undefined,
       repos: state.githubRepos,
       terminalSignIn: true,
-      onRecheck: () => vscode.postMessage({ type: "refreshProviders" }),
+      onRecheck: () => vscode.postMessage({ type: "refreshProviders", credentials: false }),
       touch: typeof window.matchMedia === "function"
         && window.matchMedia("(hover: none), (pointer: coarse)").matches,
     });

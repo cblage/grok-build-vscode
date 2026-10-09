@@ -259,6 +259,9 @@ describe("startSession bounded spawn retry", () => {
     sidebar.focused.provider = provider;
     sidebar.connectedProviders = () => [provider];
     sidebar.usableProviders = () => [provider];
+    // Starting the adapter runs the vendor binary, so the saved consent has
+    // to agree with the mocked derived views above (#171).
+    sidebar.providerConnectionState = { [provider]: true };
     sidebar.createProviderBackend = () => ({ provider });
     await sidebar.state.update("grok.defaultEffortByProvider", { [provider]: remembered });
     sidebar.host.getConfiguration.mockReturnValue({

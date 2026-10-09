@@ -98,14 +98,66 @@ function loginSidebar(needsLogin: Record<string, boolean>) {
   sidebar.locateProvider = vi.fn(() => "/usr/bin/claude");
   sidebar.workspaceRoot = vi.fn(() => "/repo");
   sidebar.host = { appendLine: vi.fn(), createTerminal: vi.fn(() => ({ show: vi.fn() })) };
-  sidebar.watchProviderLogin = vi.fn();
+  // Connect is where consent is stated, so the real setProviderConnected runs
+  // here and needs somewhere to persist to (#171).
+  sidebar.providerConnectionState = {};
+  sidebar.state = { get: (_key: string, fallback: unknown) => fallback, update: vi.fn(async () => {}) };
+  sidebar.postProviderState = vi.fn();
+  sidebar.invalidateSubscriptionUsage = vi.fn();
+  sidebar.adapterHistory = vi.fn(() => undefined);
   sidebar.newFocusedSession = vi.fn(async () => {});
   sidebar.post = vi.fn();
   sidebar.startDeviceLogin = vi.fn(async () => {});
+  // Connect starts the terminal watcher, whose probe is a real model warm-up
+  // that spawns the vendor's ACP adapter. A harness must never do that: on
+  // macOS CI the spawn failed with ENOENT and escaped as an uncaught
+  // exception while every test in the run passed. Tests about the ladder
+  // itself replace this.
+  sidebar.reprobeProviderCredentials = vi.fn(async () => false);
   return { sidebar, session };
 }
 
 describe("signing in from a conversation that is being refused", () => {
+  it.each(["grok", "codex", "claude"])("keeps %s desk sign-in in its CLI terminal", async provider => {
+    const { sidebar } = loginSidebar({});
+    await sidebar.onMessage({ type: "runGrokLogin", provider }, "local");
+    expect(sidebar.host.createTerminal).toHaveBeenCalledWith(expect.objectContaining({
+      shellArgs: provider === "claude" ? ["auth", "login"] : ["login"],
+    }));
+    expect(sidebar.startDeviceLogin).not.toHaveBeenCalled();
+  });
+
+  // Pressing Connect states CONSENT. It proves nothing about the credential,
+  // and every surface reads `connected && !needsLogin` as a healthy account:
+  // Settings clears the bar that finishes the terminal sign-in and turns the
+  // button into Sign out, which runs the vendor logout and destroys the
+  // credential the person came to create. An unsteered review found this on
+  // the desk path, where it is the FIRST thing every user does after upgrading
+  // (saved connections are cleared once, so everyone presses Connect again).
+  it.each(["grok", "codex", "claude"])(
+    "leaves %s awaiting its sign-in rather than reporting a healthy account",
+    async provider => {
+      const { sidebar } = loginSidebar({});
+      const frames: Array<{ connected: boolean; needsLogin: boolean }> = [];
+      sidebar.postProviderState = () => {
+        frames.push({
+          connected: sidebar.providerConnectionState[provider] === true,
+          needsLogin: sidebar.providerNeedsLogin[provider] === true,
+        });
+      };
+
+      await sidebar.onMessage({ type: "runGrokLogin", provider }, "local");
+
+      expect(sidebar.providerConnectionState[provider]).toBe(true);
+      expect(sidebar.providerNeedsLogin[provider]).toBe(true);
+      // And the ORDER, which is where the first attempt at this failed: Settings
+      // drops the Re-check bar on the first frame that reports a healthy account
+      // and never restores it, so no such frame may ever be sent.
+      expect(frames.filter(f => f.connected && !f.needsLogin)).toEqual([]);
+      expect(frames.some(f => f.connected && f.needsLogin)).toBe(true);
+    },
+  );
+
   it("routes remote Muse sign-in to the shared device flow", async () => {
     const { sidebar, session } = loginSidebar({});
     sidebar.locateProvider.mockReturnValue("/usr/bin/muse");
@@ -114,13 +166,14 @@ describe("signing in from a conversation that is being refused", () => {
     expect(sidebar.host.createTerminal).not.toHaveBeenCalled();
   });
 
-  it("opens the workspace-free Muse login subcommand at the desk", async () => {
+  it("routes desk Muse sign-in through the device flow with browser opening", async () => {
     const { sidebar, session } = loginSidebar({});
     sidebar.locateProvider.mockReturnValue("/usr/bin/muse");
     await sidebar.onMessage({ type: "runGrokLogin", provider: "muse" }, "local");
-    expect(sidebar.host.createTerminal).toHaveBeenCalledWith({
-      name: "Muse Code Login", shellPath: "/usr/bin/muse", shellArgs: ["login"],
-    });
+    expect(sidebar.startDeviceLogin).toHaveBeenCalledWith("muse", "/usr/bin/muse", undefined, { remote: false });
+    expect(sidebar.host.createTerminal).not.toHaveBeenCalled();
+    // The press itself is the consent, and it is recorded before the CLI runs.
+    expect(sidebar.providerConnectionState.muse).toBe(true);
   });
   it("keeps that conversation instead of parking it for a panel", async () => {
     const { sidebar, session } = loginSidebar({ claude: true });
@@ -139,5 +192,47 @@ describe("signing in from a conversation that is being refused", () => {
     await sidebar.onMessage({ type: "runGrokLogin", provider: "claude" }, session, "local");
 
     expect(sidebar.newFocusedSession).toHaveBeenCalled();
+  });
+});
+
+/**
+ * The desk terminal is the ONLY sign-in path with no completion signal of its
+ * own, and 4.11.1 briefly took away the one thing that watched it.
+ *
+ * #171 stopped the extension running an agent nobody had connected, and the
+ * brief that drove it called this ladder "speculative polling". It is not: it
+ * starts one line after consent is recorded, from the Connect press itself.
+ * Removing it meant a finished `grok login` / `codex login` / `claude auth
+ * login` was noticed by nothing, so the account sat unconnected until Re-check
+ * was pressed by hand — on the owner's desk, for all three agents.
+ *
+ * Cloud and Muse never showed it, and that is exactly why no suite caught it:
+ * both go through `startDeviceLogin`, which verifies its own credential. A
+ * test that drives the device flow proves nothing about the terminal one.
+ */
+describe("a desk terminal sign-in finishes without being asked twice", () => {
+  it.each(["grok", "codex", "claude"])("re-probes %s after the terminal opens", async provider => {
+    const { sidebar } = loginSidebar({});
+    sidebar.reprobeProviderCredentials = vi.fn(async () => true);
+
+    await sidebar.onMessage({ type: "runGrokLogin", provider }, "local");
+    await Promise.resolve();
+
+    expect(sidebar.host.createTerminal).toHaveBeenCalled();
+    expect(sidebar.reprobeProviderCredentials).toHaveBeenCalledWith(provider);
+  });
+
+  // The ladder must not outlive the consent that authorised it: disconnecting
+  // between two rungs is a withdrawal, and #171 is the reason the guard is
+  // inside `attempt` rather than only at the call site.
+  it("stops probing an agent that was disconnected mid-ladder", async () => {
+    const { sidebar } = loginSidebar({});
+    sidebar.reprobeProviderCredentials = vi.fn(async () => true);
+
+    sidebar.providerConnectionState = {};
+    sidebar.watchProviderLogin("codex");
+    await Promise.resolve();
+
+    expect(sidebar.reprobeProviderCredentials).not.toHaveBeenCalled();
   });
 });

@@ -31,14 +31,20 @@ describe("grok CLI process invocation", () => {
     expect(sidebar).not.toMatch(/\bexecFile(?:Async)?\s*\(/);
     expect(sidebar).not.toMatch(/execGrokCli\([^\n]*\["mcp"/);
     expect(sidebar).toContain('client.listMcpServers()');
-    // Pinned so a NEW one-shot invocation has to be noticed rather than slipped
-    // in. The tenth is the shared headless Codex/Claude updater; the eleventh is
-    // grok's freshness re-read, which runs at the moment an update would start
-    // tearing the pool down. The twelfth reads Muse's installed CLI version.
-    expect(sidebar.match(/execGrokCli\s*\(/g)).toHaveLength(12);
-    expect(sidebar).toMatch(/execGrokCli\(cliPath, \["--version"\],[\s\S]*parseCodexVersionOutput/);
-    expect(sidebar).toMatch(/execGrokCli\(cliPath, \["--version"\],[\s\S]*parseClaudeVersionOutput/);
-    expect(sidebar).toMatch(/execGrokCli\(cliPath, \["--version"\],[\s\S]*parseMuseVersionOutput/);
+    // The sidebar reaches execGrokCli through ONE seam now: execProviderCli,
+    // which refuses an agent the user never connected (#171). The pin moved
+    // rather than went away - a new one-shot still has to be NOTICED rather
+    // than slipped in, and going back to the raw wrapper would now also skip
+    // the consent check, which is the part that must not be slipped past.
+    expect(sidebar.match(/execGrokCli\s*\(/g)).toHaveLength(1);
+    // Twelve call sites plus the declaration. The tenth is the shared headless
+    // Codex/Claude updater; the eleventh is grok's freshness re-read, which
+    // runs at the moment an update would start tearing the pool down. The
+    // twelfth reads Muse's installed CLI version.
+    expect(sidebar.match(/execProviderCli\s*\(/g)).toHaveLength(13);
+    expect(sidebar).toMatch(/execProviderCli\("codex", cliPath, \["--version"\],[\s\S]*parseCodexVersionOutput/);
+    expect(sidebar).toMatch(/execProviderCli\("claude", cliPath, \["--version"\],[\s\S]*parseClaudeVersionOutput/);
+    expect(sidebar).toMatch(/execProviderCli\("muse", cliPath, \["--version"\],[\s\S]*parseMuseVersionOutput/);
   });
 
   it("shares the same shim predicate with the ACP spawn path", () => {

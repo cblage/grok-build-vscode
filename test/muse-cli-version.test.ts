@@ -41,7 +41,10 @@ describe("Muse CLI version reporting", () => {
     const versions = await Promise.all([host.probeProviderVersion("muse"), host.probeProviderVersion("muse")]);
     expect(versions).toEqual(["1.3.0-R3401.1", "1.3.0-R3401.1"]);
     expect(exec).toHaveBeenCalledTimes(1);
-    expect(exec).toHaveBeenCalledWith("/installed/muse", ["--version"], { timeout: 30_000, windowsHide: true });
+    // The signal is the consent lifetime: a disconnect aborts the read in
+    // flight rather than letting a late answer land (#171).
+    expect(exec).toHaveBeenCalledWith("/installed/muse", ["--version"],
+      { timeout: 30_000, windowsHide: true, signal: expect.any(AbortSignal) });
     expect(host.locateProvider).toHaveBeenCalledWith("muse");
     const message = host.providerStateMessage();
     expect(message.providers.find((p: any) => p.id === "muse").cliVersion).toBe("1.3.0-R3401.1");

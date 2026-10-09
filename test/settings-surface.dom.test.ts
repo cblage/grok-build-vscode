@@ -3182,7 +3182,7 @@ describe("Providers page: arriving is not consent to contact anyone (#171)", () 
       fileURLToPath(new URL("../media/chat.js", import.meta.url)),
       "utf8",
     );
-    for (const src of [settingsSrc, chatSrc]) {
+    for (const src of [settingsSrc, chatSrc, readFileSync(fileURLToPath(new URL("../media/projects-rail.js", import.meta.url)), "utf8")]) {
       expect(src).not.toMatch(/\{\s*type:\s*"refreshProviders"\s*\}/);
     }
   });

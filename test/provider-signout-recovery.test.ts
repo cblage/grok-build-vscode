@@ -39,7 +39,11 @@ function makeSidebar(options: {
   const sidebar = Object.create(GrokSidebar.prototype) as any;
   sidebar.pendingConfirms = new Map();
   const connected = options.connected ?? ["grok"];
-  sidebar.providerConnectionState = { grok: true, codex: false };
+  // Saved consent IS what connectedProviders derives from, so a fixture that
+  // pins one and mocks the other can gate a path it meant to exercise (#171).
+  sidebar.providerConnectionState = {
+    grok: connected.includes("grok"), codex: connected.includes("codex"),
+  };
   sidebar.providerConnections = vi.fn(() => sidebar.providerConnectionState);
   sidebar.locateProvider = vi.fn((provider: "grok" | "codex") => provider);
   sidebar.locatedProviders = vi.fn(() => ({
@@ -346,6 +350,10 @@ describe("startup refusal cleanup", () => {
     sidebar.isAuthorizedCwd = vi.fn(() => false);
     sidebar.locateProvider = vi.fn(() => "codex");
     sidebar.setProviderConnected = vi.fn(async () => {});
+    // Connect is what restores the saved consent; a re-check only re-reads
+    // an account the person already said to use, and since #171 it refuses
+    // to touch one they did not. Signing back in means both.
+    sidebar.providerConnectionState = { ...sidebar.providerConnectionState, ["codex"]: true };
     sidebar.reprobeProviderCredentials = vi.fn(async () => true);
     const emitted: HostMsg[] = [];
     sidebar.emit = vi.fn((_session: Session, message: HostMsg) => emitted.push(message));
@@ -509,6 +517,10 @@ describe("signing back in after the last provider signed out", () => {
     sidebar.connectedProviders = vi.fn(() => ["grok"]);
     sidebar.locateProvider = vi.fn(() => "grok");
     sidebar.setProviderConnected = vi.fn(async () => {});
+    // Connect is what restores the saved consent; a re-check only re-reads
+    // an account the person already said to use, and since #171 it refuses
+    // to touch one they did not. Signing back in means both.
+    sidebar.providerConnectionState = { ...sidebar.providerConnectionState, ["grok"]: true };
     sidebar.warmConnectedCodexModels = vi.fn(async () => {});
     sidebar.reprobeProviderCredentials = vi.fn(async () => true);
     sidebar.startSession = vi.fn(async (_resumeId: undefined, session: Session) => {
@@ -568,6 +580,10 @@ describe("signing back in after the last provider signed out", () => {
     sidebar.connectedProviders = vi.fn(() => ["grok"]);
     sidebar.locateProvider = vi.fn(() => "grok");
     sidebar.setProviderConnected = vi.fn(async () => {});
+    // Connect is what restores the saved consent; a re-check only re-reads
+    // an account the person already said to use, and since #171 it refuses
+    // to touch one they did not. Signing back in means both.
+    sidebar.providerConnectionState = { ...sidebar.providerConnectionState, ["grok"]: true };
     sidebar.reprobeProviderCredentials = vi.fn(async () => true);
     sidebar.startSession = vi.fn(async () => undefined);
     const restored: HostMsg[] = [];

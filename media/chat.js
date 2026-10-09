@@ -10680,7 +10680,7 @@
    * wherever the click came from — the card, Settings, or another tab.
    */
   function syncConnectWizard(provider, device) {
-    if (!IS_REMOTE || !provider) return;
+    if (!provider || (!IS_REMOTE && provider !== "muse")) return;
     // Only a RUNNING flow opens a wizard. A settled outcome renders wherever
     // the reader already is: in this dialog when one is open (which it is
     // whenever they got here by clicking Connect), and in the card otherwise.
@@ -10771,7 +10771,7 @@
     const onb = $("welcome-onboarding");
     const ver = $("welcome-version");
     if (!onb) return;
-    if (IS_REMOTE && (mode === "connect-agent" || mode === "codex-login" || mode === "claude-login" || mode === "auth-required" || mode === "muse-login" && museAvailable)) {
+    if ((IS_REMOTE || info.provider === "muse" && museAvailable && info.device) && (mode === "connect-agent" || mode === "codex-login" || mode === "claude-login" || mode === "auth-required" || mode === "muse-login" && museAvailable)) {
       // The card is an ENTRY POINT, not a second renderer: a live flow belongs
       // to the wizard, so the card keeps showing the offer underneath it.
       // The card NEVER renders a live flow. Stripping it only while the wizard

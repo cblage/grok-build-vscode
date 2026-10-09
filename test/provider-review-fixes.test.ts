@@ -153,7 +153,7 @@ describe("multi-provider review regressions", () => {
 
   it("observes Codex logout success before entering the synchronous logout reset", () => {
     const body = sidebar.slice(sidebar.indexOf("async logout("), sidebar.indexOf("dispose(): void"));
-    const exec = body.indexOf("await execGrokCli(cliPath, logoutArgs");
+    const exec = body.indexOf("await this.execProviderCli(provider, cliPath, logoutArgs");
     // Matched without its argument list: the invariant is the ORDER — the CLI is
     // observed to succeed before the reset — not the call's exact shape. Pinning
     // the full literal broke when a `report` callback was threaded through so a

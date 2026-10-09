@@ -1324,11 +1324,8 @@ export type WebviewMsg =
    *  is real network traffic to an account the person may never have connected
    *  to this extension — #171, where opening the page did it unasked.
    *
-   *  Absent, the field means `true`, which is what this message has always
-   *  done. That direction is deliberate: a client older than the host keeps its
-   *  Refresh button working, and the only cost of the older pairing is that the
-   *  fix arrives with the client rather than the host. The client is the
-   *  fast-moving surface here, so that is the better half to carry it. */
+   *  Absent means false. Refresh never grants connection consent; only Connect
+   *  may do that. Even an explicit credential refresh skips disconnected agents. */
   | { type: "refreshProviders"; credentials?: boolean }
   | { type: "retryProviderSession"; provider?: AcpProvider }
   | { type: "listSessions"; offset?: number; limit?: number; providerCursor?: { grokOffset: number; codexHighWater?: { updatedAt: number; id: string } }; query?: string }

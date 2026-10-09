@@ -80,6 +80,12 @@ const qa = buildQaFixture();
 const workspace = qa.project;
 const userData = fs.mkdtempSync(path.join(os.tmpdir(), "grok-screens-ud-"));
 fs.writeFileSync(path.join(userData, "test-config.json"), JSON.stringify({ "grok.cliPath": fixtureCli }), "utf8");
+// The person pressed Connect for Grok. Since #171 a connection is a stored
+// choice that nothing infers, so a host with no saved choice shows the Connect
+// onboarding instead of the chat these screens are about. Same key as
+// PROVIDER_CONNECTIONS_KEY in src/sidebar.ts -- test/harness-consent-key.test.ts
+// fails if the two drift.
+fs.writeFileSync(path.join(userData, "globalState.json"), JSON.stringify({ "grok.providerConnections.v2": { grok: true } }), "utf8");
 
 /** Every icon meant to be painted must occupy space — see the header. */
 const BLANK_ICONS = `() => {

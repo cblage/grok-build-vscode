@@ -47,6 +47,20 @@ function onboarding(h: Harness, extra: Record<string, unknown>) {
 }
 
 describe("a phone with nothing connected", () => {
+  it("keeps the Muse device URL and code visible in a desk wizard", () => {
+    const h = boot({ remote: false });
+    dispatch(h.window, { type: "providerState", providers: [{ id: "muse", connected: false }] });
+    onboarding(h, { state: "muse-login", provider: "muse" });
+    click(h.window, byAct(h, "connectProvider")!);
+    expect(h.posted).toContainEqual({ type: "runGrokLogin", provider: "muse" });
+    onboarding(h, { state: "muse-login", provider: "muse",
+      device: { status: "waiting", url: "https://auth.meta.com/device", code: "ABCD-EFGH" } });
+    expect(h.doc.querySelector(".connect-wizard-body")).not.toBeNull();
+    expect(text(h)).toContain("ABCD-EFGH");
+    expect(onb(h).innerHTML).toContain("https://auth.meta.com/device");
+    expect(h.doc.querySelector("#welcome-onboarding")!.textContent).not.toContain("ABCD-EFGH");
+  });
+
   it("runs Muse's device flow in the shared wizard from a Windows browser on a Mac host", () => {
     const h = boot({ remote: true });
     Object.defineProperty(h.window.navigator, "platform", { value: "Win32", configurable: true });

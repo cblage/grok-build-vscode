@@ -6,6 +6,7 @@ import { CodexBackend, type CodexBackendOptions } from "./codex-backend";
 
 export interface WarmCodexModelCacheOptions {
   cliPath: string;
+  signal?: AbortSignal;
   onModels: (models: readonly ModelInfo[], currentModelId?: string) => void | PromiseLike<void>;
   log?: (message: string) => void;
   env?: NodeJS.ProcessEnv;
@@ -17,7 +18,9 @@ export interface WarmCodexModelCacheOptions {
 }
 
 async function readModelsIn(cwd: string, options: WarmCodexModelCacheOptions): Promise<void> {
+  options.signal?.throwIfAborted();
   const client = new AcpClient({
+    signal: options.signal,
     cliPath: options.cliPath,
     cwd,
     env: options.env ?? { ...process.env },
@@ -26,9 +29,12 @@ async function readModelsIn(cwd: string, options: WarmCodexModelCacheOptions): P
   });
   try {
     await client.start();
+    options.signal?.throwIfAborted();
     const created = await client.newSession();
+    options.signal?.throwIfAborted();
     await options.onModels(client.availableModels, client.currentModelId);
     try {
+      options.signal?.throwIfAborted();
       await client.deleteSession(created.sessionId);
     } catch (error) {
       // codex 0.147 answers session/delete with "Internal error: no rollout
@@ -66,7 +72,7 @@ export async function warmCodexModelCache(options: WarmCodexModelCacheOptions): 
     await readModelsIn(scratch, options);
     return;
   } catch (error) {
-    if (!options.fallbackCwd) throw error;
+    if (options.signal?.aborted || !options.fallbackCwd) throw error;
     options.log?.(
       `[codex] model-cache warm-up in a scratch dir failed (${(error as Error).message}); retrying in the workspace`,
     );

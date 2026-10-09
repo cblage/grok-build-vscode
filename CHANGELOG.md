@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.11.1-sandbox.1 — 2026-10-09
+## 4.11.2-sandbox.1 — 2026-10-09
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.11.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.11.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,24 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.11.1 — 2026-09-25
+
+**An agent you have not connected is never run.** Connecting an agent is now something you say, not something the extension works out by starting your CLI and seeing what happens.
+
+### Fixed
+
+- **An agent you never connected is never started (#171).** Being "connected" used to be inferred: a credential check that succeeded marked the agent connected and saved that permanently, and everything afterwards followed from that flag — reading conversation history when a window opened, re-reading the model list when a CLI's version changed, housekeeping and cleanup. For Claude Code and Codex, "checking" means opening a full session, which is why opening a settings page produced requests to a vendor nobody had signed up for. 4.10.0 closed the first of those doors and we believed it was the last one; it was not.
+
+  Connecting is now a fact you state by pressing **Connect**, read from storage and never guessed. Nothing the extension does on its own runs an agent's binary without it: not history, not model catalogs, not version reads, not credential checks, not cleanup, not login retries. Detecting that a CLI is *installed* is still a look at the disk and still works, because otherwise there would be nothing to offer Connect for.
+
+  **Existing connections start clean.** The saved flags cannot tell a deliberate Connect from one the extension assigned itself, so they are all cleared once. Any agent you actually use is one press to reconnect, and **your sign-ins are untouched** — nothing logs you out of anything.
+
+- **"Open Muse sign-in" opens the browser.** Grok, Codex and Claude Code open one themselves; Muse's CLI prints a sign-in address and waits, so at the desk the button opened a terminal and left the address sitting in it. Muse now uses the same headless flow the phone does, and the computer opens that address for you. The link and short code stay on screen either way, and signing in from a phone is unchanged.
+
+### Changed
+
+- **Grok 4.7.** The README, the Marketplace listing and the project description name the current model (#183).
 
 ## 4.11.0 — 2026-09-23
 

@@ -390,6 +390,7 @@ describe("grok explicit CLI update", () => {
       focused,
       pool: new Set([focused]),
       providerCliVersions: {},
+      providerConnections: () => ({ grok: true }),
       locateProvider: vi.fn(() => "/installed/grok"),
       host: { appendLine: vi.fn(), showWarningMessage: vi.fn(), showInformationMessage: vi.fn() },
       post: vi.fn(),

@@ -117,7 +117,7 @@ async function launchFlowApp(options: {
   fs.writeFileSync(configJson, JSON.stringify(options.config ?? {}));
   if (!options.omitConnections) {
     fs.writeFileSync(path.join(userData, "globalState.json"), JSON.stringify({
-      "grok.providerConnections": options.connections ?? {},
+      "grok.providerConnections.v2": options.connections ?? {},
     }));
   }
   if (options.authEvidence) {

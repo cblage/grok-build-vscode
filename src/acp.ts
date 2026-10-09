@@ -87,6 +87,8 @@ export type PromptContentBlock =
 export { buildInterjectParams, cliHonorsInterjectContent, GROK_INTERJECT_CONTENT_MIN_VERSION } from "./grok-backend";
 
 export interface AcpClientOptions {
+  /** Host consent lifetime. Revocation stops the process and forbids later RPCs. */
+  signal?: AbortSignal;
   cliPath: string;
   cwd: string;
   effort?: EffortLevel;
@@ -386,6 +388,8 @@ export class AcpClient extends EventEmitter {
   }
 
   async start(): Promise<void> {
+    this.opts.signal?.throwIfAborted();
+    this.opts.signal?.addEventListener("abort", this.onAbort, { once: true });
     const spawnSpec = this.backend.spawn({
       cliPath: this.opts.cliPath,
       cwd: this.opts.cwd,
@@ -438,6 +442,7 @@ export class AcpClient extends EventEmitter {
     // a final successful interject response must be parsed before exit recovery
     // decides whether its user text still needs to be reclaimed.
     this.proc.on("close", (code) => {
+      this.opts.signal?.removeEventListener("abort", this.onAbort);
       this.disposeMcpFiles();
       for (const [id, p] of this.pending) {
         this.pending.delete(id);
@@ -1139,7 +1144,10 @@ export class AcpClient extends EventEmitter {
    * fallback so a wedged process can't hang the caller forever. Fire-and-forget
    * callers can ignore the returned promise — the kill is still initiated now.
    */
+  private readonly onAbort = () => { void this.dispose(); };
+
   dispose(timeoutMs = 3000): Promise<void> {
+    this.opts.signal?.removeEventListener("abort", this.onAbort);
     this.setHumanWaitActive(false);
     this.rl?.close();
     const proc = this.proc;
@@ -1240,6 +1248,7 @@ export class AcpClient extends EventEmitter {
     params: any,
     onResolve?: (value: any) => void,
   ): Promise<any> {
+    if (this.opts.signal?.aborted) return Promise.reject(this.opts.signal.reason);
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const now = Date.now();

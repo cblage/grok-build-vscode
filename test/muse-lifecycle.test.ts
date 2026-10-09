@@ -11,6 +11,7 @@ function deferred() {
 }
 function host() {
   const s: any = Object.create(GrokSidebar.prototype);
+  s.providerConnectionState = { muse: true };
   s.adapterHistoryClients = new Map(); s.museHistoryGeneration = 0;
   s.createProviderBackend = () => new MuseBackend();
   s.projectHomeDir = () => "/home/person";

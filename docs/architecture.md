@@ -90,15 +90,56 @@ vocabulary through `session/set_config_option` → MSP `session/setReasoningEffo
 Muse’s offered allow choices and scope labels are retained; host program grants
 do not replace them.
 
-Connection is explicit and binary-aware. `grok.providerConnections` records the
-user choice; a located binary alone never connects Codex. `grok.providerModelCache`
-holds each provider's last advertised model list, and `grok.projectProviderDefaults`
-holds the last provider/model for each normalized project path. These exact keys
-are used by VS Code globalState and the desktop `globalState.json` memento. An
-empty cached `modelId` means “use that provider's default,” not “no selection.”
-On Codex connect, a short-lived adapter creates a session in a temporary scratch
-cwd, stores the advertised models, deletes that throwaway session through ACP,
-and disposes; a failure is logged and does not fail the connection.
+Connection is a stored choice, not something a probe can discover.
+`grok.providerConnections.v2` (`PROVIDER_CONNECTIONS_KEY`) records that the user
+pressed Connect; `hasProviderConsent` reads that boolean and nothing else. A
+located binary and a successful probe never write it, and
+`migrateProviderConnections` stores an empty map when `.v2` is absent rather
+than importing `grok.providerConnections`. Locating a CLI (`locateProvider`) is
+a filesystem check and still runs without consent, because Connect cannot be
+offered for a binary that is not on disk. Executing one does not. An
+unconnected provider's binary is never run on the extension's own initiative —
+not for history, a model catalog, a version read, a credential probe, adapter
+empty-session deletion (`discardAdapterEmptySession`), an update, or a login
+retry. An action the person invokes by name still runs: **Grok: Log Out** runs
+`grok logout` whether or not Grok is connected.
+`providerRunSignal` aborts when consent is absent; `execProviderCli` refuses
+to spawn on that signal, and every `AcpClient` for that provider is constructed
+with it.
+
+`connected` on the `providerState` frame is consent plus a located binary
+(`connectedProviderIds` in `provider-ui.ts`). It is not a working credential.
+`needsLogin` is a separate in-memory flag: the credential is unproven or has
+lapsed. Surfaces treat `connected && needsLogin !== true` as a healthy account
+(`providerConnectedNow` in `media/settings.js`); `usableProviderIds` is the
+same test for who may take a new turn. Pressing Connect sets `needsLogin`
+before `setProviderConnected` posts, so the first frame that says connected
+already says the credential is unproven — Settings acts on that frame, and a
+healthy one drops the bar that finishes sign-in and offers Sign out, which
+runs the vendor logout. The flag is not stored. Device-login verification, an
+explicit Re-check, and a real turn clear it. So does a Codex or Claude warm-up
+that fails for a reason that is not about credentials (an `Internal error` from
+`session/new`, say): such a failure says nothing about the sign-in, and a flag
+left standing once kept Codex unusable however often the person signed in. A
+cleared flag therefore means "no evidence the credential is bad", not proof it
+is good; the next real turn is what settles it. A
+credential failure leaves the account connected.
+
+`grok.providerModelCache` holds each provider's last advertised model list,
+and `grok.projectProviderDefaults` holds the last provider/model for each
+normalized project path. VS Code globalState and the desktop `globalState.json`
+memento use these exact keys. An empty cached `modelId` means “use that
+provider's default,” not “no selection.” Codex and Claude fill that cache only
+after consent, from `reprobeProviderCredentials`
+(`warmConnectedCodexModels` / `warmConnectedClaudeModels`): a short-lived
+adapter creates a session in a temporary scratch cwd, stores the advertised
+models, deletes that throwaway session through ACP, and disposes. That runs
+on Re-check, on each rung of the desk terminal watcher (the first immediately
+after Connect), when `refreshProviders` asks for credentials, when a connected
+CLI's version changes against an existing cache, and on device-login
+verification — for Claude only when `claude auth status` cannot answer, since
+that check runs first. The Connect press records consent and reads
+`--version`; on the desk it is the watcher that opens the warm-up session. A warm-up failure is logged and does not clear consent.
 
 If no Codex binary is found, onboarding can install the pinned official
 `rust-v0.153.4` standalone package into versioned global storage. The download is
@@ -119,7 +160,7 @@ from older provider-blind clients and rejects a cross-provider live pick with a
 targeted notice before it reaches an adapter. The additive `provider` field travels
 in session/history frames through `HostMsg` to the shared webview and browser client.
 Every remote snapshot also carries the relay-safe `providerState` frame
-(`id` + `connected`, plus host-probed CLI/adapter version facts when known). The inline, `currentColor` provider marks appear only
+(`id` + `connected`, optional `needsLogin`, plus CLI/adapter version facts probed only while that provider is connected). The inline, `currentColor` provider marks appear only
 when more than one provider is connected. In mixed-provider history and rail rows
 the status dot overlays the mark; single-provider and old-host rows retain the
 standalone dot structure.
@@ -152,10 +193,10 @@ the WHOLE pool down rather than one provider’s sessions; it takes the same
 freshness guard through `grok update --check --json`, skipped only when the
 update policy names a specific target, since “is there a newer one” is a
 different question from “are you on the version we require”.
-Only Grok is updated automatically by the extension; the Codex welcome nudge uses the observed
+Only Grok is updated automatically by the extension, and only while it is connected; the Codex welcome nudge uses the observed
 version against `CODEX_MANAGED_VERSION`, with no registry check.
 Provider account rows appear on the rail gear only when no
-provider is connected or one needs login; healthy connected accounts live in
+provider is connected or one needs login; healthy accounts (`connected && needsLogin !== true`) live in
 Settings → Providers — reached on VS Code, which has no rail gear, through the
 composer chip's **Manage providers** footer. The browser receives view-only connection state and
 renders no account-management controls in the gear. Desk account actions
@@ -166,10 +207,8 @@ open a login terminal on the desk. `runGrokLogin` and `setupGithubCli` are
 `full`: a remote sign-in is the headless device-code flow, not a terminal. A remote `retryProviderSession` may only restart
 an already-connected provider; signed-out remote onboarding offers the CLI’s headless login flow for all four
 providers. Grok, Codex and Muse show a link and short code; Claude accepts a pasted
-code. Desk terminal login starts a bounded credential re-probe where supported, and Re-check bypasses the history freshness clock;
-Codex probes use `isCodexCredentialError`, so an uncoded `Sign in required` result
-sets `needsLogin` and a later success clears it. Grok uses the same observable
-re-probe lifecycle. Codex logout runs as an observed one-shot process and clears connection state only after exit success
+code. Grok, Codex and Claude open a terminal for desk sign-in, which reports no completion of its own, so `watchProviderLogin` re-probes on a bounded ladder (0/2/5/10/20/30/60s) and stops at the first authenticated probe; it starts only from the Connect press, after consent is saved, and each rung re-checks consent. Re-check observes a terminal the ladder gave up on. Muse at the desk uses the headless device flow (`startDeviceLogin` with `remote: false`) and opens the printed URL in the browser; the link and short code stay on the card, and a phone is left to open that URL on its own device. Re-check requires consent and bypasses the history freshness clock. For Grok, Codex and Claude it calls `reprobeProviderCredentials`. Codex probes use `isCodexCredentialError`, so an uncoded `Sign in required` result
+sets `needsLogin` and a later success clears it; Grok uses `isCredentialError` the same way. Muse has no such probe: Re-check acknowledges the sign-in, and a later turn reports a failure. Codex logout runs as an observed one-shot process and clears connection state only after exit success
 (an unspawnable process is opened in a terminal while state remains connected).
 After a successful sign-out, the provider is disconnected in memory and every
 matching focused, background, active-remote, or detached-tab session is
@@ -206,7 +245,8 @@ gap the untyped `any` direction used to leave open around restore, pagination, a
 
 When the panel opens (or you click **+** for a new session):
 
-1. Resolve the selected provider. Grok uses `grok.cliPath` → `~/.grok/bin/grok`
+1. Resolve the selected provider — a filesystem check (`locateProvider`), so it
+   runs whether or not that provider is connected. Grok uses `grok.cliPath` → `~/.grok/bin/grok`
    → PATH. Codex uses `grok.codexCliPath` → PATH → the newest matching OpenAI
    ChatGPT extension bundle → the versioned extension-managed package. Claude
    uses `grok.claudeCliPath` → PATH → well-known user-bin locations. Muse uses
@@ -214,7 +254,9 @@ When the panel opens (or you click **+** for a new session):
 2. Spawn `grok agent stdio`, or Node with the selected adapter entry point and
    the located CLI in `CODEX_PATH`, `CLAUDE_CODE_EXECUTABLE` or `MUSE_CODE_EXECUTABLE`.
    Windows Muse `.cmd`/`.bat` launchers use `cmd.exe /d /c` with separate argv
-   entries; executable paths containing spaces remain intact.
+   entries; executable paths containing spaces remain intact. This step runs only
+   for a connected provider: `providerRunSignal` aborts the spawn when
+   `hasProviderConsent` is false.
 3. Run `initialize` → `session/new` (or `session/load` to resume). Grok keeps its
    existing `session/set_model` lifecycle; Codex configures model, effort, and
    mode through `session/set_config_option`.
@@ -362,7 +404,7 @@ it and fail with *"cannot rename locked executable"*. On Windows the kill is a
 children that a parent-only kill would orphan, and they keep the binary locked),
 and the update retries once if a lingering lock still slips through.
 
-`maybeUpdateCliOnUpgrade` retains the normal session-start trigger: once per
+`maybeUpdateCliOnUpgrade` retains the normal session-start trigger, and returns without spawning when Grok is not connected: once per
 activation it compares `CLI_UPDATE_VERSION_KEY`, updating only after an extension
 version change; a fresh install records its baseline without updating. The update
 is bounded at **20 seconds** and attempted **once per extension version whether or
@@ -372,7 +414,7 @@ than ~0.8s) would otherwise re-charge that wait on every new window forever. A
 skipped update is self-correcting: the version floor and Plan gating still run
 against whatever is installed, and a later explicit update can bring the CLI to the required version.
 After that,
-every session start reads `grok --version` through `resolvePlanModeAvailability`
+every Grok session start calls `resolvePlanModeAvailability`, whose `readGrokVersion` runs `grok --version` only when Grok is connected
 (one short retry when the first read is empty/unparseable, then the last verified
 banner in `grok.cliVersionCache` when that binary's mtime/size still match). A live
 parseable answer always wins over the cache. On Windows, `maybePinBrokenCli` uses the
@@ -1039,16 +1081,16 @@ Release-blocking provider invariants: queued sign-out drafts are persisted in
 startup; `needsProvider` and draft-bearing sessions survive every park, release,
 sweep, and reaper path, including detached remote tabs. Sign-out notices are
 transient desk frames, never replayable session history. Codex credential probes
-use `isCodexCredentialError`; login actions poll until completion and Re-check
+use `isCodexCredentialError`. Device-login verification retries until a credential is observed or the attempts run out; a desk terminal login is watched by a longer ladder of its own (`watchProviderLogin`: 0/2/5/10/20/30/60s against verification's 0/2/5/10/20s). Re-check
 bypasses history freshness. Durable `recheckConnection` is host-local, while a
 remote `retryProviderSession` can restart only an already-connected provider.
 
 - `initialize` → `session/new` / `session/load` → `session/set_model` → `session/prompt` lifecycle
-- **Provider seam and selection.** `grokBackend` leaves the existing lifecycle and wire shapes unchanged. `CodexBackend` and `ClaudeBackend` spawn their pinned ACP adapters, normalize into the same `AcpClient` events and model/usage/tool/permission shapes, and leave Plan enforcement in the adapter. The public store listing names all four providers; `MuseBackend` runs the bundled SDK-backed adapter with its separately gated capabilities. `provider-ui.ts` combines connected-provider models for a new session, while a conversation with history stays bound to its persisted provider; an empty resumed conversation may switch. Every remote snapshot mirrors the additive, view-only `providerState` frame (`id` + `connected` plus host-probed version facts when known); it enables the same multi-provider glyph/badge, picker, and About rules as the desk. When two or more providers are connected, session rows show the lab logo and hide the idle gray status badge (colored working/needs-you/unread/error badges stay). Headless sign-in is available remotely; desk sign-out remains host-local, with cloud overrides. One connected provider or an old host that sends no frame retains the original dot-only presentation. Desktop unlink lives only in Settings → Account (`unlinkRemoteDevice`, native confirm); the gear never offers it. VS Code keeps the Command Palette path. `unlinkRemoteDevice` is host-local. The rail gear's provider rows show only when no provider is connected or one needs login; healthy connected accounts live in Settings → Providers.
+- **Provider seam and selection.** `grokBackend` leaves the existing lifecycle and wire shapes unchanged. `CodexBackend` and `ClaudeBackend` spawn their pinned ACP adapters, normalize into the same `AcpClient` events and model/usage/tool/permission shapes, and leave Plan enforcement in the adapter. The public store listing names all four providers; `MuseBackend` runs the bundled SDK-backed adapter with its separately gated capabilities. `provider-ui.ts` combines connected-provider models for a new session, while a conversation with history stays bound to its persisted provider; an empty resumed conversation may switch. Every remote snapshot mirrors the additive, view-only `providerState` frame (`id` + `connected`, optional `needsLogin`, plus version facts probed only while that provider is connected); it enables the same multi-provider glyph/badge, picker, and About rules as the desk. When two or more providers are connected, session rows show the lab logo and hide the idle gray status badge (colored working/needs-you/unread/error badges stay). Headless sign-in is available remotely; desk sign-out remains host-local, with cloud overrides. One connected provider or an old host that sends no frame retains the original dot-only presentation. Desktop unlink lives only in Settings → Account (`unlinkRemoteDevice`, native confirm); the gear never offers it. VS Code keeps the Command Palette path. `unlinkRemoteDevice` is host-local. The rail gear's provider rows show only when no provider is connected or one needs login; healthy connected accounts live in Settings → Providers.
 - **Model switching is agent-aware.** Models belong to agent types (`grok-build`/`grok-build-plan` vs. Composer's `cursor`). The CLI locks that binding after the first turn, so a cross-agent live switch raises `MODEL_SWITCH_INCOMPATIBLE_AGENT`; `switchModel` persists the pick and restarts, with `newSession` applying the model before the first turn. Empty sessions restart transparently and the abandoned empty directory is removed; sessions with history offer Summarize/Just-Restart. `carrySessionName` preserves a user rename. Versioned IDs resolve through `resolveModelId`, and the webview recomputes the per-model context window on `modelChanged`.
 - Streaming `agent_message_chunk` + `agent_thought_chunk`
 - Sessions: list/resume via `session/load` (grok stores them at `~/.grok/sessions/<urlencoded-cwd>/<id>/`); rename/delete metadata in `context.globalState["grok.sessionMeta"]`. We never edit grok's own session files. **Per-session delete** is the trash button on each history row (`deleteSession` → `deleteSessionDir`), **including the active one**: the host disposes the live `Session` *before* touching the disk — the live CLI owns the conversation and re-persists it, which is why deleting it first simply did not stick — then re-homes every watcher that was reading it onto the next row in that project's list (`neighbourAfterDelete` over `buildSessionsList`, same home for every watcher) and mints a blank conversation only when the project is empty. An unused empty conversation in the project is adopted instead of minting a second (`findUnusedEmptySession`). A viewer of a different conversation is not moved. Still refused: a live conversation the requester is *not* the one watching. Gated on the `deleteActiveSession` host capability so an older host is never offered a control it answers with a refusal. **Clear all** (#19) is a footer button in the history popover (shown only when ≥1 non-active session exists) → `clearAllSessions` in `sidebar.ts`: a confirmed sweep of every session dir for the *selected repo* *except* the focused one, via the pure `clearSessions({fs, grokHome, cwd, exceptId})` in `sessions.ts` (best-effort — a locked dir is skipped, not thrown), then purges the removed ids' `grok.sessionMeta` overrides and tears down any backgrounded live pool members it deleted. **Scale (history pagination):** the popover loads **one page at a time** (newest-first by last activity) so it stays fast with thousands of sessions — see § History pagination. Clear-all is the relief valve for an overgrown store; the pagination is the steady-state fix. **The name is also chrome, not just a history row (3.1.0):** the focused conversation's title sits in `.top-bar` (`#session-name-chip`) in VS Code and in `#session-head-title` remotely, ellipsised with the full text as its `title`, and renames in place — pencil on hover, tap on touch (`@media (hover: none)` unhides the pencil), Enter/blur commits, Escape or an unchanged/empty value cancels. It reuses the existing `renameSession` message; only the *display* needed a new one. That new `sessionName` HostMsg exists because the webview's `state.sessions` is populated by the history popover and follows its search box — VS Code cannot read a name out of a list it has never opened. It carries the same string `sessionDisplayName` gives a history row (so the two can't disagree) and is re-sent wherever the view's conversation changes: `startSession`, `postSessionsList`, the remote snapshot, and `focusRemoteSession` — that last one because it clears the client and then builds its own targeted list instead of going through `postSessionsList`, which is a real regression an integration test now pins. The client gates the rename affordance on having *received* the message, never on a version, so an older host simply shows no pencil.
-- **Provider state.** `grok.providerConnections` records explicit account connections, `grok.providerModelCache` seeds the deterministic Grok-first all-provider picker for an empty session, and `grok.projectProviderDefaults` stores the last provider/model per normalized project path. Codex and Claude connect warm the model cache through a throwaway scratch session before the first real turn; Muse obtains its model catalog from its shared history connection without creating a conversation. VS Code globalState and the desktop file memento use these exact keys. Grok connection migration is inferred once from existing-use evidence; Codex, Claude and Muse are never connected merely because a binary is locatable. An account that is configured but answers an auth-shaped failure (`isCodexCredentialError` / `isClaudeCredentialError` for adapter probes and `isCredentialError` for generic failures — never the billing/entitlement family) from the model warm-up, the history listing, or a session start is marked `needsLogin` on the additive `providerState` frame: it stays connected (disconnecting would hide every conversation it owns for a fault one sign-in fixes), and the rail gear's recovery Accounts rows offer the connect flow while the composer chip keeps Manage providers reachable with model selection locked. Picker rows always carry the provider mark (`providerLogoMarkup`), even with one agent connected; a fixed **Manage providers** footer opens Settings → Providers. `modelPickerLabel` promotes Claude's versioned `description` lead so the row reads "Sonnet 5", matching Grok/Codex names that already include a generation. A last-provider sign-out mints replacements bound to no agent at all (`Session.needsProvider`) rather than to the opposite, disconnected one; reconnecting any provider adopts every one of them — local, remote and detached — and returns their held drafts. Empty sessions may switch providers through `switchModel`'s discard-and-restart path; after the first user turn the webview scopes models to `session.provider`, composer copy is provider-aware, and `providerForRequestedModel` backstops provider-blind old-client/race picks before an adapter sees them. About reads host-probed Grok, Codex, Claude and Muse CLI versions, and labels the packaged Codex/Claude adapter versions separately; remote About only renders these host-reported facts. `grok.codexCliPath` remains a VS Code setting and a desktop JSON-config key honored by `locateProvider`, with no desktop settings-row message plumbing.
+- **Provider state.** `grok.providerConnections.v2` records consent (the rules above), `grok.providerModelCache` seeds the deterministic Grok-first all-provider picker for an empty session, and `grok.projectProviderDefaults` stores the last provider/model per normalized project path. A consented Codex or Claude credential re-probe warms the model cache through a throwaway scratch session before the first real turn; Muse obtains its model catalog from its shared history connection without creating a conversation. VS Code globalState and the desktop file memento use these exact keys. No provider is connected because a binary is locatable or a probe succeeded; an absent `.v2` map is stored empty and the old `grok.providerConnections` key is not read. An account that is configured but answers an auth-shaped failure (`isCodexCredentialError` / `isClaudeCredentialError` for adapter probes and `isCredentialError` for generic failures — never the billing/entitlement family) from the model warm-up, the history listing, or a session start is marked `needsLogin` on the additive `providerState` frame: it stays connected (disconnecting would hide every conversation it owns for a fault one sign-in fixes), and the rail gear's recovery Accounts rows offer the connect flow while the composer chip keeps Manage providers reachable with model selection locked. Picker rows always carry the provider mark (`providerLogoMarkup`), even with one agent connected; a fixed **Manage providers** footer opens Settings → Providers. `modelPickerLabel` promotes Claude's versioned `description` lead so the row reads "Sonnet 5", matching Grok/Codex names that already include a generation. A last-provider sign-out mints replacements bound to no agent at all (`Session.needsProvider`) rather than to the opposite, disconnected one; reconnecting any provider adopts every one of them — local, remote and detached — and returns their held drafts. Empty sessions may switch providers through `switchModel`'s discard-and-restart path; after the first user turn the webview scopes models to `session.provider`, composer copy is provider-aware, and `providerForRequestedModel` backstops provider-blind old-client/race picks before an adapter sees them. About reads host-probed Grok, Codex, Claude and Muse CLI versions, and labels the packaged Codex/Claude adapter versions separately; remote About only renders these host-reported facts. `grok.codexCliPath` remains a VS Code setting and a desktop JSON-config key honored by `locateProvider`, with no desktop settings-row message plumbing.
 - `initialize` uses `acpClientCapabilities`: only a live-verified grok >= 1.0.4 withholds `readTextFile` so the CLI's image-aware `read_file` runs (#79). Measured 1.0.4+ builds treat client fs as all-or-nothing, so that also stops write delegation. 0.2.x, 1.0.0–1.0.3, Codex, an unreadable version, and a cache/unverified banner keep `readTextFile: true`. Handlers remain for `fs/read_text_file`, `fs/write_text_file`, and `terminal/{create,output,wait_for_exit,kill,release}` — the write handler + plan-gate branch stay so delegated 0.2.x writes and a later CLI that honours `writeTextFile` independently still have the hook. `terminal` is a separate capability and is unaffected. Drift probe: `research/image-read-capability-probe.cjs`.
 - `session/request_permission` → chat card with `allow-always` / `allow-once` / `reject-once`, diff editor preview for `kind:"edit"`. Adapter `switch_mode` reviews (Claude ExitPlanMode, Codex plan approval) are the same permission RPC — Auto accept still must not answer them — but the card is the grok plan-review chrome: `planTextFromPermissionToolCall` lifts Codex `rawInput.plan` / Claude's content-block plan, `addPlanReviewPermissionCard` renders that text with the adapter's mode options, and a card that arrived with no plan text must not collapse to "Approved". The reply stays `permissionAnswer`. **Keyboard (#68):** the CLI's option order isn't guaranteed, so `orderPermissionOptions` (webview-helpers.js) sorts approve-first/reject-last (unknown kinds rank between — never the default, never below reject) and `defaultPermissionIndex` picks the tab stop: `allow_once` only, **never `allow_always`** (a keystroke must not widen scope for the session). The card takes focus only when `shouldFocusPermissionCard` says the composer is genuinely idle — empty, not replaying, no IME composition in flight (`state.composingIME`, since a preedit buffer isn't in `input.value`). Roving tabindex + arrows move within the group; Escape returns to the composer **without answering** (never an implicit reject); and `isTypeThroughKey` redirects a printable keystroke to the composer instead of activating a button, which is what makes taking focus free. The reporter's "wait 1s after typing" timer is deliberately **not** implemented — the action a key takes must follow visible focus, never invisible timing, least of all when that action approves a command.
 - `x.ai/ask_user_question` (#12) → inline question card. Renders each question's options (single question + single-select resolves on one click; otherwise pick-then-Submit; Skip → cancel) and replies `{ outcome: "accepted", answers, annotations }` (or `cancelled`) — `answers` keyed by question text → chosen label; the reply **must** carry `outcome` (an empty ACK is rejected). Submit immediately collapses to **Submitted** and retains the answer text, including against older hosts. `questionResolved` refines the card: `accepted` means the host wrote the response, not that the CLI consumed it; `stale` means the host no longer holds the id; `closed` broadcasts a known closure. Closed or stale drafts remain selectable, with **Add answers to composer** appending question/answer pairs without sending or replacing an existing draft. The host correlates the request's `toolCallId` with terminal (`completed` or `failed`) tool updates and closes the card immediately. This proves the interaction is over, not whether it timed out or was answered; content prose is never used to decide closure. Requests without a tool id or terminal update retain the turn-end/stale-answer fallback. The CLI ask timeout is never overridden. On resume the question replays as a `tool_call` (questions in `rawInput`) + completed `tool_call_update` (answer text); chat.js suppresses the generic tool chip and rebuilds a read-only "You answered" card from that replay. Pure builders: `makeQuestionResponse` (`acp-dispatch.ts`), `buildQuestionAnswers` (`webview-helpers.js`). Wire format: `research/ask-user-question.md`. **The free-text "Other" is ours, not the CLI's (#85):** the tool contract promises every question carries one, the CLI usually does not send it, and the first fix keyed the input on a supplied option labelled `other` — so in practice most cards had no free-text path at all. `addQuestionCard` appends the option itself when absent (case-insensitive dedupe, so a CLI that does send one never gets two) and the typed value replaces the synthetic label inside the existing `answers` map — no ACP change, so it works against whatever grok is installed. Consequence worth knowing: `hasOther` is now always true, so the Submit/Skip footer renders on single-question cards that used to resolve on one click. One click still submits; the footer is what makes a typed answer committable.

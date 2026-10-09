@@ -32,6 +32,9 @@ function setup(origin: "local" | "remote", provider: "grok" | "codex" | "claude"
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "summary.json"), JSON.stringify({ num_messages: 0 }));
   const sidebar = Object.create(GrokSidebar.prototype) as any;
+  // Abandoning an empty adapter session means an ACP delete, so the provider
+  // has to be one the person connected (#171).
+  sidebar.providerConnectionState = { [provider]: true };
   sidebar.pendingConfirms = new Map();
   const session = new Session();
   session.cwd = cwd;

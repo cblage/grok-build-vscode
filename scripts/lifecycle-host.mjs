@@ -361,6 +361,15 @@ function writeProfile(userData, workspaces, fakeCli) {
     },
   };
   fs.writeFileSync(path.join(userData, "config.json"), JSON.stringify(prefs, null, 2), "utf8");
+  // The person pressed Connect for Grok. Since #171 nothing infers a
+  // connection, so without this the host never starts the fake CLI and the
+  // first turn never arrives. Same key as PROVIDER_CONNECTIONS_KEY in
+  // src/sidebar.ts -- test/harness-consent-key.test.ts fails if they drift.
+  fs.writeFileSync(
+    path.join(userData, "globalState.json"),
+    JSON.stringify({ "grok.providerConnections.v2": { grok: true } }, null, 2),
+    "utf8",
+  );
   const sessionOverrides = path.join(userData, "lifecycle-config.json");
   fs.writeFileSync(
     sessionOverrides,

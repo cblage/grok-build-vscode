@@ -48,7 +48,6 @@ function makeSidebar(cwd = "/repo"): any {
   sidebar.connectedProviders = vi.fn(() => ["codex"]);
   sidebar.locateProvider = vi.fn(() => "codex");
   sidebar.providerNeedsLogin = {};
-  sidebar.loginReprobeTimers = new Map();
   sidebar.remoteClients = new RemoteClientState<Session>(cwd);
   sidebar.pool = new Set<Session>();
   sidebar.focused = new Session();
@@ -73,7 +72,12 @@ function makeSidebar(cwd = "/repo"): any {
   sidebar.sendRemoteClient = vi.fn();
   sidebar.dotForId = vi.fn(() => "none");
   sidebar.sessionCwd = vi.fn((session: Session) => session.cwd || cwd);
-  sidebar.setProviderConnected = vi.fn(async () => {});
+  // Stubbed to skip persistence, but it still has to WRITE: the saved flag is
+  // what permits the binary to run at all now, so a no-op here silently gates
+  // every path under test (#171).
+  sidebar.setProviderConnected = vi.fn(async (provider: string, connected: boolean) => {
+    sidebar.providerConnectionState = { ...sidebar.providerConnectionState, [provider]: connected };
+  });
   sidebar.rememberProjectProvider = vi.fn(async () => {});
   sidebar.startSession = vi.fn(async () => {});
   // A successful re-check now announces itself, so the re-check path reaches
@@ -148,22 +152,35 @@ describe("an agent that will not authenticate", () => {
     expect(codexState(sidebar).needsLogin).toBeUndefined();
   });
 
-  it("the sign-in action keeps probing until the completed login is observable", async () => {
+  it("the sign-in action records consent, then watches the terminal it opened", async () => {
+    // #171 inverted this to "probes NOBODY", calling the ladder the extension
+    // starting a vendor's binary on a guess. It is not a guess: it starts from
+    // the Connect press, after consent is saved, and #171's reporter never
+    // pressed Connect, so it could not have been their traffic. What the
+    // inversion did cost was measured on the owner's desk the same day: a
+    // finished `grok login` / `codex login` / `claude auth login` was noticed
+    // by nothing, and every agent waited for a hand-pressed Re-check.
     vi.useFakeTimers();
     try {
       const sidebar = makeSidebar();
-      sidebar.reprobeProviderCredentials = vi.fn()
-        .mockResolvedValueOnce(false)
-        .mockResolvedValueOnce(true);
+      // Fail until the fourth probe: the person is still in the browser.
+      let calls = 0;
+      sidebar.reprobeProviderCredentials = vi.fn(async () => ++calls >= 4);
 
       await sidebar.onMessage({ type: "runGrokLogin", provider: "grok" }, "local");
       await Promise.resolve();
+      // Connect IS the consent, so the flag is saved before anything is run.
+      expect(sidebar.providerConnectionState.grok).toBe(true);
+      expect(sidebar.host.createTerminal).toHaveBeenCalled();
       expect(sidebar.reprobeProviderCredentials).toHaveBeenCalledTimes(1);
-      expect(sidebar.reprobeProviderCredentials).toHaveBeenLastCalledWith("grok");
 
-      await vi.advanceTimersByTimeAsync(2_000);
-      expect(sidebar.reprobeProviderCredentials).toHaveBeenCalledTimes(2);
-      expect(sidebar.loginReprobeTimers.has("grok")).toBe(false);
+      await vi.advanceTimersByTimeAsync(120_000);
+      // 0s, 2s, 5s, 10s -- and it stops at the first probe that succeeds.
+      expect(sidebar.reprobeProviderCredentials).toHaveBeenCalledTimes(4);
+
+      // Re-check still works for a terminal the ladder gave up on.
+      await sidebar.onMessage({ type: "recheckConnection", provider: "grok" }, "local");
+      expect(sidebar.reprobeProviderCredentials).toHaveBeenCalledTimes(5);
     } finally {
       vi.useRealTimers();
     }
