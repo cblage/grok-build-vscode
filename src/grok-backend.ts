@@ -41,6 +41,15 @@ export function buildGrokAgentArgs(effort?: EffortLevel, sandbox?: string): stri
   return args;
 }
 
+export function grokSetupDetail(phase: unknown): string | undefined {
+  switch (phase) {
+    case "auth": return "signing in";
+    case "resolve_workspace": case "git_discovery": case "folder_trust": return "reading the project";
+    case "plugin_registry": case "mcp_merge": case "tool_overrides": return "loading tools and connectors";
+    default: return undefined;
+  }
+}
+
 export const grokBackend: AcpBackend = {
   provider: "grok",
   processName: "Grok process",
@@ -55,7 +64,11 @@ export const grokBackend: AcpBackend = {
   },
   normalizeSessionResponse: (response) => response,
   normalizePromptResult: (result) => result,
-  normalizeUpdate: (update, meta) => ({ update, meta }),
+  normalizeUpdate: (update, meta) => ({
+    update, meta,
+    ...(update?.sessionUpdate === "session_info_update" && typeof update.title === "string" && update.title.trim()
+      ? { sessionTitle: update.title.trim() } : {}),
+  }),
   normalizePermissionParams: (params) => params,
   setModel(sessionId, modelId, reasoningEffort) {
     return {

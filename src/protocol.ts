@@ -649,6 +649,9 @@ export type HostMsg =
   | { type: "updateReady"; version: string }
   | { type: "initialized"; info: { cliPath: string; cwd: string; version: string | null; provider?: AcpProvider; steeringSupported?: boolean; init: { protocolVersion?: unknown } } }
   | { type: "cliUpdating" }
+  | { type: "startupStatus"; provider: AcpProvider; stage: "updating" | "starting" | "opening" | "loading" | null; elapsedMs: number; detail?: string; messageCount?: number;
+      /** Rising per host (clock-seeded). A client drops a frame older than one it handled; snapshots omit it. */
+      seq?: number }
   // `worktree` gates the gear's Apply/Remove worktree items to worktree sessions.
   | { type: "session"; sessionId: string; models: ModelInfo[]; currentModelId: string | undefined; effort?: string; worktree?: boolean; provider?: AcpProvider }
   // The focused conversation's display name, using the same precedence as a
@@ -1022,8 +1025,9 @@ export type HostMsg =
    *  (`post`, never buffered). Host-local — remotes open find from their own ⋯. */
   | { type: "findInSession" }
   /** Put text back in the composer (Edit-and-resend, #56). Posted after the
-   *  rewind + reload so it survives the clearMessages/replay that follows. */
-  | { type: "restoreComposer"; text: string; chips?: FileChip[]; sessionId?: string }
+   *  rewind + reload so it survives the clearMessages/replay that follows.
+   *  `draft` marks an automatic restore: existing composer text takes priority. */
+  | { type: "restoreComposer"; text: string; chips?: FileChip[]; sessionId?: string; draft?: boolean }
   /** Drop everything after the Nth visible user message (rewind/edit, P2-9).
    *  Replaces the old clearMessages + full reload, which blanked the panel to
    *  the welcome logo and re-rendered the whole conversation. */
@@ -1587,7 +1591,7 @@ export type WebviewMsg =
 const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   museSettings: true,
   cloudHostUpdateState: true, initialState: true, moveViewHint: true, welcomeTips: true, projectSetup: true, githubState: true, githubRepos: true, providerState: true, mcpServers: true, mcpConnectors: true, mcpConnectorAuthorization: true, routines: true, codexInstallProgress: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true, updateReady: true, telemetryEnabled: true, thumbsFeedback: true,
-  initialized: true, cliUpdating: true, session: true, sessionName: true, composerDraftSession: true, modelChanged: true,
+  initialized: true, cliUpdating: true, startupStatus: true, session: true, sessionName: true, composerDraftSession: true, modelChanged: true,
   modeChanged: true, modePolicy: true, sandboxState: true, openModePopover: true, voiceState: true, voiceConfigured: true,
   voicePartial: true, voiceSubmit: true, voiceTranscript: true, voiceError: true,
   chips: true, commandsUpdate: true, mentionResults: true, projectDirListing: true, projectFileContent: true, projectFileWriteResult: true, gitStatusResult: true, gitFileDiffResult: true, turnFileDiffResult: true, turnDiffBaseline: true, gitRunResult: true, userMessage: true, agentStart: true,

@@ -89,9 +89,11 @@ import {
   sessionHasWorkInFlight,
   sessionReadyForPrompt,
   sessionUiSnapshot,
+  startupStatusMessage,
   sessionModeMessage,
   turnIsInFlight,
 } from "./session";
+import { grokSetupDetail } from "./grok-backend";
 import { buildReapCandidates, selectReapable, computeDot, Dot } from "./session-pool";
 import { resolveVoiceKey, extractGrokAuthKey, parseVoiceCommand, buildSttKeyterms, voiceSettingForRepo, voiceSettingWriteTarget, sanitizeVoiceSendPhrase, sanitizeVoiceKeyterms, voiceConfiguredFingerprint, DEFAULT_SEND_PHRASE, MAX_RECORDING_SECONDS } from "./voice";
 import { VoiceRecorder, transcribeAudio, resolveWindowsAudioDevice } from "./voice-recorder";
@@ -5457,10 +5459,11 @@ Only continue if you trust this code.`,
     requester: RemoteRequester | undefined,
     text: string,
     chips?: FileChip[],
+    draft = false,
   ): void {
     if (!text && (!chips || !chips.length)) return;
     
-    const message: HostMsg = { type: "restoreComposer", text, sessionId: session.activeSessionId || undefined, ...(chips ? { chips } : {}) };
+    const message: HostMsg = { type: "restoreComposer", text, sessionId: session.activeSessionId || undefined, ...(chips ? { chips } : {}), ...(draft ? { draft: true } : {}) };
     const retainChips = () => {
       if (chips) session.restoredChips = restoreQueuedChips(session.restoredChips, [{ text, chips }]);
     };
@@ -8620,8 +8623,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const clientId = this.remoteClients.clientsForActiveValue(session)[0];
         const requester = recipient === "local" ? undefined : recipient ??
           (session === this.focused && this.view ? undefined : clientId ? { clientId } : undefined);
-        this.restoreComposerFor(session, requester, draft, meta.queuedDraftChips);
-      } else this.emit(session, { type: "restoreComposer", text: draft });
+        this.restoreComposerFor(session, requester, draft, meta.queuedDraftChips, true);
+      } else this.emit(session, { type: "restoreComposer", text: draft, sessionId: id, draft: true });
       const { queuedDraft: _restored, queuedDraftChips: _chips, ...rest } = meta;
       return { ...current, [id]: rest };
     });
@@ -9696,7 +9699,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * version whether or not it succeeds — it blocks the composer, and a network
    * that cannot reach x.ai would otherwise re-charge that wait on every
    * window. */
-  private async maybeUpdateCliOnUpgrade(cliPath: string): Promise<void> {
+  private async maybeUpdateCliOnUpgrade(cliPath: string, session?: Session): Promise<void> {
     if (!this.hasProviderConsent("grok")) return;
     if (this.cliUpdateChecked) return;
     this.cliUpdateChecked = true;
@@ -9715,7 +9718,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.host.appendLine(
         `Extension upgraded ${lastSeen} → ${current}; updating grok CLI (silent: ${args.join(" ")}).`,
       );
-      this.post({ type: "cliUpdating" });
+      if (session) {
+        this.setStartupStage(session, "updating", policy.target);
+        this.emit(session, { type: "cliUpdating" });
+      } else this.post({ type: "cliUpdating" });
       try {
         // 20s, not the 180s the manual update gets. This one is awaited BEFORE
         // the CLI spawns, with the composer already locked, so every second of
@@ -10133,6 +10139,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const client = this.detachClient(session);
         this.setStatus(session, "idle");
         this.emit(session, { type: "setBusy", value: true, locked: true });
+        // The locked busy reads as a start; this conversation is waiting on
+        // the update, which can take minutes, so say that instead.
+        this.setStartupStage(session, "updating");
         return client?.disposeForUpdate();
       });
       // Await ACTUAL exit, as in disposePool. Signalling a kill alone leaves
@@ -10518,6 +10527,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // yet, so declining is a clean no-op rather than a half-started session.
     const consentAt = clock.now();
     if (target.provider === "grok" && !(await this.confirmRepoForcedAutoApprove(this.sessionCwd(target)))) {
+      // Back to idle, the same two steps as the early return above: a caller
+      // that locked the conversation for this start (sign-out replacement,
+      // connect) set `priming` and busy. Leaving `priming` set would queue the
+      // next Send against a start that never comes; clearing both lets that
+      // Send start the session again, which asks again.
+      target.priming = false;
+      this.emit(target, { type: "setBusy", value: false });
       return undefined;
     }
     // Its own phase because a modal is a PERSON reading a dialog, and folded
@@ -10558,6 +10574,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.queueInFlightPlanCommentsOnExit(session, replacedClient, session.gen);
     }
     const gen = ++session.gen;
+    if (!resumeId || resumeId !== session.activeSessionId) session.agentTitle = undefined;
     // Session objects can be reused for load/restart. Their grants cannot.
     session.allowedCommandPrograms.clear();
     const testDelay = this.testSessionStartDelay;
@@ -10722,8 +10739,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     let grokHandshakeVersion: string | undefined;
     let grokVersionVerified = false;
     if (session.provider === "grok") {
-      await this.maybeUpdateCliOnUpgrade(cliPath);
+      await this.maybeUpdateCliOnUpgrade(cliPath, session);
       if (gen !== session.gen) return undefined;
+      this.setStartupStage(session, "starting");
       await this.maybePinBrokenCli(cliPath);
       if (gen !== session.gen) return undefined;
       const compatibility = await this.planModeCompatibility(cliPath);
@@ -10942,16 +10960,27 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (gen !== session.gen || !title.trim()) return;
       const sid = client.sessionId ?? session.activeSessionId;
       if (!sid) return;
+      session.agentTitle = capAutoName(title);
       void this.updateSessionMeta((current) => {
         const entry = current[sid];
         const autoName = capAutoName(title);
         if (!autoName || entry?.customName || entry?.autoName === autoName) return null;
         return { ...current, [sid]: { ...(entry ?? {}), autoName } };
       }).then(() => {
+        if (gen !== session.gen) return;
         this.sessionCache.delete(sid);
         this.postSessionName(session);
         this.postSessionsList();
+        if (session.provider === "grok") {
+          this.sendLocalRepoSessionsPreview(session.worktree?.sourceGitRoot || cwd);
+          for (const clientId of this.remoteClients.clients()) this.refreshRemoteRepoPreview(clientId, cwd);
+        }
       });
+    });
+    client.on("sessionSetup", (params) => {
+      if (gen !== session.gen || session.provider !== "grok" || session.startup?.stage !== "opening") return;
+      if (params?.method !== "session/new" && params?.method !== "session/load") return;
+      this.setStartupStage(session, "opening", grokSetupDetail(params?.phase));
     });
     client.on("modelChanged", (id) => {
       if (gen !== session.gen) return;
@@ -11439,6 +11468,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
     for (let attempt = 1; attempt <= startSpawnAttempts; attempt++) {
       if (gen !== session.gen) return undefined;
+      this.setStartupStage(session, "starting");
       if (sandbox) {
         try {
           // Seatbelt can only confine a real local directory. The Host API hands
@@ -14934,6 +14964,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const override = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id];
     const custom = override?.customName?.trim();
     if (custom) return custom;
+    if (session.agentTitle) return session.agentTitle;
     // A live empty session is deliberately shown as "New session" in the
     // history list, even if grok has already left a summary file behind.
     if (!session.hasHistory) return "New session";
@@ -14998,7 +15029,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // we have is the opening message, live or as the stored `autoName`.
     const firstMsg = (session.firstUserMessageForTitle || "").trim()
       || (overrides[id]?.autoName || "").trim();
-    const displayName = customName || (firstMsg ? fallbackName(firstMsg, now) : "New session");
+    const displayName = customName || session.agentTitle || (firstMsg ? fallbackName(firstMsg, now) : "New session");
     const ts = session.lastActiveAt || now;
     return {
       id,
@@ -15036,7 +15067,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.sessionCache.set(e.id, { mtimeMs: mtimeById.get(e.id) ?? 0, entry: e });
       }
     }
-    return ids.map((id) => this.sessionCache.get(id)?.entry).filter((e): e is SessionListEntry => !!e);
+    return ids.map((id) => this.sessionCache.get(id)?.entry).filter((e): e is SessionListEntry => !!e)
+      .map((entry) => this.withLiveSessionTitle(entry, overrides));
   }
 
   /**
@@ -15067,7 +15099,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.sessionCache.set(e.id, { mtimeMs: mtimeById.get(e.id) ?? 0, entry: e });
       }
     }
-    return ids.map((id) => this.sessionCache.get(id)?.entry).filter((e): e is SessionListEntry => !!e);
+    return ids.map((id) => this.sessionCache.get(id)?.entry).filter((e): e is SessionListEntry => !!e)
+      .map((entry) => this.withLiveSessionTitle(entry, overrides));
+  }
+
+  private withLiveSessionTitle(entry: SessionListEntry, overrides: SessionMetaOverrides): SessionListEntry {
+    const title = this.liveSessionById(entry.id)?.agentTitle;
+    return title ? { ...entry, displayName: overrides[entry.id]?.customName?.trim() || title } : entry;
   }
 
   /** Which repo a remote request may act in. The client's selection by default;
@@ -18612,6 +18650,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  return to that conversation. The other two would re-steal focus and re-open
    *  the mode picker on reconnect. */
   private static readonly TRANSIENT_TYPES = new Set([
+    "startupStatus",
     "restoreComposer", "focusInput", "findInSession", "openModePopover",
     "uiConfirmRequest", "uiConfirmResolved",
     "subscriptionUsage",
@@ -18821,6 +18860,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.refreshWorkflowCompletions(session);
     const snapshot = [
       ...bracketRemoteSnapshot(session.buffer),
+      startupStatusMessage(session),
       { type: "subscriptionUsage" as const, windows: session.subscriptionUsage?.snapshot() ?? [] },
     ];
     for (const clientId of clientIds) {
@@ -19297,6 +19337,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * focused one, so this is behaviorally identical to `post`.)
    */
   private emit(session: Session, message: HostMsg): void {
+    if (message.type === "setBusy") {
+      if (message.value && message.locked) this.setStartupStage(session, "starting");
+      else if (!message.value && session.startup) this.setStartupStage(session, null);
+    } else if (message.type === "initialized" && session.startup) {
+      this.setStartupStage(session, "opening");
+    } else if (message.type === "historyReplay" && message.active && session.startup) {
+      this.setStartupStage(session, "loading");
+    } else if (message.type === "exit" && session.startup) {
+      this.setStartupStage(session, null);
+    }
     if (message.type === "runProgress") {
       const completed = this.workflowCompletion(session, message.update);
       if (completed) message = { type: "runProgress", update: completed };
@@ -19321,7 +19371,28 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // Active-session identity for the projects rail (highlight + pin home).
       this.mirrorToProjectsRail(message);
     }
-    if (!session.replaying) this.sendRemoteSession(session, message);
+    if (!session.replaying || message.type === "startupStatus") this.sendRemoteSession(session, message);
+  }
+
+  private setStartupStage(session: Session, stage: NonNullable<Session["startup"]>["stage"] | null, detail?: string): void {
+    const messageCount = stage === "loading" && session.activeSessionId
+      ? (this.sessionCache.get(session.activeSessionId)?.entry
+        ?? [...this.allAdapterCatalogs()].flat().find((entry) => entry.id === session.activeSessionId))?.numMessages : undefined;
+    session.startup = stage ? {
+      stage, startedAt: session.startup?.startedAt ?? Date.now(), detail,
+      ...(typeof messageCount === "number" && messageCount >= 0 ? { messageCount } : {}),
+    } : undefined;
+    this.emit(session, this.startupFrame(session));
+  }
+
+  /** The renderer drops a startup frame older than one it already handled: a
+   *  stale "opening" landing after the clear would otherwise hold the strip and
+   *  a disabled Send until the next start. Clock-seeded, so it keeps rising
+   *  across a host restart that a phone's page outlives. */
+  private startupSeq = 0;
+  private startupFrame(session: Session): Extract<HostMsg, { type: "startupStatus" }> {
+    this.startupSeq = Math.max((this.startupSeq || 0) + 1, Date.now());
+    return { ...startupStatusMessage(session), seq: this.startupSeq };
   }
 
   /**
@@ -19604,6 +19675,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         { type: "clearMessages" },
         ...(identity ? [identity] : []),
         ...bracketRemoteSnapshot(session.buffer),
+        startupStatusMessage(session),
         { type: "subscriptionUsage", windows: session.subscriptionUsage?.snapshot() ?? [] },
       ];
       for (const m of replay) {
@@ -19981,6 +20053,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  fire-and-forget, or awaited. */
   private detachClient(session: Session): AcpClient | undefined {
     const client = session.client;
+    if (session.startup) this.setStartupStage(session, null);
     session.gen++;
     this.clearPendingHumanRequests(session);
     this.drainPendingConfirms(session);

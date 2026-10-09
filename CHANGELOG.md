@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.14.1-sandbox.1 — 2026-10-09
+## 4.14.2-sandbox.1 — 2026-10-09
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.14.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.14.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,25 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.14.1 — 2026-09-29
+
+**See what a starting conversation is waiting for, and read a workflow as a process.**
+
+### Added
+
+- **Startup status above the composer.** While a conversation starts, a line above the composer says what it is waiting for: updating the CLI, starting the agent, opening the conversation, or loading its messages. Past 20 seconds it says the start is taking longer than usual and, in VS Code, offers Show output; a CLI update, which can take minutes, only counts its seconds. Send stays disabled until the conversation is ready, and its tooltip says why. The welcome panel no longer repeats the same status.
+- **Workflow steps as a process.** An open workflow card draws its steps as rings on a track across the full width of the card, with each agent grouped under its step. Tap a step's ring to open its agents; a step that has not started and has no agents is only a marker. A long run folds to five slots so it fits a phone.
+
+### Changed
+
+- **Grok's own conversation names appear as soon as Grok sets them**, in the rail and the header, without waiting for a reload.
+- **Listing a folder that does not exist yet is a grey row**, like a read of a missing file. Other failures stay red.
+- **On phones**, the composer's menus keep a gap from the screen edge, a long message's Show more chip shows without hover, and the file tabs' overflow chip shows how many tabs it holds, so it no longer looks like the file's own menu.
+
+### Fixed
+
+- **Text typed while a conversation loads** is no longer wiped when the load finishes. Typed into an empty composer, it is kept, after any draft that conversation already had; text that was already in the box stays with the conversation you left.
 
 ## 4.14.0 — 2026-09-28
 
