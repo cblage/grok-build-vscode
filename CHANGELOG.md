@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.12.1-sandbox.1 — 2026-10-09
+## 4.12.2-sandbox.1 — 2026-10-09
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.12.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.12.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,14 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.12.1 — 2026-09-25
+
+**A workaround for Muse Code 1.4.0 failing to save a sign-in.**
+
+### Fixed
+
+- **Connecting Muse Code on Windows and Linux no longer fails because Muse can't store the sign-in.** Muse Code 1.4.0 can fail right after you approve the sign-in code, with `keychain write failed`, and Connect then ended in "sign-in did not complete". We've seen it on Windows 11 and on headless Linux, both from this app and from a plain terminal. On Windows and Linux, when this app signs you in to Muse or starts it, it now asks Muse to keep the sign-in in its own file, `~/.config/muse/auth.json` (where Muse 1.3.0 kept it), instead of the system keychain. It doesn't do this if you've set `TBH_CREDENTIAL_BACKEND` yourself. We've confirmed on Windows and on Linux that this lets 1.4.0 save the sign-in normally. macOS is unchanged. We've reported the bug to Meta ([meta-models/muse-code-sdk#38](https://github.com/meta-models/muse-code-sdk/issues/38)). Until it's fixed, `muse login` in your own terminal may still fail. Connect from the app instead, or run `TBH_CREDENTIAL_BACKEND=file muse login` (PowerShell: `$env:TBH_CREDENTIAL_BACKEND='file'; muse login`).
 
 ## 4.12.0 — 2026-09-25
 
