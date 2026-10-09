@@ -91,12 +91,12 @@ export class MuseSession {
     if (!executable) throw new Error("MUSE_CODE_EXECUTABLE must name the installed Muse CLI");
     // The SDK spawns the command itself and exposes neither `shell` nor
     // `windowsVerbatimArguments`, so the shim is wrapped here instead. The
-    // executable and `serve` stay SEPARATE argv entries: Node quotes each one
-    // on its own, which is what carries an install path containing a space.
+    // executable and `serve` stay separate argv entries. Omit /s: it strips
+    // Node's quotes around a spaced executable path before cmd resolves it.
     const needsShell = museCliNeedsShell(executable);
     const handshake = this.handshake = this.spawn({
       command: needsShell ? process.env.COMSPEC || "cmd.exe" : executable,
-      args: needsShell ? ["/d", "/s", "/c", executable, "serve"] : ["serve"],
+      args: needsShell ? ["/d", "/c", executable, "serve"] : ["serve"],
       cwd: process.cwd(), env: process.env,
       onStderr: chunk => process.stderr.write(chunk) });
     handshake.onNotification(notification => {

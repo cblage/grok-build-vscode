@@ -1,4 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { readWorkflowCompletion } from "../src/workflow-state";
+import { GrokSidebar } from "../src/sidebar";
+import { Session } from "../src/session";
+import { bracketRemoteSnapshot } from "../src/remote-policy";
 import {
   isRunProgressUpdate,
   parseRunProgressUpdate,
@@ -6,6 +11,170 @@ import {
   runProgressKindLabel,
   formatRunProgressPct,
 } from "../src/run-progress";
+
+const statelessRuns = JSON.parse(readFileSync(new URL("fixtures/workflow-stateless-phases.json", import.meta.url), "utf8")).runs;
+const outputRuns = JSON.parse(readFileSync(new URL("fixtures/workflow-output.json", import.meta.url), "utf8")).runs;
+
+const capturedStates = ["complete", "cancelled", "active-1", "active-2", "active-3"].map(name => ({
+  name, file: JSON.parse(readFileSync(new URL(`fixtures/workflow-state/${name}.json`, import.meta.url), "utf8")),
+}));
+
+describe("buffered workflow repairs", () => {
+  it("replaces every frame in order from the newest observation and delivers the repair once", () => {
+    const sidebar = Object.create(GrokSidebar.prototype) as any;
+    const session = new Session();
+    const run = statelessRuns[0];
+    const update = parseRunProgressUpdate({ ...run.state, sessionUpdate: "workflow_updated",
+      run_id: run.run_id, name: run.name, status: "active" })!;
+    const latest = { ...update, revision: 42, agents: [{ label: "final writer", state: "done", tokensUsed: 12345 }] };
+    // Missing disk roster must retain the newest notification's roster/tokens.
+    const disk = JSON.stringify({ ...run.state, agents: undefined });
+    const completed = readWorkflowCompletion("session", latest, () => disk)!;
+    sidebar.focused = session;
+    sidebar.workflowCompletion = (_session: Session, previous: typeof update) =>
+      readWorkflowCompletion("session", previous, () => disk);
+    const desk = vi.fn();
+    sidebar.view = { webview: { postMessage: desk } };
+    sidebar.mirrorToProjectsRail = () => {};
+    sidebar.sendRemoteSession = vi.fn();
+    const before = { type: "userMessage" as const, text: "before" };
+    const after = { type: "userMessage" as const, text: "after" };
+    const between = { type: "userMessage" as const, text: "between observations" };
+    const other = { type: "runProgress" as const, update: { ...update, id: "wf_other", done: true } };
+    session.buffer.push(before, { type: "runProgress", update }, between, other,
+      { type: "runProgress", update: latest }, after);
+    sidebar.refreshWorkflowCompletions(session);
+    sidebar.refreshWorkflowCompletions(session);
+    expect({ buffer: session.buffer, desk: desk.mock.calls, remote: sidebar.sendRemoteSession.mock.calls })
+      .toEqual({ buffer: [before, { type: "runProgress", update: completed }, between, other,
+        { type: "runProgress", update: completed }, after],
+        desk: [[{ type: "runProgress", update: completed, replaceOnly: true }]],
+        remote: [[session, { type: "runProgress", update: completed, replaceOnly: true }]] });
+  });
+
+  it("isolates repaired updates and their nested fields from other frames and deliveries", () => {
+    const sidebar = Object.create(GrokSidebar.prototype) as any;
+    const session = new Session();
+    const run = statelessRuns[0];
+    const update = parseRunProgressUpdate({ ...run.state, sessionUpdate: "workflow_updated",
+      run_id: run.run_id, name: run.name, status: "active" })!;
+    const completed = readWorkflowCompletion("session", update, () => JSON.stringify(run.state))!;
+    sidebar.workflowCompletion = () => completed;
+    sidebar.sendRemoteSession = vi.fn();
+    const first = { type: "runProgress" as const, update: structuredClone(update) };
+    const last = { type: "runProgress" as const, update: structuredClone(update) };
+    session.buffer.push(first, last);
+    sidebar.refreshWorkflowCompletions(session);
+    const expected = structuredClone(completed);
+    first.update.done = false;
+    first.update.agents![0].tokensUsed = -1;
+    first.update.phases![0].title = "changed phase";
+    first.update.workflowContent!.resultSummary = "changed result";
+    expect.soft({ last: last.update, delivered: sidebar.sendRemoteSession.mock.calls[0][1].update })
+      .toEqual({ last: expected, delivered: expected });
+    // Mutation in the other direction also cannot reach the first frame.
+    const firstAfterMutation = structuredClone(first.update);
+    last.update.agents!.push({ label: "another agent" });
+    last.update.phases!.push({ title: "another phase" });
+    expect.soft(first.update).toEqual(firstAfterMutation);
+  });
+
+  it("keeps repairs outside a trimmed phone snapshot and skips runs absent from the host buffer", () => {
+    const sidebar = Object.create(GrokSidebar.prototype) as any;
+    const session = new Session();
+    const run = statelessRuns[0];
+    const update = parseRunProgressUpdate({ ...run.state, sessionUpdate: "workflow_updated",
+      run_id: run.run_id, name: run.name, status: "active" })!;
+    sidebar.workflowCompletion = vi.fn((_session, previous) =>
+      readWorkflowCompletion("session", previous, () => JSON.stringify(run.state)));
+    sidebar.sendRemoteSession = vi.fn();
+    session.buffer.push({ type: "runProgress", update });
+    for (let i = 0; i < 11; i++) session.buffer.push({ type: "userMessage", text: `turn ${i}` });
+    sidebar.refreshWorkflowCompletions(session);
+    const snapshot = bracketRemoteSnapshot(session.buffer);
+    session.buffer = [];
+    sidebar.workflowCompletion.mockClear();
+    sidebar.sendRemoteSession.mockClear();
+    sidebar.refreshWorkflowCompletions(session);
+    expect({ snapshot, buffer: session.buffer, reads: sidebar.workflowCompletion.mock.calls,
+      deliveries: sidebar.sendRemoteSession.mock.calls }).toEqual({
+      snapshot: [{ type: "historyReplay", active: true }, { type: "historyBatch",
+        messages: Array.from({ length: 10 }, (_, i) => ({ type: "userMessage", text: `turn ${i + 1}` })) },
+      { type: "historyReplay", active: false }], buffer: [], reads: [], deliveries: [],
+    });
+  });
+});
+
+describe("workflow content provenance", () => {
+  it.each(outputRuns)("preserves result provenance and the legacy detail for $run_id", (run) => {
+    const u = parseRunProgressUpdate(run)!;
+    const payload = run.result_summary || "Workflow outcome ignored: ignored cancelled while status is cancelled";
+    expect({ content: u.workflowContent, legacy: u.detail }).toEqual({
+      content: { resultSummary: run.result_summary || null, pauseMessage: null },
+      legacy: `${run.current_phase} · ${payload} · ${run.agents_used} of ${run.agent_budget} agents used`,
+    });
+  });
+  it("separates pause reasons from results and explicitly clears missing content", () => {
+    const parse = (over: object) => parseRunProgressUpdate({ sessionUpdate: "workflow_updated", run_id: "r", ...over })!.workflowContent;
+    expect([parse({ resultSummary: "A result", pauseMessage: "Review required" }), parse({ last_event: "log", last_event_detail: "bookkeeping" })])
+      .toEqual([{ resultSummary: "A result", pauseMessage: "Review required" }, { resultSummary: null, pauseMessage: null }]);
+  });
+});
+
+describe("the CLI workflow state store", () => {
+  it.each(capturedStates)("reads the captured $name state file without guessing completion", ({ file }) => {
+    const previous = parseRunProgressUpdate({ ...file.state, sessionUpdate: "workflow_updated", status: "active", revision: 42 })!;
+    const result = readWorkflowCompletion("session", previous, () => JSON.stringify(file));
+    expect(result).toEqual(file.state.status === "active" ? undefined : expect.objectContaining({
+      id: file.state.run_id, done: true, phase: file.state.status === "complete" ? "completed" : "cancelled",
+      elapsedMs: file.state.elapsed_ms_floor, revision: 42,
+    }));
+  });
+
+  it("does not use a root terminal status when the wrapped state is active or invalid", () => {
+    const previous = parseRunProgressUpdate({ ...capturedStates[0].file.state, sessionUpdate: "workflow_updated", status: "active" })!;
+    for (const state of [{ status: "active" }, null, [], "complete", {}]) {
+      expect(readWorkflowCompletion("session", previous, () => JSON.stringify({ status: "complete", state }))).toBeUndefined();
+    }
+  });
+
+  it("repairs stale notifications from terminal two-stage states without inventing phase states", () => {
+    for (const run of statelessRuns) {
+      const previous = parseRunProgressUpdate({ ...run.state, run_id: run.run_id, name: run.name,
+        sessionUpdate: "workflow_updated", status: "active", revision: 42 })!;
+      const completed = readWorkflowCompletion("session", previous, () => JSON.stringify(run.state));
+      expect(completed).toMatchObject({ id: run.run_id, displayName: run.name, title: run.name,
+        done: true, phase: "completed", currentPhase: "Summarize", elapsedMs: run.state.elapsed_ms_floor,
+        revision: 42, agentsUsed: 3, agentBudget: 4 });
+      expect(completed?.phases).toEqual([{ title: "Read" }, { title: "Summarize" }]);
+      expect(completed?.agents?.map(a => a.state)).toEqual(["done", "done", "done"]);
+    }
+  });
+
+  it("leaves active all-done rosters, unavailable state and unsafe run ids alone", () => {
+    const run = statelessRuns[0];
+    const previous = parseRunProgressUpdate({ ...run.state, run_id: run.run_id, name: run.name,
+      sessionUpdate: "workflow_updated", status: "active" })!;
+    for (const status of ["active", "user_paused", undefined]) {
+      expect(readWorkflowCompletion("session", previous, () => JSON.stringify({ ...run.state, status }))).toBeUndefined();
+    }
+    for (const raw of ["{", "null", "[]"]) expect(readWorkflowCompletion("session", previous, () => raw)).toBeUndefined();
+    for (const code of ["ENOENT", "EACCES", "EIO"]) {
+      expect(readWorkflowCompletion("session", previous, () => { throw Object.assign(new Error(code), { code }); })).toBeUndefined();
+    }
+    const noRead = vi.fn(() => JSON.stringify(run.state));
+    expect(readWorkflowCompletion("session", { ...previous, id: "../../other" }, noRead)).toBeUndefined();
+    expect(readWorkflowCompletion(undefined, previous, noRead)).toBeUndefined();
+    expect(readWorkflowCompletion("session", { ...previous, done: true }, noRead)).toBeUndefined();
+    expect(noRead).not.toHaveBeenCalled();
+  });
+
+  it("parses a complete run even though its phase definitions have no state", () => {
+    const run = statelessRuns[0];
+    expect(parseRunProgressUpdate({ ...run.state, run_id: run.run_id, name: run.name, sessionUpdate: "workflow_updated" }))
+      .toMatchObject({ done: true, phase: "complete", phases: [{ title: "Read" }, { title: "Summarize" }] });
+  });
+});
 
 describe("isRunProgressUpdate", () => {
   it("accepts workflow_updated / goal_updated and lifecycle siblings", () => {
@@ -110,6 +279,13 @@ describe("parseRunProgressUpdate — workflow", () => {
       expect(paused?.done).toBe(false);
       expect(paused?.failed).toBe(false);
       expect(paused?.cancelled).toBe(false);
+    });
+
+    it.each(["complete", "completed"])("recognizes %s with a retained Report position and Partial result", (status) => {
+      expect(at({ status, current_phase: "Report", result_summary: "Partial" })).toMatchObject({
+        phase: status, currentPhase: "Report", done: true, failed: false, cancelled: false,
+        detail: "Report · Partial · 1 of 128 agents used",
+      });
     });
 
     it("catches lifecycle words we have not seen, on their stems", () => {

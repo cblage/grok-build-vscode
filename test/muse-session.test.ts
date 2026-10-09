@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MuseSession } from "../adapters/muse/session.mts";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { AcpClient } from "../src/acp";
@@ -136,6 +138,22 @@ describe("Muse reasoning effort", () => {
 });
 
 describe("Muse CLI spawn", () => {
+  it.skipIf(process.platform !== "win32")("starts a real Windows shim from an install path containing spaces", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "Muse install with spaces "));
+    try {
+      const executable = join(dir, "muse.cmd");
+      writeFileSync(executable, "@echo off\r\necho SPAWN_OK %1\r\n");
+      const s = setup();
+      vi.stubEnv("MUSE_CODE_EXECUTABLE", executable);
+      await s.session.initialize();
+      // Use the adapter's actual SDK spawn plan in Node, not a quoted mock.
+      const { command, args } = s.spawn.mock.calls[0][0];
+      const result = spawnSync(command, args, { encoding: "utf8", windowsHide: true, timeout: 5000 });
+      expect({ code: result.status, stdout: result.stdout.trim(), stderr: result.stderr.trim() })
+        .toEqual({ code: 0, stdout: "SPAWN_OK serve", stderr: "" });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each([
     ["win32", String.raw`C:\Users\Dell\AppData\Local\Programs\muse\muse.cmd`],
     ["win32", String.raw`C:\Users\Dell User\AppData\Local\Programs\muse\muse.CMD`],
@@ -149,7 +167,7 @@ describe("Muse CLI spawn", () => {
     expect(s.spawn).toHaveBeenCalledOnce();
     const { command, args } = s.spawn.mock.calls[0][0];
     expect({ command, args }).toEqual({
-      command: comspec, args: ["/d", "/s", "/c", executable, "serve"],
+      command: comspec, args: ["/d", "/c", executable, "serve"],
     });
   });
 
@@ -164,7 +182,7 @@ describe("Muse CLI spawn", () => {
     expect(s.spawn).toHaveBeenCalledOnce();
     const { command, args } = s.spawn.mock.calls[0][0];
     expect({ command, args }).toEqual({
-      command: "cmd.exe", args: ["/d", "/s", "/c", executable, "serve"],
+      command: "cmd.exe", args: ["/d", "/c", executable, "serve"],
     });
   });
 

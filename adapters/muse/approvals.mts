@@ -1,4 +1,5 @@
 import type { PermissionOption, RequestPermissionRequest, RequestPermissionResponse } from "@agentclientprotocol/sdk";
+import { parseToolInput } from "./tool-input.mjs";
 
 interface Choice { choiceId: string; decision: string; scope: string; label: string }
 interface Approval {
@@ -59,10 +60,15 @@ export class Approvals {
     if (this.current.get(request.approvalId) !== request) return;
     const options = permissionOptions(request.availableChoices);
     if (!options.length) throw new Error("Muse offered no supported permission choices");
+    const rawInput = parseToolInput(request.rawArgs);
+    const command = [rawInput?.command, rawInput?.cmd].find(value => typeof value === "string" && value.trim());
+    // Existing permission renderers display the title, including older clients.
+    const title = request.toolName === "bash" && typeof command === "string"
+      ? command : request.toolName || "Muse permission";
     const response = await this.ask({ sessionId: request.sessionId, options,
       toolCall: { toolCallId: request.toolCallId || request.approvalId,
-        title: request.toolName || "Muse permission", status: "pending",
-        rawInput: request.rawArgs } });
+        title, kind: request.toolName === "bash" ? "execute" : "other", status: "pending",
+        rawInput } });
     if (this.current.get(request.approvalId) !== request) return;
     const outcome = response.outcome;
     const id = outcome.outcome === "selected" ? outcome.optionId

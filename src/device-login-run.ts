@@ -113,7 +113,9 @@ export function runDeviceLogin(
 
   let child: ReturnType<typeof nodeSpawn>;
   try {
-    child = spawnIo.spawn(cliPath, [...args], {
+    const shell = grokCliNeedsShell(cliPath);
+    // Node joins shell:true commands without quoting the executable.
+    child = spawnIo.spawn(shell ? `"${cliPath}"` : cliPath, [...args], {
       // Device-code flows (Grok, Codex) must not wait on input: a child holding
       // an open stdin it will never read from looks identical to a child that
       // is working. Paste-code (Claude `auth login`) is the other shape — the
@@ -121,7 +123,7 @@ export function runDeviceLogin(
       // opens the pipe.
       stdio: [needsCode ? "pipe" : "ignore", "pipe", "pipe"],
       env: opts.rawEnv ? runEnv : deviceLoginEnv(runEnv, { needsCode }),
-      shell: grokCliNeedsShell(cliPath),
+      shell,
       windowsHide: true,
     });
   } catch (error) {

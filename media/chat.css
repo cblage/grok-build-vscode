@@ -637,6 +637,10 @@ body.rail-resizing * {
 }
 .rail-chevron svg { width: 12px; height: 12px; }
 .rail-twisty { cursor: inherit; pointer-events: none; }
+@media (hover: none), (pointer: coarse) {
+  .rail-head-btn { min-height: 36px; }
+  .rail-repo-head { min-height: max(36px, var(--rail-repo-min-height)); }
+}
 /* One hue, every surface that draws the project's mark: the rail, the
    composer chip, the switcher rows and the file panel's title. The marks are
    currentColor, so tinting the host is the whole mechanism. On the chip the
@@ -2759,7 +2763,7 @@ body.thinking-hidden .msg.thinking { display: none; }
   background: linear-gradient(var(--run-progress-fill), var(--run-progress-fill)), var(--vscode-sideBar-background);
 }
 .workflow-pin-run:last-child { margin-bottom: 0; }
-.workflow-expanded[hidden], .workflow-dots[hidden], .workflow-phases[hidden], .workflow-roster[hidden], .workflow-agent-detail[hidden], .workflow-blocked[hidden] { display: none; }
+.workflow-expanded[hidden], .workflow-dots[hidden], .workflow-phases[hidden], .workflow-roster[hidden], .workflow-agent-detail[hidden], .workflow-blocked[hidden], .workflow-chevron[hidden] { display: none; }
 /* Reads immediately under the receipt, because it is what qualifies it. */
 .workflow-blocked { color: var(--vscode-editorWarning-foreground, #cca700); }
 .workflow-tool-marker[hidden] { display: none; }
@@ -2794,14 +2798,36 @@ body.thinking-hidden .msg.thinking { display: none; }
 .workflow-phase[data-state="active"] { color: var(--vscode-foreground); border-color: var(--vscode-charts-blue, #3794ff); }
 .workflow-phase[data-state="active"]::before { content: "› "; }
 .workflow-phase[data-state="done"]::before,
+.workflow-phase[data-state="complete"]::before,
 .workflow-phase[data-state="completed"]::before { content: "✓ "; }
 .workflow-phase[data-state="done"],
+.workflow-phase[data-state="complete"],
 .workflow-phase[data-state="completed"] { border-color: var(--vscode-charts-green, #4ec9b0); }
+/* A stage that was active when a run stopped or failed must not look
+   like a stage that was never reached (○, identical to pending). */
+.workflow-phase[data-state="failed"]::before { content: "✕ "; }
+.workflow-phase[data-state="failed"] { border-color: var(--vscode-errorForeground); color: var(--vscode-errorForeground); }
+.workflow-phase[data-state="cancelled"]::before { content: "› "; }
+.workflow-phase[data-state="cancelled"] { opacity: 0.7; }
 /* Name, steps and stage on the left; elapsed and the chevron on the right; the
    controls on their OWN row at the foot of the card. Pause and Stop used to
    share this row, which clipped "Stop" off the right edge of a phone, and the
    chevron hung below it on top of the receipt line. */
 .workflow-heading { display: block; }
+.workflow-report-body > .workflow-heading { display: none; }
+.workflow-timing { display: flex; }
+.workflow-output {
+  margin-top: 12px;
+  padding-top: 9px;
+  border-top: 1px solid var(--vscode-editorWidget-border, #555);
+  color: var(--vscode-foreground);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.workflow-output-label { display: block; margin-bottom: 6px; }
+.workflow-output-body > :first-child { margin-top: 0; }
+.workflow-output-body > :last-child { margin-bottom: 0; }
+.workflow-output-body pre { overflow-x: auto; }
 .workflow-pin-run > .workflow-heading {
   position: sticky;
   top: 0;
@@ -2810,24 +2836,10 @@ body.thinking-hidden .msg.thinking { display: none; }
   padding: 0 11px;
   background: inherit;
 }
-/* Keep the reported stage available to assistive technology without repeating
-   the expanded phase strip visually or taking up space in the heading. */
-.workflow-pin-run.is-expanded > .workflow-heading .run-progress-phase {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  padding: 0;
-  border: 0;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-}
 .workflow-heading > .workflow-pin-toggle { display: flex; width: 100%; margin: 0; padding: 0; }
 .workflow-heading .run-progress-row { align-items: center; gap: 9px; }
-.workflow-chevron { flex: none; opacity: 0.7; font-size: 0.9em; }
-.workflow-chevron::before { content: "⌄"; }
-.is-expanded > .workflow-heading .workflow-chevron::before { content: "⌃"; }
+.workflow-chevron, .workflow-agent-chevron { display: inline-flex; flex: none; align-self: center; opacity: 0.7; }
+.workflow-chevron svg, .workflow-agent-chevron svg { width: 12px; height: 12px; }
 .workflow-pin .workflow-receipt { margin-top: 3px; }
 /* The composer is directly below, so the controls need a real target and air
    above them rather than the transcript card's 6px. */
@@ -2838,20 +2850,31 @@ body.thinking-hidden .msg.thinking { display: none; }
 .workflow-dots { display: inline-flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 .workflow-dot { width: 7px; height: 7px; border: 1px solid currentColor; border-radius: 50%; opacity: 0.45; }
 .workflow-dot[data-state="unknown"] { border-style: dashed; }
-.workflow-dot[data-state="done"], .workflow-dot[data-state="completed"] { background: var(--vscode-charts-green, #4ec9b0); border-color: var(--vscode-charts-green, #4ec9b0); opacity: 1; }
+.workflow-dot[data-state="done"], .workflow-dot[data-state="complete"], .workflow-dot[data-state="completed"] { background: var(--vscode-charts-green, #4ec9b0); border-color: var(--vscode-charts-green, #4ec9b0); opacity: 1; }
+.workflow-dot[data-state="failed"] { background: var(--vscode-errorForeground); border-color: var(--vscode-errorForeground); opacity: 1; }
+.workflow-dot[data-state="cancelled"] { opacity: 0.7; }
 .workflow-dot[aria-current="step"] { border: 2px solid var(--vscode-charts-blue, #3794ff); opacity: 1; }
 /* A row, so the icon sits beside the name the way a tool line's does, and
    the ellipsis lands on the text rather than clipping the icon off. */
 .workflow-marker { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
 .workflow-marker > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .workflow-card:not(.run-progress-done) { border: 0; padding: 4px 0; background: none; }
-.workflow-report-toggle { cursor: pointer; font-weight: 600; }
+.workflow-report-toggle { cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: 9px; }
+/* The native disclosure triangle sits on the LEFT and is not our chevron; the
+   summary draws its own on the right so a finished card matches a live one. */
+.workflow-report-toggle { list-style: none; }
+.workflow-report-toggle::-webkit-details-marker { display: none; }
+.workflow-report-name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workflow-report-dots { display: inline-flex; flex-wrap: wrap; gap: 5px; align-items: center; flex: none; }
+.workflow-report-state { font-weight: 400; opacity: 0.75; }
+.workflow-report-elapsed { margin-left: auto; font-variant-numeric: tabular-nums; opacity: 0.75; }
+.workflow-report-chevron { flex: none; display: inline-flex; align-items: center; }
+.workflow-report-dots[hidden], .workflow-report-elapsed[hidden] { display: none; }
 .workflow-report-body { margin-top: 6px; }
 .workflow-agent-toggle { display: flex; align-items: baseline; gap: 6px; width: 100%; border: 0; padding: 4px 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; white-space: nowrap; }
 .workflow-agent-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
 .workflow-agent-state { flex: 0 0 auto; }
-.workflow-agent-toggle::after { content: "⌄"; margin-left: auto; }
-.workflow-agent-toggle[aria-expanded="true"]::after { content: "⌃"; }
+.workflow-agent-chevron { margin-left: auto; }
 .workflow-agent-detail { padding: 4px 0; }
 .workflow-roster { overflow-x: auto; list-style: none; padding: 0; margin: 8px 0 2px; }
 .workflow-agent { padding: 5px 0; border-top: 1px solid var(--vscode-editorWidget-border, #555); overflow-wrap: anywhere; }
@@ -2862,7 +2885,10 @@ body.thinking-hidden .msg.thinking { display: none; }
 .run-progress-card .run-progress-btn:disabled { opacity: 0.55; cursor: default; }
 .workflow-pin-toggle:focus-visible, .workflow-agent-toggle:focus-visible, .workflow-report-toggle:focus-visible, .run-progress-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
 @media (hover: none), (pointer: coarse) {
-  .workflow-pin-toggle, .workflow-agent-toggle, .workflow-pin .run-progress-btn { min-height: 36px; }
+  /* The finished report's summary is the tap target that opens it, so it
+     needs the same target as the live card's disclosure -- a coarse pointer
+     cannot reliably hit a line of text. */
+  .workflow-pin-toggle, .workflow-agent-toggle, .workflow-report-toggle, .workflow-pin .run-progress-btn { min-height: 36px; }
 }
 
 .tool-group {
@@ -3471,11 +3497,11 @@ body.hide-turn-diff-summary .turn-diff-summary { display: none; }
    `.desk-ft-md, .files-browse-md` shares these rules so a README preview matches chat ÔÇö do not
    restyle code/links/tables under the panel prefix; that drifts (see # follow-up). */
 
-.msg.agent .body,
+.workflow-output-body, .msg.agent .body,
 .desk-ft-md, .files-browse-md { white-space: normal; line-height: 1.55; }
-.msg.agent .body h1,
-.msg.agent .body h2,
-.msg.agent .body h3,
+.workflow-output-body h1, .msg.agent .body h1,
+.workflow-output-body h2, .msg.agent .body h2,
+.workflow-output-body h3, .msg.agent .body h3,
 .desk-ft-md h1, .files-browse-md h1,
 .desk-ft-md h2, .files-browse-md h2,
 .desk-ft-md h3, .files-browse-md h3 {
@@ -3483,27 +3509,27 @@ body.hide-turn-diff-summary .turn-diff-summary { display: none; }
   font-weight: 600;
   line-height: 1.3;
 }
-.msg.agent .body h1, .desk-ft-md h1, .files-browse-md h1 { font-size: 1.4em; }
-.msg.agent .body h2, .desk-ft-md h2, .files-browse-md h2 { font-size: 1.25em; }
-.msg.agent .body h3, .desk-ft-md h3, .files-browse-md h3 { font-size: 1.1em; }
-.msg.agent .body > h1:first-child,
-.msg.agent .body > h2:first-child,
-.msg.agent .body > h3:first-child,
+.workflow-output-body h1, .msg.agent .body h1, .desk-ft-md h1, .files-browse-md h1 { font-size: 1.4em; }
+.workflow-output-body h2, .msg.agent .body h2, .desk-ft-md h2, .files-browse-md h2 { font-size: 1.25em; }
+.workflow-output-body h3, .msg.agent .body h3, .desk-ft-md h3, .files-browse-md h3 { font-size: 1.1em; }
+.workflow-output-body > h1:first-child, .msg.agent .body > h1:first-child,
+.workflow-output-body > h2:first-child, .msg.agent .body > h2:first-child,
+.workflow-output-body > h3:first-child, .msg.agent .body > h3:first-child,
 .desk-ft-md > h1, .files-browse-md > h1:first-child,
 .desk-ft-md > h2, .files-browse-md > h2:first-child,
 .desk-ft-md > h3, .files-browse-md > h3:first-child { margin-top: 0; }
-.msg.agent .body ul,
-.msg.agent .body ol,
+.workflow-output-body ul, .msg.agent .body ul,
+.workflow-output-body ol, .msg.agent .body ol,
 .desk-ft-md ul, .files-browse-md ul,
 .desk-ft-md ol, .files-browse-md ol {
   margin: 6px 0;
   padding-inline-start: 22px; /* logical: indents from the right for RTL lists */
 }
-.msg.agent .body ul, .desk-ft-md ul, .files-browse-md ul { list-style-type: disc; }
-.msg.agent .body ol, .desk-ft-md ol, .files-browse-md ol { list-style-type: decimal; }
-.msg.agent .body li, .desk-ft-md li, .files-browse-md li { margin: 3px 0; }
-.msg.agent .body li > ul, .desk-ft-md li > ul, .files-browse-md li > ul { margin: 3px 0; list-style-type: circle; }
-.msg.agent .body li > ul ul, .desk-ft-md li > ul ul, .files-browse-md li > ul ul { list-style-type: square; }
+.workflow-output-body ul, .msg.agent .body ul, .desk-ft-md ul, .files-browse-md ul { list-style-type: disc; }
+.workflow-output-body ol, .msg.agent .body ol, .desk-ft-md ol, .files-browse-md ol { list-style-type: decimal; }
+.workflow-output-body li, .msg.agent .body li, .desk-ft-md li, .files-browse-md li { margin: 3px 0; }
+.workflow-output-body li > ul, .msg.agent .body li > ul, .desk-ft-md li > ul, .files-browse-md li > ul { margin: 3px 0; list-style-type: circle; }
+.workflow-output-body li > ul ul, .msg.agent .body li > ul ul, .desk-ft-md li > ul ul, .files-browse-md li > ul ul { list-style-type: square; }
 /* The wrapper owns the block surface (Codex-style): radius on the div,
    overflow clipped so full-width diff-line tints follow the rounded corners.
    Every fenced block renderMarkdown emits is wrapped in .code-block, in agent,
@@ -3517,7 +3543,7 @@ body.hide-turn-diff-summary .turn-diff-summary { display: none; }
 }
 /* Codex's roomier 14px block margin, in agent prose and the file preview ÔÇö
    inside a compact user bubble or plan card the 8px base reads better. */
-.msg.agent .body .code-block,
+.workflow-output-body .code-block, .msg.agent .body .code-block,
 .desk-ft-md .code-block, .files-browse-md .code-block { margin: 14px 0; }
 .code-block pre {
   margin: 0;
@@ -3614,21 +3640,21 @@ body.hide-turn-diff-summary .turn-diff-summary { display: none; }
 .diff-line.diff-del { background: var(--tdiff-del-bg); border-left-color: var(--tdiff-del-line); }
 .diff-line.diff-hunk { color: var(--vscode-textLink-foreground); }
 .diff-line.diff-meta { color: var(--vscode-descriptionForeground); }
-.msg.agent .body strong, .desk-ft-md strong, .files-browse-md strong { font-weight: 600; }
-.msg.agent .body em, .desk-ft-md em, .files-browse-md em { font-style: italic; }
-.msg.agent .body .md-table-wrap,
+.workflow-output-body strong, .msg.agent .body strong, .desk-ft-md strong, .files-browse-md strong { font-weight: 600; }
+.workflow-output-body em, .msg.agent .body em, .desk-ft-md em, .files-browse-md em { font-style: italic; }
+.workflow-output-body .md-table-wrap, .msg.agent .body .md-table-wrap,
 .desk-ft-md .md-table-wrap, .files-browse-md .md-table-wrap {
   overflow-x: auto;
   margin: 8px 0;
 }
-.msg.agent .body table,
+.workflow-output-body table, .msg.agent .body table,
 .desk-ft-md table, .files-browse-md table {
   border-collapse: collapse;
   font-size: inherit;
   width: 100%;
 }
-.msg.agent .body th,
-.msg.agent .body td,
+.workflow-output-body th, .msg.agent .body th,
+.workflow-output-body td, .msg.agent .body td,
 .desk-ft-md th, .files-browse-md th,
 .desk-ft-md td, .files-browse-md td {
   border: 1px solid var(--vscode-editorWidget-border);
@@ -3642,7 +3668,7 @@ body.hide-turn-diff-summary .turn-diff-summary { display: none; }
   word-break: normal;
   overflow-wrap: normal;
 }
-.msg.agent .body th,
+.workflow-output-body th, .msg.agent .body th,
 .desk-ft-md th, .files-browse-md th {
   background: var(--vscode-textBlockQuote-background, var(--vscode-editorWidget-background));
   font-weight: 600;

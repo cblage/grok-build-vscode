@@ -140,6 +140,15 @@ it("scopes the rail clear-history confirmation to supported providers", () => {
  * expanded, closed when not — which is precisely why no other glyph could take
  * its place, since a rocket has no open variant.
  */
+it("hides decorative group disclosure icons from assistive technology", () => {
+  const { window, doc } = bootRail();
+  loadCatalog(railApi(window));
+  for (const indicator of doc.querySelectorAll(".rail-head-twisty")) {
+    expect.soft(indicator.getAttribute("aria-hidden")).toBe("true");
+  }
+  window.happyDOM.abort();
+});
+
 it("separates the disclosure chevron from the project mark", () => {
   const { window, doc } = bootRail();
   const api = railApi(window);

@@ -10,6 +10,9 @@
  * noticing a CLI that will never speak.
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import {
   classifyDeviceLoginFailure,
@@ -236,6 +239,23 @@ function fakeIo(): { io: DeviceLoginIo; child: FakeChild; calls: unknown[][] } {
 }
 
 describe("device login shell policy", () => {
+  it.skipIf(process.platform !== "win32").each(["grok", "codex", "claude", "muse"] as const)(
+    "starts %s login and receives its URL from a real shim in a spaced path", async provider => {
+      const dir = mkdtempSync(join(tmpdir(), "Login install with spaces "));
+      try {
+        const executable = join(dir, `${provider}.cmd`);
+        writeFileSync(executable, "@echo off\r\necho https://example.com/device?user_code=ABCD-1234\r\n");
+        const onPrompt = vi.fn();
+        const plan = deviceLoginPlan(provider);
+        const result = await new Promise(resolve => runDeviceLogin(executable, plan.args,
+          { onPrompt, onDone: resolve }, undefined, process.env, { needsCode: !!plan.needsCode }));
+        expect({ result, prompts: onPrompt.mock.calls }).toEqual({
+          result: { ok: true, output: expect.stringContaining("https://example.com/device") },
+          prompts: [[expect.objectContaining({ url: "https://example.com/device?user_code=ABCD-1234" })]],
+        });
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
   afterEach(() => Object.defineProperty(process, "platform", platformDescriptor));
 
@@ -251,7 +271,7 @@ describe("device login shell policy", () => {
     const { io, child, calls } = fakeIo();
     runDeviceLogin(executable, ["login"], { onPrompt: vi.fn(), onDone: vi.fn() }, io, {});
     child.emit("close", 0);
-    expect(calls[0]).toEqual([executable, ["login"], expect.objectContaining({ shell })]);
+    expect(calls[0]).toEqual([shell ? `"${executable}"` : executable, ["login"], expect.objectContaining({ shell })]);
   });
 
   it("keeps Claude paste-code stdin piped through the win32 shell", () => {

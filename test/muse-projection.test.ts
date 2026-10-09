@@ -21,11 +21,41 @@ describe("Muse raw notification projection", () => {
     expect(logs).toEqual(["Muse projection: prefix-changing text revision for item answer"]);
   });
 
+  it.each(["inProgress", "completed", "failed", "cancelled", "rejected", "timedOut", "aborted", "futureStatus"])(
+    "projects live and replayed tool status %s using the open terminal contract", status => {
+      for (const history of [false, true]) {
+        const updates: any[] = [];
+        const p = new Projection(u => updates.push(u), () => {});
+        const item = { itemId: "tool", kind: "toolCall", tool: "bash", revision: 2, status };
+        if (history) p.acceptHistory(item);
+        else {
+          p.accept("item/started", { item: { ...item, revision: 1, status: "inProgress" } });
+          p.accept("item/updated", { item });
+        }
+        const expected = status === "inProgress" ? "in_progress" : status === "completed" ? "completed" : "failed";
+        expect(updates.at(-1)).toMatchObject({ status: expected,
+          rawOutput: expected === "failed" ? { message: `Muse tool ended with status: ${status}` } : undefined });
+      }
+    });
+
+  it.each([
+    ['{"command":"echo example","timeout":123}', { command: "echo example", timeout: 123 }],
+    ['{"cmd":"echo alias"}', { cmd: "echo alias" }],
+    ['{"path":"example.txt"}', { path: "example.txt" }],
+    ["{}", {}], [undefined, undefined], ["", undefined], ["{invalid", undefined],
+    ["null", undefined], ["[]", undefined], ['"echo not an object"', undefined], ["42", undefined],
+  ])("projects argument JSON %s safely as an object", (args, expected) => {
+    const updates: any[] = [];
+    const p = new Projection(u => updates.push(u), () => {});
+    p.accept("item/started", { item: { itemId: "tool", kind: "toolCall", tool: "bash", revision: 1, status: "inProgress", args } });
+    expect(updates[0].rawInput).toEqual(expected);
+  });
+
   it("projects tool output snapshots and consumes reminder lifecycle without answer text", () => {
     const updates: any[] = [], logs: string[] = [];
     const p = new Projection(u => updates.push(u), m => logs.push(m));
     p.accept("item/started", { item: { itemId: "tool", callId: "call", kind: "toolCall",
-      revision: 1, tool: "bash", args: { command: "example" }, status: "running" } });
+      revision: 1, tool: "bash", args: JSON.stringify({ command: "example" }), status: "inProgress" } });
     for (const delta of ["one", " two"]) p.accept("item/delta", { itemId: "tool", field: "output", delta });
     p.accept("item/completed", { item: { itemId: "tool", callId: "call", kind: "toolCall",
       revision: 2, tool: "bash", status: "completed", visibleOutput: "one two" } });

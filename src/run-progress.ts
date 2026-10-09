@@ -1,7 +1,8 @@
 /**
  * Pure helpers for Deep Research / Workflow / Goal progress cards (P2-10).
  *
- * These ride the live `_x.ai/session_notification` rail as:
+ * These ride live `_x.ai/session_notification` and persisted/replayed
+ * `_x.ai/session/update` rails as:
  *   - `workflow_updated`  — background workflow / deep-research runs
  *   - `goal_updated`      — `/goal` autonomous loops
  *
@@ -100,6 +101,7 @@ const LIFECYCLE_STATUS = /paus|cancel|stopp|stopped|complet|fail|error|interrupt
 
 /** Terminal-ish phases that stop the live dots. */
 const DONE_PHASES = new Set([
+  "complete",
   "completed",
   "failed",
   "cancelled",
@@ -136,6 +138,10 @@ export interface RunProgressUpdate {
   phase: string;
   /** One-line status (last_event + detail, deliverable title, …). */
   detail?: string;
+  /** Source-preserving workflow content. Null means supplied but no content;
+   * absence means an older host whose `detail` has lost field provenance.
+   * Keep `detail` unchanged for older clients; they ignore this extra field. */
+  workflowContent?: { resultSummary: string | null; pauseMessage: string | null };
   /**
    * 0–1 COMPLETION when known — goals only.
    *
@@ -185,7 +191,7 @@ function lower(v: unknown): string {
 }
 
 /**
- * True when an `_x.ai/session_notification` update is a workflow/goal progress
+ * True when an xAI session update is a workflow/goal progress
  * event the progress cards act on. Excludes high-frequency noise (no
  * subagent_progress equivalent here — workflow_updated is the rollup).
  */
@@ -210,7 +216,7 @@ export function isRunProgressUpdate(update: unknown): boolean {
 }
 
 /**
- * Normalize a session_notification update into a card-friendly shape, or null
+ * Normalize an xAI session update into a card-friendly shape, or null
  * when it isn't a run-progress kind / lacks an id.
  */
 export function parseRunProgressUpdate(update: unknown): RunProgressUpdate | null {
@@ -323,6 +329,7 @@ function parseWorkflow(u: Record<string, unknown>, sessionUpdate: string): RunPr
     subtitle: objective,
     phase,
     detail: detailParts.join(" · ") || undefined,
+    workflowContent: { resultSummary: resultSummary || null, pauseMessage: pauseMsg || null },
     agentsUsed,
     agentBudget,
     phases: Array.isArray(u.phases) ? u.phases.flatMap((value) => {

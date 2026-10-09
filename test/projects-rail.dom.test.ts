@@ -1666,6 +1666,10 @@ describe("projects rail", () => {
       const twistyIdx = kids.findIndex((c) => c.includes("rail-head-twisty"));
       expect(titleIdx).toBeGreaterThanOrEqual(0);
       expect(twistyIdx).toBeGreaterThan(titleIdx);
+      const indicator = recentBtn.querySelector(".rail-head-twisty")!;
+      expect(indicator.querySelector("svg path")).not.toBeNull();
+      expect(indicator.textContent).toBe("");
+      expect(indicator.getAttribute("aria-hidden")).toBe("true");
     });
 
     it("collapses and remembers RECENT / PROJECTS", () => {
@@ -1802,6 +1806,8 @@ describe("projects rail", () => {
       // Both are indicators, not buttons; the whole head toggles.
       expect(twisty().tagName).toBe("SPAN");
       expect(chevron().tagName).toBe("SPAN");
+      expect(chevron().querySelector("svg path")).not.toBeNull();
+      expect(chevron().textContent).toBe("");
       const openMark = markPath();
       const openChev = chevPath();
       click(window, alpha().querySelector(".rail-repo-head") as HTMLElement);
@@ -1809,7 +1815,13 @@ describe("projects rail", () => {
       expect(alpha().querySelector(".rail-sessions")).toBe(null);
       // Only the chevron answers the fold. The mark is the project's identity.
       expect(chevPath()).not.toBe(openChev);
+      expect(chevron().textContent).toBe("");
       expect(markPath()).toBe(openMark);
+    });
+
+    it("uses the existing 36px touch floor for whole disclosure targets", () => {
+      const css = fs.readFileSync(new URL("../media/chat.css", import.meta.url), "utf8");
+      expect(css).toMatch(/@media \(hover: none\), \(pointer: coarse\) \{\s*\.rail-head-btn \{ min-height: 36px; \}\s*\.rail-repo-head \{ min-height: max\(36px, var\(--rail-repo-min-height\)\); \}/);
     });
 
     it("the whole project header toggles expand; hover actions do not", () => {

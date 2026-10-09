@@ -1,4 +1,5 @@
 import type { SessionUpdate } from "@agentclientprotocol/sdk";
+import { parseToolInput } from "./tool-input.mjs";
 
 interface ItemState {
   kind?: string;
@@ -79,11 +80,15 @@ export class Projection {
     if (item.kind === "toolCall") {
       const first = !state.toolCallId;
       state.toolCallId = item.callId || id;
-      const status = item.status === "completed" ? "completed"
-        : ["failed", "cancelled", "aborted"].includes(item.status) ? "failed" : "in_progress";
+      // MSP's open enum has exactly one nonterminal value. ACP has no
+      // terminal-unknown status: use its non-success terminal and preserve
+      // the reported outcome as generic text, including future MSP values.
+      const status = item.status === "inProgress" ? "in_progress"
+        : item.status === "completed" ? "completed" : "failed";
       this.emit({ sessionUpdate: first ? "tool_call" : "tool_call_update",
         toolCallId: state.toolCallId!, title: item.tool || "Muse tool",
-        kind: item.tool === "bash" ? "execute" : "other", status, rawInput: item.args });
+        kind: item.tool === "bash" ? "execute" : "other", status, rawInput: parseToolInput(item.args),
+        rawOutput: status === "failed" ? { message: `Muse tool ended with status: ${item.status}` } : undefined });
       if (typeof item.visibleOutput === "string") this.append(state, id, "output", item.visibleOutput);
     } else if (item.kind === "agentMessage" && typeof item.text === "string") {
       this.append(state, id, "text", item.text);

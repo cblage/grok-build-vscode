@@ -9,6 +9,20 @@ const request = { sessionId: "session", approvalId: "approval", toolCallId: "cal
   currentRequirementId: { approvalId: "approval", sourceIndex: 0 }, availableChoices: [once, session, persistent, deny] };
 
 describe("Muse permission correlation", () => {
+  it.each([
+    ['{"command":"echo example"}', { command: "echo example" }, "echo example"],
+    ['{"cmd":"echo alias"}', { cmd: "echo alias" }, "echo alias"],
+    ['{"path":"example.txt"}', { path: "example.txt" }, "bash"],
+    ['{"command":42}', { command: 42 }, "bash"],
+    ['{"command":""}', { command: "" }, "bash"],
+    [undefined, undefined, "bash"], ["{invalid", undefined, "bash"], ["null", undefined, "bash"],
+    ["[]", undefined, "bash"], ['"not an object"', undefined, "bash"],
+  ])("shows the parsed approval arguments without inventing a command for %s", (rawArgs, rawInput, title) => {
+    const ask = vi.fn((_params: any) => new Promise<any>(() => {}));
+    new Approvals(ask, vi.fn(), vi.fn(), vi.fn()).accept("approval/requested", { ...request, rawArgs });
+    expect(ask.mock.calls[0][0].toolCall).toEqual({ toolCallId: "call", title, kind: "execute", status: "pending", rawInput });
+  });
+
   it("preserves offered ids and does not advertise a session grant as persistent", () => {
     expect(permissionOptions(request.availableChoices)).toEqual([
       { optionId: once.choiceId, name: "Allow (once)", kind: "allow_once" },

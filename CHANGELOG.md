@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.11.1-sandbox.1 — 2026-09-22
+## 4.11.1-sandbox.1 — 2026-10-09
 
 ### Added
 
@@ -22,43 +22,32 @@
 
 ---
 
-## 4.11.0 — 2026-09-21
+## 4.11.0 — 2026-09-23
 
-**A fourth agent to talk to, and a workflow card you can read at a glance.** Muse Code joins Grok, Codex and Claude Code. The workflow card stops saying everything it knows all the time. And the conversation list no longer starts a process per repository to build itself.
+
+**A fourth agent to talk to, and a workflow that knows when it is finished.** Muse Code joins Grok, Codex and Claude Code. A running workflow stays within reach; a finished one leaves a report where it happened, including when nobody was watching it finish.
 
 ### Added
 
-- **Muse Code is a fourth provider.** Meta's coding agent now appears alongside Grok, Codex and Claude Code: sign in through Muse's own CLI, hold a conversation with streaming replies and tool approvals, resume from history, and pick a model. It does not speak the protocol the other three share, so the extension ships a small adapter that translates — the same arrangement Codex and Claude Code already run under, with the difference that this one is ours rather than a third party's.
+- **Muse Code is a fourth provider.** Connect Meta's coding agent in **Settings → Providers**, then pick its model and reasoning effort, follow streaming replies, approve tools and resume conversations from history. Sign-in works from the editor, a browser or your phone: the computer running Muse starts its own login, and your screen shows Meta's link and short code. macOS and Linux install it with Meta's own script; on Windows that script does not run, so the CLI has to be put on PATH by hand — the extension no longer treats Windows as impossible, and starts Muse normally once it is there. About shows the installed CLI version once it has been read. Approval choices belong to Muse. Mode switching, steering, compaction, history deletion and the connectors managed here are not offered for it.
 
-  **The platform that decides is the one the agent runs on**, not the one you are looking at — so a Windows browser driving a Mac offers Muse normally.
-
-  **Sign in from wherever you are.** `muse login` turns out to be an ordinary device-code flow, so Muse connects the same way the other three do: the machine running the agent starts the login, and Meta's link and short code arrive on whichever screen asked for them — a phone, a browser, or the editor at your desk.
-
-  Two of the models Muse offers are marked *contributor*, and one of them is Muse's own default. Muse's description is passed through to the picker exactly as Meta writes it: "Your content, including inter-session messages, may be used for product improvement." Worth reading before you pick one.
-
-  Deleting history and compacting a conversation are **not** implemented for Muse, and are hidden rather than offered and failing.
-
-  About names Muse's installed CLI version beside the other three, once the host has read it.
+  Some of the models Muse offers are marked as contributing your data, including one of its own defaults. Meta's description is passed to the picker exactly as Meta writes it — “Your content, including inter-session messages, may be used for product improvement.” Worth reading before you pick one.
 
 ### Changed
 
-- **The workflow card was rebuilt around what you actually need mid-run (#163).** It used to draw the same run three times over — a tool line, a card in the transcript, and a pinned card identical to it — and hedge its liveness three times in a row in the headline. On a phone the pinned copy alone took about half the screen.
+- **A workflow stays in reach while it runs, and gets out of the way when it finishes (#163).** The live card pins above the composer, collapsed by default: its name, reported phase dots, current phase, elapsed time and when an update last arrived. Pause, Resume and Stop stay reachable. Open it for the phase strip and one row per agent; while it is closed, agents that have failed or are waiting on a permission prompt are COUNTED by state — “1 agent failed” — which is the smallest thing that distinguishes a stuck run from a quiet one without putting the roster back on the card. An arriving update is not proof that an agent is making progress, so the card keeps those two facts separate.
 
-  There are two surfaces now and each has one job. **In the transcript** a running workflow is one line, the name and its status, which does not expand; when the run finishes it becomes the report and opens, because there is finally something fixed to read. **Pinned above the composer**, the card is collapsed by default: the name, one dot per reported step with the current one marked, the phase, elapsed, and a single freshness line. Tap it for the labelled phase strip, the agent budget, and one row per agent — each of which opens for its own detail. Pause, Resume and Stop stay reachable either way, because the transcript card scrolls out of reach, which was the original complaint.
+  When the run ends, the pin goes and its transcript marker becomes a **collapsed report**. The header shows the outcome, reported duration and phase dots without asking you to open it. Open it for the result and agent detail. A finish missed while nobody was watching is recovered from the saved workflow state; reopening an older conversation puts the report where the run happened, without reviving the pin or appending a second copy at the bottom.
 
-  **Agents that are failed, cancelled, or waiting on a permission prompt are named on the collapsed card.** They are the one thing a quiet card cannot hide: a stuck agent still arrives inside frames, so the freshness line goes on reading "updated 3s ago" while nothing actually moves.
+- **The conversation list no longer starts a process for every project.** Codex, Claude and Muse each reuse one history connection across repositories. Opening several projects no longer multiplies the same background work, and the shared process starts outside the project folders so closing one releases it on Windows.
 
-  Where the wire cannot establish that something is alive, the card still says so rather than implying it. A frame arriving is "updated 20s ago". A token moving is attributable activity and sits on the agent row it describes. "Reported running" is neither, and says that too. Nothing animates — a pulsing indicator on a local timer would be the same kind of lie as the percentage this card lost in 4.9.0.
-
-- **Counts read as counts.** `19,638` rather than `19638`, wherever a number is drawn — the workflow card, the file panel's change counts, the settings routine counts, the turn summary.
-
-- **Opening the app no longer spawns a process per repository.** With five projects on the rail, starting one session used to spawn ten adapter processes in 400ms — one Codex and one Claude per repo — each alive for about 25 seconds, each re-arming for as long as the rail was on screen, and every one of them existing to make a single history request. It is two processes now, reused across every project, so the opening burst is a few cheap round trips instead of ten process launches.
+- **Counts read as counts.** Large counts use separators in the workflow card, file panel, settings routines and turn summary.
 
 ### Fixed
 
-- **A closed project folder can be deleted again on Windows.** The shared history process above outlives the project that first asked for it, and a process born inside a folder holds that folder open — so after closing a project, Explorer would refuse to delete or rename it, with nothing on screen explaining why. The process now starts in your home directory, which is never a project. It makes no difference to what history you get back: that was measured against both CLIs, not assumed.
+- **A Windows install path with spaces can start an agent again.** A command shim installed under a name such as `C:\Users\Jane Smith\…` was split at the space before the CLI could start. Signing in now preserves that path across all four providers, and Muse’s Windows launcher can start the agent from it too.
 
-- **Clear all history no longer promises more than it does.** The confirmation names the providers it will actually clear, and says what it kept. A provider that cannot delete its history no longer shows a Delete that silently does nothing.
+- **Clear all history says what it can clear.** The confirmation names the providers it can actually clear and says open conversations are kept; Muse is reported separately afterwards, as history that was not cleared. Muse rows no longer offer a Delete that cannot work.
 
 ## 4.10.0 — 2026-09-21
 

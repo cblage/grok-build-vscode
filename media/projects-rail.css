@@ -363,6 +363,9 @@ html, body {
   pointer-events: none;
 }
 .rail-chevron svg { width: 12px; height: 12px; }
+@media (hover: none), (pointer: coarse) {
+  .rail-head-btn { min-height: 36px; }
+}
 
 /* The mark carries the project tint; the chevron beside it never does. Tinting
    both would make the disclosure state look like part of the identity, and a

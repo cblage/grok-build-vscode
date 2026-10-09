@@ -1162,6 +1162,7 @@
     btn.appendChild(titleEl);
     const twisty = document.createElement("span");
     twisty.className = "rail-head-twisty";
+    twisty.setAttribute("aria-hidden", "true");
     twisty.innerHTML = opts.open ? ICON.chevronDown : ICON.chevronRight;
     btn.appendChild(twisty);
     btn.disabled = !!opts.forcedOpenBySearch;

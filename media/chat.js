@@ -2023,6 +2023,7 @@
         })
         .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
         .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
+        .replace(/(^|[^\p{L}\p{N}_])_([^_\n]+)_(?=$|[^\p{L}\p{N}_])/gu, "$1<em>$2</em>")
         .replace(/\x00C(\d+)\x00/g, (_, i) => held[+i]);
     }
 
@@ -7529,7 +7530,7 @@
     let html = "";
     if (opts.icon) html += `<span class="rail-head-icon">${opts.icon}</span>`;
     html += `<span class="rail-head-title"></span>`;
-    html += `<span class="rail-head-twisty">${opts.open ? ICON.chevronDown : ICON.chevronRight}</span>`;
+    html += `<span class="rail-head-twisty" aria-hidden="true">${opts.open ? ICON.chevronDown : ICON.chevronRight}</span>`;
     btn.innerHTML = html;
     btn.querySelector(".rail-head-title").textContent = opts.title;
     btn.disabled = !!opts.forcedOpenBySearch;
@@ -14079,6 +14080,45 @@
     return name || "";
   }
 
+  // The roster printed the label and the phase side by side, and the label
+  // almost always already contained the phase: an agent labelled `pick` in
+  // phase `Pick` read "pick Pick", `read:readme` in `Read` read
+  // "read:readme Read". Compose ONE name -- the phase, then only what the
+  // label actually adds.
+  const AGENT_NAME_SEPARATORS = " :_-/";
+
+  function workflowAgentName(agent) {
+    const phase = String(agent.phase || "").trim();
+    const label = String(agent.label || "").trim();
+    if (!phase || !label) return label || phase;
+    // Compared and stripped with an explicit character list rather than a
+    // regex class: an earlier spelling lost its backslash and silently ate
+    // the letter s, turning `report-synthesizer` into `Report / ynthesizer`.
+    const sep = (c) => AGENT_NAME_SEPARATORS.includes(c);
+    const bare = (s) => s.toLowerCase().split("").filter((c) => !sep(c)).join("");
+    if (bare(label) === bare(phase)) return phase;
+    if (label.toLowerCase().startsWith(phase.toLowerCase())) {
+      const tail = label.slice(phase.length);
+      let i = 0;
+      while (i < tail.length && sep(tail[i])) i++;
+      const rest = tail.slice(i);
+      if (!rest) return phase;
+      // `read:readme` adds "readme" after a separator, so the phase leads and
+      // the label contributes the rest. `researcher-0` has no separator: it
+      // already reads as its own phase and stands alone, because
+      // "Research / researcher-0" is the repetition again.
+      return i > 0 ? `${phase} / ${rest}` : label;
+    }
+    return `${phase} / ${label}`;
+  }
+
+  // The live lifecycle word, humanized. An empty phase means ordinarily
+  // running: the CLI only fills it once something has happened to the run.
+  function workflowLiveStatus(update) {
+    return /paus|interrupt|budget|block|permission/i.test(update.phase || "")
+      ? String(update.phase).replace(/[_-]+/g, " ").trim() || "running" : "running";
+  }
+
   function workflowElapsed(ms) {
     const seconds = Math.floor(Math.max(0, ms) / 1000);
     return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
@@ -14096,8 +14136,16 @@
     // A snapshot can include a total before this view observes an increase.
     const noTokens = Number.isFinite(agent.tokensUsed) && agent.tokensUsed > 0 ? "" : "no token activity observed";
     if (!event) return noTokens;
-    const seconds = Math.max(0, Math.floor((Date.now() - event.at) / 1000));
-    return `${event.kind} ${formatCount(seconds)}s ago${!event.tokensObserved && noTokens ? ` · ${noTokens}` : ""}`;
+    const label = record.update.done ? event.kind : workflowAge(event.at, event.kind,
+      event.kind === "tokens moved" ? "no recent token movement (30s+)" : "no recent state change (30s+)");
+    return `${label}${!event.tokensObserved && noTokens ? ` · ${noTokens}` : ""}`;
+  }
+
+  // Receipt silence is not proof a run stopped. Keep the two clocks distinct,
+  // but replace unbounded seconds with a quiet, stable observation after 30s.
+  function workflowAge(at, label, quiet) {
+    const seconds = Math.max(0, Math.floor((Date.now() - at) / 1000));
+    return seconds >= 30 ? quiet : `${label} ${formatCount(seconds)}s ago`;
   }
 
   function workflowBlockages(update) {
@@ -14133,9 +14181,10 @@
         // Three distinct facts, never one standing in for another: a frame
         // arrived just now, a frame arrived before this view existed (replay),
         // and this is a finished run being read back.
-        if (receipt) receipt.textContent = record.receivedAt != null
-          ? `updated ${formatCount(Math.max(0, Math.floor((Date.now() - record.receivedAt) / 1000)))}s ago`
-          : record.update.done ? "historical workflow update" : "no update since this view opened";
+        if (receipt) receipt.textContent = record.update.done
+          ? record.receivedAt != null ? "final workflow update" : "historical workflow update"
+          : record.receivedAt != null ? workflowAge(record.receivedAt, "updated", "no recent updates (30s+)")
+          : "no update since this view opened";
         for (const row of surface.querySelectorAll(".workflow-agent")) {
           const agent = record.update.agents[Number(row.dataset.agentIndex)];
           row.querySelector(".workflow-agent-activity").textContent = workflowAgentActivity(record, agent);
@@ -14144,33 +14193,68 @@
     }
   }
 
+  function workflowOutputText(raw) {
+    if (typeof raw !== "string") return "";
+    const text = raw.trim();
+    // The CLI renders a null completion value as "done".
+    if (!text || text === "done") return "";
+    try {
+      const value = JSON.parse(text);
+      if (typeof value === "string") return workflowOutputText(value);
+      if (value && !Array.isArray(value) && typeof value === "object") {
+        // Known human-facing fields, not arbitrary strings such as status,
+        // paths or ids. Workflow completion values have no universal schema.
+        for (const field of ["report", "summary", "sentence"]) {
+          const content = workflowOutputText(value[field]);
+          if (content) return content;
+        }
+      }
+      return "";
+    } catch {
+      // summarize_result caps at 16KiB: a truncated JSON object must not
+      // fall back to a raw blob. Nor should a JSON code fence bypass this.
+      if (/^(?:\{|\[\s*(?:["{[\d-]|true\b|false\b|null\b|\]))/.test(text) || /^```(?:json)?\s*[\r\n]/i.test(text)) return "";
+      return text;
+    }
+  }
+
   function renderWorkflowSurface(el, record) {
     const u = record.update;
     if (!el.firstChild) {
       const headingTag = u.done ? "div" : "button";
       el.innerHTML = `<div class="workflow-heading"><${headingTag} class="workflow-pin-toggle run-progress-row"><span class="run-progress-title"></span><span class="workflow-dots" hidden></span><span class="run-progress-phase"></span><span class="run-progress-elapsed" hidden></span><span class="workflow-chevron" aria-hidden="true"></span></${headingTag}></div>` +
-        `<div class="workflow-receipt"></div><div class="workflow-blocked" hidden></div><div class="workflow-expanded" hidden><ol class="workflow-phases" hidden></ol><div class="run-progress-sub" hidden></div><div class="run-progress-detail" hidden></div><div class="workflow-spend" hidden></div><ul class="workflow-roster" hidden></ul></div><div class="run-progress-actions"></div>`;
+        `<div class="run-progress-sub" hidden></div><div class="workflow-progress"><ol class="workflow-phases" hidden></ol><div class="workflow-timing"></div><div class="workflow-receipt"></div><div class="workflow-blocked" hidden></div><div class="run-progress-detail" hidden></div><div class="workflow-spend" hidden></div></div><div class="workflow-expanded" hidden><ul class="workflow-roster" hidden></ul></div><div class="run-progress-actions"></div>`;
       if (!u.done) el.querySelector(".workflow-pin-toggle").onclick = () => {
         record.expanded = !record.expanded;
         syncWorkflowPin();
       };
     }
-    el.classList.toggle("is-expanded", !!record.expanded);
+    const expanded = u.done || !!record.expanded;
+    el.classList.toggle("is-expanded", expanded);
     const toggle = el.querySelector(".workflow-pin-toggle");
     if (!u.done) {
       toggle.type = "button";
       toggle.setAttribute("aria-expanded", String(!!record.expanded));
     }
-    el.querySelector(".workflow-expanded").hidden = !record.expanded;
+    el.querySelector(".workflow-expanded").hidden = !expanded;
+    el.querySelector(".workflow-chevron").innerHTML = record.expanded ? ICON.chevronDown : ICON.chevronRight;
     const title = el.querySelector(".run-progress-title");
     title.textContent = u.title && u.title !== u.id ? u.title : u.displayName || "Workflow";
     title.title = title.textContent;
     if (!u.done) toggle.setAttribute("aria-label", `${record.expanded ? "Collapse" : "Expand"} ${title.textContent}`);
-    const status = u.failed ? "failed" : u.cancelled ? "cancelled" : u.done ? "done" : String(u.phase || "").replace(/[_-]+/g, " ");
     const position = workflowPhaseLabel(u);
-    const lifecycle = u.done || /paus|interrupt|budget|block|permission/i.test(u.phase || "");
-    el.querySelector(".run-progress-phase").textContent = position || lifecycle ? `· ${position || status}${position && lifecycle ? ` · ${status}` : ""}` : "";
+    // Expanded, the heading carries the status and the strip carries the step.
+    // Collapsed, neither is on screen, so a run that has STOPPED must say so
+    // here or it is indistinguishable from one still working.
+    const live = workflowLiveStatus(u);
+    el.querySelector(".run-progress-phase").textContent = expanded ? ""
+      : live === "running" ? position
+      : position ? `${position} · ${live}` : live;
     const elapsed = el.querySelector(".run-progress-elapsed");
+    const timing = el.querySelector(".workflow-timing");
+    if (expanded) timing.appendChild(elapsed);
+    else toggle.insertBefore(elapsed, el.querySelector(".workflow-chevron"));
+    timing.hidden = !expanded || !Number.isFinite(u.elapsedMs);
     elapsed.hidden = !Number.isFinite(u.elapsedMs);
     elapsed.textContent = elapsed.hidden ? "" : workflowElapsed(u.elapsedMs);
     elapsed.title = "Reported workflow elapsed time; advances only when reported";
@@ -14187,8 +14271,9 @@
     const dots = el.querySelector(".workflow-dots");
     strip.replaceChildren();
     dots.replaceChildren();
-    strip.hidden = !Array.isArray(u.phases) || !u.phases.length;
-    dots.hidden = strip.hidden || !!record.expanded;
+    const hasPhases = Array.isArray(u.phases) && u.phases.length;
+    strip.hidden = !hasPhases || !expanded;
+    dots.hidden = !hasPhases || expanded;
     strip.setAttribute("aria-label", "Reported workflow phases");
     dots.setAttribute("aria-label", "Reported workflow steps");
     // Position and state are both reported fields. Never guess completion from
@@ -14198,32 +14283,56 @@
     const ids = reference ? phases.filter((p) => p.id === reference) : [];
     const matches = u.currentPhaseId || ids.length ? ids : phases.filter((p) => reference && p.title === reference);
     for (const phase of phases) {
-      const current = matches.length === 1 ? phase === matches[0] : !reference && phase.state === "active";
-      const phaseState = current ? "active" : phase.state || "unknown";
+      const atPosition = matches.length === 1 ? phase === matches[0] : !reference && phase.state === "active";
+      const reportedTerminal = /^(done|complete|completed|failed|cancelled|stopped)$/.test(phase.state || "");
+      const current = !u.done && !reportedTerminal && atPosition;
+      // current_phase survives completion. It locates the final step; it must
+      // not revive it, nor leave an active step in a terminal transcript card.
+      const phaseState = u.done && !reportedTerminal && (atPosition || phase.state === "active" || (!phase.state && !u.failed && !u.cancelled))
+        ? u.failed ? "failed" : u.cancelled ? "cancelled" : "done"
+        : current ? "active" : phase.state || "unknown";
       for (const [parent, className, label, tag] of [[strip, "workflow-phase", phase.title, "li"], [dots, "workflow-dot", "", "span"]]) {
         const item = workflowText(parent, className, label, tag);
         item.dataset.state = phaseState;
         if (phase.id) item.dataset.phaseId = phase.id;
-        item.title = `${phase.title}: ${current ? "current" : phase.state || "state unavailable"}`;
+        item.title = `${phase.title}: ${current ? "current" : phaseState === "unknown" ? "state unavailable" : phaseState}`;
         item.setAttribute("aria-label", item.title);
         if (current) item.setAttribute("aria-current", "step");
       }
     }
-    let detailText = u.detail;
-    if (detailText && Number.isFinite(u.agentsUsed) && Number.isFinite(u.agentBudget)) {
-      detailText = detailText.replace(`${u.agentsUsed} of ${u.agentBudget} agents used`, `${formatCount(u.agentsUsed)} of ${formatCount(u.agentBudget)} agents used`);
-    }
+    // Legacy detail mixes results, pause reasons and arbitrary CLI events.
+    // Its provenance cannot be recovered by splitting on a separator. Only
+    // source-preserving hosts can provide output; do not guess on old hosts.
+    const detailText = u.workflowContent?.pauseMessage;
     for (const [selector, value] of [[".run-progress-sub", u.subtitle], [".run-progress-detail", detailText]]) {
       const target = el.querySelector(selector);
-      target.hidden = !value;
+      target.hidden = !expanded || !value;
       target.textContent = value || "";
     }
     const spend = el.querySelector(".workflow-spend");
     const spendText = Number.isFinite(u.agentsUsed)
       ? (Number.isFinite(u.agentBudget) ? `${formatCount(u.agentsUsed)} of ${formatCount(u.agentBudget)} agents used` : `${formatCount(u.agentsUsed)} agents used`)
       : Number.isFinite(u.agentBudget) ? `${formatCount(u.agentBudget)} agent budget` : "";
-    spend.hidden = !spendText || (detailText || "").includes(spendText);
+    spend.hidden = !expanded || !spendText;
     spend.textContent = spendText;
+    const outputText = workflowOutputText(u.workflowContent?.resultSummary);
+    let output = el.querySelector(".workflow-output");
+    if (!outputText) {
+      if (output) output.remove();
+    } else {
+      if (!output) {
+        output = document.createElement("section");
+        output.className = "workflow-output";
+        output.setAttribute("aria-label", "Output");
+        workflowText(output, "workflow-output-label", "Output", "strong");
+        workflowText(output, "workflow-output-body", "");
+        el.querySelector(".workflow-expanded").prepend(output);
+      }
+      const body = output.querySelector(".workflow-output-body");
+      body.innerHTML = renderMarkdown(outputText);
+      applyAutoDir(body);
+      renderMermaidIn(body);
+    }
     const roster = el.querySelector(".workflow-roster");
     roster.hidden = !Array.isArray(u.agents);
     const existing = new Map([...roster.children].filter((row) => row._agentKey).map((row) => [row._agentKey, row]));
@@ -14234,24 +14343,41 @@
       row._agentKey = key;
       row.dataset.agentIndex = String(i);
       row.dataset.state = agent.state || "unknown";
+      const activity = workflowAgentActivity(record, agent);
+      // A finished run has nothing behind the row worth opening -- the detail
+      // is the live activity line, which reads "tokens moved" and no more.
+      // It also only EXISTS when this view watched the run finish: activity is
+      // recorded off the live rail only, so the same report drew chevrons or
+      // not depending on whether you happened to be looking. Now neither does.
+      const hasDetails = !!activity && !record.update.done;
+      if (row._hasDetails !== hasDetails) row.replaceChildren();
+      row._hasDetails = hasDetails;
       if (!row.firstChild) {
-        const button = workflowText(row, "workflow-agent-toggle", "", "button");
-        button.type = "button";
-        button.setAttribute("aria-expanded", "false");
+        const button = workflowText(row, "workflow-agent-toggle", "", hasDetails ? "button" : "div");
+        if (hasDetails) {
+          button.type = "button";
+          button.setAttribute("aria-expanded", "false");
+        }
         workflowText(button, "workflow-agent-name", "", "strong");
         workflowText(button, "workflow-agent-state", "", "span");
+        const chevron = hasDetails ? workflowText(button, "workflow-agent-chevron", "", "span") : null;
+        if (chevron) {
+          chevron.setAttribute("aria-hidden", "true");
+          chevron.innerHTML = ICON.chevronRight;
+        }
         const detail = workflowText(row, "workflow-agent-detail", "");
         detail.hidden = true;
         workflowText(detail, "workflow-agent-activity", "");
-        button.onclick = () => {
+        if (hasDetails) button.onclick = () => {
           detail.hidden = !detail.hidden;
           button.setAttribute("aria-expanded", String(!detail.hidden));
+          chevron.innerHTML = detail.hidden ? ICON.chevronRight : ICON.chevronDown;
         };
       }
-      row.querySelector(".workflow-agent-name").textContent = agent.label;
-      row.querySelector(".workflow-agent-state").textContent = [agent.phase, agent.state ? agent.state.replace(/[_-]+/g, " ") : "",
+      row.querySelector(".workflow-agent-name").textContent = workflowAgentName(agent);
+      row.querySelector(".workflow-agent-state").textContent = [agent.state ? agent.state.replace(/[_-]+/g, " ") : "",
         Number.isFinite(agent.tokensUsed) ? `${compactTokens(agent.tokensUsed)} tokens` : ""].filter(Boolean).join(" · ");
-      row.querySelector(".workflow-agent-activity").textContent = workflowAgentActivity(record, agent);
+      row.querySelector(".workflow-agent-activity").textContent = activity;
       return row;
     });
     for (const child of [...roster.children]) if (!rows.includes(child)) child.remove();
@@ -14287,6 +14413,11 @@
     }
   }
 
+  function syncWorkflowReportChevron(report) {
+    const chevron = report.querySelector(".workflow-report-chevron");
+    if (chevron) chevron.innerHTML = report.open ? ICON.chevronDown : ICON.chevronRight;
+  }
+
   function renderWorkflowTranscript(el, record) {
     const u = record.update;
     const name = u.title && u.title !== u.id ? u.title : u.displayName || "Workflow";
@@ -14295,7 +14426,7 @@
     el.classList.toggle("run-progress-done", !!u.done);
     if (!u.done) {
       el.replaceChildren();
-      const status = /paus|interrupt|budget|block|permission/i.test(u.phase || "") ? String(u.phase).replace(/[_-]+/g, " ") : "running";
+      const status = workflowLiveStatus(u);
       const marker = workflowText(el, "workflow-marker", "");
       // Every other line in the transcript that reports work carries an icon;
       // a bare string beside them reads as something half-drawn.
@@ -14306,12 +14437,36 @@
     if (!report) {
       el.replaceChildren();
       report = workflowText(el, "workflow-report", "", "details");
-      workflowText(report, "workflow-report-toggle", "", "summary");
+      const summary = workflowText(report, "workflow-report-toggle", "", "summary");
+      // The same parts the live card uses, in the same order. A finished run
+      // used to be a bare string beside the browser's OWN <details> marker --
+      // a different glyph, on the opposite side, from every card still running.
+      // Nobody chose two affordances; one of them was the UA default showing
+      // through, which is also why the elapsed time and the steps vanished.
+      // Deliberately NOT the live card's class names. `.workflow-card
+      // .run-progress-phase` would otherwise match the body's copy and this
+      // one, with different meanings, and every existing assertion about the
+      // body would quietly start reading the summary instead.
+      summary.innerHTML = `<span class="workflow-report-name"></span><span class="workflow-report-dots"></span><span class="workflow-report-state"></span><span class="workflow-report-elapsed" hidden></span><span class="workflow-report-chevron" aria-hidden="true"></span>`;
+      report.addEventListener("toggle", () => syncWorkflowReportChevron(report));
       workflowText(report, "workflow-report-body", "");
     }
-    report.querySelector("summary").textContent = `${name} · ${u.failed ? "failed" : u.cancelled ? "cancelled" : "done"}`;
+    const summary = report.querySelector(".workflow-report-toggle");
+    summary.querySelector(".workflow-report-name").textContent = name;
+    summary.querySelector(".workflow-report-state").textContent = u.failed ? "failed" : u.cancelled ? "cancelled" : "done";
     const body = report.querySelector(".workflow-report-body");
     renderWorkflowSurface(body, record);
+    // The body already resolves each step's TERMINAL state for a finished run
+    // (a surviving current_phase must not leave one step looking active), so
+    // clone that rail instead of deriving the same thing a second time.
+    const rail = summary.querySelector(".workflow-report-dots");
+    const resolved = body.querySelector(".workflow-dots");
+    rail.replaceChildren(...[...resolved.children].map((dot) => dot.cloneNode(true)));
+    rail.hidden = !rail.children.length;
+    const reportElapsed = summary.querySelector(".workflow-report-elapsed");
+    reportElapsed.hidden = !Number.isFinite(u.elapsedMs);
+    reportElapsed.textContent = reportElapsed.hidden ? "" : workflowElapsed(u.elapsedMs);
+    syncWorkflowReportChevron(report);
     // Finished reports have one disclosure, with all fixed content inside it.
     body.querySelector(".run-progress-title").hidden = true;
     body.querySelector(".workflow-dots").hidden = true;
@@ -14371,6 +14526,13 @@
   }
 
   function applyWorkflowProgress(update) {
+    // Older hosts recognized the lifecycle word but sent done:false for
+    // `complete`. Repair only explicit terminal evidence, never quiet receipts
+    // or a roster whose agents could be between workflow stages.
+    const terminal = /^(complete|completed|failed|cancelled|cleared|stopped|budget_exceeded|error|success)$/.test(update.phase || "");
+    if (terminal && !update.done) update = { ...update, done: true,
+      failed: update.failed || /^(failed|budget_exceeded|error)$/.test(update.phase),
+      cancelled: update.cancelled || /^(cancelled|cleared|stopped)$/.test(update.phase) };
     const id = String(update.id);
     let el = state.runProgressCards.get(id);
     // Loading older transcript pages must not rewind a live run or its pin.
@@ -19863,6 +20025,15 @@
         applyChildStream(msg);
         break;
       case "runProgress":
+        if (msg.replaceOnly) {
+          // A repair must not append a report outside this surface's window.
+          // Keep parked desk history current for a later prepend as well.
+          for (const entry of state.historyPrefix) {
+            if (entry.type === "runProgress" && entry.update.id === msg.update.id
+              && entry.update.kind === msg.update.kind) entry.update = msg.update;
+          }
+          if (!state.runProgressCards.has(String(msg.update.id))) break;
+        }
         applyRunProgress(msg.update);
         break;
       case "permissionRequest":

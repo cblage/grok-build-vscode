@@ -165,6 +165,22 @@ describe("host-owned session command grants", () => {
     expect(h.reply(1)).toBeUndefined();
   });
 
+  it("leaves Muse's own persistent choice alone and adds no host grant", async () => {
+    const h = harness();
+    h.session.provider = "muse";
+    h.request();
+    // The CLI's own allow_always survives -- it is the card's Save rule, and
+    // dropping it took away a choice that works. Ours is never offered,
+    // because answering it would send a single allow under a session label.
+    const options = h.session.pendingPermissions.get(1)!.options;
+    expect(options.map((o) => o.optionId)).toEqual(["cli-always", "cli-once", "cli-no"]);
+    // And the grant that is never read is never written either.
+    await h.answer("cli-always");
+    expect(h.session.allowedCommandPrograms.size).toBe(0);
+    h.request("npm test", 2);
+    expect(h.reply(2)).toBeUndefined();
+  });
+
   it("offers at most three distinct new programs and names only the missing ones", () => {
     const h = harness();
     h.request("npm t && npm run build && cd a && dotnet test");
