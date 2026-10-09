@@ -1,8 +1,8 @@
-# Grok Build (Community)
+# GUI for Grok Build & Muse Code
 
 [![License: FSL-1.1-MIT](https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg)](LICENSE) ![Agents](https://img.shields.io/badge/Agents-Grok%20Build%20%C2%B7%20Codex%20%C2%B7%20Claude%20Code%20%C2%B7%20Muse%20Code-000000) [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com) [![Cursor](https://badgen.net/badge/Cursor/Extension/007ACC)](https://cursor.com) [![Companion](https://img.shields.io/badge/Companion-AFK%20Pilot-0E639C)](https://afkpilot.com) [![The Product Compass](https://img.shields.io/badge/The%20Product%20Compass-productcompass.pm-FF6B35)](https://www.productcompass.pm)
 
-> **GUI for Grok Build CLI (incl. Grok 4.7)** — not affiliated with or endorsed by SpaceXAI (formerly xAI). *Grok*, *Grok Build*, and *xAI* are trademarks of xAI; this project uses those names only to describe what it's compatible with.
+> **GUI for Grok Build (incl. Grok 4.7) & Muse Code** — and for Codex and Claude Code in the same window. Not affiliated with or endorsed by SpaceXAI (formerly xAI), Meta, OpenAI or Anthropic. *Grok*, *Grok Build* and *xAI* are trademarks of xAI; *Muse Code* of Meta; *Codex* of OpenAI; *Claude Code* of Anthropic. This project uses those names only to describe what it is compatible with.
 
 Two ways to use the same agent UI on top of the **Grok Build CLI**:
 
@@ -245,7 +245,7 @@ While a device is linked or a local agent turn is in flight, the extension also 
 ## Requirements
 
 - **VS Code** 1.106+ (or a compatible editor on the same base — Cursor 3.x qualifies; Antigravity is still on base 1.104 and keeps the last compatible extension version).
-- **A supported provider CLI** on macOS, Linux, or Windows: Grok Build (`grok`), Codex, Claude Code or Muse Code. Grok ships a native Windows build, so the extension runs natively on all three — no WSL required (WSL2 + Remote-WSL still works if you prefer it). Muse's own installer is macOS/Linux only; its Windows binaries exist but you put the CLI on PATH yourself.
+- **A supported provider CLI** on macOS, Linux, or Windows: Grok Build (`grok`), Codex, Claude Code or Muse Code. Grok and Muse ship native Windows installers, so the extension runs natively on all three — no WSL required (WSL2 + Remote-WSL still works if you prefer it).
 - **A login:** either a **SuperGrok or X Premium+** subscription (`grok login`) or an xAI API key. Either subscription unlocks **Grok Build**; with an API key you also get the **grok-4.x** models and **grok-imagine**. (Grok's free tier does **not** include the CLI agent.)
 - **Voice control** is optional and uses Grok sign-in or an OpenAI API key (Codex sign-in alone does not include transcription) — it just needs [`ffmpeg`](https://ffmpeg.org) to record. Setup + advanced options: [docs/voice-setup.md](docs/voice-setup.md).
 
@@ -253,9 +253,16 @@ While a device is linked or a local agent turn is in flight, the extension also 
 
 ## Install
 
+**Muse Code:** choose **Connect** in Settings → Providers. If Muse is missing, the VS Code / Cursor sidebar and desktop app offer **Install Muse Code**, with a confirmation before Meta's installer runs in a visible terminal. Afterwards, click **Re-check**, then **Connect Muse Code**. You can also install manually:
+
+- **Windows (PowerShell):** `irm https://dev.meta.ai/install.ps1 | iex` — installs to `%LOCALAPPDATA%\Programs\muse\muse.cmd` and adds that directory to your user PATH.
+- **macOS / Linux:** `curl -fsSL https://dev.meta.ai/install.sh | bash` — installs to `~/.local/bin/muse`.
+
+On a phone or remote browser, Muse must be installed on the machine running the workspace; the remote view cannot launch the desk installer.
+
 ### VS Code / Cursor extension
 
-**1. Install the extension.** In VS Code or Cursor, open **Extensions** (`Ctrl/Cmd+Shift+X`) and search **"Grok Build for VS Code (Community)"** — or install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=PawelHuryn.grok-vscode-phuryn) / [Open VSX Registry](https://open-vsx.org/extension/PawelHuryn/grok-vscode-phuryn).
+**1. Install the extension.** In VS Code or Cursor, open **Extensions** (`Ctrl/Cmd+Shift+X`) and search **"GUI for Grok Build & Muse Code"** — or install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=PawelHuryn.grok-vscode-phuryn) / [Open VSX Registry](https://open-vsx.org/extension/PawelHuryn/grok-vscode-phuryn).
 
 **2. Open Grok and sign in.** Press `Ctrl/Cmd+;`. The sidebar **walks you through installing the `grok` CLI and signing in** — one click per step, with your SuperGrok / X Premium+ subscription or an xAI API key. That's the whole setup.
 

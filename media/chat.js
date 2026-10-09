@@ -122,7 +122,7 @@
   // VS Code UI a browser user can't see) and the AFK Pilot account section.
   const IS_REMOTE = !!window.grokRemoteClient;
   // Desktop Electron preload sets grokDesktopShell; VS Code webview never does.
-  // Client-owned font scale (localStorage + keyboard/wheel) applies to remote AND desktop
+  // Client-owned font scale (localStorage + keyboard) applies to remote AND desktop
   // — not the VS Code sidebar, which stays on host `grok.chatFontScale`.
   // Do not key off the file-tree bridge — that API is panel-only; chat.js must not call it.
   const IS_DESKTOP_CLIENT = !!window.grokDesktopShell;
@@ -1125,6 +1125,9 @@
     cornerDownRight: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 10 20 15 15 20"/><path d="M4 4v7a4 4 0 0 0 4 4h12"/></svg>`,
     gitBranch: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>`,
     gitFork: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>`,
+    // Lucide git-pull-request / external-link, at the chip's 12px size.
+    gitPullRequest: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><line x1="6" x2="6" y1="9" y2="21"/></svg>`,
+    externalLink: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>`,
     // Undo / rewind — used on user-bubble action row (P2-9).
     undo: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6.7 3L3 13"/></svg>`,
     // Remote Control gear section (sign in / continue remotely / sign out / how it works).
@@ -1910,6 +1913,81 @@
   // HTML in a README cannot become live markup.
   window.__grokRenderMarkdown = (raw) => renderMarkdown(String(raw == null ? "" : raw));
 
+  // Bare http(s) addresses are not markdown links, so a reply like
+  // "abierto: https://github.com/owner/repo/pull/17" used to be plain text.
+  // Those addresses become links. A GitHub pull URL becomes the PR chip
+  // wherever it sits, including mid-sentence. The transcript click handler
+  // already opens http(s) hrefs in the browser.
+  function parseGitHubPullUrl(raw) {
+    let url;
+    try {
+      url = new URL(raw);
+    } catch {
+      return null;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    if (url.username || url.password) return null;
+    const host = url.hostname.toLowerCase();
+    if (host !== "github.com" && host !== "www.github.com") return null;
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (parts.length < 4 || parts[2] !== "pull" || !/^\d+$/.test(parts[3])) return null;
+    if (!/^[A-Za-z0-9_.-]+$/.test(parts[0]) || !/^[A-Za-z0-9_.-]+$/.test(parts[1])) return null;
+    return {
+      href: url.href,
+      owner: parts[0],
+      repo: parts[1],
+      number: parts[3],
+    };
+  }
+
+  function pullRequestFromLine(line) {
+    let rest = String(line || "").trim();
+    // "Pull request:", "**Pull request:**" (colon inside the marks) and
+    // "**Pull request**:". `\b` so "Preview:" is not read as a "PR" label.
+    rest = rest.replace(/^(?:\*\*|__)?\s*(?:pull request|pr)\b\s*:?\s*(?:\*\*|__)?\s*:?\s*/i, "");
+    rest = rest.replace(/^(\*\*|__)([\s\S]+)\1$/, "$2").trim();
+    const urlMatch = rest.match(/^(https?:\/\/\S+)$/i);
+    if (!urlMatch) return null;
+    return parseGitHubPullUrl(urlMatch[1].replace(/[.,);:\]]+$/, ""));
+  }
+
+  function pullRequestChipHtml(pr) {
+    const href = escapeHtml(pr.href).replace(/"/g, "&quot;");
+    const repo = `${pr.owner}/${pr.repo}`;
+    const aria = escapeHtml(`Open pull request #${pr.number} (${repo}) in the browser`).replace(/"/g, "&quot;");
+    return (
+      `<a class="pr-open" href="${href}" title="${aria}" aria-label="${aria}">` +
+        `<span class="pr-open-mark" aria-hidden="true">${ICON.gitPullRequest}</span>` +
+        `<span class="pr-open-label">${escapeHtml(`PR #${pr.number}`)}</span>` +
+        `<span class="pr-open-repo">${escapeHtml(repo)}</span>` +
+        `<span class="pr-open-ext" aria-hidden="true">${ICON.externalLink}</span>` +
+      `</a>`
+    );
+  }
+
+  function unescapeHtml(s) {
+    return String(s)
+      .replace(/&quot;/g, '"')
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&");
+  }
+
+  // Leave sentence punctuation and closing emphasis outside the held URL.
+  function splitUrlTrailing(raw) {
+    let url = raw;
+    let trailing = "";
+    while (url && /[.,;:!?*_]$/.test(url)) {
+      trailing = url.slice(-1) + trailing;
+      url = url.slice(0, -1);
+    }
+    if (url.endsWith(")") && !url.includes("(")) {
+      trailing = ")" + trailing;
+      url = url.slice(0, -1);
+    }
+    return { url, trailing };
+  }
+
   function renderMarkdown(raw) {
     // Normalise line endings FIRST. Everything below splits on a newline and
     // then tests each line with $-anchored patterns -- and a carriage return
@@ -2004,11 +2082,27 @@
       // <code> tags mean nothing to a regex (#143). Same shape reaches a URL
       // containing `*`, and a [link](x) written inside backticks.
       //
-      // Link TEXT is deliberately left live: [**bold**](url) is valid markdown
-      // and worked before, so only the href is held.
+      // Format link labels before holding the whole anchor, so URLs in the
+      // label cannot be linkified again.
       const held = [];
       const hold = (html) => `\x00C${held.push(html) - 1}\x00`;
-      return t
+      const restore = (html) => html.replace(/\x00C(\d+)\x00/g, (_, i) => held[+i]);
+      const emphasis = (text) => text
+        .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
+        .replace(/(^|[^\p{L}\p{N}_])_([^_\n]+)_(?=$|[^\p{L}\p{N}_])/gu, "$1<em>$2</em>");
+      // `raw` is the address after HTML escaping. A GitHub pull URL is the chip;
+      // any other http(s) address is an ordinary link. Both are held so the
+      // emphasis pass cannot see characters inside them.
+      function linkifyUrl(raw, autolink = false) {
+        const { url, trailing } = autolink ? { url: raw, trailing: "" } : splitUrlTrailing(raw);
+        if (!url) return raw;
+        const pr = parseGitHubPullUrl(unescapeHtml(url));
+        if (pr) return hold(pullRequestChipHtml(pr)) + trailing;
+        const href = url.replace(/"/g, "&quot;");
+        return hold(`<a href="${href}">${url}</a>`) + trailing;
+      }
+      const protectedText = t
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
         .replace(/`([^`\n]+)`/g, (_, code) => {
           if (looksLikeFileRef(code)) {
@@ -2018,13 +2112,19 @@
           return hold(`<code>${code}</code>`);
         })
         .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, text, url) => {
+          const pr = parseGitHubPullUrl(unescapeHtml(url));
+          // The visible text is the address itself: show the chip, not the raw URL.
+          // A named link ([#82](url), [**bold**](url)) stays a normal anchor so
+          // its label and emphasis survive.
+          if (pr && /^https?:\/\//i.test(text.trim())) return hold(pullRequestChipHtml(pr));
           const safe = url.replace(/"/g, "&quot;");
-          return `<a href="${hold(safe)}">${text}</a>`;
+          return hold(`<a href="${safe}">${restore(emphasis(text))}</a>`);
         })
-        .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
-        .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
-        .replace(/(^|[^\p{L}\p{N}_])_([^_\n]+)_(?=$|[^\p{L}\p{N}_])/gu, "$1<em>$2</em>")
-        .replace(/\x00C(\d+)\x00/g, (_, i) => held[+i]);
+        .replace(/&lt;(https?:\/\/[^\s\x00]*?)&gt;/g, (_, url) => linkifyUrl(url, true));
+      // Hold bare URLs before emphasis so their interiors stay literal. Closing
+      // delimiters remain outside the placeholder for the emphasis pass to pair.
+      return restore(emphasis(protectedText
+        .replace(/https?:\/\/[^\s<\x00]+/g, (raw) => linkifyUrl(raw))));
     }
 
     // GFM tables: header row | separator row (|---|---|) | data rows
@@ -2148,6 +2248,16 @@
       if (bm) {
         closeFrom(0);
         out += `\x00B${bm[1]}\x00`;
+        lastWasBlock = true;
+        lastPara = false;
+        pendingBreak = false;
+        continue;
+      }
+
+      const pr = pullRequestFromLine(line);
+      if (pr) {
+        closeFrom(0);
+        out += pullRequestChipHtml(pr);
         lastWasBlock = true;
         lastPara = false;
         pendingBreak = false;
@@ -10662,6 +10772,10 @@
   function renderConnectWizard() {
     if (!connectWizard) return;
     const provider = connectWizard.provider;
+    if (connectWizard.museOnboarding) {
+      connectWizard.body.innerHTML = museOnboardingPanel(connectWizard.museOnboarding.mode, connectWizard.museOnboarding.info);
+      return;
+    }
     // The mirror is the live source, but a confirmed account retires its
     // mirror, so a settled panel keeps its own copy of the last thing it was
     // told rather than falling back to the empty-state offer.
@@ -10679,8 +10793,25 @@
    * Keep the wizard in step with the host, and open it when a flow begins
    * wherever the click came from — the card, Settings, or another tab.
    */
-  function syncConnectWizard(provider, device) {
+  function syncConnectWizard(provider, device, mode, info) {
     if (!provider || (!IS_REMOTE && provider !== "muse")) return;
+    // A missing CLI never started a login flow. Keep its response over Settings
+    // and existing conversations, including bare replies from older hosts.
+    if (provider === "muse" && museAdvertised && mode === "missing-muse"
+      && (device || connectWizard && connectWizard.provider === provider)) {
+      openConnectWizard(provider);
+      connectWizard.museOnboarding = { mode, info: info || {} };
+      renderConnectWizard();
+      return;
+    }
+    if (provider === "muse" && connectWizard && connectWizard.provider === provider) {
+      if (connectWizard.museOnboarding && mode === "muse-login" && !device) {
+        connectWizard.museOnboarding = { mode, info: info || {} };
+        renderConnectWizard();
+        return;
+      }
+      connectWizard.museOnboarding = null;
+    }
     // Only a RUNNING flow opens a wizard. A settled outcome renders wherever
     // the reader already is: in this dialog when one is open (which it is
     // whenever they got here by clicking Connect), and in the card otherwise.
@@ -10752,6 +10883,30 @@
     return !typed;
   }
 
+  function museOnboardingPanel(mode, info) {
+    const provider = (state.providers || []).find(p => p.id === "muse");
+    const reason = provider && provider.unavailableReason;
+    if (reason) return `<div class="onb"><p class="onb-heading">Muse Code</p><p class="onb-desc">${escapeHtml(reason)}</p></div>`;
+    if (mode !== "missing-muse") {
+      if (IS_REMOTE) return remoteConnectPanel(mode, { provider: "muse" }, null);
+      return `<div class="onb"><p class="onb-heading">Connect Muse Code</p>`
+        + `<p class="onb-desc">Press Connect Muse Code to sign in with Meta's CLI.</p>`
+        + `<button class="onb-action" data-act="connectProvider" data-provider="muse">Connect Muse Code</button>`
+        + `<button class="onb-action" data-act="recheckProvider" data-provider="muse">Re-check</button></div>`;
+    }
+    const command = info.platform === "win32"
+      ? "irm https://dev.meta.ai/install.ps1 | iex"
+      : "curl -fsSL https://dev.meta.ai/install.sh | bash";
+    return `<div class="onb"><p class="onb-heading">Muse Code is not installed</p>`
+      + `<p class="onb-desc">${IS_REMOTE
+        ? "Muse Code is not installed on the machine running this workspace. Install it on that machine, then Re-check."
+        : "Install Meta's Muse Code CLI on this computer. When installation finishes, click Re-check, then Connect Muse Code."}</p>`
+      + (!IS_REMOTE ? `<div class="onb-cmd"><code>${escapeHtml(command)}</code><button class="onb-copy" type="button" title="Copy" data-cmd="${escapeHtml(command)}">${ICON.copy}</button></div>` : "")
+      + (!IS_REMOTE && state.hostCaps && state.hostCaps.installMuse === true
+        ? '<button class="onb-action" type="button" data-act="installMuse">Install Muse Code</button>' : "")
+      + '<button class="onb-action onb-secondary" type="button" data-act="recheckProvider" data-provider="muse">Re-check</button></div>';
+  }
+
   function showOnboarding(mode, info, beforeRender) {
     info = info || {};
     if ((info.provider === "muse" || mode === "muse-login" || mode === "missing-muse") && !museAdvertised) return;
@@ -10794,14 +10949,7 @@
       return;
     }
     if ((mode === "muse-login" || mode === "missing-muse") && museAdvertised) {
-      const provider = (state.providers || []).find(p => p.id === "muse");
-      const reason = provider && provider.unavailableReason;
-      onb.innerHTML = `<div class="onb"><p class="onb-heading">Muse Code</p>`
-        + `<p class="onb-desc">${escapeHtml(reason || (mode === "missing-muse"
-          ? "Install Meta's Muse Code CLI on the execution host, then re-check."
-          : "Run muse login on the execution host, then re-check."))}</p>`
-        + (reason ? "" : `${!IS_REMOTE && mode !== "missing-muse" ? '<button class="onb-action" data-act="connectProvider" data-provider="muse">Open Muse sign-in</button>' : ''}<button class="onb-action" data-act="recheckProvider" data-provider="muse">Re-check</button>`)
-        + `</div>`;
+      onb.innerHTML = museOnboardingPanel(mode, info);
       return;
     }
     if (mode === "no-project") {
@@ -14868,8 +15016,7 @@
     };
     window.addEventListener("keydown", (e) => {
       if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
-      // Ignore when an editable field is composing IME, but allow zoom over inputs
-      // (desktop apps zoom the whole UI regardless of focus).
+      // Allow zoom over inputs, as before #155.
       const key = e.key;
       if (key === "=" || key === "+" || key === "Add") {
         e.preventDefault();
@@ -14878,24 +15025,24 @@
         e.preventDefault();
         setClientFontScale(stepClientFontScale(state.remoteFontScale, -CLIENT_FONT_SCALE_STEP));
       } else if (key === "0" || key === "Digit0" || key === "Numpad0") {
-        // Ctrl/Cmd+0 resets to 100%.
         if (key === "0" || e.code === "Digit0" || e.code === "Numpad0") {
           e.preventDefault();
           setClientFontScale(1);
         }
       }
     });
-    window.addEventListener(
-      "wheel",
-      (e) => {
-        if (!(e.ctrlKey || e.metaKey)) return;
-        // Continuous scale; prevent Chromium page-zoom fighting us.
-        e.preventDefault();
-        const delta = e.deltaY === 0 ? 0 : e.deltaY > 0 ? -0.05 : 0.05;
-        if (delta) setClientFontScale(stepClientFontScale(state.remoteFontScale, delta));
-      },
-      { passive: false },
-    );
+
+    // Browser clients keep native page zoom, including trackpad pinch (Ctrl+wheel).
+    // Only the desktop shell suppresses accidental modifier+wheel zoom.
+    if (IS_DESKTOP_CLIENT) {
+      window.addEventListener(
+        "wheel",
+        (e) => {
+          if (e.ctrlKey || e.metaKey) e.preventDefault();
+        },
+        { passive: false, capture: true },
+      );
+    }
   }
 
   function setRemoteTtsEnabled(enabled) {
@@ -19174,7 +19321,7 @@
         // The CSS derives both `zoom` and the containing-block height
         // compensation from this one variable, so the composer stays pinned.
         // Client-owned zoom (remote + desktop) ignores host updates so local
-        // keyboard/wheel/slider choice is not clobbered.
+        // keyboard/slider choice is not clobbered.
         state.hostFontScale = Number(msg.value) || 1;
         if (!CLIENT_OWNS_FONT_SCALE) applyChatZoom();
         break;
@@ -20470,7 +20617,7 @@
             // AFTER the mirror: renderConnectWizard reads it, and syncing
             // first painted the previous state every time (caught by driving
             // the states in a browser, 2026-08-31).
-            syncConnectWizard(msg.provider, msg.device);
+            syncConnectWizard(msg.provider, msg.device, msg.state, { platform: msg.platform });
             // The composer card reads the same mirror, and this is the only
             // frame that moves it. Without this call its "Signing in…" state
             // waits for the next providerState -- which is the frame that
@@ -21746,6 +21893,9 @@
       const act = onbAction.dataset.act;
       if (LAUNCH_ACTS.includes(act)) markOnboardingLaunched(act, onbAction.dataset.provider);
       if (act === "runInstall") vscode.postMessage({ type: "runInstallCmd" });
+      else if (act === "installMuse" && !IS_REMOTE && museAvailable && state.hostCaps && state.hostCaps.installMuse === true) {
+        vscode.postMessage({ type: "runMuseInstallCmd" });
+      }
       else if (act === "installCodex") vscode.postMessage({ type: "installCodex" });
       else if (act === "cancelCodexInstall") vscode.postMessage({ type: "cancelCodexInstall" });
       else if (act === "runLogin") vscode.postMessage({ type: "runGrokLogin" });

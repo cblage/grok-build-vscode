@@ -947,6 +947,28 @@ describe("VS Code projects rail renderer", () => {
     });
   });
   describe("add project", () => {
+    it("GitHub Re-check requests a refresh without agent credential probes (#186)", () => {
+      const { doc, window, posted } = bootRail();
+      const api = railApi(window);
+      api.onMessage({
+        type: "repos", entries: repos, selectedCwd: "/work/alpha", activeCwd: "/work/alpha",
+        canAddProject: true, canCloneProject: true,
+      });
+      (doc.querySelector(".rail-add-project-wide") as HTMLButtonElement).click();
+      ([...doc.querySelectorAll(".rail-menu-item")].find(el =>
+        el.textContent?.includes("Clone from GitHub")) as HTMLButtonElement).click();
+      api.onMessage({ type: "githubState", github: {
+        connected: false, cliPresent: true, loginFlow: { status: "starting" },
+      } });
+      (doc.querySelector(".add-project-github-connect") as HTMLButtonElement).click();
+      const recheck = doc.querySelector(".add-project-github-recheck") as HTMLButtonElement;
+      expect(recheck.hidden).toBe(false);
+      posted.length = 0;
+      recheck.click();
+      expect(posted).toEqual([{ type: "refreshProviders", credentials: false }]);
+      window.happyDOM.abort();
+    });
+
     it("shows no control until the host says it answers addProjectFolder", () => {
       // Capability by field presence. An older host sends `repos` without the
       // flag and must not get a button whose message it would ignore.

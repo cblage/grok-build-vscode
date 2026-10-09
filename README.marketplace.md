@@ -1,10 +1,10 @@
-# Grok Build for VS Code (Community)
+# GUI for Grok Build & Muse Code
 
 [![License: FSL-1.1-MIT](https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg)](https://github.com/phuryn/grok-build-vscode/blob/main/LICENSE) ![Agents](https://img.shields.io/badge/Agents-Grok%20Build%20%C2%B7%20Codex%20%C2%B7%20Claude%20Code%20%C2%B7%20Muse%20Code-000000) [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com) [![Cursor](https://badgen.net/badge/Cursor/Extension/007ACC)](https://cursor.com) [![The Product Compass](https://img.shields.io/badge/The%20Product%20Compass-productcompass.pm-FF6B35)](https://www.productcompass.pm)
 
-> **GUI for Grok Build CLI (incl. Grok 4.7)** — not affiliated with or endorsed by SpaceXAI (formerly xAI). *Grok*, *Grok Build*, and *xAI* are trademarks of xAI; this project uses those names only to describe what it's compatible with.
+> **GUI for Grok Build (incl. Grok 4.7) & Muse Code** — and for Codex and Claude Code in the same window. Not affiliated with or endorsed by SpaceXAI (formerly xAI), Meta, OpenAI or Anthropic. *Grok*, *Grok Build* and *xAI* are trademarks of xAI; *Muse Code* of Meta; *Codex* of OpenAI; *Claude Code* of Anthropic. This project uses those names only to describe what it is compatible with.
 
-The GUI for **Grok Build CLI** (incl. **Grok 4.7**), right in your editor — with **Remote Control**: pair **[AFK Pilot](https://afkpilot.com)** once and watch, approve, and steer your agent from your phone or any browser while away from your desk. Drop open files in as `@`-context, run **multiple sessions** at once, keep **resumable chat history**, generate **images & video inline**, and dictate by **voice**. If you'd rather stay in VS Code than a terminal, this brings Grok Build's agent into your sidebar.
+The GUI for **Grok Build CLI** (incl. **Grok 4.7**) and **Meta's Muse Code**, right in your editor. It drives **OpenAI's Codex** and **Anthropic's Claude Code** too: one window, one model picker, and every conversation keeps the agent it started with. And it comes with **Remote Control**: pair **[AFK Pilot](https://afkpilot.com)** once and watch, approve, and steer your agent from your phone or any browser while away from your desk. Drop open files in as `@`-context, run **multiple sessions** at once, keep **resumable chat history**, generate **images & video inline**, and dictate by **voice**. If you'd rather stay in VS Code than a terminal, this brings Grok Build's agent into your sidebar.
 
 No manual setup: the extension **walks you through installing the `grok` CLI and signing in** — with a **SuperGrok or X Premium+ subscription**, or an **xAI API key** — right from the sidebar, one click per step.
 
@@ -237,7 +237,7 @@ While a device is linked or a local agent turn is in flight, the extension also 
 ## Requirements
 
 - **VS Code** 1.106+ (or a compatible editor on the same base — Cursor 3.x qualifies; Antigravity is still on base 1.104 and keeps the last compatible extension version).
-- **A supported provider CLI** on macOS, Linux, or Windows: Grok Build (`grok`), Codex, Claude Code or Muse Code. Grok ships a native Windows build, so the extension runs natively on all three — no WSL required (WSL2 + Remote-WSL still works if you prefer it). Muse's own installer is macOS/Linux only; its Windows binaries exist but you put the CLI on PATH yourself.
+- **A supported provider CLI** on macOS, Linux, or Windows: Grok Build (`grok`), Codex, Claude Code or Muse Code. Grok and Muse ship native Windows installers, so the extension runs natively on all three — no WSL required (WSL2 + Remote-WSL still works if you prefer it).
 - **A login:** either a **SuperGrok or X Premium+** subscription (`grok login`) or an xAI API key. Either subscription unlocks **Grok Build**; with an API key you also get the **grok-4.x** models and **grok-imagine**. (Grok's free tier does **not** include the CLI agent.)
 - **Voice control** is optional and uses Grok sign-in or an OpenAI API key (Codex sign-in alone does not include transcription) — it just needs [`ffmpeg`](https://ffmpeg.org) to record. Setup + advanced options: [docs/voice-setup.md](https://github.com/phuryn/grok-build-vscode/blob/main/docs/voice-setup.md).
 
@@ -245,7 +245,7 @@ While a device is linked or a local agent turn is in flight, the extension also 
 
 ## Install
 
-**1. Install the extension.** In VS Code or Cursor, open **Extensions** (`Ctrl/Cmd+Shift+X`) and search **"Grok Build for VS Code (Community)"**.
+**1. Install the extension.** In VS Code or Cursor, open **Extensions** (`Ctrl/Cmd+Shift+X`) and search **"GUI for Grok Build & Muse Code"**.
 
 **2. Open Grok and sign in.** Press `Ctrl/Cmd+;`. The sidebar **walks you through installing the `grok` CLI and signing in** — one click per step, with your SuperGrok / X Premium+ subscription or an xAI API key. That's the whole setup.
 

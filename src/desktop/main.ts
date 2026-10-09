@@ -91,6 +91,7 @@ import {
   installWindowSecurityLocks,
   isTrustedMainFrameIpc,
 } from "./window-security";
+import { installDesktopZoomHandlers } from "./window-zoom";
 import { autoUpdater } from "electron-updater";
 import {
   DESKTOP_RELEASES_API_URL,
@@ -796,6 +797,8 @@ async function createApp(): Promise<void> {
     mainWindow.webContents.openDevTools({ mode: "bottom" });
     log("DevTools opened (non-production build); CDP on --remote-debugging-port if passed");
   }
+
+  installDesktopZoomHandlers(mainWindow.webContents, applyDesktopCssZoom);
 
   // Keyboard DevTools without needing the auto-hidden menu bar (Windows).
   // Menu accelerator still works; F12 is the discoverable Chromium habit.

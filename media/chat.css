@@ -1183,6 +1183,49 @@ a:hover {
   text-underline-offset: 2px;
 }
 
+/* A pull request the agent just opened: one chip, the number and the repo,
+   and the whole chip opens that PR in the browser. Same job as Claude's
+   "PR #N" row. The shared `a:hover` underline is wrong on a button-shaped link. */
+a.pr-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  max-width: 100%;
+  margin: 1px 2px;
+  vertical-align: middle;
+  padding: 2px 8px 2px 6px;
+  border: 1px solid var(--vscode-editorWidget-border, transparent);
+  border-radius: 6px;
+  background: var(--chat-surface-code);
+  color: var(--vscode-foreground);
+  font-size: 12px;
+  line-height: 18px;
+  text-decoration: none;
+}
+a.pr-open:hover {
+  text-decoration: none;
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.18));
+  color: var(--vscode-foreground);
+}
+.pr-open-mark,
+.pr-open-ext {
+  display: inline-flex;
+  flex: none;
+  opacity: 0.75;
+}
+.pr-open-label {
+  font-weight: 600;
+  flex: none;
+}
+.pr-open-repo {
+  color: var(--vscode-descriptionForeground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
 /* A detected file ref renders EXACTLY like any other link: no rules on the
    anchor itself (the shared `a` styling above applies), and the inner
    <code> is fully neutralized ÔÇö no chip, no monospace, no own color. */

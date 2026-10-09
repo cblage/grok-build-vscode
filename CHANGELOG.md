@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.11.2-sandbox.1 — 2026-10-09
+## 4.12.1-sandbox.1 — 2026-10-09
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.11.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.12.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,26 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.12.0 — 2026-09-25
+
+**Links you can click, and Muse Code you can install.** Pull request and web addresses in a reply's text open from the chat, and a machine without Muse Code now offers to install it instead of doing nothing when you press Connect. The extension is also listed under a new name, **GUI for Grok Build & Muse Code**, because it is not only for VS Code and it drives four agents.
+
+### Added
+
+- **A pull request address is a button, and other web addresses are links.** A GitHub pull URL renders as a chip with the PR number and the repository, whether it stands alone or sits in a sentence (`abierto: https://github.com/owner/repo/pull/17`). Any other bare `http` or `https` address in the text is a link. Clicking either opens it in the browser. An address inside a code span or a code block stays literal; one in bold, or written as `<https://…>`, becomes a clean link without the markup leaking into it; and a Markdown link whose label contains an address stays one link, to its target. Thanks to [@mateolafalce](https://github.com/mateolafalce) ([#185](https://github.com/phuryn/grok-build-vscode/pull/185)), who also reported it (#184).
+- **Install Muse Code from the app.** In VS Code, Cursor and the desktop app, when Muse is not installed its panel shows Meta's install command and an **Install Muse Code** button that runs Meta's official installer in a terminal after you confirm — on macOS and Linux, and on Windows too, where Meta's PowerShell installer puts `muse` on your PATH. Then click **Re-check** and **Connect**. From a phone or browser, the panel says Muse is not installed on that machine, since the install has to run there. On every surface, pressing Connect on a machine without Muse now says so, instead of briefly showing something and leaving you where you were.
+
+### Changed
+
+- **Listed as "GUI for Grok Build & Muse Code".** The two agents it names are the ones with no graphical interface of their own; the listing now names Codex and Claude Code as well, since all four run in the same window. The extension's ID is unchanged, so it keeps updating in place.
+
+### Fixed
+
+- **Ctrl/Cmd + mouse wheel no longer resizes the desktop chat** — including in the installed app, not only in development builds. Ctrl/Cmd + / − / 0 still zoom, and pinch-to-zoom in a browser is untouched. Thanks to [@fiko942](https://github.com/fiko942) ([#155](https://github.com/phuryn/grok-build-vscode/pull/155)).
+- **Desktop updater: CVE-2026-54673.** The updater's HTTP library could forward credentials across a redirect; it is now on the patched `builder-util-runtime` 9.7.0. This app's update feed sends no credentials, so exposure was minimal, but the component is no longer the vulnerable version. Thanks to [@anupamme](https://github.com/anupamme) ([#182](https://github.com/phuryn/grok-build-vscode/pull/182)).
+- **The GitHub Re-check in the Projects panel works** (#186). It did nothing at all; it now refreshes your GitHub sign-in the way the same button in the chat does, and still cannot start an agent you have not connected.
+- **An agent that fails to start is reported, not thrown.** If the short check that reads Codex's or Claude Code's model list could not launch the agent at all, the failure surfaced as an unhandled error in the editor's log instead of a one-line message.
 
 ## 4.11.1 — 2026-09-25
 

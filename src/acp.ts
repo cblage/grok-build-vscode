@@ -454,7 +454,8 @@ export class AcpClient extends EventEmitter {
     });
     this.proc.on("error", (err) => {
       this.opts.log(`spawn error: ${err.message}`);
-      this.emit("error", err);
+      // Warm-up clients only await start(); an unhandled "error" event throws.
+      if (this.listenerCount("error") > 0) this.emit("error", err);
     });
 
     const init = await this.request("initialize", {

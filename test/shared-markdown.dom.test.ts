@@ -10,7 +10,7 @@
  * fallback rather than failing anything.
  */
 import { describe, expect, it } from "vitest";
-import { bootWebview } from "./webview-harness";
+import { bootWebview, click } from "./webview-harness";
 
 function render(md: string): string {
   const h = bootWebview({ ready: true });
@@ -53,11 +53,130 @@ describe("shared markdown renderer (window.__grokRenderMarkdown)", () => {
     expect(html).toContain("&lt;img");
   });
 
+  it("turns a Pull request line into a chip that opens that PR", () => {
+    const html = render(
+      "Done.\n\nPull request: https://github.com/lines-frlp-utn/byo-kv-cache/pull/16\n",
+    );
+    expect(html).toContain('class="pr-open"');
+    expect(html).toContain('href="https://github.com/lines-frlp-utn/byo-kv-cache/pull/16"');
+    expect(html).toContain("PR #16");
+    expect(html).toContain("lines-frlp-utn/byo-kv-cache");
+    expect(html).not.toContain("Pull request:");
+  });
+
+  it("chips a bare GitHub pull URL on its own line, and a bold label", () => {
+    const bare = render("https://github.com/acme/widgets/pull/82\n");
+    expect(bare).toContain('href="https://github.com/acme/widgets/pull/82"');
+    expect(bare).toContain("PR #82");
+    const bold = render("**Pull request:** https://github.com/acme/widgets/pull/3\n");
+    expect(bold).toContain("PR #3");
+    expect(bold).not.toContain("**");
+  });
+
+  it("asks the host to open the pull request when the chip is clicked", () => {
+    const h = bootWebview({ ready: true });
+    const html = String(
+      (h.window as any).__grokRenderMarkdown(
+        "Pull request: https://github.com/acme/widgets/pull/82\n",
+      ),
+    );
+    const host = h.doc.createElement("div");
+    host.innerHTML = html;
+    h.doc.body.appendChild(host);
+    click(h.window, host.querySelector("a.pr-open")!);
+    expect(h.posted).toContainEqual({
+      type: "openUrl",
+      url: "https://github.com/acme/widgets/pull/82",
+    });
+  });
+
+  it("chips a pull URL inside a sentence and leaves the surrounding words", () => {
+    const sentence = render(
+      "El PR ya está abierto: https://github.com/lines-frlp-utn/byo-kv-cache/pull/17\n",
+    );
+    expect(sentence).toContain("El PR ya está abierto:");
+    expect(sentence).toContain('class="pr-open"');
+    expect(sentence).toContain("PR #17");
+    expect(sentence).toContain('href="https://github.com/lines-frlp-utn/byo-kv-cache/pull/17"');
+    expect(sentence).not.toContain(">https://github.com/lines-frlp-utn/byo-kv-cache/pull/17<");
+  });
+
+  it("links a bare http address and keeps sentence punctuation outside the href", () => {
+    const html = render("Notas en https://example.com/docs.\n");
+    expect(html).toContain('href="https://example.com/docs"');
+    expect(html).toContain(">https://example.com/docs</a>.");
+    expect(html).not.toContain("pr-open");
+  });
+
+  it("leaves a pull URL inside a fence, a code span, or a named link as-is", () => {
+    const fenced = render("```\nPull request: https://github.com/acme/widgets/pull/82\n```\n");
+    expect(fenced).not.toContain("pr-open");
+    const code = render("El id es `https://github.com/acme/widgets/pull/82` en el log.\n");
+    expect(code).not.toContain("pr-open");
+    expect(code).toContain("<code>https://github.com/acme/widgets/pull/82</code>");
+    const linked = render("[#82](https://github.com/acme/widgets/pull/82)\n");
+    expect(linked).not.toContain("pr-open");
+    expect(linked).toContain('href="https://github.com/acme/widgets/pull/82"');
+  });
+
   it("survives a null or undefined body without throwing", () => {
     const h = bootWebview({ ready: true });
     const fn = (h.window as any).__grokRenderMarkdown;
     expect(() => fn(null)).not.toThrow();
     expect(() => fn(undefined)).not.toThrow();
+  });
+});
+
+describe("markdown linkification edge cases (#185)", () => {
+  it("keeps a standalone backticked PR URL literal", () => {
+    const url = "https://github.com/acme/widgets/pull/17";
+    for (const prefix of ["", "Pull request: "]) {
+      const html = render(`${prefix}\`${url}\`\n`);
+      expect(html).toContain(`<code>${url}</code>`);
+      expect(html).not.toContain("<a ");
+    }
+  });
+
+  it("keeps emphasis delimiters out of a bare URL's target", () => {
+    const url = "https://example.com/docs";
+    for (const [mark, tag] of [["**", "strong"], ["*", "em"], ["_", "em"]]) {
+      expect(render(`${mark}${url}${mark}\n`)).toContain(
+        `<${tag}><a href="${url}">${url}</a></${tag}>`,
+      );
+    }
+  });
+
+  it("keeps asterisks inside a bare URL literal", () => {
+    for (const url of ["https://e.com/a*b*c", "https://e.com/path/*a*/file"]) {
+      expect(render(`see ${url}\n`)).toBe(`see <a href="${url}">${url}</a>`);
+      expect(render(`**${url}**\n`)).toBe(`<strong><a href="${url}">${url}</a></strong>`);
+    }
+  });
+
+  it("keeps underscores inside a bare URL literal", () => {
+    const url = "https://e.com/path/_a_/file";
+    expect(render(`see ${url}\n`)).toBe(`see <a href="${url}">${url}</a>`);
+    expect(render(`_${url}_\n`)).toBe(`<em><a href="${url}">${url}</a></em>`);
+  });
+
+  it("links an angle-bracket autolink without including its brackets", () => {
+    const url = "https://example.com/docs";
+    expect(render(`<${url}>\n`)).toBe(`<a href="${url}">${url}</a>`);
+    const query = `${url}?a=1&b=2`;
+    expect(render(`<${query}>\n`)).toBe(
+      `<a href="${url}?a=1&amp;b=2">${url}?a=1&amp;b=2</a>`,
+    );
+  });
+
+  it("does not linkify a URL inside a named Markdown link's label", () => {
+    for (const url of ["https://example.com/docs", "https://github.com/acme/widgets/pull/17"]) {
+      const html = render(`[Read **docs** at ${url} with \`code\`](https://example.org/guide)\n`);
+      expect(html).toBe(
+        `<a href="https://example.org/guide">Read <strong>docs</strong> at ${url} with <code>code</code></a>`,
+      );
+      expect(html.match(/<a\b/g)).toHaveLength(1);
+      expect(html).not.toContain(String.fromCharCode(0));
+    }
   });
 });
 

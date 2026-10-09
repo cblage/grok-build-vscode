@@ -101,7 +101,7 @@ describe("client font scale (remote)", () => {
     expect(doc.body.style.getPropertyValue("--chat-zoom")).toBe("1.4");
   });
 
-  it("Ctrl/Cmd + +/- /0 and wheel adjust zoom", () => {
+  it("Ctrl/Cmd + +/- /0 adjust zoom without requiring Shift", () => {
     const { window } = bootWebview({ remote: true, beforeScripts: withRail });
     const api = (window as any).__grokFontScale;
     api.set(1);
@@ -122,15 +122,6 @@ describe("client font scale (remote)", () => {
     );
     expect(api.get()).toBe(1);
 
-    api.set(1);
-    // happy-dom's WheelEvent may not accept ctrlKey/deltaY in the init dict —
-    // set them on the instance so the client handler sees a real mod+wheel.
-    const wheel = new (window as any).WheelEvent("wheel", { bubbles: true, cancelable: true });
-    Object.defineProperty(wheel, "deltaY", { value: -100, configurable: true });
-    Object.defineProperty(wheel, "ctrlKey", { value: true, configurable: true });
-    Object.defineProperty(wheel, "metaKey", { value: false, configurable: true });
-    window.dispatchEvent(wheel);
-    expect(api.get()).toBeGreaterThan(1);
   });
 });
 
@@ -185,6 +176,52 @@ describe("client font scale (desktop bridge)", () => {
     expect((window as any).__grokFontScale.get()).toBeCloseTo(1.4, 5);
     expect(doc.body.style.getPropertyValue("--chat-zoom")).toBe("1.4");
     expect((window as any).localStorage.getItem("grok.desktop.fontScale")).toBe("1.4");
+  });
+});
+
+describe.each(["remote", "desktop", "vscode"] as const)("%s zoom input boundaries", (surface) => {
+  function boot() {
+    return bootWebview({
+      remote: surface === "remote",
+      beforeScripts: (w) => { (w as any).grokDesktopShell = surface === "desktop"; },
+    });
+  }
+
+  it.each(["ctrlKey", "metaKey"])("only desktop cancels %s+wheel; ordinary scrolling stays available", (modifier) => {
+    const { window, doc } = boot();
+    const api = (window as any).__grokFontScale;
+    api?.set(1.2);
+    const before = doc.body.style.getPropertyValue("--chat-zoom");
+    for (const modified of [false, true]) {
+      const wheel = new (window as any).WheelEvent("wheel", { bubbles: true, cancelable: true });
+      // happy-dom does not consistently apply WheelEvent's modifier init fields.
+      Object.defineProperty(wheel, modifier, { value: modified });
+      Object.defineProperty(wheel, "deltaY", { value: -100 });
+      doc.getElementById("messages")!.dispatchEvent(wheel);
+      expect(wheel.defaultPrevented).toBe(modified && surface === "desktop");
+      expect(doc.body.style.getPropertyValue("--chat-zoom")).toBe(before);
+    }
+  });
+
+  it.each(["ctrlKey", "metaKey"])("preserves pre-#155 %s shortcuts and the Alt exclusion", (modifier) => {
+    const { window, doc } = boot();
+    const api = (window as any).__grokFontScale;
+    for (const [key, code, expected] of [
+      ["=", "Equal", 1.3], ["+", "Equal", 1.3], ["Add", "NumpadAdd", 1.3],
+      ["-", "Minus", 1.1], ["Subtract", "NumpadSubtract", 1.1],
+      ["0", "Digit0", 1], ["0", "Numpad0", 1],
+    ] as const) {
+      for (const altKey of [false, true]) {
+        api?.set(1.2);
+        const event = new (window as any).KeyboardEvent("keydown", {
+          key, code, [modifier]: true, altKey, shiftKey: key === "+", bubbles: true, cancelable: true,
+        });
+        doc.getElementById("input")!.dispatchEvent(event);
+        const handled = surface !== "vscode" && !altKey;
+        expect(event.defaultPrevented).toBe(handled);
+        if (api) expect(api.get()).toBeCloseTo(handled ? expected : 1.2, 5);
+      }
+    }
   });
 });
 

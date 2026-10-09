@@ -7,6 +7,8 @@ import { GrokSidebar } from "../src/sidebar";
 import { Uri } from "../src/host";
 import { AcpClient } from "../src/acp";
 import { execGrokCli } from "../src/cli-process";
+import { INTERNAL_PROVIDERS } from "../src/acp-backend";
+import { DISCONNECTED_GITHUB, readGithubAuthState } from "../src/github-auth";
 
 const calls = vi.hoisted(() => ({ start: vi.fn(), newSession: vi.fn(), loadSession: vi.fn(), list: vi.fn(), delete: vi.fn() }));
 vi.mock("../src/acp", async original => {
@@ -35,6 +37,10 @@ vi.mock("../src/acp", async original => {
 vi.mock("../src/cli-process", async original => ({
   ...await original<typeof import("../src/cli-process")>(),
   execGrokCli: vi.fn(async () => ({ stdout: "2.1.100", stderr: "" })),
+}));
+vi.mock("../src/github-auth", async original => ({
+  ...await original<typeof import("../src/github-auth")>(),
+  readGithubAuthState: vi.fn(),
 }));
 vi.mock("../src/claude-cli-locator", () => ({ locateClaudeCli: vi.fn(() => process.execPath) }));
 vi.mock("../src/codex-cli-locator", () => ({ locateCodexCli: vi.fn(() => undefined) }));
@@ -138,18 +144,45 @@ describe("stored connection consent at the host boundary (#171)", () => {
     expect(state.update).not.toHaveBeenCalledWith("grok.providerConnections.v2", expect.anything());
   });
 
-  it("the Projects rail cannot refresh providers at all", async () => {
-    // Its GitHub card posts refreshProviders and the rail allowlist does not
-    // carry it, so the host drops the message. Recorded because the message it
-    // posts LOOKS like a live route: the button is inert, not gated, and the
-    // `credentials: false` on it is only there so it stays honest if the type
-    // is ever allowlisted. Nothing here should make it live.
+  it("the Projects rail Re-check refreshes GitHub state through the chat handler (#186)", async () => {
     const { s, state } = coldHost(true);
+    s.githubConnection = { ...DISCONNECTED_GITHUB };
+    vi.mocked(readGithubAuthState).mockResolvedValue({ ...DISCONNECTED_GITHUB, connected: true, login: "rail-user" });
+    // Keep the real refresh, post and rail mirror; only external I/O is stubbed.
+    delete s.refreshGithubState;
+    delete s.post;
+    s.broadcastRemoteDevice = vi.fn();
+    s.sendRemoteSession = vi.fn();
     await s.onProjectsRailMessage({ type: "refreshProviders", credentials: false });
+    expect(readGithubAuthState).toHaveBeenCalledOnce();
+    expect(s.projectsRail.webview.postMessage).toHaveBeenCalledWith({
+      type: "githubState", github: { connected: true, cliPresent: true, login: "rail-user" },
+    });
+    noAgentWork();
+    // As in chat, already-connected Claude may have its version refreshed.
+    expect(execGrokCli).toHaveBeenCalledWith(process.execPath, ["--version"], expect.any(Object));
+    expect(state.update).not.toHaveBeenCalledWith("grok.providerConnections.v2", expect.anything());
+    expect(s.host.appendLine).not.toHaveBeenCalledWith("[projects-rail] ignored refreshProviders");
+  });
+
+  it.each([false, true, undefined])("rail refresh with credentials=%s cannot run any unconnected provider", async credentials => {
+    const connections = Object.fromEntries(INTERNAL_PROVIDERS.map(id => [id, false]));
+    const { s, state } = coldHost(false, undefined, { "grok.providerConnections.v2": connections });
+    // All four binaries are discoverable and appear signed in elsewhere. Neither
+    // fact is Connect consent, even if a rail message asks for credential probes.
+    s.locateProvider = vi.fn(() => process.execPath);
+    s.providerCredentialFilePresent = vi.fn(() => true);
+    const credentialsProbe = vi.spyOn(s, "reprobeProviderCredentials");
+    const versionProbe = vi.spyOn(s, "reprobeProviderVersion");
+    await s.onProjectsRailMessage({ type: "refreshProviders", ...(credentials === undefined ? {} : { credentials }) });
+    expect(s.refreshGithubState).toHaveBeenCalledOnce(); // The request really reached refresh.
+    expect(s.locatedProviders()).toEqual(Object.fromEntries(INTERNAL_PROVIDERS.map(id => [id, true])));
+    expect(credentialsProbe).not.toHaveBeenCalled();
+    expect(versionProbe).not.toHaveBeenCalled();
     noAgentWork();
     expect(execGrokCli).not.toHaveBeenCalled();
+    expect(s.providerConnections()).toEqual(connections);
     expect(state.update).not.toHaveBeenCalledWith("grok.providerConnections.v2", expect.anything());
-    expect(s.host.appendLine).toHaveBeenCalledWith("[projects-rail] ignored refreshProviders");
   });
 
   it("migrates ambiguous old flags once without touching credentials", async () => {
