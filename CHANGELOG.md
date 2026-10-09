@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.13.1-sandbox.1 — 2026-10-09
+## 4.13.2-sandbox.1 — 2026-10-09
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.13.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.13.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,15 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.13.1 — 2026-09-26
+
+**Connect uses the sign-in your agent's CLI already has.**
+
+### Fixed
+
+- **Connecting an agent no longer makes you sign in again** (#171). At the computer, Connect, in the agent chooser or in Settings → Providers, now checks whether Grok, Codex, Claude Code or Muse Code is already signed in on this machine, and if it is, connects with that sign-in. Before, it started a fresh sign-in anyway (for Grok, Codex and Claude Code, a terminal running the CLI's login, which opens your browser) and showed a sign-in panel even when the CLI was signed in. It shows "Checking…" while it looks. If the CLI isn't signed in, you get that agent's sign-in panel, and nothing opens until you press its sign-in button.
+- **Muse Code's sign-in page opens only when you click it.** At the desk it used to open in your browser by itself, and clicking the link on its card did nothing. The link now opens it, and nothing else does.
 
 ## 4.13.0 — 2026-09-26
 
