@@ -61,22 +61,23 @@ Rows with a positive snapshot token total and no observed activity have no
 button or chevron. Expansion is held in memory per run, with every new run
 collapsed; it is never a host setting.
 
-A live transcript entry is a non-expandable name/status marker. The pinned card
-shows static dots from the reported phases, current phase, reported elapsed time,
-and `updated Ns ago` from frame arrival. Its expanded view adds labelled phases,
-agent budget and single-line agent summaries. Pause/Resume and Stop stay outside
-the disclosure. A finished run (`complete` or `completed`, including a Partial
+Since 4.13.2 the live transcript entry and the pinned card render the same
+closed header (`makeDelegationHeader`, shared with subagent cards): icon, kind,
+name, static dots from the reported phases (windowed to the current step and its
+neighbours past four), status and elapsed time. Two minutes without a frame shows
+as the status "no update for 2 min". Expanding shows labelled phases, one row per
+agent with its tokens, the pause message and the result; Pause/Resume and Stop are
+on the pinned card only. A finished run (`complete` or `completed`, including a Partial
 result summary) leaves the pin and replaces its marker with an expandable
 summary that arrives collapsed, without Pause/Stop. Stateless phase definitions
 remain unknown during a live run except for its current position; successful
 completion marks them done. The retained current phase cannot mark a terminal run's step active;
 failed/cancelled runs preserve pending steps instead of claiming they finished.
 
-The expanded card orders purpose, progress (strip, elapsed time, receipt,
-pause reason and spend), labelled markdown Output when present, then roster.
-The collapsed pin retains the phase name alone; expanded views do not repeat
-phase or status in the heading. Output uses the same `renderMarkdown`, direction
-handling and link interception as message bodies, including underscore emphasis.
+The expanded body orders the steps, the agent roster, the pin's controls, the
+pause message, the result and a token total; the header keeps its status while
+the card is open. The result uses the same `renderMarkdown`, direction handling
+and link interception as message bodies, including underscore emphasis.
 This summary renders notification metadata, not the contents of a report file.
 Workflow definitions and artifact generation live in the CLI, not this repo.
 Assistant prose arrives independently through `messageChunk`, and file reads

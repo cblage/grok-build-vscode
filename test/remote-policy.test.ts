@@ -1485,7 +1485,7 @@ describe("a cloud environment is its own desk", () => {
     // promotion protected nothing and removed the paste path from a phone
     // driving a desk.
     expect([...promoted].sort()).toEqual([
-      "githubSignOut", "logout", "refreshProviders", "setTelemetryEnabled", "setThumbsFeedback",
+      "cloudHostUpdate", "githubSignOut", "logout", "refreshProviders", "setTelemetryEnabled", "setThumbsFeedback",
     ]);
   });
 });

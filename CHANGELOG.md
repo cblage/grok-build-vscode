@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.13.2-sandbox.1 — 2026-10-09
+## 4.13.3-sandbox.1 — 2026-10-09
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.13.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.13.2.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,28 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.13.2 — 2026-09-27
+
+**Subagents and workflows show up for every agent, and cloud machines can update themselves.**
+
+### Added
+
+- **Subagents and workflows for every agent.** Claude Code workflows show their progress live, with the steps a workflow declares listed from the start. Muse Code workflows get a card with a dot for each agent and what the run returned. Codex subagents get a card with what the subagent answered. A reopened Claude Code conversation shows a finished background task as a short notice instead of raw XML.
+- **Update a cloud machine from your phone.** When a newer release is out, a phone connected to a cloud machine offers **Update now**; an update marked as required applies by itself. Either way the machine waits until no agent is working — a workflow still running in the background counts — then updates and reconnects. If the new version can't be installed, it comes back on the version it had and says so.
+
+### Changed
+
+- **One quiet card for subagents and workflows.** Both kinds share one header: icon, kind, name, step dots for a workflow, status and time. Cards start closed. Open one for what it did (a subagent's activity, a workflow's steps and agents), the tokens where the agent reports them, and the result, which reads like a reply and has a copy button. A long workflow shows three dots around where the run is instead of every dot.
+- **Cloud machines keep Claude Code, Codex and Muse Code current**, as they already did Grok.
+
+### Fixed
+
+- **A paused workflow's message keeps its formatting** (#189).
+- **Messages sent while Muse Code posts a workflow's result go through.** They used to fail with "Internal error". Muse now queues them behind its own reply and runs them next.
+- **Reopening a Muse Code conversation no longer fails with "already in use"** when another Muse window touched it a moment before.
+- **Find opens a closed subagent or workflow card** when the match is inside it.
+- **Muse Code's history no longer lists blank "Untitled" conversations** that were never used.
 
 ## 4.13.1 — 2026-09-26
 

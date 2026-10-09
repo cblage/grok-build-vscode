@@ -1,5 +1,7 @@
 # Grok CLI over ACP — current field feedback
 
+Muse MSP resume contention and its ACP error mapping are documented separately in [Muse Code adapter](../../research/muse-adapter.md). A prompt arriving while Muse runs a turn of its own (a workflow's result delivery) is queued by Muse (`ifBusy: "queue"`, disposition `queued`) and awaited; Stop reclaims it with `turn/unqueue`.
+
 Feedback for the xAI team from a thin ACP client (`grok agent stdio`, JSON-RPC over stdio). It
 carries open behavior only, plus a short record of what has closed. The 0.2.3–0.2.112 record is
 [archived separately](ACP-feedback-through-0.2.112.md); headings below cite the archive section
@@ -483,6 +485,21 @@ and `subagent_finished` gained `will_wake`. All still undocumented.
 **Client cost/workaround:** persisted and re-injected interaction state, wrapper stripping, task-id
 correlation, and separate live/replay lifecycle routing. The replay filter and the `sessionKind`
 filter are both retirable on 1.0.5.
+
+**Cross-provider client mapping (2026-09-26 captures):** Codex's ACP subagent
+opt-in replaces synthetic Start/Complete tool rows and replays child sessions;
+Claude's native-subagent opt-in loses the Agent call on replay, so the client
+keeps that opt-in disabled and normalizes the hand-back. Muse workflow snapshots use
+provider metadata on a standard ACP update, then the shared workflow card.
+Codex's bundled initialize schema strips `subagents`, so the client also sends
+AIR `nativeSubagentSessions`; Codex's `asyncTasks` remains disabled. Claude
+uses `asyncTasks` to upgrade a correlated launch receipt into observed live
+phases/agents and terminal state. A literal parse of `rawInput.script` seeds up to
+64 pending phase titles (200 characters each) at launch and on replay when input
+is available; missing/unparseable scripts retain observed-only progress. Cold
+replay otherwise has only the receipt and ID-correlated notification; the XML wake-up is a notice. Muse's collapsed dots
+follow child states; opaque workflow result references have no supported
+resolver in the installed SDK. [Adapter audit](../../research/live-workflow-follow-up.md). [Captured shapes and normalization](../../research/subagent-workflow-shapes.md#client-mappings).
 
 **Ask:** persist resolved interactions across `session/load`; make a background "completed" mean
 completed; stop duplicating structured output in text; do not push a child session's updates down the

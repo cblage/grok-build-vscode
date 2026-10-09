@@ -768,6 +768,8 @@
     sessionSuperseded: null,
     /** Desktop update rail — `updateAvailable` (notice) or `updateReady` (restart). */
     appUpdate: null,
+    cloudHostUpdate: null,
+    cloudHostUpdateOutcome: "",
     repoPreviews: {},
     repoPreviewsAsked: {},
     repoPreviewErrors: {},
@@ -3480,6 +3482,8 @@
       providers: state.providers || [],
       providersChecking: !!state.providersChecking,
       githubState: state.githubState || undefined,
+      cloudHostUpdate: state.cloudHostUpdate,
+      cloudHostUpdateText: cloudHostUpdateText(),
       extVersion: state.extVersion,
       cliVersion: state.cliVersion,
       hostKind: state.hostKind,
@@ -3735,6 +3739,7 @@
         // the Routines page would sit there looking like the button did
         // nothing. Remember that one is outstanding; the relay's refusal below
         // is its answer.
+        if (msg && msg.type === "cloudHostUpdate") { requestCloudHostUpdate(); return; }
         if (msg && msg.type === "saveRoutine") state.routineSavePending = true;
         if (!postPreference(msg)) vscode.postMessage(msg);
         else refreshSettingsOverlay();
@@ -4425,6 +4430,135 @@
    * `updateReady` — same capability pattern as pin control + `pinnedSessions`.
    * VS Code never posts either; no IS_DESKTOP gate.
    */
+  const CLOUD_UPDATE_REQUEST_KEY = "grok.cloudHostUpdate:" + REMOTE_STORAGE_SUFFIX;
+  let cloudUpdateRequest = null;
+  let cloudUpdateTimer = null;
+  let cloudUpdateConnection = hostWait.snapshot() ? hostWait.snapshot().connection : null;
+  if (IS_REMOTE) {
+    try { cloudUpdateRequest = JSON.parse(sessionStorage.getItem(CLOUD_UPDATE_REQUEST_KEY) || "null"); }
+    catch (_) { /* Storage can be unavailable. */ }
+    if (cloudUpdateRequest && typeof cloudUpdateRequest === "object" &&
+        typeof cloudUpdateRequest.installed === "string" && typeof cloudUpdateRequest.latest === "string") {
+      cloudUpdateRequest.reconnecting = true;
+      armCloudUpdateDeadline();
+    } else cloudUpdateRequest = null;
+  }
+
+  function saveCloudUpdateRequest() {
+    try {
+      if (cloudUpdateRequest) sessionStorage.setItem(CLOUD_UPDATE_REQUEST_KEY, JSON.stringify(cloudUpdateRequest));
+      else sessionStorage.removeItem(CLOUD_UPDATE_REQUEST_KEY);
+    } catch (_) { /* Private browsing. */ }
+  }
+
+  function armCloudUpdateDeadline() {
+    clearTimeout(cloudUpdateTimer);
+    if (!cloudUpdateRequest || !cloudUpdateRequest.started || cloudUpdateRequest.timedOut) return;
+    cloudUpdateTimer = setTimeout(() => {
+      cloudUpdateRequest.timedOut = true;
+      state.cloudHostUpdateOutcome = "The cloud host has not confirmed its update after 15 minutes. Try reconnecting.";
+      saveCloudUpdateRequest();
+      // An outcome is a notice about our request, not a capability advertisement.
+      // With no frame on this connection, the update controls remain absent.
+      if (!state.cloudHostUpdate) addError(state.cloudHostUpdateOutcome);
+      renderCloudHostUpdate();
+      refreshSettingsOverlay();
+    }, Math.max(0, cloudUpdateRequest.started + 15 * 60_000 - Date.now()));
+  }
+
+  function requestCloudHostUpdate() {
+    const update = state.cloudHostUpdate;
+    if (!update || !["available", "failed"].includes(update.state) || !update.installed || !update.latest) return;
+    cloudUpdateRequest = { installed: update.installed, latest: update.latest, started: null, reconnecting: false };
+    state.cloudHostUpdateOutcome = "";
+    saveCloudUpdateRequest();
+    vscode.postMessage({ type: "cloudHostUpdate" });
+  }
+
+  function forgetCloudHostUpdate() {
+    if (!IS_REMOTE) return;
+    state.cloudHostUpdate = null;
+    if (cloudUpdateRequest) {
+      cloudUpdateRequest.reconnecting = true;
+      if (!cloudUpdateRequest.started) cloudUpdateRequest.started = Date.now();
+      saveCloudUpdateRequest();
+      armCloudUpdateDeadline();
+    }
+    renderCloudHostUpdate();
+    refreshSettingsOverlay();
+  }
+
+  function receiveCloudHostUpdate(msg) {
+    if (!IS_REMOTE) return;
+    state.cloudHostUpdate = msg;
+    if (msg.state === "updating") {
+      if (!cloudUpdateRequest) cloudUpdateRequest = { installed: msg.installed, latest: msg.latest };
+      if (!cloudUpdateRequest.started) cloudUpdateRequest.started = Date.now();
+      saveCloudUpdateRequest();
+      armCloudUpdateDeadline();
+    } else if (cloudUpdateRequest && cloudUpdateRequest.reconnecting && msg.state !== "queued") {
+      const newer = (a, b) => {
+        if (!/^\d+\.\d+\.\d+$/.test(a || "") || !/^\d+\.\d+\.\d+$/.test(b || "")) return false;
+        const aa = a.split(".").map(Number), bb = b.split(".").map(Number);
+        for (let i = 0; i < 3; i++) if (aa[i] !== bb[i]) return aa[i] > bb[i];
+        return true;
+      };
+      state.cloudHostUpdateOutcome = msg.installed !== cloudUpdateRequest.installed && newer(msg.installed, cloudUpdateRequest.latest)
+        ? "Updated to " + msg.installed
+        : "The cloud host came back " + (msg.installed ? "on " + msg.installed : "without an installed version") + ". The update was not confirmed.";
+      cloudUpdateRequest = null;
+      clearTimeout(cloudUpdateTimer);
+      saveCloudUpdateRequest();
+    }
+    renderCloudHostUpdate();
+  }
+
+  function cloudHostUpdateText() {
+    const update = state.cloudHostUpdate;
+    if (!update) return "";
+    if (update.state === "failed" && update.error
+        && (!state.cloudHostUpdateOutcome.startsWith("Updated to ") || cloudUpdateRequest)) return update.error;
+    if (state.cloudHostUpdateOutcome) return state.cloudHostUpdateOutcome;
+    switch (update.state) {
+      case "available": return "Update available — " + update.latest;
+      case "queued": return (update.mandatory ? "Required update — " : "") + "Will update when the agent is idle";
+      case "updating": return "Updating the cloud host… Reconnecting when it is ready.";
+      case "failed": return update.error || "The cloud host update failed. Please try again.";
+      default: return update.installed
+        ? (update.latest ? "Up to date · " : "Installed · ") + update.installed
+        : "No installed cloud release to update";
+    }
+  }
+
+  function renderCloudHostUpdate() {
+    let banner = document.getElementById("cloud-host-update-banner");
+    const update = state.cloudHostUpdate;
+    if (!IS_REMOTE || !update || (update.state === "current" && !state.cloudHostUpdateOutcome)) {
+      if (banner) banner.remove();
+      return;
+    }
+    if (!banner) {
+      const composer = document.querySelector(".composer");
+      if (!composer) return;
+      banner = document.createElement("div");
+      banner.id = "cloud-host-update-banner";
+      banner.className = "cloud-host-update-banner";
+      banner.setAttribute("role", "status");
+      composer.insertBefore(banner, composer.firstChild);
+    }
+    banner.replaceChildren();
+    const text = document.createElement("span");
+    text.textContent = cloudHostUpdateText();
+    banner.appendChild(text);
+    if (["available", "failed"].includes(update.state) && update.installed && update.latest) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = "Update now";
+      button.onclick = requestCloudHostUpdate;
+      banner.appendChild(button);
+    }
+  }
+
   function renderAppUpdateAffordance() {
     const foot = document.querySelector("#projects-rail .rail-foot");
     if (!foot) return;
@@ -11299,12 +11433,7 @@
     if (role === "user" || role === "agent") {
       const actions = document.createElement("div");
       actions.className = "msg-actions";
-      const copyBtn = document.createElement("button");
-      copyBtn.className = "msg-action-btn msg-copy-btn";
-      copyBtn.type = "button";
-      copyBtn.title = "Copy message";
-      copyBtn.innerHTML = `<span class="msg-action-glyph">${ICON.copy}</span>`;
-      actions.appendChild(copyBtn);
+      actions.appendChild(makeMessageCopyButton());
       // Rewind sits next to Copy on user bubbles only (P2-9). Latest message
       // has nothing after it to discard — hidden via refreshUserRewindButtons.
       //
@@ -13877,90 +14006,164 @@
     const titleEl = el.querySelector(".subagent-title");
     if (!t || /^subagent$/i.test(t)) {
       if (!titleEl.textContent) {
-        el.querySelector(".subagent-sep").hidden = true;
         titleEl.hidden = true;
       }
       return;
     }
-    el.querySelector(".subagent-sep").hidden = false;
     titleEl.hidden = false;
     titleEl.textContent = t;
   }
 
-  // Complete a card: stop the dots, stamp the duration, attach the expandable
-  // result under an "Output of the subagent:" label. Completion can arrive
-  // twice — a completed tool_call_update AND a subagent_finished lifecycle
-  // event (and a re-focus replays both) — so this is idempotent, except that a
-  // late duplicate may still fill in a missing duration (Composer's completed
-  // update carries no duration_ms; its lifecycle event does).
-  function finishSubagentCard(el, info) {
-    const failed = !!info.failed;
-    const cancelled = !!info.cancelled && !failed;
-    const ms = typeof info.durationMs === "number" ? info.durationMs : null;
-    const dur = ms != null ? `· ${Math.max(1, Math.round(ms / 1000))}s` : "";
-    // A failure/cancel is visible on the row itself ("· failed"/"· cancelled",
-    // red via .subagent-failed CSS, muted via .subagent-cancelled) — you
-    // shouldn't have to expand the result to see it went wrong.
-    const statusWord = failed ? "failed" : cancelled ? "cancelled" : "";
-    const timeText = statusWord ? (dur ? `· ${statusWord} ${dur}` : `· ${statusWord}`) : dur;
-    if (el.classList.contains("subagent-done")) {
-      // Already finished (a tool-channel completion routinely races ahead of the
-      // lifecycle finish for the SAME card) — upgrade a missing duration AND a
-      // not-yet-shown failure/cancel marker, the two things a later event adds.
-      if (failed) el.classList.add("subagent-failed");
-      if (cancelled && !el.classList.contains("subagent-failed")) el.classList.add("subagent-cancelled");
-      const timeEl = el.querySelector(".subagent-time");
-      if (timeEl) {
-        if (statusWord) timeEl.textContent = timeText;
-        else if (ms != null && !timeEl.textContent) timeEl.textContent = dur;
-      }
-      return;
+  function makeMessageCopyButton() {
+    const button = document.createElement("button");
+    button.className = "msg-action-btn msg-copy-btn";
+    button.type = "button";
+    button.title = "Copy message";
+    button.setAttribute("aria-label", "Copy message");
+    button.innerHTML = `<span class="msg-action-glyph">${ICON.copy}</span>`;
+    return button;
+  }
+
+  function renderDelegationResult(el, text, bodyClass) {
+    if (el._copyText === text) return;
+    el.classList.add("delegation-result");
+    el._copyText = text;
+    el.replaceChildren();
+    const body = workflowText(el, bodyClass, "");
+    body.innerHTML = renderMarkdown(text);
+    applyAutoDir(body);
+    renderMermaidIn(body);
+    workflowText(el, "msg-actions", "").appendChild(makeMessageCopyButton());
+  }
+
+  // A long run keeps the header short. Past four steps the header shows the
+  // current step with one on each side, and an ellipsis where steps are
+  // hidden; the full list is inside the card. The focus is the current step,
+  // else a failed one, else the first unfinished one, else the last.
+  function windowWorkflowDots(dots) {
+    const items = [...dots.children].filter(d => d.classList.contains("workflow-dot"));
+    if (items.length <= 4) return;
+    const find = (test) => items.findIndex(test);
+    let at = find(d => d.getAttribute("aria-current") === "step" || d.dataset.state === "active");
+    if (at < 0) at = find(d => d.dataset.state === "failed");
+    if (at < 0) at = find(d => !/^(done|complete|completed|failed|cancelled|stopped)$/.test(d.dataset.state || ""));
+    if (at < 0) at = items.length - 1;
+    const start = Math.max(0, Math.min(at - 1, items.length - 3));
+    items.forEach((d, i) => { d.hidden = i < start || i >= start + 3; });
+    const more = () => {
+      const el = document.createElement("span");
+      el.className = "workflow-dots-more";
+      el.textContent = "…";
+      el.setAttribute("aria-hidden", "true");
+      return el;
+    };
+    if (start > 0) dots.insertBefore(more(), items[0]);
+    if (start + 3 < items.length) dots.appendChild(more());
+  }
+
+  // All delegation surfaces use these slots, including terminal reports.
+  function makeDelegationHeader(kind, tag = "button", report = false) {
+    const sub = kind === "Subagent";
+    const header = document.createElement(tag);
+    header.className = `delegation-header ${sub ? "subagent-row" : report ? "workflow-report-toggle" : "workflow-pin-toggle run-progress-row"}`;
+    if (tag === "button") header.type = "button";
+    const slot = (name, alias, text = "") => workflowText(header, `delegation-${name} ${alias}`, text, "span");
+    slot("icon", sub ? "subagent-badge" : "run-progress-badge").innerHTML = sub ? ICON.bot : TOOL_ICON.workflow;
+    slot("kind", sub ? "subagent-label" : "run-progress-kind", kind);
+    slot("name", sub ? "subagent-title" : report ? "workflow-report-name" : "run-progress-title");
+    if (!sub) slot("dots", report ? "workflow-report-dots workflow-dots" : "workflow-dots");
+    slot("status", sub ? "subagent-status" : report ? "workflow-report-state" : "run-progress-phase", "running");
+    slot("time", sub ? "subagent-time" : report ? "workflow-report-elapsed" : "run-progress-elapsed");
+    return header;
+  }
+
+  function setDelegationExpandable(header, expandable, expanded) {
+    header.classList.toggle("expandable", expandable);
+    header.setAttribute("aria-expanded", String(!!expandable && !!expanded));
+    header.setAttribute("aria-disabled", String(!expandable));
+    header.tabIndex = expandable ? 0 : -1;
+    let chevron = header.querySelector(".delegation-chevron");
+    if (!expandable) { if (chevron) chevron.remove(); return; }
+    if (!chevron) {
+      chevron = workflowText(header, "delegation-chevron " + (header.classList.contains("workflow-report-toggle")
+        ? "workflow-report-chevron" : "workflow-chevron"), "", "span");
+      chevron.setAttribute("aria-hidden", "true");
+      chevron.innerHTML = ICON.chevronRight;
     }
-    flushChildStream(el);
-    el.classList.add("subagent-done");
-    if (failed) el.classList.add("subagent-failed");
-    else if (cancelled) el.classList.add("subagent-cancelled");
-    const dots = el.querySelector(".blink-dots");
-    if (dots) dots.remove();
-    const timeEl = el.querySelector(".subagent-time");
-    if (timeEl) timeEl.textContent = timeText;
-    // cleanSubagentOutput strips the CLI envelope (plumbing tags, boilerplate
-    // lead-ins, one wrapping <response> pair, the trailing Agent ID hint) so
-    // only the child's actual words render — as markdown, since subagent
-    // answers routinely carry fences/bold/lists.
-    const liveStatus = el.querySelector(".subagent-status");
-    if (liveStatus) liveStatus.textContent = "";
+    chevron.classList.toggle("is-open", !!expanded);
+  }
+
+  function refreshSubagentCard(el) {
+    const done = el.classList.contains("subagent-done");
+    el.querySelector(".subagent-status").textContent = el.classList.contains("subagent-failed") ? "failed"
+      : el.classList.contains("subagent-cancelled") ? "stopped" : done ? "done" : "running";
+    const ms = done ? el._subagentDurationMs : el._liveStartedAt != null ? Date.now() - el._liveStartedAt : el._subagentDurationMs;
+    const time = el.querySelector(".subagent-time");
+    time.hidden = !Number.isFinite(ms);
+    time.textContent = time.hidden ? "" : workflowElapsed(ms);
+    const meta = el.querySelector(".delegation-meta");
+    meta.textContent = Number.isFinite(el._subagentTokens) ? `${compactTokens(el._subagentTokens)} tokens` : "";
+    wireSubagentExpand(el);
+  }
+
+  function observeSubagentLive(el) {
+    if (state.replaying || el.classList.contains("subagent-done") || el._liveStartedAt != null) return;
+    el._liveStartedAt = Date.now();
+    if (!workflowAgeTimer) workflowAgeTimer = setInterval(refreshWorkflowAges, 1000);
+  }
+
+  function finishSubagentCard(el, info) {
+    if (!el.classList.contains("subagent-done")) {
+      flushChildStream(el);
+      if (el._liveStartedAt != null) el._subagentDurationMs = Date.now() - el._liveStartedAt;
+      el.classList.add("subagent-done");
+    }
+    if (Number.isFinite(info.durationMs)) el._subagentDurationMs = info.durationMs;
+    if (Number.isFinite(info.tokens)) el._subagentTokens = info.tokens;
+    if (info.failed) el.classList.add("subagent-failed");
+    if (info.cancelled && !el.classList.contains("subagent-failed")) el.classList.add("subagent-cancelled");
     const result = cleanSubagentOutput(info.output || "");
     if (result) {
-      const body = el.querySelector(".subagent-result");
-      body.innerHTML = `<div class="subagent-result-label">Output of the subagent:</div>` + renderMarkdown(result);
-      applyAutoDir(body);
-      wireSubagentExpand(el, "Show the subagent's result");
+      el._explicitSubagentResult = result;
+      renderDelegationResult(el.querySelector(".subagent-result"), result, "subagent-result-body");
     }
+    settleChildResult(el);
+    refreshSubagentCard(el);
+  }
+
+  // Codex ends the child session without repeating its final reply on the tool
+  // update. Its trailing message is already here, including on cold replay.
+  function settleChildResult(el) {
+    if (!el.classList.contains("subagent-done") || !el._childProseEl) return;
+    const text = el._childProse || "";
+    if (!el._explicitSubagentResult && text.trim()
+      && !el.classList.contains("subagent-failed") && !el.classList.contains("subagent-cancelled")) {
+      renderDelegationResult(el.querySelector(".subagent-result"), text, "subagent-result-body");
+    }
+    const result = el.querySelector(".subagent-result")._copyText;
+    el._childProseEl.hidden = !!result && result.trim() === text.trim();
   }
 
   function hasChildStreamContent(el) {
     const stream = el.querySelector(".subagent-stream");
-    return !!(stream && stream.childNodes.length);
+    return !!(stream && [...stream.children].some(child => !child.hidden));
   }
 
-  function toggleSubagentDetails(el) {
+  function wireSubagentExpand(el) {
+    const row = el.querySelector(".subagent-row");
     const stream = el.querySelector(".subagent-stream");
     const result = el.querySelector(".subagent-result");
-    const anyOpen = (stream && !stream.hidden) || (result && !result.hidden);
-    const hide = anyOpen;
-    if (stream && hasChildStreamContent(el)) stream.hidden = hide;
-    if (result && result.innerHTML) result.hidden = hide;
-  }
-
-  function wireSubagentExpand(el, title) {
-    const row = el.querySelector(".subagent-row");
-    if (!row) return;
-    row.classList.add("expandable");
-    if (title) row.title = title;
-    if (row._expandWired) return;
-    row._expandWired = true;
-    row.onclick = () => toggleSubagentDetails(el);
+    const meta = el.querySelector(".delegation-meta");
+    const expandable = hasChildStreamContent(el) || !!result.textContent || !!meta.textContent;
+    setDelegationExpandable(row, expandable, el._expanded);
+    stream.hidden = !el._expanded || !hasChildStreamContent(el);
+    result.hidden = !el._expanded || !result.textContent;
+    meta.hidden = !el._expanded || !meta.textContent;
+    row.onclick = () => {
+      if (!expandable) return;
+      el._expanded = !el._expanded;
+      wireSubagentExpand(el);
+    };
   }
 
   function findSubagentCardByChildSession(id) {
@@ -13978,14 +14181,6 @@
     }
     const childId = update.child_session_id || update.subagent_id;
     if (childId && !el.dataset.childSessionId) el.dataset.childSessionId = String(childId);
-  }
-
-  function setSubagentLiveStatus(el, text) {
-    if (el.classList.contains("subagent-done")) return;
-    const status = el.querySelector(".subagent-status");
-    if (!status) return;
-    const t = String(text || "").replace(/\s+/g, " ").trim();
-    status.textContent = t.length > 72 ? t.slice(0, 71) + "…" : t;
   }
 
   // Child chunks arrive word-level. Paint once per frame per card — same
@@ -14012,6 +14207,8 @@
       applyAutoDir(el._childProseEl);
     }
     if (el._childThoughtEl) el._childThoughtEl.textContent = el._childThought || "";
+    settleChildResult(el);
+    wireSubagentExpand(el);
   }
 
   // A tool row is a hard close, like addToToolGroup nulling activeAgentEl:
@@ -14033,7 +14230,6 @@
       el._childProse = "";
     }
     el._childProse = (el._childProse || "") + (text || "");
-    setSubagentLiveStatus(el, el._childProse);
     scheduleChildStreamFlush(el);
   }
 
@@ -14071,7 +14267,6 @@
     applyToolLabel(row, call);
     stream.appendChild(row);
     if (id) el._childTools.set(id, row);
-    setSubagentLiveStatus(el, toolLabel(call));
   }
 
   function updateChildToolRow(el, stream, call) {
@@ -14090,6 +14285,7 @@
   function applyChildStream(msg) {
     const el = findSubagentCardByChildSession(msg && msg.childSessionId);
     if (!el) return;
+    observeSubagentLive(el);
     const stream = el.querySelector(".subagent-stream");
     if (!stream) return;
     if (msg.event === "messageChunk") appendChildProse(el, stream, msg.text);
@@ -14100,33 +14296,28 @@
   }
 
   function addSubagentCard(call) {
+    if (call?.child_session_id && call.toolCallId && state.subagentCards.has(call.toolCallId)) {
+      applySubagentUpdate(call);
+      return;
+    }
     closeToolGroup();
     clearWelcome();
     hideGrokking();
     const el = document.createElement("div");
     el.className = "subagent-card";
-    el.innerHTML =
-      `<div class="subagent-row">` +
-        `<span class="subagent-badge">${ICON.bot || "🤖"}</span>` +
-        `<span class="subagent-label">Subagent</span>` +
-        `<span class="subagent-sep">·</span>` +
-        `<span class="subagent-title"></span>` +
-        `<span class="subagent-status"></span>` +
-        BLINK_DOTS +
-        `<span class="subagent-time"></span>` +
-      `</div>` +
-      `<div class="subagent-stream" hidden></div>` +
-      `<div class="subagent-result" hidden></div>`;
+    el.appendChild(makeDelegationHeader("Subagent"));
+    workflowText(el, "subagent-stream", "").hidden = true;
+    workflowText(el, "subagent-result", "").hidden = true;
+    workflowText(el, "delegation-meta", "").hidden = true;
     setSubagentTitle(el, call);
-    // Cards rebuilt by a cold restore never receive their own subagent_spawned
-    // (session/load strips the lifecycle rail), so they'd sit permanently
-    // untagged — a magnet for a LATER live spawn's FIFO tag, corrupting the old
-    // card with the new run's duration/output. Mark them so live spawn-tagging
-    // and the no-id finish fallback skip them.
+    // Replay may omit lifecycle IDs. A later live spawn must not claim an
+    // untagged historical card through the Grok FIFO fallback.
     if (state.replaying) el.dataset.subagentReplayed = "1";
     appendTranscriptChild(el);
     if (call && call.toolCallId) state.subagentCards.set(call.toolCallId, el);
+    tagSubagentChildSession(el, call);
     applySubagentUpdate(call, el); // a replayed call may already be completed
+    refreshSubagentCard(el);
     scrollToBottom();
   }
 
@@ -14143,10 +14334,13 @@
     // Task → status "completed" + rawOutput {type:"Text", text} with NO
     // duration (the subagent_finished lifecycle event fills that in).
     const out = call && call.rawOutput;
+    const usage = call?._meta?.subagentUsage;
+    if (typeof usage?.durationMs === "number") el._subagentDurationMs = usage.durationMs;
+    if (typeof usage?.tokens === "number") el._subagentTokens = usage.tokens;
     const status = String(call?.status || "").toLowerCase();
     const finished = status === "completed" || status === "failed" || status === "cancelled" ||
       (out && out.type === "SubagentCompleted");
-    if (!finished) return;
+    if (!finished) { observeSubagentLive(el); refreshSubagentCard(el); return; }
     // Output lives in rawOutput.output (SubagentCompleted), rawOutput.text
     // ({type:"Text"} — Composer + background acks), or the content text.
     const output = out && typeof out.output === "string" ? out.output
@@ -14154,18 +14348,19 @@
       : toolUpdateText(call);
     // A background spawn (rawInput.background: true) "completes" immediately
     // with a started-ack while the child keeps running — that's not the
-    // result. Keep the dots; the real output arrives on the
+    // result. Keep running; the real output arrives on the
     // get_command_or_subagent_output poller's TaskOutput, matched back to this
     // card by the child id parsed here (wire capture: accredia session).
     if (/^subagent started in background\b/i.test(String(output || "").trim())) {
       const ackId = /subagent_id:\s*([0-9a-f-]+)/i.exec(String(output));
       if (ackId && !el.dataset.subagentId) el.dataset.subagentId = ackId[1];
+      observeSubagentLive(el);
       return;
     }
     // Thread the failure/cancel through the tool-channel path too — not just the
     // lifecycle rail — since the tool-channel completion is the common ordering.
     finishSubagentCard(el, {
-      durationMs: out && typeof out.duration_ms === "number" ? out.duration_ms : null,
+      durationMs: out && typeof out.duration_ms === "number" ? out.duration_ms : el._subagentDurationMs ?? null,
       output,
       failed: status === "failed",
       cancelled: status === "cancelled",
@@ -14233,13 +14428,14 @@
   }
 
   // ---------- Workflow / Goal / Deep-research progress cards (P2-10) ----------
-  // Host normalizes workflow_updated / goal_updated. Workflow clocks and
-  // activity claims below use reported data; goals retain their completion UI.
+  // Host normalizes workflow_updated / goal_updated. Local clocks only start
+  // on live observations; replay never invents a missing duration.
 
   let workflowPin = null;
   let workflowAgeTimer = null;
 
   function addWorkflowToolMarker(call) {
+    if (state.activeProvider === "muse" && call?.title === "workflow") return true;
     if (!/^Workflow: [\w.:-]+$/.test(call?.title || "")) return false;
     closeToolGroup();
     flushAgent();
@@ -14281,17 +14477,6 @@
     return el;
   }
 
-  function workflowPhaseLabel(update) {
-    const phases = Array.isArray(update.phases) ? update.phases : [];
-    const indexed = phases.map((p, i) => ({ p, i }));
-    const reference = update.currentPhaseId || update.currentPhase;
-    const byId = reference ? indexed.filter(({ p }) => p.id === reference) : [];
-    const useId = update.currentPhaseId || byId.length;
-    const matches = useId ? byId : indexed.filter(({ p }) => update.currentPhase && p.title === update.currentPhase);
-    const name = useId && matches.length === 1 ? matches[0].p.title : update.currentPhase;
-    return name || "";
-  }
-
   // The roster printed the label and the phase side by side, and the label
   // almost always already contained the phase: an agent labelled `pick` in
   // phase `Pick` read "pick Pick", `read:readme` in `Read` read
@@ -14327,8 +14512,24 @@
   // The live lifecycle word, humanized. An empty phase means ordinarily
   // running: the CLI only fills it once something has happened to the run.
   function workflowLiveStatus(update) {
-    return /paus|interrupt|budget|block|permission/i.test(update.phase || "")
-      ? String(update.phase).replace(/[_-]+/g, " ").trim() || "running" : "running";
+    return /paus/i.test(update.phase || "") ? "paused" : "running";
+  }
+
+  function workflowClock(record) {
+    const u = record.update;
+    if (Number.isFinite(u.elapsedMs)) return u.elapsedMs + (!u.done && record.elapsedAt != null && workflowLiveStatus(u) === "running" ? Date.now() - record.elapsedAt : 0);
+    return record.finishedMs ?? (record.startedAt != null ? Date.now() - record.startedAt : null);
+  }
+
+  function refreshWorkflowHeader(header, record) {
+    const u = record.update;
+    const status = u.failed ? "failed" : u.cancelled ? "stopped" : u.done ? "done" : workflowLiveStatus(u);
+    header.querySelector(".delegation-status").textContent = status === "running" && record.receivedAt != null && Date.now() - record.receivedAt >= 120000
+      ? "no update for 2 min" : status;
+    const ms = workflowClock(record);
+    const time = header.querySelector(".delegation-time");
+    time.hidden = !Number.isFinite(ms);
+    time.textContent = time.hidden ? "" : workflowElapsed(ms);
   }
 
   function workflowElapsed(ms) {
@@ -14364,39 +14565,13 @@
     return (update.agents || []).filter((a) => /fail|error|permission|block|await.*approval|waiting.*approval/i.test(a.state || ""));
   }
 
-  /**
-   * One line naming agents that are NOT simply running, for the collapsed card.
-   *
-   * The roster lives behind the disclosure on purpose — a quiet card was the
-   * point, and a healthy run has nothing to say. A stuck one does. An agent
-   * sitting on a permission prompt still arrives inside frames, so the receipt
-   * above goes on reading "updated 3s ago" while nothing moves, and collapsed
-   * that is indistinguishable from work in progress. This is the one exception
-   * to keeping the roster hidden, and it is the smallest one available: a count
-   * and the state's own word, never the roster itself.
-   */
-  function workflowBlockageSummary(agents) {
-    const groups = new Map();
-    for (const agent of agents) {
-      const label = String(agent.state || "blocked").replace(/[_-]+/g, " ").trim() || "blocked";
-      groups.set(label, (groups.get(label) || 0) + 1);
-    }
-    return [...groups].map(([label, n]) => `${formatCount(n)} ${n === 1 ? "agent" : "agents"} ${label}`).join(" · ");
-  }
-
   function refreshWorkflowAges() {
+    for (const el of state.subagentCards.values()) refreshSubagentCard(el);
     for (const el of state.runProgressCards.values()) {
       const record = el._workflow;
       if (!record) continue;
       for (const surface of [el, record.pin].filter((surface) => surface?.isConnected)) {
-        const receipt = surface.querySelector(".workflow-receipt");
-        // Three distinct facts, never one standing in for another: a frame
-        // arrived just now, a frame arrived before this view existed (replay),
-        // and this is a finished run being read back.
-        if (receipt) receipt.textContent = record.update.done
-          ? record.receivedAt != null ? "final workflow update" : "historical workflow update"
-          : record.receivedAt != null ? workflowAge(record.receivedAt, "updated", "no recent updates (30s+)")
-          : "no update since this view opened";
+        refreshWorkflowHeader(surface.querySelector(".delegation-header"), record);
         for (const row of surface.querySelectorAll(".workflow-agent")) {
           const agent = record.update.agents[Number(row.dataset.agentIndex)];
           row.querySelector(".workflow-agent-activity").textContent = workflowAgentActivity(record, agent);
@@ -14430,62 +14605,33 @@
     }
   }
 
-  function renderWorkflowSurface(el, record) {
+  function renderWorkflowSurface(el, record, reportHeader) {
     const u = record.update;
     if (!el.firstChild) {
-      const headingTag = u.done ? "div" : "button";
-      el.innerHTML = `<div class="workflow-heading"><${headingTag} class="workflow-pin-toggle run-progress-row"><span class="run-progress-title"></span><span class="workflow-dots" hidden></span><span class="run-progress-phase"></span><span class="run-progress-elapsed" hidden></span><span class="workflow-chevron" aria-hidden="true"></span></${headingTag}></div>` +
-        `<div class="run-progress-sub" hidden></div><div class="workflow-progress"><ol class="workflow-phases" hidden></ol><div class="workflow-timing"></div><div class="workflow-receipt"></div><div class="workflow-blocked" hidden></div><div class="run-progress-detail" hidden></div><div class="workflow-spend" hidden></div></div><div class="workflow-expanded" hidden><ul class="workflow-roster" hidden></ul></div><div class="run-progress-actions"></div>`;
-      if (!u.done) el.querySelector(".workflow-pin-toggle").onclick = () => {
-        record.expanded = !record.expanded;
-        syncWorkflowPin();
-      };
+      if (!reportHeader) workflowText(el, "workflow-heading", "").appendChild(makeDelegationHeader("Workflow"));
+      const body = workflowText(el, "workflow-expanded", "");
+      body.innerHTML = `<section class="workflow-steps"><div class="delegation-section-label">Steps</div><ol class="workflow-phases"></ol></section>` +
+        `<section class="workflow-agents"><div class="delegation-section-label">Agents</div><ul class="workflow-roster"></ul></section>` +
+        `<div class="run-progress-actions"></div><div class="run-progress-detail" hidden></div><div class="workflow-spend delegation-meta" hidden></div>`;
     }
-    const expanded = u.done || !!record.expanded;
+    const toggle = reportHeader || el.querySelector(".delegation-header");
+    const body = el.querySelector(".workflow-expanded");
+    const expanded = !!reportHeader || !!el._expanded;
+    body.hidden = !expanded;
     el.classList.toggle("is-expanded", expanded);
-    const toggle = el.querySelector(".workflow-pin-toggle");
-    if (!u.done) {
-      toggle.type = "button";
-      toggle.setAttribute("aria-expanded", String(!!record.expanded));
-    }
-    el.querySelector(".workflow-expanded").hidden = !expanded;
-    el.querySelector(".workflow-chevron").innerHTML = record.expanded ? ICON.chevronDown : ICON.chevronRight;
-    const title = el.querySelector(".run-progress-title");
-    title.textContent = u.title && u.title !== u.id ? u.title : u.displayName || "Workflow";
+    el.classList.toggle("run-progress-failed", !!u.failed);
+    const title = toggle.querySelector(".delegation-name");
+    title.textContent = u.title && u.title !== u.id ? u.title : u.displayName || "";
     title.title = title.textContent;
-    if (!u.done) toggle.setAttribute("aria-label", `${record.expanded ? "Collapse" : "Expand"} ${title.textContent}`);
-    const position = workflowPhaseLabel(u);
-    // Expanded, the heading carries the status and the strip carries the step.
-    // Collapsed, neither is on screen, so a run that has STOPPED must say so
-    // here or it is indistinguishable from one still working.
-    const live = workflowLiveStatus(u);
-    el.querySelector(".run-progress-phase").textContent = expanded ? ""
-      : live === "running" ? position
-      : position ? `${position} · ${live}` : live;
-    const elapsed = el.querySelector(".run-progress-elapsed");
-    const timing = el.querySelector(".workflow-timing");
-    if (expanded) timing.appendChild(elapsed);
-    else toggle.insertBefore(elapsed, el.querySelector(".workflow-chevron"));
-    timing.hidden = !expanded || !Number.isFinite(u.elapsedMs);
-    elapsed.hidden = !Number.isFinite(u.elapsedMs);
-    elapsed.textContent = elapsed.hidden ? "" : workflowElapsed(u.elapsedMs);
-    elapsed.title = "Reported workflow elapsed time; advances only when reported";
-
-    // Sits beside the receipt rather than inside the disclosure: "updated 3s
-    // ago" is true of a run whose agents are all stuck, so the two lines have
-    // to be readable together or the fresh one reassures on its own.
-    const blocked = workflowBlockages(u);
-    const blockedEl = el.querySelector(".workflow-blocked");
-    blockedEl.hidden = !blocked.length;
-    blockedEl.textContent = blocked.length ? workflowBlockageSummary(blocked) : "";
-
+    refreshWorkflowHeader(toggle, record);
     const strip = el.querySelector(".workflow-phases");
-    const dots = el.querySelector(".workflow-dots");
+    const dots = toggle.querySelector(".workflow-dots");
     strip.replaceChildren();
     dots.replaceChildren();
     const hasPhases = Array.isArray(u.phases) && u.phases.length;
-    strip.hidden = !hasPhases || !expanded;
-    dots.hidden = !hasPhases || expanded;
+    strip.hidden = !hasPhases;
+    el.querySelector(".workflow-steps").hidden = !hasPhases;
+    dots.hidden = !hasPhases;
     strip.setAttribute("aria-label", "Reported workflow phases");
     dots.setAttribute("aria-label", "Reported workflow steps");
     // Position and state are both reported fields. Never guess completion from
@@ -14512,21 +14658,37 @@
         if (current) item.setAttribute("aria-current", "step");
       }
     }
+    if (!hasPhases && u.agentProgressDots && Array.isArray(u.agents)) {
+      dots.hidden = !u.agents.length;
+      for (const agent of u.agents) {
+        const dot = workflowText(dots, "workflow-dot workflow-agent-dot", "", "span");
+        const state = agent.state || "unknown";
+        dot.dataset.state = /^(started|usage|running|active)$/.test(state) ? "active"
+          : /^(complete|completed|done)$/.test(state) ? "done"
+          : /^(failed|error|rejected|timedOut|aborted)$/.test(state) ? "failed" : state;
+        dot.title = `${workflowAgentName(agent)}: ${state}`;
+        dot.setAttribute("aria-label", dot.title);
+      }
+    }
+    windowWorkflowDots(dots);
     // Legacy detail mixes results, pause reasons and arbitrary CLI events.
     // Its provenance cannot be recovered by splitting on a separator. Only
     // source-preserving hosts can provide output; do not guess on old hosts.
+    const detail = el.querySelector(".run-progress-detail");
     const detailText = u.workflowContent?.pauseMessage;
-    for (const [selector, value] of [[".run-progress-sub", u.subtitle], [".run-progress-detail", detailText]]) {
-      const target = el.querySelector(selector);
-      target.hidden = !expanded || !value;
-      target.textContent = value || "";
-    }
+    detail.hidden = !detailText;
+    detail.innerHTML = renderMarkdown(detailText || "");
+    applyAutoDir(detail);
+    renderMermaidIn(detail);
     const spend = el.querySelector(".workflow-spend");
-    const spendText = Number.isFinite(u.agentsUsed)
-      ? (Number.isFinite(u.agentBudget) ? `${formatCount(u.agentsUsed)} of ${formatCount(u.agentBudget)} agents used` : `${formatCount(u.agentsUsed)} agents used`)
-      : Number.isFinite(u.agentBudget) ? `${formatCount(u.agentBudget)} agent budget` : "";
-    spend.hidden = !expanded || !spendText;
-    spend.textContent = spendText;
+    const tokens = (u.agents || []).filter(a => Number.isFinite(a.tokensUsed));
+    const completeTokenTotal = tokens.length && tokens.length === u.agents.length
+      && (!Number.isFinite(u.agentsUsed) || u.agentsUsed === tokens.length);
+    const totals = [Number.isFinite(u.agentsUsed) ? `${formatCount(u.agentsUsed)} ${u.agentsUsed === 1 ? "agent" : "agents"}` : "",
+      // A zero total is a run that has not spent yet, not information.
+      completeTokenTotal && tokens.some(a => a.tokensUsed > 0) ? `${compactTokens(tokens.reduce((sum, a) => sum + a.tokensUsed, 0))} tokens` : ""].filter(Boolean);
+    spend.textContent = totals.join(" \u00b7 ");
+    spend.hidden = !totals.length;
     const outputText = workflowOutputText(u.workflowContent?.resultSummary);
     let output = el.querySelector(".workflow-output");
     if (!outputText) {
@@ -14535,18 +14697,13 @@
       if (!output) {
         output = document.createElement("section");
         output.className = "workflow-output";
-        output.setAttribute("aria-label", "Output");
-        workflowText(output, "workflow-output-label", "Output", "strong");
-        workflowText(output, "workflow-output-body", "");
-        el.querySelector(".workflow-expanded").prepend(output);
+        body.insertBefore(output, spend);
       }
-      const body = output.querySelector(".workflow-output-body");
-      body.innerHTML = renderMarkdown(outputText);
-      applyAutoDir(body);
-      renderMermaidIn(body);
+      renderDelegationResult(output, outputText, "workflow-output-body");
     }
     const roster = el.querySelector(".workflow-roster");
-    roster.hidden = !Array.isArray(u.agents);
+    roster.hidden = !u.agents?.length;
+    el.querySelector(".workflow-agents").hidden = roster.hidden;
     const existing = new Map([...roster.children].filter((row) => row._agentKey).map((row) => [row._agentKey, row]));
     const rows = (u.agents || []).map((agent, i, agents) => {
       const key = workflowAgentKey(agent, agents);
@@ -14588,16 +14745,16 @@
       }
       row.querySelector(".workflow-agent-name").textContent = workflowAgentName(agent);
       row.querySelector(".workflow-agent-state").textContent = [agent.state ? agent.state.replace(/[_-]+/g, " ") : "",
-        Number.isFinite(agent.tokensUsed) ? `${compactTokens(agent.tokensUsed)} tokens` : ""].filter(Boolean).join(" · ");
+        agent.tokensUsed > 0 ? `${compactTokens(agent.tokensUsed)} tokens` : ""].filter(Boolean).join(" · ");
       row.querySelector(".workflow-agent-activity").textContent = activity;
       return row;
     });
     for (const child of [...roster.children]) if (!rows.includes(child)) child.remove();
     rows.forEach((row, i) => { if (roster.children[i] !== row) roster.insertBefore(row, roster.children[i] || null); });
-    if (Array.isArray(u.agents) && !u.agents.length) workflowText(roster, "workflow-agent-empty", "No agents reported", "li");
 
     const actions = el.querySelector(".run-progress-actions");
     const paused = /paus/i.test(u.phase || "");
+    const controlsAvailable = el === record.pin && !u.done && !u.launchOnly && u.controlsAvailable !== false;
     // Deliberately NOT gated on `receivedAt`. The handle is what a control
     // needs, and the host owns the run either way -- a Stop for a run that has
     // since ended is ignored there, while greying the controls out on a live
@@ -14605,12 +14762,12 @@
     const reason = !u.displayName ? "Controls unavailable: no workflow handle reported"
       : !/^[\w.:-]+$/.test(u.displayName) ? "Controls unavailable: invalid workflow handle" : "";
     // Preserve focused controls and pending pointer clicks across rollup frames.
-    const controlsKey = JSON.stringify([u.done, paused, u.displayName, reason]);
+    const controlsKey = JSON.stringify([u.done, u.launchOnly, paused, u.displayName, reason, u.controlsAvailable]);
     if (actions.dataset.controlsKey !== controlsKey) {
       actions.dataset.controlsKey = controlsKey;
       actions.replaceChildren();
-      actions.hidden = !!u.done;
-      if (!u.done) {
+      actions.hidden = !controlsAvailable;
+      if (controlsAvailable) {
         for (const action of [paused ? "resume" : "pause", "stop"]) {
           const button = workflowText(actions, "run-progress-btn", action[0].toUpperCase() + action.slice(1), "button");
           button.type = "button";
@@ -14623,67 +14780,37 @@
         if (reason) workflowText(actions, "workflow-control-reason", reason);
       }
     }
-  }
-
-  function syncWorkflowReportChevron(report) {
-    const chevron = report.querySelector(".workflow-report-chevron");
-    if (chevron) chevron.innerHTML = report.open ? ICON.chevronDown : ICON.chevronRight;
+    const expandable = !!(hasPhases || u.agents?.length || !actions.hidden || detailText || outputText || totals.length);
+    setDelegationExpandable(toggle, expandable, reportHeader ? toggle.parentElement.open : expanded);
+    if (!reportHeader) toggle.onclick = () => {
+      if (!expandable) return;
+      el._expanded = !el._expanded;
+      if (el === record.pin) record.expanded = el._expanded;
+      renderWorkflowSurface(el, record);
+      if (workflowPin) workflowPin.classList.toggle("is-expanded", !!record.expanded);
+    };
   }
 
   function renderWorkflowTranscript(el, record) {
     const u = record.update;
-    const name = u.title && u.title !== u.id ? u.title : u.displayName || "Workflow";
     el.classList.toggle("run-progress-failed", !!u.failed);
     el.classList.toggle("run-progress-cancelled", !!u.cancelled && !u.failed);
     el.classList.toggle("run-progress-done", !!u.done);
     if (!u.done) {
-      el.replaceChildren();
-      const status = workflowLiveStatus(u);
-      const marker = workflowText(el, "workflow-marker", "");
-      // Every other line in the transcript that reports work carries an icon;
-      // a bare string beside them reads as something half-drawn.
-      marker.innerHTML = TOOL_ICON.workflow + `<span>${escapeHtml(`${name} · ${status}`)}</span>`;
+      renderWorkflowSurface(el, record);
       return;
     }
     let report = el.querySelector(".workflow-report");
     if (!report) {
       el.replaceChildren();
       report = workflowText(el, "workflow-report", "", "details");
-      const summary = workflowText(report, "workflow-report-toggle", "", "summary");
-      // The same parts the live card uses, in the same order. A finished run
-      // used to be a bare string beside the browser's OWN <details> marker --
-      // a different glyph, on the opposite side, from every card still running.
-      // Nobody chose two affordances; one of them was the UA default showing
-      // through, which is also why the elapsed time and the steps vanished.
-      // Deliberately NOT the live card's class names. `.workflow-card
-      // .run-progress-phase` would otherwise match the body's copy and this
-      // one, with different meanings, and every existing assertion about the
-      // body would quietly start reading the summary instead.
-      summary.innerHTML = `<span class="workflow-report-name"></span><span class="workflow-report-dots"></span><span class="workflow-report-state"></span><span class="workflow-report-elapsed" hidden></span><span class="workflow-report-chevron" aria-hidden="true"></span>`;
-      report.addEventListener("toggle", () => syncWorkflowReportChevron(report));
+      report.appendChild(makeDelegationHeader("Workflow", "summary", true));
       workflowText(report, "workflow-report-body", "");
     }
-    const summary = report.querySelector(".workflow-report-toggle");
-    summary.querySelector(".workflow-report-name").textContent = name;
-    summary.querySelector(".workflow-report-state").textContent = u.failed ? "failed" : u.cancelled ? "cancelled" : "done";
-    const body = report.querySelector(".workflow-report-body");
-    renderWorkflowSurface(body, record);
-    // The body already resolves each step's TERMINAL state for a finished run
-    // (a surviving current_phase must not leave one step looking active), so
-    // clone that rail instead of deriving the same thing a second time.
-    const rail = summary.querySelector(".workflow-report-dots");
-    const resolved = body.querySelector(".workflow-dots");
-    rail.replaceChildren(...[...resolved.children].map((dot) => dot.cloneNode(true)));
-    rail.hidden = !rail.children.length;
-    const reportElapsed = summary.querySelector(".workflow-report-elapsed");
-    reportElapsed.hidden = !Number.isFinite(u.elapsedMs);
-    reportElapsed.textContent = reportElapsed.hidden ? "" : workflowElapsed(u.elapsedMs);
-    syncWorkflowReportChevron(report);
-    // Finished reports have one disclosure, with all fixed content inside it.
-    body.querySelector(".run-progress-title").hidden = true;
-    body.querySelector(".workflow-dots").hidden = true;
-    body.querySelector(".workflow-chevron").hidden = true;
-    body.querySelector(".workflow-expanded").hidden = false;
+    const header = report.querySelector(".delegation-header");
+    renderWorkflowSurface(report.querySelector(".workflow-report-body"), record, header);
+    report.ontoggle = () => setDelegationExpandable(header, header.classList.contains("expandable"), report.open);
+    header.onclick = (event) => { if (!header.classList.contains("expandable")) event.preventDefault(); };
   }
 
   function syncWorkflowPin() {
@@ -14693,10 +14820,9 @@
     // dozen frames across its whole length. Gating the pin on freshness meant
     // the owner watched "deep-research - running" sit in the transcript with
     // nothing above the composer, which is the complaint the pin exists to fix.
-    // How fresh the information is belongs in the receipt, not in whether the
-    // run is shown at all.
+    // Receipt silence is shown in the header without withholding the pin.
     const records = [...state.runProgressCards.values()].map((el) => el._workflow)
-      .filter((r) => r && !r.update.done)
+      .filter((r) => r && !r.update.done && !r.update.launchOnly)
       .sort((a, b) => Number(workflowBlockages(b.update).length > 0) - Number(workflowBlockages(a.update).length > 0));
     if (!records.length) {
       if (workflowPin) workflowPin.remove();
@@ -14759,9 +14885,15 @@
     let record = el._workflow;
     if (!record) record = el._workflow = { update, activity: new Map(), receivedAt: null, pin: null, expanded: false };
     const historical = state.replaying;
-    if (!historical) record.receivedAt = Date.now();
     const stale = Number.isFinite(update.revision) && Number.isFinite(record.update.revision) && update.revision < record.update.revision;
     if (!stale) {
+      if (!historical) {
+        record.receivedAt = Date.now();
+        // Repeated snapshots refresh the receipt, but must not rewind a clock.
+        if (record.elapsedAt == null || update.elapsedMs !== record.update.elapsedMs || update.phase !== record.update.phase) record.elapsedAt = Date.now();
+        if (!update.done && record.startedAt == null) record.startedAt = Date.now();
+        if (update.done && record.startedAt != null && record.finishedMs == null) record.finishedMs = Date.now() - record.startedAt;
+      }
       const before = record.update.agents || [];
       const agents = update.agents || [];
       const nextActivity = new Map();
@@ -14786,7 +14918,7 @@
     syncWorkflowToolMarkers();
     syncWorkflowPin();
     refreshWorkflowAges();
-    if (!historical && !workflowAgeTimer) workflowAgeTimer = setInterval(refreshWorkflowAges, 1000);
+    if (!historical && !update.launchOnly && !workflowAgeTimer) workflowAgeTimer = setInterval(refreshWorkflowAges, 1000);
     scrollToBottom();
   }
 
@@ -18482,13 +18614,28 @@
       const row = details.closest(".has-details");
       if (row) setDetailExpanded(row, true);
     }
+    // A hit inside a closed delegation card opens that card through its own
+    // state, so the card's refresh timer and later updates keep it open.
+    // Unhiding the body alone was undone within a second.
+    // Only a card that has something to open is opened: an empty card still
+    // carries hidden section labels, and forcing it open left a chevron that
+    // could not close it.
+    const openable = (card) => !!card?.querySelector(".delegation-header.expandable");
     const sub = el.closest(".subagent-card");
-    if (sub) {
-      const stream = sub.querySelector(".subagent-stream");
-      const result = sub.querySelector(".subagent-result");
-      if (stream && stream.contains(el)) stream.hidden = false;
-      if (result && result.contains(el)) result.hidden = false;
+    if (sub && !sub._expanded && openable(sub)) {
+      sub._expanded = true;
+      wireSubagentExpand(sub);
     }
+    const workflowBody = el.closest(".workflow-expanded");
+    if (workflowBody && workflowBody.hidden && openable(workflowBody.parentElement)) {
+      const surface = workflowBody.parentElement;
+      surface._expanded = true;
+      workflowBody.hidden = false;
+      surface.classList.add("is-expanded");
+      setDelegationExpandable(surface.querySelector(".delegation-header"), true, true);
+    }
+    const report = el.closest("details.workflow-report");
+    if (report && !report.open && openable(report)) report.open = true;
   }
 
   function scrollToFindMatch(m) {
@@ -18980,7 +19127,7 @@
   ]);
 
   const SETTINGS_LIVE_MSGS = new Set([
-    "initialState", "showThinking", "appPurpose", "expandCommandOutputs",
+    "cloudHostUpdateState", "initialState", "showThinking", "appPurpose", "expandCommandOutputs",
     "steerByDefault", "promptNav", "expandDiffCard", "steerUnavailable", "soundNotifications", "processingSound",
     "readRepliesAloud", "summarizeRepliesAloud", "fontScale", "voiceConfigured",
     "providerState", "githubState", "mcpServers", "mcpConnectors", "remoteStatus", "telemetryEnabled", "thumbsFeedback", "grokUpdateStatus", "initialized",
@@ -18994,6 +19141,9 @@
       return;
     }
     switch (msg.type) {
+      case "cloudHostUpdateState":
+        receiveCloudHostUpdate(msg);
+        break;
       case "initialState":
         state.useCtrlEnter = msg.useCtrlEnter;
         state.effort = msg.effort || "";
@@ -19080,6 +19230,7 @@
         // more detail and with the phase attached. Answering both would abandon
         // the in-flight reads twice for one reconnection.
         if (hostWait.snapshot()) break;
+        forgetCloudHostUpdate();
         onRemoteHostReachable(null);
         break;
       case "hostLink":
@@ -19089,6 +19240,10 @@
         // free to receive, so the strip can say what is happening without a
         // `git status` riding on every flap of a phone's radio.
         if (!msg.link) break;
+        if (!msg.link.reachable || (cloudUpdateConnection !== null && cloudUpdateConnection !== msg.link.connection)) {
+          forgetCloudHostUpdate();
+        }
+        cloudUpdateConnection = msg.link.connection;
         if (msg.link.reachable) onRemoteHostReachable(msg.link);
         else noteRemoteFileDisconnect();
         break;
@@ -20232,6 +20387,7 @@
             const failed = !cancelled && status !== "completed";
             finishSubagentCard(el, {
               durationMs: typeof u.duration_ms === "number" ? u.duration_ms : null,
+              tokens: u.tokens_used,
               output: typeof u.output === "string" && u.output ? u.output
                 : (failed || cancelled) ? `*Subagent ${status}${u.error ? ": " + String(u.error) : ""}.*` : "",
               failed,
@@ -22058,7 +22214,7 @@
     if (msgCopyBtn) {
       e.preventDefault();
       e.stopPropagation();
-      const msgEl = msgCopyBtn.closest(".msg");
+      const msgEl = msgCopyBtn.closest(".msg, .delegation-result");
       const text = (msgEl && msgEl._copyText) || "";
       navigator.clipboard.writeText(text).then(() => {
         const glyph = msgCopyBtn.querySelector(".msg-action-glyph");

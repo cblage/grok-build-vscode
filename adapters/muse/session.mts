@@ -1,5 +1,5 @@
-import { spawnMspConnection, type MspHandshake, type SpawnedMspConnection } from "@muse-code/sdk";
-import type { AgentContext, ContentBlock, PromptResponse } from "@agentclientprotocol/sdk";
+import { MspError, spawnMspConnection, type MspHandshake, type SpawnedMspConnection } from "@muse-code/sdk";
+import { RequestError, type AgentContext, type ContentBlock, type PromptResponse } from "@agentclientprotocol/sdk";
 import { Projection } from "./projection.mjs";
 import { Approvals } from "./approvals.mjs";
 // A deep import because the SDK root re-exports nothing from `msp.js`, and
@@ -10,6 +10,19 @@ import type { ReasoningEffort } from "@muse-code/sdk/dist/src/msp.js";
 
 // MSP exposes a session-wide vocabulary, with no per-model capability list.
 export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const satisfies readonly ReasoningEffort[];
+
+const RESUME_RETRY_DELAY_MS = 300;
+const RESUME_RETRY_WINDOW_MS = 10_000;
+
+/** turnCount counts completed turns, not prompts. Keep unfinished work and
+ *  forks; creation/resume bookkeeping can advance updatedAt on a blank row. */
+function isBlankMuseSession(session: Record<string, any>): boolean {
+  const hasText = (value: unknown) => typeof value === "string" && !!value.trim();
+  return session.turnCount === 0 && session.activeTurnId === null
+    && session.forkedFrom === null && session.status !== "running"
+    && !hasText(session.firstUserPrompt) && !hasText(session.title)
+    && !hasText(session.lastActivityAt);
+}
 
 /**
  * How long a closing adapter waits for `muse serve` to actually exit. The host
@@ -39,6 +52,7 @@ function childExitTimeout(): Promise<undefined> {
 
 interface PendingTurn {
   turnId?: string;
+  queued?: boolean;
   cancelRequested?: boolean;
   early: Map<string, Record<string, any>>;
   resolve: (result: Record<string, any>) => void;
@@ -53,7 +67,6 @@ export class MuseSession {
   private closing?: Promise<void>;
   private sessionId?: string;
   private reasoningEffort?: ReasoningEffort;
-  private activeTurnId?: string;
   private creating = false;
   private replayBuffer?: { method: string; params: Record<string, any> }[];
   private pending?: PendingTurn;
@@ -169,7 +182,7 @@ export class MuseSession {
       ...(cwd ? { workspaceRoot: cwd } : {}), ...(cursor ? { cursor } : {}), limit: 200,
     });
     if (!Array.isArray(result.sessions)) throw new Error("Muse session/list returned no sessions");
-    return { sessions: result.sessions.map((s: any) => ({ sessionId: s.sessionId, cwd: s.workspaceRoot,
+    return { sessions: result.sessions.filter((s: any) => !isBlankMuseSession(s)).map((s: any) => ({ sessionId: s.sessionId, cwd: s.workspaceRoot,
       title: s.title || s.firstUserPrompt, updatedAt: s.updatedAt,
       _meta: { createdAt: s.createdAt, turnCount: s.turnCount, modelId: s.modelId, branch: s.branch } })),
       nextCursor: result.nextCursor as string | null };
@@ -190,6 +203,25 @@ export class MuseSession {
     return {};
   }
 
+  private async resumeSession(sessionId: string) {
+    const deadline = Date.now() + RESUME_RETRY_WINDOW_MS;
+    do {
+      try {
+        // Each command() mints a fresh commandId on the existing connection.
+        return await this.connection().command("session/resume", { sessionId, history: "inline" });
+      } catch (error) {
+        if (!(error instanceof MspError) || (error.kind !== "sessionInUse" && error.code !== -32021)) throw error;
+        // Other serves briefly take the writer lease even for sessions they do
+        // not own. This is transient despite MSP reporting retryable: false.
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        await new Promise(resolve => setTimeout(resolve, Math.min(RESUME_RETRY_DELAY_MS, remaining)));
+      }
+    } while (Date.now() < deadline);
+    // An ordinary Error loses its message at the ACP boundary.
+    throw new RequestError(-32021, "Muse Code is busy with this conversation in another window. Try again in a moment.");
+  }
+
   async loadSession(sessionId: string, cwd: string, mcpServers: unknown[]) {
     if (this.sessionId || this.creating) throw new Error("Muse adapter already owns a session");
     if (mcpServers.length) throw new Error("Muse adapter does not accept client MCP servers");
@@ -197,10 +229,9 @@ export class MuseSession {
     this.sessionId = sessionId;
     this.replayBuffer = [];
     try {
-      const result = await this.connection().command("session/resume", { sessionId, history: "inline" });
+      const result = await this.resumeSession(sessionId);
       const resumed = result.session as any;
       if (resumed?.sessionId !== sessionId || resumed.workspaceRoot !== cwd) throw new Error("Muse resume workspace/session mismatch");
-      this.activeTurnId = resumed.activeTurnId ?? undefined;
       const history = result.history as any;
       this.reasoningEffort = history?.snapshot?.state?.reasoningEffort?.reasoningEffort;
       const seen = new Set<string>();
@@ -255,9 +286,8 @@ export class MuseSession {
 
   async prompt(sessionId: string, prompt: ContentBlock[]): Promise<PromptResponse> {
     this.assertSession(sessionId);
-    if (this.pending || this.activeTurnId) throw new Error("Muse session already has an active prompt");
+    if (this.pending) throw new Error("Muse session already has an active prompt");
     if (!prompt.length || prompt.some(part => part.type !== "text")) throw new Error("Muse adapter accepts text prompts only");
-    this.approvals.clear();
     let pending!: PendingTurn;
     const completed = new Promise<Record<string, any>>((resolve, reject) => {
       pending = { resolve, reject, early: new Map() };
@@ -266,13 +296,17 @@ export class MuseSession {
     void completed.catch(() => {});
     this.pending = pending;
     try {
+      // Approvals belong to Muse's turns, not to this prompt: one raised by a turn
+      // Muse runs on its own must stay answerable while this prompt queues behind it.
       const admitted = await Promise.race([this.connection().command("turn/start", {
-        sessionId, input: prompt.map(part => ({ type: "text", text: (part as { text: string }).text })),
+        sessionId, ifBusy: "queue", input: prompt.map(part => ({ type: "text", text: (part as { text: string }).text })),
       }), completed.then(() => new Promise<never>(() => {}))]);
-      if (admitted.status !== "accepted" || typeof admitted.turnId !== "string" || admitted.startedNewTurn !== true) {
-        throw new Error(`Muse did not start a new turn: ${JSON.stringify(admitted)}`);
+      if (admitted.status !== "accepted" || typeof admitted.turnId !== "string" || !admitted.turnId
+        || (admitted.disposition !== "started" && admitted.disposition !== "queued")) {
+        throw new Error(`Muse did not admit a prompt turn: ${JSON.stringify(admitted)}`);
       }
       pending.turnId = admitted.turnId;
+      pending.queued = admitted.disposition === "queued";
       this.log(`Muse turn admitted: ${admitted.turnId}`);
       const early = pending.early.get(admitted.turnId);
       if (early) pending.resolve(early);
@@ -287,15 +321,26 @@ export class MuseSession {
       throw new Error(`Muse turn failed: ${JSON.stringify(terminal.error ?? terminal.terminal)}`);
     } finally {
       this.pending = undefined;
-      this.approvals.clear();
     }
   }
 
   async cancel(sessionId: string): Promise<void> {
     this.assertSession(sessionId);
-    if (this.pending) this.pending.cancelRequested = true;
-    const turnId = this.pending?.turnId ?? this.activeTurnId;
-    if (turnId) await this.connection().command("turn/cancel", { sessionId, turnId });
+    const pending = this.pending;
+    if (!pending) return;
+    pending.cancelRequested = true;
+    const turnId = pending.turnId;
+    if (!turnId) return; // Admission will cancel using its authoritative ID.
+    if (pending.queued) {
+      try {
+        await this.connection().command("turn/unqueue", { sessionId, turnId });
+        return; // Settlement is turn/unqueued, not the command acknowledgement.
+      } catch (error) {
+        if (!(error instanceof MspError) || error.kind !== "commandRejected") throw error;
+        // Launch can win the reclaim race. Stop only this same admitted turn.
+      }
+    }
+    await this.connection().command("turn/cancel", { sessionId, turnId });
   }
 
   private assertSession(id: string): void {
@@ -336,16 +381,16 @@ export class MuseSession {
     }
     if (params.sessionId !== this.sessionId) return;
     if (this.replayBuffer) { this.replayBuffer.push({ method, params }); return; }
-    if (method === "turn/started") this.activeTurnId = params.turnId;
-    if (method === "turn/completed" && params.turnId === this.activeTurnId) this.activeTurnId = undefined;
     this.projection.accept(method, params);
     this.approvals.accept(method, params);
+    if (method === "turn/completed" && typeof params.turnId === "string") this.approvals.forgetTurn(params.turnId);
     if (method === "userInput/requested" || method === "view/gap") {
       this.fail(new Error(`Muse ${method} is unsupported in this boundary slice`));
     }
-    if (method === "turn/completed" && this.pending && typeof params.turnId === "string") {
-      if (!this.pending.turnId) this.pending.early.set(params.turnId, params);
-      else if (params.turnId === this.pending.turnId) this.pending.resolve(params);
+    if (["turn/completed", "turn/unqueued"].includes(method) && this.pending && typeof params.turnId === "string") {
+      const terminal = method === "turn/unqueued" ? { ...params, terminal: "cancelled" } : params;
+      if (!this.pending.turnId) this.pending.early.set(params.turnId, terminal);
+      else if (params.turnId === this.pending.turnId) this.pending.resolve(terminal);
     }
   }
 

@@ -66,6 +66,7 @@
   // copy and test/protocol.test.ts asserts the two are set-equal in both
   // directions (and that chat.js actually handles every host type).
   const HOST_MESSAGE_TYPES = [
+    "cloudHostUpdateState",
     "providerConfigContent", "providerConfigWriteResult",
     "initialState", "moveViewHint", "welcomeTips", "projectSetup", "githubState", "githubRepos", "providerState", "mcpServers", "mcpConnectors", "mcpConnectorAuthorization", "routines", "codexInstallProgress", "planModeAvailability", "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "updateAvailable", "updateReady", "telemetryEnabled", "thumbsFeedback", "initialized",
     "cliUpdating", "session", "sessionName", "sessionRemoved", "modelChanged", "modeChanged", "modePolicy", "sandboxState", "openModePopover",
@@ -81,6 +82,7 @@
     "remoteStatus", "hostReachable", "hostLink",
   ];
   const WEBVIEW_MESSAGE_TYPES = [
+    "cloudHostUpdate",
     "readProviderConfig", "writeProviderConfig", "restartProviderSession", "openProviderConfig",
     "ready", "remotePreferences", "send", "newSession", "cancel", "pickModel", "setMode", "setSandbox", "removeChip",
     "toggleChip", "openFile", "showInFolder", "openUrl", "openText", "openDiff", "exportExpr", "setEffort",
@@ -497,6 +499,7 @@
 
   function isSubagentToolCall(call) {
     if (!call) return false;
+    if (call._meta?.claudeCode?.subagent === true) return true;
     if (call.kind === "subagent" || call.kind === "agent") return true;
     // Structural marker on grok 0.2.9x: _meta["x.ai/tool"].name carries the
     // real tool id regardless of how the call is titled — and when present it

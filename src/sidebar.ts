@@ -1,3 +1,4 @@
+import { CloudHostUpdate, cloudHostIsIdle, cloudHostBootSupportsUpdate, cloudLiveWorkflowRuns, installedCloudHostVersion, parseCloudHostUpdateAttempt, removeCloudHostUpdateStamps, CLOUD_UPDATE_REFUSAL } from "./cloud-host-update";
 import { MuseBackend, withMuseCredentialBackend } from "./muse-backend";
 import { locateMuseCli, parseMuseVersionOutput } from "./muse-cli-locator";
 import { museInstallCommand } from "./muse-install";
@@ -881,7 +882,11 @@ export class GrokSidebar {
     absByRel: Map<string, string>;
   }>();
   private editorWatcher?: HostDisposable;
-  private terminalManager = new TerminalManager();
+  private terminalManager = new TerminalManager({
+    beforeCreate: () => {
+      if (this.cloudHostUpdate && !this.cloudHostUpdate.admitting) throw new Error(CLOUD_UPDATE_REFUSAL);
+    },
+  });
   private voiceRecorder = new VoiceRecorder();
   private voiceTempPath?: string;
   private voiceBatchCtx?: { backend: SttBackend; key: string };
@@ -915,6 +920,10 @@ export class GrokSidebar {
   // sign-in flow). The taps in post()/emit() are no-ops when it's off, so the
   // shipping path is unaffected.
   private uplink?: RemoteUplink;
+  private cloudHostUpdate?: CloudHostUpdate;
+  private cloudHostWork = 0;
+  private cloudWorkflowReceivedAt = new WeakMap<object, number>();
+  private cloudLastAgentActivity = -Infinity;
   private readonly remoteClients: RemoteClientState<Session, RemoteBrowserPreferences>;
   /**
    * One git write at a time per repository.
@@ -971,7 +980,7 @@ export class GrokSidebar {
   // remote turn. `grok.remote.keepAwake` is the opt-out. See src/keep-awake.ts.
   private readonly keepAwake = new KeepAwake((l) => this.host.appendLine(l), process.platform, process.pid, os.release());
   private static readonly DEVICE_GLOBAL_REMOTE_TYPES = new Set<HostMsg["type"]>([
-    "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "cliUpdating",
+    "cloudHostUpdateState", "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "cliUpdating",
     "onboarding", "providerState", "mcpServers", "mcpConnectors", "expandCommandOutputs", "steerByDefault", "soundNotifications",
     "mcpConnectorAuthorization",
     // Device-global, not session-scoped: a phone reading conversation B asked
@@ -1274,8 +1283,88 @@ export class GrokSidebar {
     });
     void this.sweepImageStaging();
     void this.sweepFileStaging();
+    this.startCloudHostUpdate();
     this.startRoutineScheduler();
     this.startWorkflowCompletionPolling();
+  }
+
+  private startCloudHostUpdate(): void {
+    if (!isCloudEnvironment() || !this.host.exitCloudHost) return;
+    if (!cloudHostBootSupportsUpdate(os.homedir())) return;
+    const app = path.join(os.homedir(), "afkpilot");
+    let record: string | undefined;
+    try { record = fs.readFileSync(path.join(app, ".afkpilot-asset"), "utf8"); }
+    catch { /* Source installs have no asset record and cannot offer an update. */ }
+    const attemptPath = path.join(app, ".afkpilot-host-update-attempt");
+    let attempt = null;
+    try { attempt = parseCloudHostUpdateAttempt(fs.readFileSync(attemptPath, "utf8")); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.host.appendLine(`[cloud-update] cannot read attempt record: ${errorDetail(error)}`);
+        return; // Do not risk an automatic restart loop when bookkeeping is unreadable.
+      }
+    }
+    this.cloudHostUpdate = new CloudHostUpdate({
+      installed: installedCloudHostVersion(record),
+      attempt,
+      saveAttempt: (value) => {
+        if (!value) {
+          try { fs.unlinkSync(attemptPath); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+          return;
+        }
+        fs.writeFileSync(`${attemptPath}.tmp`, JSON.stringify(value), { encoding: "utf8", mode: 0o600 });
+        fs.renameSync(`${attemptPath}.tmp`, attemptPath);
+      },
+      check: async () => {
+        const response = await fetch(`${httpBaseFromRelayUrl(this.relayUrl())}/update/cloud-host.json`, {
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!response.ok) throw new Error("Cloud update check failed");
+        return response.json();
+      },
+      idle: () => {
+        const sessions = new Set([...this.pool, this.focused]);
+        const now = Date.now();
+        return cloudHostIsIdle(sessions, this.terminalManager.anyRunning(),
+          this.deviceLoginInFlight() || !!this.mcpRemoteAuthorization,
+          this.cloudHostWork + (this.providerCliUpdate ? 1 : 0),
+          cloudLiveWorkflowRuns(sessions, this.cloudWorkflowReceivedAt, now), this.cloudLastAgentActivity, now);
+      },
+      publish: (message) => this.uplink?.publishCloudUpdate(message),
+      maintenance: () => {
+        if (!this.uplink) return Promise.reject(new Error("No uplink for maintenance hold"));
+        return this.uplink.maintenance();
+      },
+      removeStamp: () => removeCloudHostUpdateStamps(os.homedir()),
+      exit: () => this.host.exitCloudHost!(),
+    });
+  }
+
+  private trackCloudAgentActivity(session: Session, client: AcpClient, gen: number): void {
+    if (!this.cloudHostUpdate) return;
+    // Includes provider-initiated delivery turns, with no host turn token.
+    for (const event of ["messageChunk", "thoughtChunk", "mediaContent", "toolCall", "toolCallUpdate",
+      "plan", "childStream", "taskBackgrounded", "taskCompleted", "promptComplete", "notice",
+      "xaiNotification", "subagentLifecycle", "update", "contextUsage", "adapterUsageUpdate"]) {
+      client.on(event, () => {
+        if (gen !== session.gen || !this.cloudHostUpdate) return;
+        this.cloudLastAgentActivity = Date.now();
+        this.cloudHostUpdate.considerApply();
+      });
+    }
+  }
+
+  /** Covers awaits before a turn token exists, including scheduled/background sends. */
+  private async withCloudHostWork<T>(work: () => Promise<T>): Promise<T | undefined> {
+    if (!this.cloudHostUpdate) return work();
+    if (!this.cloudHostUpdate.admitting) return undefined;
+    this.cloudHostWork++;
+    try { return await work(); }
+    finally {
+      this.cloudHostWork--;
+      this.cloudHostUpdate.considerApply();
+    }
   }
 
   /* ------------------------------------------------------------ routines */
@@ -1331,16 +1420,6 @@ export class GrokSidebar {
       if (this.routinesInFlight.has(routine.id)) continue;
       const { key } = routineWindow(routine, now);
       if (!key) continue;
-      // The claim IS the mutual exclusion. Losing it is the normal outcome for
-      // every host that did not win, and for this host on every later tick
-      // inside the same window.
-      const claimed = this.routineRuns.claim(routine.id, key, {
-        routineId: routine.id,
-        windowKey: key,
-        startedAt: now,
-        outcome: "running",
-      });
-      if (!claimed) continue;
       await this.runRoutine(routine, key, now);
     }
   }
@@ -1351,6 +1430,18 @@ export class GrokSidebar {
    * is worse than one that does not run.
    */
   private async runRoutine(routine: Routine, windowKey: string, startedAt: number): Promise<void> {
+    // Claim and send share one admission hold: startSession's nested hold must
+    // not let an update exit in the gap before this routine starts its turn.
+    await this.withCloudHostWork(async () => {
+      if (this.routinesInFlight.has(routine.id)) return;
+      if (!this.routineRuns.claim(routine.id, windowKey, {
+        routineId: routine.id, windowKey, startedAt, outcome: "running",
+      })) return;
+      await this.runAdmittedRoutine(routine, windowKey, startedAt);
+    });
+  }
+
+  private async runAdmittedRoutine(routine: Routine, windowKey: string, startedAt: number): Promise<void> {
     this.routinesInFlight.add(routine.id);
     const finish = (outcome: RoutineRun["outcome"], extra: Partial<RoutineRun> = {}): void => {
       this.routineRuns.finish({
@@ -1449,20 +1540,21 @@ export class GrokSidebar {
       this.postSessionsList();
       this.postRoutines();
 
-      await this.handleSend(routine.prompt, false, session, "local");
+      let started = false;
+      await this.handleSend(routine.prompt, false, session, "local", undefined, undefined, () => { started = true; });
       // `handleSend` CATCHES a failed turn — it renders the error and resolves
       // normally — so awaiting it says nothing about whether the turn worked.
       // Reporting every one of those as a success would put a green tick on the
       // strip for a rate-limited run, which is precisely the lie this page
       // exists to prevent.
-      const failed = session.status === "error";
+      const failed = !started || session.status === "error";
       // Re-read rather than reusing the id captured above: a session that had
       // to restart mid-start carries a different id by now, and the run must
       // link to the conversation that actually holds the answer.
       finish(failed ? "failed" : "ran", {
         cwd: routine.cwd,
         ...(session.client?.sessionId ? { sessionId: session.client.sessionId } : {}),
-        ...(failed ? { detail: "Failed — the turn ended in an error" } : {}),
+        ...(failed ? { detail: started ? "Failed — the turn ended in an error" : "Failed — the prompt was not sent" } : {}),
       });
     } catch (e) {
       finish("failed", { detail: `Failed — ${(e as Error).message}` });
@@ -9259,6 +9351,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   dispose(): void {
+    this.cloudHostUpdate?.dispose();
     void this.host.setContext("grok.composerFocus", false);
     if (this.reaper) { clearInterval(this.reaper); this.reaper = undefined; }
     if (this.routineTimer) { clearInterval(this.routineTimer); this.routineTimer = undefined; }
@@ -10214,9 +10307,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     clock?: OpenClock,
     opts: { silent?: boolean; canReplace?: () => boolean } = {},
   ): Promise<AcpClient | undefined> {
-    if (target.provider === "muse") await this.museCliChange;
-    if (this.providerCliUpdate?.provider === target.provider) await this.providerCliUpdate.done;
-    return this.runExclusiveSessionStart(target, () => this.startSessionBody(resumeId, target, intent, clock, opts));
+    return this.withCloudHostWork(async () => {
+      if (target.provider === "muse") await this.museCliChange;
+      if (this.providerCliUpdate?.provider === target.provider) await this.providerCliUpdate.done;
+      return this.runExclusiveSessionStart(target, () => this.startSessionBody(resumeId, target, intent, clock, opts));
+    });
   }
 
   private async startSessionBody(
@@ -10687,6 +10782,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       client.terminal = this.terminalManager.ownedBy(client);
     }
 
+    this.trackCloudAgentActivity(session, client, gen);
     client.on("initialized", (init) => {
       if (gen !== session.gen) return;
       this.warnOAuthShadowOnce(init?._meta?.defaultAuthMethodId, env);
@@ -10794,6 +10890,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         session.feedbackCommandsAdvertise = commandsAdvertiseFeedback(cmds);
         this.refreshFeedbackAvailability(session);
       }
+    });
+    client.on("notice", (text: string) => {
+      if (gen !== session.gen) return;
+      session.inUserMessage = false;
+      if (session.replaying) {
+        this.emit(session, { type: "subagentUpdate", update: { sessionUpdate: "turn_completed" } });
+      }
+      this.emit(session, { type: "planNotice", text });
     });
     client.on("messageChunk", (text: string) => {
       if (gen !== session.gen) return;
@@ -11644,6 +11748,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private async onMessage(msg: WebviewMsg, origin: MsgOrigin, clientId?: string): Promise<void> {
+    if (this.cloudHostUpdate && !this.cloudHostUpdate.admitting) {
+      const refusal: HostMsg = { type: "error", text: CLOUD_UPDATE_REFUSAL };
+      if (origin === "remote" && clientId) this.sendRemoteClient(clientId, refusal);
+      else this.post(refusal);
+      return;
+    }
+    await this.withCloudHostWork(() => this.onAdmittedMessage(msg, origin, clientId));
+  }
+
+  private async onAdmittedMessage(msg: WebviewMsg, origin: MsgOrigin, clientId?: string): Promise<void> {
+    if (msg.type === "cloudHostUpdate") {
+      if (isCloudEnvironment() && Object.keys(msg).length === 1) this.cloudHostUpdate?.request();
+      return;
+    }
     const remoteBound = origin === "remote" && clientId
       ? this.remoteClients.active(clientId)
       : undefined;
@@ -12300,12 +12418,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // A manual key, so an explicit run never consumes the scheduled window
         // — "Run now" at 07:59 must not cancel the 08:00 run.
         const key = manualWindowKey(now);
-        this.routineRuns.claim(target.id, key, {
-          routineId: target.id,
-          windowKey: key,
-          startedAt: now,
-          outcome: "running",
-        });
         await this.runRoutine(target, key, now);
         break;
       }
@@ -17453,6 +17565,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     origin: MsgOrigin = "local",
     queuedSendCommit?: { text: string; items: QueuedSendEntry[] },
     submissionId?: string,
+    onStarted?: () => void,
+  ): Promise<void> {
+    if (this.cloudHostUpdate && !this.cloudHostUpdate.admitting) {
+      this.emit(target ?? this.focused, { type: "error", text: CLOUD_UPDATE_REFUSAL });
+      return;
+    }
+    await this.withCloudHostWork(() => this.handleAdmittedSend(text, bare, target, origin, queuedSendCommit, submissionId, onStarted));
+  }
+
+  private async handleAdmittedSend(
+    text: string, bare: boolean, target: Session | undefined, origin: MsgOrigin,
+    queuedSendCommit?: { text: string; items: QueuedSendEntry[] }, submissionId?: string,
+    onStarted?: () => void,
   ): Promise<void> {
     // `target` lets a queued-send flush fire into a BACKGROUNDED session (its
     // turn ended while another was focused). Only the focused session may spawn
@@ -17664,6 +17789,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // The token, not the status, is what says a turn is running from here on —
     // and only whoever holds it may end this one.
     const turn = beginTurn(session);
+    onStarted?.();
     this.startTurnDiffBaseline(session, turn);
     this.setStatus(session, "working");
     // The send IS the activity — the rail should not wait ~2s for the CLI to
@@ -18998,6 +19124,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // Hydration may keep the first frame it sees. Repair every replay position
       // from the newest observation, with independent nested data for each frame.
       for (const message of frames) message.update = structuredClone(completed);
+      this.cloudHostUpdate?.considerApply();
       if (session.suppressContent) continue;
       const frame: HostMsg = { type: "runProgress", update: completed, replaceOnly: true };
       if (session === this.focused) this.postLocal(frame);
@@ -19020,6 +19147,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (message.type === "runProgress") {
       const completed = this.workflowCompletion(session, message.update);
       if (completed) message = { type: "runProgress", update: completed };
+      if (this.cloudHostUpdate) this.cloudWorkflowReceivedAt.set(message, Date.now());
     }
     // A capture still running when tools start may already contain their writes.
     // Prefer the tool-row fallback to presenting that as the pre-turn file.
@@ -19028,6 +19156,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     if (message.type === "clearMessages") session.buffer = [];
     else if (!GrokSidebar.TRANSIENT_TYPES.has(message.type)) session.buffer.push(message);
+    if (message.type === "runProgress") this.cloudHostUpdate?.considerApply();
     if (message.type === "userMessage" && !message.steer) {
       session.liveFeedbackEligible = false;
       session.turnRating = 0;
@@ -21488,6 +21617,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.host.appendLine(`[remote] dropped ${m.type} (not allowed from a remote client)`);
         return;
       }
+      if (m.type === "cloudHostUpdate") {
+        void this.onMessage(m, "remote", clientId);
+        return;
+      }
       if (!allowRemoteRepoTarget(m, (cwd) => this.remoteTargetableCwd(cwd))) {
         this.host.appendLine(`[remote] dropped ${m.type} (cwd was not discovered)`);
         if (m.type === "listRepoSessions") {
@@ -21578,6 +21711,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private handleRemoteClientReady(clientId: string, tabToken?: string): void {
+    this.cloudHostUpdate?.clientReady();
     if (tabToken) {
       const superseded = this.remoteClients.identify(clientId, tabToken);
       if (superseded) {
@@ -21711,6 +21845,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         },
         sameCwd: pathsEqual,
       },
+      onConnected: () => this.cloudHostUpdate?.connected(),
       onClientReady: (clientId, tabToken) => this.handleRemoteClientReady(clientId, tabToken),
       onClientLeft: (clientId) => {
         this.releaseRemoteClient(clientId);
@@ -21966,6 +22101,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const sessionCwdOk = !!session && !!authorizedListCwd(sessionCwd, authorized, pathsEqual);
     const snap: HostMsg[] = [];
     snap.push(initial);
+    if (this.cloudHostUpdate) snap.push(this.cloudHostUpdate.snapshot);
     snap.push(this.providerStateMessage());
     snap.push(this.githubStateMessage());
     snap.push(this.mcpConnectorsMessage());

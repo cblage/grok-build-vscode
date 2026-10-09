@@ -405,6 +405,8 @@ export type QueuedSend = {
 };
 
 export type HostMsg =
+  | { type: "cloudHostUpdateState"; installed: string | null; latest: string | null;
+      state: "current" | "available" | "queued" | "updating" | "failed"; mandatory?: true; error?: string }
   | ({ type: "providerConfigContent"; requestId?: string; provider: "grok" | "codex" | "claude"; relPath: string;
       /** On a miss, path presence opts into create-on-save. Older hosts omit it. */
       absPath?: string; text?: string; stamp?: { mtimeMs: number; size: number } }
@@ -944,7 +946,7 @@ export type HostMsg =
   /**
    * Live child-session stream demuxed off the parent ACP stdout (#62).
    * Additive: an older webview that ignores this type loses nothing it has today.
-   * Child transcripts are not replayed on cold session/load.
+   * Codex also replays child transcripts on cold session/load; Grok does not.
    */
   | { type: "childStream"; childSessionId: string; event: "messageChunk"; text: string }
   | { type: "childStream"; childSessionId: string; event: "thoughtChunk"; text: string }
@@ -952,7 +954,7 @@ export type HostMsg =
   | { type: "childStream"; childSessionId: string; event: "toolCall"; call: ToolCallPayload }
   | { type: "childStream"; childSessionId: string; event: "toolCallUpdate"; call: ToolCallPayload }
   // Deep Research / Workflow / Goal progress (P2-10) — normalized from the
-  // live `_x.ai/session_notification` rail (`workflow_updated` / `goal_updated`).
+  // Grok lifecycle rails and provider-normalized workflow rollups.
   // Cards update in place by `id`; terminal phases stop the live dots.
   // replaceOnly is a live repair hint: never create a card outside the window.
   // Buffered/snapshot frames omit it; older receivers ignore the optional field.
@@ -1099,6 +1101,7 @@ export type HostMsg =
 
 /** webview -> host */
 export type WebviewMsg =
+  | { type: "cloudHostUpdate" }
   | { type: "ready"; tabToken?: string }
   // Browser-owned remote preferences reported for session_start telemetry.
   | { type: "remotePreferences"; fontScale: number; readRepliesAloud: boolean; summarizeRepliesAloud?: boolean; usesTouch: boolean }
@@ -1555,7 +1558,7 @@ export type WebviewMsg =
 // error). The runtime arrays are just the keys, so they can never drift from the
 // union without failing the build.
 const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
-  initialState: true, moveViewHint: true, welcomeTips: true, projectSetup: true, githubState: true, githubRepos: true, providerState: true, mcpServers: true, mcpConnectors: true, mcpConnectorAuthorization: true, routines: true, codexInstallProgress: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true, updateReady: true, telemetryEnabled: true, thumbsFeedback: true,
+  cloudHostUpdateState: true, initialState: true, moveViewHint: true, welcomeTips: true, projectSetup: true, githubState: true, githubRepos: true, providerState: true, mcpServers: true, mcpConnectors: true, mcpConnectorAuthorization: true, routines: true, codexInstallProgress: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true, updateReady: true, telemetryEnabled: true, thumbsFeedback: true,
   initialized: true, cliUpdating: true, session: true, sessionName: true, modelChanged: true,
   modeChanged: true, modePolicy: true, sandboxState: true, openModePopover: true,
   voiceState: true, voiceConfigured: true,
@@ -1606,7 +1609,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   refreshContextDetails: true,
   refreshSubscriptionUsage: true,
   remoteSignIn: true, remoteSignOut: true, unlinkRemoteDevice: true, openRemotePortal: true,
-  openUpdateRelease: true, restartToUpdate: true,
+  cloudHostUpdate: true, openUpdateRelease: true, restartToUpdate: true,
 };
 
 export const HOST_MESSAGE_TYPES: readonly HostMsg["type"][] = Object.keys(HOST_MESSAGE_TYPE_MAP) as HostMsg["type"][];
