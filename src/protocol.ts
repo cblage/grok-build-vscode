@@ -643,7 +643,9 @@ export type HostMsg =
   // Optional and additive: a client that never sees it keeps its old fallback.
   | { type: "sessionName"; sessionId: string; name: string; cwd: string; repoCwd?: string }
   | { type: "modelChanged"; modelId: string }
-  | { type: "modeChanged"; modeId: string }
+  // `modes` is the set this session offers. Absent on an older host: the page
+  // keeps its previous rule (Muse's button hidden, Codex without Plan).
+  | { type: "modeChanged"; modeId: string; modes?: Array<"agent" | "plan" | "yolo"> }
   /** YOLO/Auto-accept blocked when config has disable_bypass_permissions_mode. */
   | { type: "modePolicy"; yoloDisabled: boolean; yoloDisabledReason?: string }
   /** Effective sandbox for the next spawn + profiles available in the dropdown. */

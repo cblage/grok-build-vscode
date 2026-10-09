@@ -2,7 +2,7 @@ import { supportsSessionDeletion } from "./acp-backend";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface, Interface } from "node:readline";
 import { EventEmitter } from "node:events";
-import { claudeSubscriptionWindows, grokSubscriptionWindows, type SubscriptionWindow } from "./subscription-usage";
+import { claudeSubscriptionWindows, grokSubscriptionWindows, museSubscriptionWindows, type SubscriptionWindow } from "./subscription-usage";
 import * as path from "node:path";
 import {
   collectToolImages,
@@ -164,6 +164,8 @@ export interface PermissionOption {
   optionId: string;
   kind: string; // "allow_always" | "allow_once" | "reject_once" | ...
   name: string;
+  /** Muse stamps its own scope here: `once`, `session`, or `localPersistent`. */
+  _meta?: { scope?: string; [key: string]: unknown } | null;
 }
 
 export interface PermissionRequest {
@@ -1694,6 +1696,16 @@ export class AcpClient extends EventEmitter {
         // unparseable so the host can log the raw params.
         const status = parseWorktreeStatus(params) ?? { status: "unknown" };
         this.emit("worktreeStatus", status, params);
+        if (id != null) this.respondOk(id, {});
+        return;
+      }
+      if (method === "_muse/subscription_usage") {
+        // The adapter forwards Muse's raw MSP usage. Only this provider, and
+        // only the session that owns the process — a shared adapter stdout
+        // must not paint another conversation's account windows.
+        if (this.provider === "muse" && params?.sessionId && params.sessionId === this.sessionId) {
+          this.emit("subscriptionUsage", museSubscriptionWindows(params.usage));
+        }
         if (id != null) this.respondOk(id, {});
         return;
       }

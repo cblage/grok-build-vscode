@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.12.2-sandbox.1 — 2026-10-09
+## 4.13.1-sandbox.1 — 2026-10-09
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.12.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.13.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,29 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.13.0 — 2026-09-26
+
+**Muse Code works properly now.** Muse arrived in 4.11, but much of it didn't work: the mode button did nothing, usage never showed, and a failed tool never said why. This release fixes those.
+
+### Added
+
+- **Agent and Auto accept for Muse Code.** The mode button on a Muse session now works. It offers **Agent** and **Auto accept**, the same two Codex offers. Plan isn't offered on Muse, because this app can't make Muse hold back file edits.
+  - **Agent** leaves Muse's own approval settings in charge of what it asks you.
+  - **Auto accept** approves each request Muse makes with a one-time allow. If Muse offers only a lasting allow, you're asked instead. It never gives Muse a lasting "always allow", so switching back to Agent leaves no permission behind.
+  - A new Muse session starts in the mode you last chose, like the other agents. A reopened one starts in Agent.
+- **Muse Code subscription usage.** The usage popover now shows Muse's current usage window and its weekly window. They appear once Muse reports them, usually after your first reply.
+
+### Fixed
+
+- **A failed Muse tool says why.** The row used to say only "Muse tool ended with status: failed". It now shows the reason Muse gave. If Muse gave none, it shows Muse's summary, or else the last lines the command printed.
+- **Muse commands show their output.** A command that completes shows what it printed. When you reopen a conversation, every command shows its output, including failed ones.
+- **Links to files in folders with spaces.** A link to a full path containing spaces is now a link instead of raw text, in paragraphs, lists and headings. That covers `[README.md](/home/me/My Project/README.md)` and the `[README.md](</home/me/My Project/README.md>)` form. A relative path with spaces stays plain text. From a phone or a browser, links to files on your machine still show as plain text, because they can't be opened from there. In VS Code and the desktop app, they open the file.
+- **`####` headings** now render as headings instead of showing the hashes.
+
+### Changed
+
+- **Contributor models in the Muse model picker.** Where you can hover, with a mouse or trackpad, Meta's data-use notice is now in the tooltip. On a touch screen with no hover, it stays under the model name.
 
 ## 4.12.1 — 2026-09-25
 

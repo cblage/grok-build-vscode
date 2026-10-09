@@ -3545,9 +3545,11 @@ body.hide-turn-diff-summary .turn-diff-summary { display: none; }
 .workflow-output-body h1, .msg.agent .body h1,
 .workflow-output-body h2, .msg.agent .body h2,
 .workflow-output-body h3, .msg.agent .body h3,
+.workflow-output-body h4, .msg.agent .body h4,
 .desk-ft-md h1, .files-browse-md h1,
 .desk-ft-md h2, .files-browse-md h2,
-.desk-ft-md h3, .files-browse-md h3 {
+.desk-ft-md h3, .files-browse-md h3,
+.desk-ft-md h4, .files-browse-md h4 {
   margin: 16px 0 8px;
   font-weight: 600;
   line-height: 1.3;
@@ -3555,12 +3557,15 @@ body.hide-turn-diff-summary .turn-diff-summary { display: none; }
 .workflow-output-body h1, .msg.agent .body h1, .desk-ft-md h1, .files-browse-md h1 { font-size: 1.4em; }
 .workflow-output-body h2, .msg.agent .body h2, .desk-ft-md h2, .files-browse-md h2 { font-size: 1.25em; }
 .workflow-output-body h3, .msg.agent .body h3, .desk-ft-md h3, .files-browse-md h3 { font-size: 1.1em; }
+.workflow-output-body h4, .msg.agent .body h4, .desk-ft-md h4, .files-browse-md h4 { font-size: 1em; }
 .workflow-output-body > h1:first-child, .msg.agent .body > h1:first-child,
 .workflow-output-body > h2:first-child, .msg.agent .body > h2:first-child,
 .workflow-output-body > h3:first-child, .msg.agent .body > h3:first-child,
+.workflow-output-body > h4:first-child, .msg.agent .body > h4:first-child,
 .desk-ft-md > h1, .files-browse-md > h1:first-child,
 .desk-ft-md > h2, .files-browse-md > h2:first-child,
-.desk-ft-md > h3, .files-browse-md > h3:first-child { margin-top: 0; }
+.desk-ft-md > h3, .files-browse-md > h3:first-child,
+.desk-ft-md > h4, .files-browse-md > h4:first-child { margin-top: 0; }
 .workflow-output-body ul, .msg.agent .body ul,
 .workflow-output-body ol, .msg.agent .body ol,
 .desk-ft-md ul, .files-browse-md ul,
@@ -4083,6 +4088,10 @@ textarea#input {
   white-space: nowrap;
 }
 .toolbar-btn svg { width: 16px; height: 16px; flex: none; }
+/* Author `display: inline-flex` above beats the UA `[hidden]` rule, same
+   trap as .icon-btn. A hidden mode button would still paint. */
+#mode-btn[hidden],
+.toolbar-btn[hidden] { display: none; }
 .toolbar-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
 /* Bar-icon primitive: every ICON-ONLY action in the top areas (and, via
    matching rules, the file-panel strip / viewer / rail chrome). Glyph 20×20
@@ -6765,4 +6774,9 @@ body.host-wait-visible .gfp-panel.gfp-overlay { bottom: var(--host-wait-height, 
 }
 
 .model-picker-row:has(.model-picker-description) { flex-wrap: wrap; }
-.model-picker-description { flex-basis: 100%; white-space: normal; text-align: left; font-size: 12px; line-height: 1.4; color: var(--muted); }
+/* The row tooltip already carries this text. Inline only where a hover
+   tooltip does not exist: it is a disclosure about the user's data. */
+.model-picker-description { display: none; flex-basis: 100%; white-space: normal; text-align: left; font-size: 12px; line-height: 1.4; color: var(--muted); }
+@media (hover: none) {
+  .model-picker-description { display: block; }
+}
