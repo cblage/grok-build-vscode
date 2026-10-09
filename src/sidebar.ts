@@ -1058,6 +1058,7 @@ export class GrokSidebar {
     "setExpandCommandOutputs",
     "setSteerByDefault",
     "setPromptNav",
+    "setPinLiveWorkflows",
     "setExpandDiffCard",
     "setSoundNotifications",
     "setProcessingSound",
@@ -3056,6 +3057,12 @@ export class GrokSidebar {
         this.post({
           type: "promptNav",
           value: this.host.getConfiguration("grok").get<boolean>("promptNav", true),
+        });
+      }
+      if (e.affectsConfiguration("grok.pinLiveWorkflows")) {
+        this.post({
+          type: "pinLiveWorkflows",
+          value: this.host.getConfiguration("grok").get<boolean>("pinLiveWorkflows", true),
         });
       }
       if (e.affectsConfiguration("grok.soundNotifications")) {
@@ -12577,6 +12584,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await this.host.getConfiguration("grok")
           .update("promptNav", !!msg.value, "global");
         break;
+      case "setPinLiveWorkflows":
+        await this.host.getConfiguration("grok")
+          .update("pinLiveWorkflows", !!msg.value, "global");
+        break;
       case "setSoundNotifications":
         await this.host.getConfiguration("grok")
           .update("soundNotifications", !!msg.value, "global");
@@ -18144,6 +18155,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       steerByDefault: cfg.get("steerByDefault", false),
       expandDiffCard: cfg.get("expandDiffCard", false),
       promptNav: cfg.get("promptNav", true),
+      pinLiveWorkflows: cfg.get("pinLiveWorkflows", true),
       soundNotifications: cfg.get("soundNotifications", false),
       processingSound: cfg.get("processingSound", false),
       readRepliesAloud: cfg.get("readRepliesAloud", false),
@@ -22305,6 +22317,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         steerByDefault: cfg.get("steerByDefault", false),
         expandDiffCard: cfg.get("expandDiffCard", false),
         promptNav: cfg.get("promptNav", true),
+        pinLiveWorkflows: cfg.get("pinLiveWorkflows", true),
         fontScale: this.chatFontScale(),
         soundNotifications: cfg.get("soundNotifications", false),
         processingSound: cfg.get("processingSound", false),

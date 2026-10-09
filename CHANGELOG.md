@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.13.3-sandbox.1 — 2026-10-09
+## 4.13.4-sandbox.1 — 2026-10-09
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.13.2.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.13.3.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,22 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.13.3 — 2026-09-28
+
+**One card for a running workflow, and steps you can read at a glance.**
+
+### Changed
+
+- **One card for a running workflow.** It is pinned above the message box, and the place where it started keeps a one-line trace instead of a second copy. When the run finishes, the card lands where it started.
+- **Unpin a workflow.** The pin button at the end of an opened workflow card puts the card back where the workflow started, with its controls, and the choice is remembered. A phone keeps its own choice.
+- **Colours and words that mean something.** A workflow's header dots, steps and agents share one marker: green done, blue in progress, grey next, red failed. The steps run across with arrows, and the one in progress is bold. Every agent's rows use the same status words (done, running, failed, stopped), whichever agent reports them.
+
+### Fixed
+
+- **A reopened Grok workflow sits after the row that launched it**, not above it.
+- **A Grok workflow that returns JSON shows it in the card**, instead of no result.
+- **"Sending your message" clears once the message has gone through.** On a phone or browser it could stay up, "waiting for confirmation", after the message had already been sent and answered, until the next one.
 
 ## 4.13.2 — 2026-09-27
 
