@@ -2,6 +2,16 @@
 
 Muse MSP resume contention and its ACP error mapping are documented separately in [Muse Code adapter](../../research/muse-adapter.md). A prompt arriving while Muse runs a turn of its own (a workflow's result delivery) is queued by Muse (`ifBusy: "queue"`, disposition `queued`) and awaited; Stop reclaims it with `turn/unqueue`.
 
+Muse Deny unmatched is temporarily omitted from the picker: it denies its own
+`submit_reminder_decision` tool and holds the end-of-turn gate while the
+reminder agent retries. Saved/default Deny unmatched uses Prompt unmatched;
+the adapter durably repairs replayed modes before continuing. The owner's
+measurement and re-enable steps are in [Muse modes](../../research/muse-modes.md#deny-unmatched-hold--2026-09-28).
+
+Missing-file reads retain their failed provider result but render as neutral
+“doesn't exist yet” rows. Other read failures remain red. Provider envelopes
+and verification limits: [missing-file reads](../../research/missing-file-reads.md).
+
 Feedback for the xAI team from a thin ACP client (`grok agent stdio`, JSON-RPC over stdio). It
 carries open behavior only, plus a short record of what has closed. The 0.2.3–0.2.112 record is
 [archived separately](ACP-feedback-through-0.2.112.md); headings below cite the archive section
@@ -500,6 +510,15 @@ is available; missing/unparseable scripts retain observed-only progress. Cold
 replay otherwise has only the receipt and ID-correlated notification; the XML wake-up is a notice. Muse's collapsed dots
 follow child states; opaque workflow result references have no supported
 resolver in the installed SDK. [Adapter audit](../../research/live-workflow-follow-up.md). [Captured shapes and normalization](../../research/subagent-workflow-shapes.md#client-mappings).
+
+Claude adapter 0.76.0's `AsyncTaskRuntime` explicitly ignores `local_agent`.
+The 2026-09-27 desktop capture has an asynchronous `Agent` receipt and a parent
+follow-up, but no task lifecycle for that agent ID. The client now hides the
+receipt, settles the card as “in background” with no clock or result, and accepts
+ID-correlated task events or replay notifications when available. The wake-up's
+ID-less `_claude/origin: task-notification` usage marker cannot finish a card.
+Upstream needs to expose background Agent
+outcomes with native subagent sessions disabled; enabling those loses replay.
 
 **Ask:** persist resolved interactions across `session/load`; make a background "completed" mean
 completed; stop duplicating structured output in text; do not push a child session's updates down the

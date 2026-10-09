@@ -1,14 +1,51 @@
 import { describe, it, expect, vi } from "vitest";
-import { modeToRemember, rememberedEffort, sessionModes, startsInYolo } from "../src/mode-prefs";
+import { modeToRemember, rememberedEffort, sessionModes, startsInYolo, musePosture, museShellSandboxEnabled, usesClientAutoAccept } from "../src/mode-prefs";
 import { GrokSidebar } from "../src/sidebar";
 import { Session } from "../src/session";
 
 describe("remembered mode preference (#25)", () => {
+  const defaults = { shellSandbox: true, sandboxNetwork: "proxy-only" as const, trustWorkspaces: false };
+  it.each([false, true])("replaces saved and default Deny unmatched with Prompt unmatched (cloud=%s)", cloud => {
+    expect(musePosture("denyUnmatched", false, undefined, defaults, cloud)).toEqual({ ...defaults, mode: "agent" });
+    const saved = { ...defaults, mode: "denyUnmatched" as const, trustWorkspaces: true };
+    expect(musePosture("yolo", true, saved, defaults, cloud)).toEqual({ ...saved, mode: "agent" });
+    expect(saved.mode).toBe("denyUnmatched");
+  });
+  it.each(["agent", "yolo", "onRequest", "denyUnmatched"] as const)("uses the VM rather than the Muse sandbox for cloud %s", mode => {
+    expect(museShellSandboxEnabled({ ...defaults, mode }, true)).toBe(false);
+    expect(museShellSandboxEnabled({ ...defaults, mode })).toBe(mode !== "yolo");
+  });
+
+  it("uses Prompt unmatched for a remembered cloud On request default, preserving existing histories for explicit refusal", () => {
+    expect(musePosture("onRequest", false, undefined, defaults, true).mode).toBe("agent");
+    expect(musePosture("onRequest", false, undefined, defaults).mode).toBe("onRequest");
+    const saved = { ...defaults, mode: "onRequest" as const };
+    expect(musePosture("agent", true, saved, defaults, true)).toEqual(saved);
+  });
+  it("seeds new Muse sessions from the shared mode and Agent settings", () => {
+    expect(musePosture("yolo", false, undefined, defaults)).toEqual({ ...defaults, mode: "yolo" });
+    const configured = { ...defaults, shellSandbox: false, trustWorkspaces: true };
+    expect(musePosture("agent", false, undefined, configured)).toEqual({ ...configured, mode: "agent" });
+  });
+
+  it("reopens with the conversation's posture, unaffected by defaults changed elsewhere", () => {
+    const saved = { ...defaults, mode: "yolo" as const };
+    expect(musePosture("agent", true, saved, { ...defaults, trustWorkspaces: true })).toEqual(saved);
+    expect(musePosture("yolo", true, { ...saved, mode: "agent" }, defaults).mode).toBe("agent");
+    expect(musePosture("yolo", true, undefined, { ...defaults, trustWorkspaces: true })).toEqual({ ...defaults, mode: "agent" });
+  });
+
+  it("leaves all Muse approvals to its native mode, including before replay", () => {
+    expect(usesClientAutoAccept("muse")).toBe(false);
+    for (const provider of ["grok", "codex", "claude"]) expect(usesClientAutoAccept(provider)).toBe(true);
+  });
   it("remembers a switch to Agent or Auto accept, but never Plan", () => {
     expect(modeToRemember("agent")).toBe("agent");
     expect(modeToRemember("yolo")).toBe("yolo");
     // Plan is a transient per-task choice — leave the remembered preference alone.
     expect(modeToRemember("plan")).toBeNull();
+    expect(modeToRemember("onRequest")).toBeNull();
+    expect(modeToRemember("denyUnmatched")).toBeNull();
   });
 
   it("starts a NEW session in Auto accept only when that's the remembered mode", () => {
@@ -27,7 +64,9 @@ describe("remembered mode preference (#25)", () => {
     expect(sessionModes("grok")).toEqual(["agent", "plan", "yolo"]);
     expect(sessionModes("claude")).toEqual(["agent", "plan", "yolo"]);
     expect(sessionModes("codex")).toEqual(["agent", "yolo"]);
-    expect(sessionModes("muse")).toEqual(["agent", "yolo"]);
+    expect(sessionModes("muse")).toEqual(["yolo", "agent", "onRequest"]);
+    expect(sessionModes("muse", true)).toEqual(["yolo", "agent"]);
+    for (const provider of ["grok", "codex", "claude"]) expect(sessionModes(provider, true)).toEqual(sessionModes(provider));
   });
 });
 

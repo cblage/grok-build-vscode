@@ -3542,6 +3542,11 @@ body.hide-turn-diff-summary .turn-diff-summary { display: none; }
   white-space: pre-wrap;
   word-break: break-word;
 }
+.tool-missing-message {
+  color: var(--vscode-descriptionForeground);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .tool-kind {
   font-size: 10px;
   color: var(--vscode-descriptionForeground);
@@ -4199,7 +4204,6 @@ textarea#input {
   outline-offset: -2px;
 }
 .toolbar-btn.plan-active { color: var(--vscode-charts-blue, #569cd6); }
-.toolbar-btn.yolo-active { color: var(--vscode-charts-orange, #d7ba7d); }
 .btn-label {
   flex-shrink: 1;
   min-width: 0;
@@ -6858,3 +6862,36 @@ body.host-wait-visible .gfp-panel.gfp-overlay { bottom: var(--host-wait-height, 
   font: inherit;
   cursor: pointer;
 }
+.remote-btn { position: relative; }
+.remote-viewer-dot { display: none; }
+.remote-btn.phone-connected .remote-viewer-dot {
+  display: block;
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  right: 3px;
+  bottom: 3px;
+  border-radius: 50%;
+  background: #3fb950;
+  box-shadow: 0 0 0 2px var(--vscode-editor-background);
+}
+.toolbar-popover.remote-handoff-popover {
+  width: min(330px, calc(100vw - 24px));
+  padding: 20px;
+  box-sizing: border-box;
+  max-height: calc(100vh - 72px);
+  overflow-y: auto;
+}
+.remote-handoff-popover h3 { margin: 0 24px 12px 0; font-size: 15px; }
+.remote-handoff-popover p { margin: 12px 0; line-height: 1.5; }
+.remote-handoff-close { position: absolute; top: 8px; right: 8px; }
+.remote-handoff-qr { background: white; max-width: 260px; margin: 0 auto; }
+.remote-handoff-qr svg { display: block; width: 100%; height: auto; }
+.remote-handoff-qr-pending {
+  max-width: 260px; margin: 0 auto 12px; aspect-ratio: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  background: var(--vscode-editorWidget-background, #252526); border: 1px dashed var(--vscode-widget-border, #555);
+  border-radius: 6px; color: var(--vscode-descriptionForeground, #aaa); font-size: 12px;
+}
+.remote-handoff-qr-pending .host-wait-spinner { width: 20px; height: 20px; }
+.remote-handoff-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.remote-handoff-popover > .confirm-btn { margin: 4px 6px 0 0; }

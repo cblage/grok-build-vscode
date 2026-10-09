@@ -1,4 +1,6 @@
 import type { AcpProvider } from "./acp-backend";
+import type { MusePosture } from "./mode-prefs";
+import type { FileChip } from "./chips";
 import * as nodeFs from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
@@ -47,6 +49,7 @@ export interface SessionMetaOverride {
   provider?: AcpProvider;
   /** Provider-reported cwd for stores that are not laid out under the Grok home. */
   providerCwd?: string;
+  musePosture?: MusePosture;
   /**
    * "This conversation was used just now", asserted by the host rather than
    * read off disk.
@@ -148,6 +151,7 @@ export interface SessionMetaOverride {
    *  typed it. Restored into the composer the next time the conversation starts,
    *  and cleared in the same write so a reopen cannot append it twice. */
   queuedDraft?: string;
+  queuedDraftChips?: FileChip[];
 }
 export type SessionMetaOverrides = Record<string, SessionMetaOverride>;
 

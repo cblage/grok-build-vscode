@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.13.4-sandbox.1 — 2026-10-09
+## 4.14.1-sandbox.1 — 2026-10-09
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.13.3.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.14.0.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,31 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.14.0 — 2026-09-28
+
+**Hand the conversation to your phone in one scan, and Muse Code in its own modes.**
+
+### Added
+
+- **Remote control, one button.** A phone button in the top bar. On a linked machine it shows a QR code that opens the conversation on screen on your phone; on one that is not linked yet it offers to sign in and link it. The desktop rail's and VS Code Projects view's session menus have **Continue on phone** for any conversation. After linking, the browser page that approved it shows the same kind of code. If another window of the app already holds the link, the popover says so instead of waiting.
+- **Muse Code in its own approval modes (#192).** A Muse conversation offers Muse's modes under Muse's names: **Allow all** (Muse's full access, the same as `muse --yolo`), **Prompt unmatched** (Muse asks for anything no rule matches) and, on the desk, **On request** (tools run in Muse's sandbox, and it asks only when a tool requests it). Settings → Providers → Muse Code adds Shell sandbox, Sandbox network and Trust workspaces for new conversations. Approval changes apply at once; sandbox and trust change when the conversation reopens or a new one starts. Deny unmatched is held back until Muse fixes a bug that keeps every turn open for about a minute in that mode ([meta-models/muse-code-sdk#63](https://github.com/meta-models/muse-code-sdk/issues/63)).
+- **Unsent text stays with its conversation (#187).** Switching conversations keeps each one's draft, including on a phone and in a new conversation. Thanks to [@mateolafalce](https://github.com/mateolafalce) ([#188](https://github.com/phuryn/grok-build-vscode/pull/188)).
+- **Editing a sent message brings back its files.** Thanks to [@fiko942](https://github.com/fiko942) ([#157](https://github.com/phuryn/grok-build-vscode/pull/157)).
+
+### Changed
+
+- **Claude Code's background subagents** show as running in the background, instead of taking Claude's launch receipt for their result.
+- **Every mode has its own icon**, so the mode button alone shows which is on, and Auto accept's lightning is no longer orange.
+- **Mode descriptions show on phones too.**
+- **A read of a file that does not exist yet is a grey "doesn't exist yet" row**, not a red failure. Agents check before they create a file. Other read failures stay red.
+
+### Fixed
+
+- **Muse Code on cloud machines can run shell commands.** Muse's sandbox cannot start inside a cloud machine, and Muse then refused every command in every mode but full access. The machine is already an isolated VM, so there Muse now runs without its own sandbox; its approvals still apply.
+- **Switching an empty conversation to another agent** no longer shows the previous agent's modes and models under the new one's name while it starts.
+- **A reopened Codex subagent that was cut off by a disconnect** shows as stopped, instead of running forever.
+- **A Muse Code workflow's JSON result** no longer carries Muse's internal "Returned value:" label.
 
 ## 4.13.3 — 2026-09-28
 

@@ -66,10 +66,11 @@
   // copy and test/protocol.test.ts asserts the two are set-equal in both
   // directions (and that chat.js actually handles every host type).
   const HOST_MESSAGE_TYPES = [
+    "museSettings",
     "cloudHostUpdateState",
     "providerConfigContent", "providerConfigWriteResult",
     "initialState", "moveViewHint", "welcomeTips", "projectSetup", "githubState", "githubRepos", "providerState", "mcpServers", "mcpConnectors", "mcpConnectorAuthorization", "routines", "codexInstallProgress", "planModeAvailability", "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "updateAvailable", "updateReady", "telemetryEnabled", "thumbsFeedback", "initialized",
-    "cliUpdating", "session", "sessionName", "sessionRemoved", "modelChanged", "modeChanged", "modePolicy", "sandboxState", "openModePopover",
+    "cliUpdating", "session", "sessionName", "composerDraftSession", "sessionRemoved", "modelChanged", "modeChanged", "modePolicy", "sandboxState", "openModePopover",
     "voiceState", "voiceConfigured", "voicePartial", "voiceSubmit", "voiceTranscript",
     "voiceError", "chips", "commandsUpdate", "mentionResults", "projectDirListing", "projectFileContent", "projectFileWriteResult", "gitStatusResult", "gitFileDiffResult", "turnFileDiffResult", "turnDiffBaseline", "gitRunResult", "userMessage", "agentStart", "thoughtChunk",
     "messageChunk", "media", "userMessageChunk", "historyReplay", "historyBatch", "permissionHistoryQueue",
@@ -79,9 +80,10 @@
     "promptComplete", "contextUsage", "commandOutput", "expandCommandOutputs", "setAllToolDetails", "focusInput", "findInSession", "restoreComposer", "truncateMessages", "uiConfirmRequest", "uiConfirmResolved", "agentReset", "agentError", "agentEnd", "exit", "setBusy", "summarizing",
     "sessionContext", "clearMessages", "onboarding", "error", "hostNotice", "xaiNotification", "subagentUpdate", "childStream", "runProgress", "sessions", "repoSessions", "pinnedSessions", "repos",
     "sessionDot", "queuedSends", "submitQueuedSend", "steerUnavailable", "feedbackAvailability", "turnFeedbackAck", "usage", "steerByDefault", "promptNav", "pinLiveWorkflows", "expandDiffCard", "soundNotifications", "processingSound", "readRepliesAloud", "summarizeRepliesAloud", "speechSummary", "imageFull", "imageOriginal", "moveComposerCaret",
-    "remoteStatus", "hostReachable", "hostLink",
+    "remoteStatus", "remoteHandoff", "showRemoteHandoff", "hostReachable", "hostLink",
   ];
   const WEBVIEW_MESSAGE_TYPES = [
+    "setMuseSetting",
     "cloudHostUpdate",
     "readProviderConfig", "writeProviderConfig", "restartProviderSession", "openProviderConfig",
     "ready", "remotePreferences", "send", "newSession", "cancel", "pickModel", "setMode", "setSandbox", "removeChip",
@@ -99,7 +101,7 @@
     "setSoundNotifications", "setProcessingSound", "setReadRepliesAloud", "setSummarizeRepliesAloud", "setVoiceSendPhrase", "setVoiceKeyterms", "setTelemetryEnabled", "setThumbsFeedback", "setDesktopTray", "summarizeSpeech", "requestImageFull", "requestImageOriginal", "composerFocus",
     "newWorktreeSession", "applyWorktree", "removeWorktree", "rewindSession", "editLastMessage", "uiConfirmAnswer", "workflowControl", "refreshContextDetails",
     "refreshSubscriptionUsage",
-    "remoteSignIn", "remoteSignOut", "unlinkRemoteDevice", "openRemotePortal",
+    "remoteSignIn", "remoteSignOut", "unlinkRemoteDevice", "openRemotePortal", "remoteHandoff", "showRemoteHandoff",
     "openUpdateRelease", "restartToUpdate",
   ];
   const HOST_MESSAGE_TYPE_SET = new Set(HOST_MESSAGE_TYPES);

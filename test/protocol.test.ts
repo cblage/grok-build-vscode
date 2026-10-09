@@ -18,6 +18,11 @@ const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.me
 const sorted = (a: readonly string[]) => [...a].sort();
 
 describe("host <-> webview message contract (src/protocol.ts is the source of truth)", () => {
+  it("contributes the phone handoff command and routes it through the chat host", () => {
+    expect(packageJson.contributes.commands).toContainEqual({ command: "grok.continueOnPhone", title: "Grok: Continue on Phone" });
+    const extension = readFileSync(new URL("../src/extension.ts", import.meta.url), "utf8");
+    expect(extension).toContain('registerCommand("grok.continueOnPhone", () => sidebar.continueOnPhone())');
+  });
   it("pins the interrupted-send error code so harnesses do not match copy", () => {
     expect(INTERRUPTED_SEND_CODE).toBe("interrupted-send");
     expect(chatSrc).toContain('el.setAttribute("data-error-code", code)');
@@ -32,6 +37,7 @@ describe("host <-> webview message contract (src/protocol.ts is the source of tr
 
   it("advertises remote voice as a host protocol capability", () => {
     expect(HOST_CAPABILITIES).toEqual({
+      museNativeModes: true,
       installMuse: true,
       uploadFile: true,
       remoteVoice: true,
@@ -68,6 +74,8 @@ describe("host <-> webview message contract (src/protocol.ts is the source of tr
       // everyone who has not updated yet.
       remoteRewind: true,
       remoteSteering: true,
+      // A New's composer waits for this reply; an older host never sends it.
+      composerDraftSession: true,
     });
   });
 

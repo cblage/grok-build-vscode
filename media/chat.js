@@ -487,6 +487,10 @@
   const newBtn = $("new-btn");
   const historyBtn = $("history-btn");
   const remoteBtn = $("remote-btn");
+  let remoteHandoffPopover = null;
+  let remoteHandoff = null;
+  let remoteHandoffSerial = 0;
+  let remoteLinkReturn = null;
   const repoBtn = $("repo-btn");
   const modeBtn = $("mode-btn");
   const sandboxBtn = $("sandbox-btn");
@@ -596,6 +600,7 @@
     // Null until a host sends `modeChanged.modes`. Absent means the old rule:
     // Muse's button hidden, Codex without Plan.
     offeredModes: null,
+    disabledModes: {},
     effort: "",
     cwd: "",
     contextWindow: 200000,
@@ -1016,14 +1021,12 @@
     // grok.worktree — true when the focused session runs in an isolated git
     // worktree (from the `session` message). Gates the gear Apply/Remove items.
     isWorktree: false,
-    // Whether the host machine holds a relay device token (`remoteStatus`).
-    // Drives the gear AFK Pilot items; never sent to remote clients.
-    // THREE states, not two: null = not answered yet. The host reads the token
-    // from secret storage asynchronously, so defaulting to false told an
-    // already-linked machine to "Sign in (link this device)" for that window —
-    // inviting the user to re-link a device that was working. Unknown shows
-    // nothing at all.
+    // null means the host has not answered: never invite an already-linked desk to link again.
     remoteLinked: null,
+    remoteHandoffSupported: false,
+    remoteHandoffReady: false,
+    remoteHeldElsewhere: false,
+    remoteViewerCount: 0,
     // Display form of the one directory new and cloned projects land in
     // (`projectSetup.root`, e.g. `~/Grok Build`). Empty until the host says —
     // the Add project form shows the destination as you type, so it needs this
@@ -1091,6 +1094,9 @@
     // as a duplicate; these two do not.
     settings2: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>`,
     shield: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg>`,
+    shieldQuestion: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M9.1 9a3 3 0 0 1 5.82 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>`,
+    box: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>`,
+    construction: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="8" rx="1"/><path d="M17 14v7"/><path d="M7 14v7"/><path d="M17 3v3"/><path d="M7 3v3"/><path d="M10 14 2.3 6.3"/><path d="m14 6 7.7 7.7"/><path d="m8 6 8 8"/></svg>`,
     bot: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>`,
     listTree: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12h-8"/><path d="M21 6H8"/><path d="M21 18h-8"/><path d="M3 6v4c0 1.1.9 2 2 2h3"/><path d="M3 10v6c0 1.1.9 2 2 2h3"/></svg>`,
     zap: `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>`,
@@ -1157,29 +1163,17 @@
     globe: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10Z"/></svg>`,
   };
 
-  function modeMeta() {
-    return {
-      agent: {
-        icon: ICON.bot,
-        label: "Agent mode",
-        desc: "Grok acts directly, asking approval only for changes it judges sensitive",
-      },
-      plan: {
-        icon: ICON.listTree,
-        label: "Plan mode",
-        desc: "Grok explores and proposes a plan; file writes and commands are blocked until you approve it",
-      },
-      yolo: {
-        icon: ICON.zap,
-        label: "Auto accept",
-        desc: "Grok automatically approves all permission requests (YOLO)",
-        disabled: !!state.yoloDisabled,
-        disabledNote: state.yoloDisabled
-          ? (state.yoloDisabledReason || "Disabled by disable_bypass_permissions_mode")
-          : "",
-      },
-    };
-  }
+  const MODE_META = {
+    agent: { icon: ICON.bot, label: "Agent mode" },
+    plan: { icon: ICON.listTree, label: "Plan mode" },
+    yolo: { icon: ICON.zap, label: "Auto accept" },
+  };
+  const MUSE_MODE_META = {
+    yolo: { icon: ICON.zap, label: "Allow all", description: "No prompts; everything runs." },
+    agent: { icon: ICON.shieldQuestion, label: "Prompt unmatched", description: "Prompt for anything no rule matches (the interactive default)." },
+    onRequest: { icon: ICON.box, label: "On request", description: "Tools run sandboxed; prompt only on explicit permission requests." },
+    denyUnmatched: { icon: ICON.construction, label: "Deny unmatched", description: "Anything no rule matches is denied." },
+  };
 
   // Three blinking dots — the tool rows' in-progress animation, reused by every
   // progress indicator (Grokking / Thinking) so they all pulse the same way
@@ -1415,12 +1409,35 @@
   function offeredModeIds() {
     if (Array.isArray(state.offeredModes)) return state.offeredModes;
     if (state.activeProvider === "muse") return [];
-    return Object.keys(modeMeta()).filter((id) => id !== "plan" || state.activeProvider !== "codex");
+    return Object.keys(MODE_META).filter((id) => id !== "plan" || state.activeProvider !== "codex");
+  }
+
+  function offersMuseModes() {
+    // Native Muse menus put Allow all first; legacy hosts send agent, yolo.
+    // Keep that signal when cloud offers only these two native choices.
+    return state.activeProvider === "muse" && Array.isArray(state.offeredModes)
+      && ["yolo", "agent"].every((id, index) => state.offeredModes[index] === id);
+  }
+
+  function modeMeta(id) {
+    const dictionary = offersMuseModes() ? MUSE_MODE_META : MODE_META;
+    const base = Object.hasOwn(dictionary, id) ? dictionary[id] : { icon: ICON.bot, label: "Unknown mode" };
+    // This fork's modePolicy disables Auto accept when grok's config sets
+    // disable_bypass_permissions_mode; the mode menu reads these two fields.
+    if (id === "yolo" && state.yoloDisabled) {
+      return { ...base, disabled: true, disabledNote: state.yoloDisabledReason || "Disabled by disable_bypass_permissions_mode" };
+    }
+    return base;
   }
 
   function modeDescription(id) {
+    if (offersMuseModes() && Object.hasOwn(MUSE_MODE_META, id)) return MUSE_MODE_META[id].description;
     const name = providerDisplayName(state.activeProvider);
     if (state.activeProvider === "muse") {
+      if (state.hostCaps && state.hostCaps.museNativeModes) {
+        if (id === "agent") return "Muse Code asks for approval. Sandbox and trust change on reopen or in a new conversation";
+        if (id === "yolo") return "Muse Code full access (YOLO). Sandbox and trust change on reopen or in a new conversation";
+      }
       if (id === "agent") return `Follows ${name}'s own approval rules`;
       if (id === "yolo") return `Answers every approval ${name} raises. This may look the same as Agent, because ${name} asks rarely by default`;
     }
@@ -1433,11 +1450,7 @@
   // first thing dropped in a narrow composer — take the id from the caller so
   // the tooltip can never name a different mode than the icon is showing.
   function modeButtonTitle(modeId) {
-    // modeMeta() rather than upstream's MODE_META constant: this fork computes
-    // the yolo row's disabled state per call, so the labels have to be built
-    // fresh rather than frozen at module load.
-    const modes = modeMeta();
-    const meta = modes[modeId] || modes.agent;
+    const meta = modeMeta(modeId);
     if (state.busyLocked) return `${meta.label} — available once the session is ready`;
     if (offeredModeIds().includes("plan") && !state.planModeAvailable) {
       return `${meta.label} — Pick mode — ${state.planModeUnavailableReason}`;
@@ -1447,7 +1460,7 @@
 
   function updateModeBtn(modeId) {
     modeBtn.hidden = offeredModeIds().length === 0;
-    const meta = modeMeta()[modeId] || modeMeta().agent;
+    const meta = modeMeta(modeId);
     modeBtn.innerHTML = `${meta.icon}<span class="btn-label">${escapeHtml(meta.label)}</span>`;
     modeBtn.classList.toggle("plan-active", modeId === "plan");
     modeBtn.classList.toggle("yolo-active", modeId === "yolo");
@@ -1498,13 +1511,16 @@
   newBtn.innerHTML = ICON.squarePen;
   historyBtn.innerHTML = ICON.clock;
   ensureVisibleNewSession();
-  // "Continue remotely", one tap from the chat instead of buried in the gear
-  // menu — the desk is where someone decides to get up and keep going on
-  // their phone. Local client only (a remote is already remote), and only
-  // once this machine is linked; syncRemoteButton flips it live.
   if (remoteBtn) {
-    remoteBtn.innerHTML = ICON.smartphone;
-    remoteBtn.onclick = () => vscode.postMessage({ type: "openRemotePortal", withHint: true });
+    remoteBtn.innerHTML = ICON.smartphone + '<span class="remote-viewer-dot" aria-hidden="true"></span>';
+    remoteBtn.setAttribute("aria-haspopup", "dialog");
+    remoteBtn.onclick = (e) => {
+      e.stopPropagation();
+      if (remoteHandoff) { closePopovers(); return; }
+      openRemoteHandoff("topbar");
+    };
+    if (IS_REMOTE) remoteBtn.remove();
+    syncRemoteButton();
   }
   updateSendButton(); // spinner by default — session is starting up (busy+locked)
   gearBtn.classList.remove("icon-btn");
@@ -2386,6 +2402,9 @@
   function closePopovers() {
     clearSandboxRulesHideTimer();
     flushPicker();
+    if (remoteHandoffPopover) remoteHandoffPopover.hidden = true;
+    remoteHandoff = null;
+    if (remoteBtn) remoteBtn.setAttribute("aria-expanded", "false");
     gearBtn.setAttribute("aria-expanded", "false");
     gearPopover.classList.remove("model-picker");
     gearPopover.removeAttribute("role");
@@ -3455,6 +3474,8 @@
       steerSupported: steerableProvider(),
       providersKnown: !!state.providersKnown,
       remoteLinked: state.remoteLinked,
+      remoteHandoffSupported: state.remoteHandoffSupported,
+      remoteViewerCount: state.remoteViewerCount,
       hostCaps: state.hostCaps || {},
     };
   }
@@ -3483,6 +3504,7 @@
       promptNav: !!state.promptNav,
       expandDiffCard: !!state.expandDiffCard,
       providers: state.providers || [],
+      museSettings: state.museSettings,
       providersChecking: !!state.providersChecking,
       githubState: state.githubState || undefined,
       cloudHostUpdate: state.cloudHostUpdate,
@@ -3850,7 +3872,7 @@
     });
   }
 
-  function showRemoteExplainer() {
+  function showRemoteExplainer(source = "settings") {
     const overlay = document.createElement("div");
     overlay.className = "confirm-overlay remote-explainer-overlay";
     const panel = document.createElement("div");
@@ -3929,7 +3951,7 @@
     };
     moreBtn.onclick = (e) => {
       e.stopPropagation();
-      vscode.postMessage({ type: "openRemotePortal" });
+      vscode.postMessage({ type: "openRemotePortal", source });
       done();
     };
 
@@ -4017,33 +4039,6 @@
       `<span class="gear-lead" title="Adds worktrees, thinking traces, and tool details (still off by default).">${ICON.squareChevronRight}<span>Coding</span></span>${state.appPurpose === "coding" ? '<span class="popover-check">✓</span>' : ""}`,
       () => { setAppPurpose("coding"); refresh(); },
     );
-
-    // ── Remote Control ────────────────────────────────────────────────────
-    // Hidden in the browser client: a remote can't (un)link the desk.
-    // `remoteLinked === null` = the host hasn't answered yet: show NOTHING
-    // rather than guessing. Unlink lives only in Settings → Account.
-    if (!IS_REMOTE && state.remoteLinked !== null) {
-      section(target === addPopover ? "Remote control" : "Remote Control");
-      if (state.remoteLinked) {
-        item(`<span class="gear-lead">${ICON.smartphone}<span>Continue remotely</span></span>`, () => {
-          vscode.postMessage({ type: "openRemotePortal", withHint: true });
-          closePopovers();
-        });
-        item(`<span class="gear-lead">${ICON.user}<span>Your account</span></span>`, () => {
-          vscode.postMessage({ type: "openRemotePortal" });
-          closePopovers();
-        });
-      } else {
-        item(`<span class="gear-lead">${ICON.user}<span>Sign in (link this device)</span></span>`, () => {
-          vscode.postMessage({ type: "remoteSignIn" });
-          closePopovers();
-        });
-        item(`<span class="gear-lead">${ICON.info}<span>How it works</span></span>`, () => {
-          closePopovers();
-          showRemoteExplainer();
-        });
-      }
-    }
 
     section("Settings");
     item(`<span class="gear-lead">${ICON.gear}<span>Settings</span></span>`, () => {
@@ -4986,9 +4981,8 @@
     const effortMoved = level !== null && level !== wasLevel;
     if (model && (model.modelId !== wasModel.modelId || model.provider !== wasModel.provider)) {
       const message = { type: "setModel", modelId: model.modelId };
-      // The row's OWN provider, not the one the preview resolved: a row that
-      // declares none leaves the host to infer it from the model id, which is
-      // what an older catalog needs (providerForRequestedModel).
+      // Model rows keep the provider that supplied them. Older hosts without
+      // providerState still receive their original model-id-only request.
       if (state.providersKnown && model.declared) message.provider = model.declared;
       if (effortMoved) message.effort = level;
       vscode.postMessage(message);
@@ -5004,9 +4998,29 @@
   function previewModel(m) {
     if (modelSelectionLocked()) return;
     const provider = m.provider || state.activeProvider;
-    if (!modelBaseline) modelBaseline = { modelId: state.currentModelId, provider: state.activeProvider };
+    if (!modelBaseline) modelBaseline = {
+      modelId: state.currentModelId, provider: state.activeProvider,
+      modeId: state.currentModeId, modes: state.offeredModes, disabledModes: state.disabledModes,
+    };
     state.currentModelId = m.modelId;
+    if (provider !== state.activeProvider) {
+      // The old session's advertised modes do not belong to this preview.
+      // Use the new provider's defaults until the host supplies its modes.
+      // Returning to the original pick is a no-op on close, so restore its
+      // advertised modes as well; there will be no host reply to restore them.
+      const original = provider === modelBaseline.provider;
+      state.offeredModes = original ? modelBaseline.modes : null;
+      state.currentModeId = original ? modelBaseline.modeId : "agent";
+      state.activeProvider = provider;
+      // Nothing can take a mode until the new provider's session exists, so
+      // show its modes but hold them; the host's modeChanged releases them.
+      const waiting = `Available once ${providerDisplayName(provider)} has started`;
+      state.disabledModes = original ? modelBaseline.disabledModes
+        : Object.fromEntries(offeredModeIds().map((id) => [id, waiting]));
+    }
     state.activeProvider = provider;
+    updateModeBtn(state.currentModeId);
+    syncProviderVoice();
     modelPending = { modelId: m.modelId, provider, declared: m.provider };
     // A model carries its own ladder, so a level previewed against the PREVIOUS
     // model stays a choice only while THIS one still offers it: an off-menu
@@ -5155,11 +5169,8 @@
     if (!modePopover.hidden) { closePopovers(); return; }
     closePopovers();
     modePopover.innerHTML = "";
-    // modeMeta() rather than upstream's MODE_META constant — it carries the
-    // Auto-accept disabled state this fork's modePolicy drives.
-    const metas = modeMeta();
     for (const id of offered) {
-      const meta = metas[id];
+      const meta = modeMeta(id);
       const el = document.createElement("div");
       const active = id === state.currentModeId;
       // Verified-old CLI: hard-disable Plan. Unverified probe: keep it clickable
@@ -5168,11 +5179,13 @@
       // cannot show it.
       const planUnavailable = id === "plan" && !state.planModeAvailable;
       const planRecheckable = planUnavailable && state.planModeRecheckable;
-      const disabled = !!meta.disabled || (planUnavailable && !planRecheckable);
-      const disabledNote = planUnavailable ? state.planModeUnavailableReason : meta.disabledNote;
+      const hostReason = Object.hasOwn(state.disabledModes, id) ? state.disabledModes[id] : "";
+      const disabled = !!hostReason || !!meta.disabled || (planUnavailable && !planRecheckable);
+      const disabledNote = hostReason || (planUnavailable ? state.planModeUnavailableReason : meta.disabledNote);
       el.className = "toolbar-popover-item mode-popover-item" +
         (active ? " active" : "") +
         (disabled ? " disabled" : "");
+      el.setAttribute("aria-disabled", String(disabled));
       el.innerHTML =
         `<span class="mode-item-icon">${meta.icon}</span>` +
         `<span class="mode-item-body">` +
@@ -7115,6 +7128,81 @@
     }
   }
 
+  // Composer text belongs to a conversation, independently of transcript replay.
+  const composerDrafts = new Map();
+  let composerSessionId = null;
+  let composerExpectedSessionId = null;
+  const pendingComposerDrafts = new Set();
+  let composerRestoredChips = [];
+
+  function setComposerRestoredChips(chips) {
+    if (!composerRestoredChips.length && !chips.length) return;
+    const oldIds = new Set(composerRestoredChips.map((chip) => chip.id));
+    composerRestoredChips = chips;
+    state.chips = [...state.chips.filter((chip) => !oldIds.has(chip.id)), ...chips];
+    renderChips();
+    updateSendButton();
+  }
+
+  function switchComposerDraft(sessionId) {
+    if (composerSessionId === sessionId) return;
+    if (composerSessionId !== null) {
+      if (input.value || composerRestoredChips.length) composerDrafts.set(composerSessionId, {
+        text: input.value, chips: composerRestoredChips,
+      });
+      else composerDrafts.delete(composerSessionId);
+    }
+    if (composerSessionId !== null || pendingComposerDrafts.has(sessionId)) {
+      const draft = composerDrafts.get(sessionId);
+      input.value = draft?.text || "";
+      setComposerRestoredChips(draft?.chips || []);
+    }
+    composerSessionId = sessionId;
+    slashPopover.hidden = true;
+    hideMention();
+    renderInputHighlight();
+  }
+
+  function confirmComposerSession(sessionId) {
+    // Identity echoes can arrive after another gesture. Only the correlated
+    // New reply may bind its draft; ordinary frames cannot guess which New.
+    if (pendingComposerDrafts.has(composerSessionId)) {
+      // A host that predates that reply never sends it. There, the first
+      // identity that can only be the conversation the New created binds it.
+      if (!(state.hostCaps && state.hostCaps.composerDraftSession)
+          && state.railExpectedIdentity?.kind === "new"
+          && railIdentitySatisfies(sessionId)) {
+        bindComposerDraft(composerSessionId, sessionId);
+      }
+      return;
+    }
+    if (composerExpectedSessionId && sessionId !== composerExpectedSessionId) return;
+    switchComposerDraft(sessionId);
+    composerExpectedSessionId = null;
+    syncFocusedRemoteHandoff();
+  }
+
+  function bindComposerDraft(draftId, sessionId) {
+    if (!sessionId || !pendingComposerDrafts.delete(draftId)) return;
+    if (composerSessionId === draftId) composerSessionId = sessionId;
+    else if (composerDrafts.has(draftId)) {
+      const draft = composerDrafts.get(draftId);
+      if (composerSessionId === sessionId) {
+        input.value = [draft.text, input.value].filter(Boolean).join("\n\n");
+        setComposerRestoredChips([...draft.chips, ...composerRestoredChips]);
+        renderInputHighlight();
+      } else composerDrafts.set(sessionId, draft);
+    }
+    composerDrafts.delete(draftId);
+    syncFocusedRemoteHandoff();
+  }
+
+  function postNewSession() {
+    vscode.postMessage(pendingComposerDrafts.has(composerSessionId)
+      ? { type: "newSession", draftId: composerSessionId }
+      : { type: "newSession" });
+  }
+
   /**
    * Replace any in-flight transition. One at a time; a new click bumps the
    * token so a late frame for the old one cannot complete or clear the new.
@@ -7148,6 +7236,16 @@
         // as confirmation of a conversation the host had not created yet.
         knownIds: railKnownSessionIds(),
       };
+    if (fields.kind === "new") {
+      const draftId = newRemoteTabToken();
+      pendingComposerDrafts.add(draftId);
+      switchComposerDraft(draftId);
+      composerExpectedSessionId = null;
+    } else {
+      switchComposerDraft(fields.sessionId);
+      composerExpectedSessionId = fields.sessionId;
+    }
+    syncFocusedRemoteHandoff();
     // Highlight without a veil would claim conversation X while Y is still on
     // screen and fully actionable. Pair them so the click is visibly owned.
     veilTranscriptForPendingOpen();
@@ -7197,6 +7295,12 @@
     if (!state.railTransition) return;
     clearRailTransitionTimer();
     state.railTransition = null;
+    // The composer moved at the click. Put it back on the conversation the
+    // host still has, or Send would deliver the clicked one's draft there.
+    // A New's pending draft stays bindable if the host creates it after all.
+    composerExpectedSessionId = null;
+    if (state.activeSessionId) switchComposerDraft(state.activeSessionId);
+    syncFocusedRemoteHandoff();
     // historyReplay owns the veil while a transcript is materialising; leave
     // it up if we are mid-replay so aborting a superseded click cannot blank a
     // real load still in progress.
@@ -8412,7 +8516,7 @@
     // transcript must not grow an empty-state panel on top of it.
     startRailNewTransition(repoCwd, "creating", previousSessionId);
     resetForNewSession();
-    vscode.postMessage({ type: "newSession" });
+    postNewSession();
   }
 
   function wireSessionNewButton(btn) {
@@ -8531,7 +8635,7 @@
     if (!record) return;
     menuSlot.appendChild(railMenuButton(
       "Session actions",
-      () => railSessionMenuItems(record, repo, true, { inlineRename: true }),
+      () => railSessionMenuItems(record, repo, true, { inlineRename: true, followsFocus: true }),
       "session-head",
     ));
   }
@@ -9202,6 +9306,11 @@
         ...waiting,
         onSelect: () => beginContinueInNewChat(s.id),
       });
+      if (!IS_REMOTE) items.push({
+        label: "Continue on phone…", icon: ICON.smartphone,
+        onSelect: () => opts?.followsFocus
+          ? openRemoteHandoff("rail") : openRemoteHandoff("rail", s.id, repo.cwd),
+      });
       // The live transcript this client is showing — same scope as Continue.
       items.push({
         label: "Export as Markdown",
@@ -9247,6 +9356,10 @@
         });
       }
     }
+    if (!active && !IS_REMOTE) items.push({
+      label: "Continue on phone…", icon: ICON.smartphone,
+      onSelect: () => openRemoteHandoff("rail", s.id, repo.cwd),
+    });
     // Capability, never a version: a host that has never sent `pinnedSessions`
     // will silently drop `toggleSessionPin`, so offering the control there gives
     // a control that does nothing — worse than not having one. The frame arrives
@@ -11403,6 +11516,7 @@
     const el = document.createElement("div");
     el.className = `msg ${role}`;
     el._copyText = text || "";
+    el._chips = chips || [];
     // A steered (interjected) message rides inside the turn that was already
     // running — it is not its own prompt and has no rewind point, so it must be
     // excluded from the bubble→rewind-point mapping (see refreshUserRewindButtons).
@@ -12075,7 +12189,7 @@
   }
 
   const TOOL_VERB = {
-    read_file: "Read", file_read: "Read",
+    read_file: "Read", file_read: "Read", view_file: "Read", view: "Read",
     write_file: "Write", file_write: "Write", write: "Write",
     bash: "Run", execute: "Run", run_command: "Run", run_terminal_command: "Run",
     shell: "Run", run_bash: "Run",
@@ -12101,7 +12215,7 @@
     if (!title) return "";
     const tick = title.match(/`([^`]+)`/);
     if (tick && tick[1]) return tick[1].trim();
-    const stripped = title.replace(/^(edit|write|read|delete|create|update)\s+/i, "").trim();
+    const stripped = title.replace(/^(edit|write|read|view|delete|create|update)\s+/i, "").trim();
     if (stripped && stripped !== title && /[\\/]|\.\w{1,8}$/.test(stripped)) return stripped;
     return "";
   }
@@ -12113,13 +12227,22 @@
       r.new_path || r.new_file || r.file || r.filename ||
       r.target_directory || r.directory || r.dir ||
       (Array.isArray(r.paths) ? r.paths[0] : "") ||
+      (call.locations && call.locations[0] && call.locations[0].path) ||
       pathFromToolTitle(call);
   }
   function isReadTool(call) {
     if (!call) return false;
     const name = toolName(call);
     const kind = toolKind(call);
-    return name === "read_file" || name === "file_read" || kind === "read";
+    return /^(read_file|file_read|view_file|view)$/.test(name) || kind === "read";
+  }
+  function isMissingFileRead(call, message) {
+    if (!isReadTool(call) || /^(list|glob|grep|search)/i.test(toolName(call))) return false;
+    // Match failure text only, never a successful file's contents. Leave mixed
+    // missing/permission/I/O failures red. Provider evidence: research/missing-file-reads.md.
+    return typeof message === "string"
+      && !/permission denied|access (?:is )?denied|operation not permitted|\b(?:EACCES|EPERM|EIO)\b|(?:input\/output|I\/O) error/i.test(message)
+      && /\bENOENT\b|\bNo such file or directory\b|\bFile does not exist\b/i.test(message);
   }
   function asLineNum(v) {
     return typeof v === "number" && Number.isFinite(v) ? v : null;
@@ -12224,7 +12347,7 @@
   // through to the "command" catch-all.
   function titleKind(call) {
     const t = (call.title || "").trim().toLowerCase();
-    if (/^read\b/.test(t)) return "read";
+    if (/^(read|view)\b/.test(t)) return "read";
     if (/^(grep|glob|search|ripgrep)\b/.test(t)) return "search";
     if (/^(shell|execute|run|bash)\b/.test(t)) return "execute";
     if (/^(write|create)\b/.test(t)) return "write";
@@ -12345,6 +12468,8 @@
     const r = call.rawInput || call.input || {};
     const filePath = toolFilePath(call);
     const command = r.command || r.cmd;
+    const failure = state.toolFailuresById.get(call.toolCallId) || toolFailureText(call);
+    if (isMissingFileRead(call, failure)) return `${filePath ? prettyPath(filePath) : "File"} — doesn't exist yet`;
     const pattern = r.glob_pattern || r.pattern || r.query || r.regex || r.search;
     const url = r.url || r.uri;
     // Collapsed rows read as a scannable summary, not a wall of shell — the
@@ -12519,6 +12644,8 @@
         if (!carrier) wireCommandToggle(flat, detailsEl);
       }
       el.replaceWith(flat);
+      flat._call = calls[0];
+      if (calls[0].toolCallId) state.toolItemsByToolCallId.set(calls[0].toolCallId, flat);
       const fail = calls[0].toolCallId && state.toolFailuresById.get(calls[0].toolCallId);
       if (fail) applyToolFailure(flat, fail); // a single tool that failed carries its error
     } else {
@@ -12985,7 +13112,7 @@
       const idx = groupCalls._calls.findIndex((c) => c && c.toolCallId === id);
       if (idx >= 0) groupCalls._calls[idx] = merged;
     }
-    const labelEl = item.querySelector(".tool-item-label");
+    const labelEl = item.querySelector(".tool-item-label, .tool-label");
     if (labelEl) applyToolLabel(labelEl, merged);
     // The running header names the NEWEST call (addToToolGroup), and its
     // argument often arrives on an update rather than the first tool_call —
@@ -13578,6 +13705,30 @@
   // (grok's "image reference not readable: …" etc.) shows beneath it. Idempotent.
   function applyToolFailure(rowEl, message) {
     if (!rowEl || rowEl.classList.contains("tool-failed")) return;
+    if (isMissingFileRead(rowEl._call, message)) {
+      applyToolLabel(rowEl.querySelector(".tool-item-label, .tool-label"), rowEl._call);
+      if (rowEl.querySelector(".tool-missing-message")) return;
+      let details = rowEl.querySelector(".tool-item-details");
+      if (!details) {
+        details = document.createElement("div");
+        details.className = "tool-item-details";
+        rowEl.appendChild(details);
+      }
+      details.classList.remove("tool-read-carrier");
+      details.hidden = !detailShouldExpand();
+      const reason = document.createElement("pre");
+      reason.className = "tool-missing-message";
+      reason.textContent = message;
+      details.replaceChildren(reason);
+      if (!rowEl.classList.contains("has-details")) {
+        const chevron = document.createElement("span");
+        chevron.className = "tool-chevron";
+        chevron.textContent = "›";
+        rowEl.insertBefore(chevron, details);
+        wireCommandToggle(rowEl, details, "Show read result");
+      }
+      return;
+    }
     rowEl.classList.add("tool-failed");
     const err = document.createElement("div");
     err.className = "tool-error";
@@ -13592,7 +13743,7 @@
     if (item) {
       applyToolFailure(item, message);
       const group = item.closest && item.closest(".tool-group");
-      if (group) group.classList.add("has-error"); // collapsed group still signals the failure
+      if (group && item.classList.contains("tool-failed")) group.classList.add("has-error");
       scrollToBottom();
     }
   }
@@ -14098,9 +14249,10 @@
 
   function refreshSubagentCard(el) {
     const done = el.classList.contains("subagent-done");
+    const background = el.classList.contains("subagent-background");
     el.querySelector(".subagent-status").textContent = el.classList.contains("subagent-failed") ? "failed"
-      : el.classList.contains("subagent-cancelled") ? "stopped" : done ? "done" : "running";
-    const ms = done ? el._subagentDurationMs : el._liveStartedAt != null ? Date.now() - el._liveStartedAt : el._subagentDurationMs;
+      : el.classList.contains("subagent-cancelled") ? "stopped" : done ? "done" : background ? "in background" : "running";
+    const ms = background ? undefined : done ? el._subagentDurationMs : el._liveStartedAt != null ? Date.now() - el._liveStartedAt : el._subagentDurationMs;
     const time = el.querySelector(".subagent-time");
     time.hidden = !Number.isFinite(ms);
     time.textContent = time.hidden ? "" : workflowElapsed(ms);
@@ -14110,12 +14262,13 @@
   }
 
   function observeSubagentLive(el) {
-    if (state.replaying || el.classList.contains("subagent-done") || el._liveStartedAt != null) return;
+    if (state.replaying || el.classList.contains("subagent-done") || el.classList.contains("subagent-background") || el._liveStartedAt != null) return;
     el._liveStartedAt = Date.now();
     if (!workflowAgeTimer) workflowAgeTimer = setInterval(refreshWorkflowAges, 1000);
   }
 
   function finishSubagentCard(el, info) {
+    el.classList.remove("subagent-background");
     if (!el.classList.contains("subagent-done")) {
       flushChildStream(el);
       if (el._liveStartedAt != null) el._subagentDurationMs = Date.now() - el._liveStartedAt;
@@ -14341,6 +14494,9 @@
     if (typeof usage?.durationMs === "number") el._subagentDurationMs = usage.durationMs;
     if (typeof usage?.tokens === "number") el._subagentTokens = usage.tokens;
     const status = String(call?.status || "").toLowerCase();
+    el.classList.toggle("subagent-background", status === "background");
+    // A launch receipt says nothing about elapsed work or its eventual outcome.
+    if (status === "background") el._liveStartedAt = null;
     const finished = status === "completed" || status === "failed" || status === "cancelled" ||
       (out && out.type === "SubagentCompleted");
     if (!finished) { observeSubagentLive(el); refreshSubagentCard(el); return; }
@@ -14359,6 +14515,11 @@
       if (ackId && !el.dataset.subagentId) el.dataset.subagentId = ackId[1];
       observeSubagentLive(el);
       return;
+    }
+    // A provider can correct a provisional stopped edge with its final outcome.
+    if (call?._meta?.subagentStatusAuthoritative === true) {
+      el.classList.toggle("subagent-failed", status === "failed");
+      el.classList.toggle("subagent-cancelled", status === "cancelled");
     }
     // Thread the failure/cancel through the tool-channel path too — not just the
     // lifecycle rail — since the tool-channel completion is the common ordering.
@@ -17330,6 +17491,10 @@
         rm.onclick = (e) => {
           e.stopPropagation();
           if (chip.previewId) imagePreviews.delete(chip.previewId);
+          if (composerRestoredChips.some((c) => c.id === chip.id)) {
+            setComposerRestoredChips(composerRestoredChips.filter((c) => c.id !== chip.id));
+            return;
+          }
           vscode.postMessage({ type: "removeChip", id: chip.id });
         };
         el.appendChild(rm);
@@ -17341,7 +17506,11 @@
       el.title = chip.path + rangeTitle;
       el.innerHTML = (chip.hidden ? ICON.eyeOff : ICON.file) +
         `<span>${escapeHtml(label)}</span>`;
-      el.onclick = () => vscode.postMessage({ type: "toggleChip", id: chip.id });
+      el.onclick = () => {
+        if (composerRestoredChips.some((c) => c.id === chip.id)) {
+          setComposerRestoredChips(composerRestoredChips.map((c) => c.id === chip.id ? { ...c, hidden: !c.hidden } : c));
+        } else vscode.postMessage({ type: "toggleChip", id: chip.id });
+      };
       chipsEl.appendChild(el);
     }
   }
@@ -17580,6 +17749,7 @@
     stopVoiceForManualSend();
     queueOutgoing(t, chips);
     input.value = "";
+    setComposerRestoredChips([]);
     renderInputHighlight(); // also flips the busy button back to Stop (empty composer)
     updateSlash();
     updateMention();
@@ -17588,7 +17758,155 @@
   }
 
   function syncRemoteButton() {
-    if (remoteBtn) remoteBtn.hidden = IS_REMOTE || !state.remoteLinked;
+    if (!remoteBtn) return;
+    remoteBtn.hidden = IS_REMOTE;
+    const connected = state.remoteLinked === true && state.remoteViewerCount > 0;
+    remoteBtn.classList.toggle("phone-connected", connected);
+    remoteBtn.title = connected ? "Remote control · phone connected" : "Remote control";
+    remoteBtn.setAttribute("aria-label", remoteBtn.title);
+  }
+
+  function focusedRemoteHandoffSessionId() {
+    // The composer follows the navigation gesture, including correlated New
+    // drafts. activeSessionId can still name the conversation being left.
+    if (composerExpectedSessionId || pendingComposerDrafts.has(composerSessionId)) return undefined;
+    return composerSessionId || undefined;
+  }
+
+  function syncFocusedRemoteHandoff() {
+    if (!remoteHandoff?.followsFocus) return;
+    const sessionId = focusedRemoteHandoffSessionId();
+    if (remoteHandoff.sessionId === sessionId) return;
+    remoteHandoff.sessionId = sessionId;
+    remoteHandoff.result = null;
+    // Retire the old reply even while no replacement request can be sent.
+    remoteHandoff.requestId = ++remoteHandoffSerial;
+    renderRemoteHandoff();
+    requestRemoteHandoff();
+  }
+
+  function requestRemoteHandoff(action) {
+    if (!remoteHandoff || !state.remoteHandoffSupported) return;
+    if (remoteHandoff.followsFocus && !remoteHandoff.sessionId) return;
+    if (action !== "open") remoteHandoff.requestId = ++remoteHandoffSerial;
+    vscode.postMessage({ type: "remoteHandoff", requestId: remoteHandoff.requestId,
+      source: remoteHandoff.source, sessionId: remoteHandoff.sessionId,
+      repoCwd: remoteHandoff.repoCwd, action: action || (remoteHandoff.requested ? "refresh" : "show") });
+    remoteHandoff.requested = true;
+  }
+
+  function openRemoteHandoff(source, sessionId, repoCwd, afterLink) {
+    if (IS_REMOTE) return;
+    closeSettingsOverlay();
+    closePopovers();
+    // Old hosts only know the portal action. No unanswered QR request or guessed identity.
+    if (state.remoteLinked === true && !state.remoteHandoffSupported) {
+      vscode.postMessage({ type: "openRemotePortal", withHint: true, source });
+      return;
+    }
+    remoteHandoff = { source, followsFocus: !sessionId,
+      sessionId: sessionId || focusedRemoteHandoffSessionId(),
+      repoCwd, afterLink: !!afterLink, requested: false, requestId: ++remoteHandoffSerial };
+    if (!remoteHandoffPopover) {
+      remoteHandoffPopover = document.createElement("div");
+      remoteHandoffPopover.className = "toolbar-popover remote-handoff-popover";
+      remoteHandoffPopover.setAttribute("role", "dialog");
+      remoteHandoffPopover.setAttribute("aria-label", "Remote control");
+      remoteHandoffPopover.addEventListener("click", (e) => e.stopPropagation());
+      remoteHandoffPopover.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closePopovers(); remoteBtn?.focus(); }
+      });
+      document.body.appendChild(remoteHandoffPopover);
+    }
+    remoteBtn?.setAttribute("aria-expanded", "true");
+    renderRemoteHandoff();
+    requestRemoteHandoff();
+    remoteHandoffPopover.querySelector("button")?.focus();
+  }
+
+  function renderRemoteHandoff() {
+    if (!remoteHandoff || !remoteHandoffPopover) return;
+    const context = remoteHandoff;
+    const result = context.result;
+    const popover = remoteHandoffPopover;
+    const focusedLabel = popover.contains(document.activeElement)
+      ? document.activeElement.getAttribute("aria-label") || document.activeElement.textContent : null;
+    popover.replaceChildren();
+    const close = document.createElement("button");
+    close.className = "icon-btn remote-handoff-close";
+    close.innerHTML = ICON.x;
+    close.setAttribute("aria-label", "Close remote control");
+    close.onclick = () => { closePopovers(); remoteBtn?.focus(); };
+    popover.appendChild(close);
+    const title = document.createElement("h3");
+    title.textContent = state.remoteLinked === null ? "Checking…"
+      : !state.remoteLinked ? "Use this chat from your phone"
+      : context.afterLink ? (result?.qrSvg ? "Linked. Now scan this." : "Linked. Getting your code ready…")
+      : "Continue on your phone";
+    popover.appendChild(title);
+    const button = (label, action, primary) => {
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = "confirm-btn" + (primary ? " confirm-primary" : "");
+      el.textContent = label;
+      el.onclick = action;
+      return el;
+    };
+    const text = document.createElement("p");
+    if (state.remoteLinked === false) {
+      text.textContent = "Sign in once and this machine shows up on afkpilot.com on any phone or browser; keep this app open and it stays awake while you are away; prompts and code are never stored.";
+      popover.append(text, button("Sign in and link this machine", () => {
+        remoteLinkReturn = { source: context.source,
+          sessionId: context.followsFocus ? undefined : context.sessionId, repoCwd: context.repoCwd };
+        vscode.postMessage({ type: "remoteSignIn", source: context.source });
+        closePopovers();
+      }, true), button("How it works", () => { closePopovers(); showRemoteExplainer(context.source); }));
+    } else if (state.remoteLinked === true) {
+      const waitingForSession = context.followsFocus && !context.sessionId;
+      if (result?.url && result.qrSvg && state.remoteHandoffReady) {
+        const qr = document.createElement("div");
+        qr.className = "remote-handoff-qr";
+        qr.setAttribute("role", "img");
+        qr.setAttribute("aria-label", "Scan to continue on your phone");
+        qr.innerHTML = result.qrSvg; // SVG generated by the local host's pinned encoder.
+        popover.appendChild(qr);
+        text.textContent = `Scan with your phone camera to open ${result.title} there.`;
+      } else if (result?.url) {
+        text.textContent = "The code could not be displayed. Copy the link or open it in your browser.";
+      } else if (state.remoteHeldElsewhere) {
+        // One link, one connection: another window of this app holds it, and a
+        // code from here would open that window's conversations, not this one's.
+        text.textContent = "Another window on this computer is connected to AFK Pilot. Use Remote control in that window, or close it and this one takes over.";
+      } else {
+        // Hold the code's space while the host resolves the conversation or
+        // learns its device id, so the popover does not jump when it lands.
+        const pending = document.createElement("div");
+        pending.className = "remote-handoff-qr-pending";
+        pending.setAttribute("role", "status");
+        pending.innerHTML = '<span class="host-wait-spinner" aria-hidden="true"></span><span>Generating QR code…</span>';
+        popover.appendChild(pending);
+      }
+      const actions = document.createElement("div");
+      actions.className = "remote-handoff-actions";
+      const open = button("Open in browser", () => {
+        if (state.remoteHandoffSupported) requestRemoteHandoff("open");
+        else vscode.postMessage({ type: "openRemotePortal", withHint: true, source: context.source });
+      }, true);
+      open.disabled = waitingForSession;
+      actions.appendChild(open);
+      const copy = button("Copy link", async () => {
+        try { await navigator.clipboard.writeText(result.url); copy.textContent = "Copied"; }
+        catch { copy.textContent = "Could not copy"; }
+      });
+      copy.disabled = !result?.url;
+      actions.appendChild(copy);
+      if (text.textContent) popover.append(text);
+      popover.append(actions);
+    }
+    popover.hidden = false;
+    positionDropdownPopover(popover, remoteBtn || gearBtn);
+    if (focusedLabel) [...popover.querySelectorAll("button")].find((el) =>
+      (el.getAttribute("aria-label") || el.textContent) === focusedLabel)?.focus();
   }
 
   // REMOTE ONLY — paint the user's message the instant they send it.
@@ -17712,8 +18030,11 @@
     // reattach, a CLI respawn) resets the pending-submission state below, and
     // the echo must still be able to settle the strip it belongs to.
     sendWait.submissionId = submissionId;
-    vscode.postMessage({ type: "send", text, ...(submissionId ? { submissionId } : {}) });
+    vscode.postMessage({ type: "send", text,
+      ...(composerRestoredChips.length ? { chips: explicitVisibleChips(state.chips) } : {}),
+      ...(submissionId ? { submissionId } : {}) });
     input.value = "";
+    setComposerRestoredChips([]);
     renderInputHighlight();
     slashPopover.hidden = true;
     hideMention();
@@ -19256,6 +19577,7 @@
   ]);
 
   const SETTINGS_LIVE_MSGS = new Set([
+    "museSettings",
     "cloudHostUpdateState", "initialState", "showThinking", "appPurpose", "expandCommandOutputs",
     "steerByDefault", "promptNav", "expandDiffCard", "steerUnavailable", "soundNotifications", "processingSound",
     "readRepliesAloud", "summarizeRepliesAloud", "fontScale", "voiceConfigured",
@@ -19321,6 +19643,7 @@
         // suppressed on the way out, but initialState is mirrored wholesale.
         if (!IS_REMOTE) applyPinLiveWorkflows(msg.pinLiveWorkflows !== false);
         if (!IS_REMOTE && typeof msg.promptNav === "boolean") state.promptNav = msg.promptNav;
+        state.museSettings = msg.museSettings;
         if (!IS_REMOTE) {
           state.expandDiffCard = msg.expandDiffCard === true;
           applyExpandDiffCard();
@@ -19563,17 +19886,40 @@
         state.planModeRecheckable = !state.planModeAvailable && msg.recheckable === true;
         updateSendButton();
         break;
-      case "remoteStatus":
+      case "showRemoteHandoff":
+        if (!IS_REMOTE) {
+          if (msg.explain) { closeSettingsOverlay(); closePopovers(); showRemoteExplainer(msg.source); }
+          else openRemoteHandoff(msg.source, msg.sessionId, msg.repoCwd);
+        }
+        break;
+      case "remoteHandoff":
+        if (!IS_REMOTE && remoteHandoff && msg.requestId === remoteHandoff.requestId) {
+          remoteHandoff.result = msg;
+          renderRemoteHandoff();
+        }
+        break;
+      case "remoteStatus": {
+        const changed = state.remoteLinked !== !!msg.linked || state.remoteHandoffReady !== (msg.handoffReady === true)
+          || state.remoteHeldElsewhere !== (msg.heldElsewhere === true);
+        state.remoteHeldElsewhere = msg.heldElsewhere === true;
         state.remoteLinked = !!msg.linked;
+        state.remoteHandoffSupported = typeof msg.handoffReady === "boolean";
+        state.remoteHandoffReady = msg.handoffReady === true;
+        state.remoteViewerCount = Number.isFinite(msg.viewerCount) ? msg.viewerCount : 0;
         syncRemoteButton();
-        // The answer can land while the gear is already open (it usually
-        // arrives within a frame of boot, but a slow secret read is exactly
-        // the case this guards): repaint so the section appears rather than
-        // waiting for the next open.
-        if (!gearPopover.hidden && state.gearView === "main") renderGearMain();
-        if (!addPopover.hidden) renderAddPopover();
+        if (state.remoteLinked && remoteLinkReturn) {
+          const pending = remoteLinkReturn;
+          remoteLinkReturn = null;
+          openRemoteHandoff(pending.source, pending.sessionId, pending.repoCwd, true);
+        } else if (remoteHandoff && changed) {
+          remoteHandoff.result = null;
+          renderRemoteHandoff();
+          requestRemoteHandoff();
+        }
+        refreshSettingsOverlay();
         refreshModelControls();
         break;
+      }
       case "steerByDefault":
         // Live toggle (grok.steerByDefault). Pure policy for the next send —
         // the queued block's Steer button is unaffected.
@@ -19589,6 +19935,9 @@
         break;
       case "pinLiveWorkflows":
         if (!IS_REMOTE) applyPinLiveWorkflows(!!msg.value);
+        break;
+      case "museSettings":
+        state.museSettings = msg.value;
         break;
       case "promptNav":
         // Arrives after the host writes grok.promptNav, which is how a
@@ -19799,13 +20148,32 @@
         forceScrollToBottom();
         break;
       }
+      case "composerDraftSession":
+        bindComposerDraft(msg.draftId, msg.sessionId);
+        break;
       case "restoreComposer": {
+        // The renderer's navigation gesture can precede the host's focus move.
+        // Keep a reply for the old conversation with that conversation's draft.
+        if (msg.sessionId && composerSessionId && msg.sessionId !== composerSessionId) {
+          const draft = composerDrafts.get(msg.sessionId);
+          const chips = new Map((draft?.chips || []).map((chip) => [chip.id, chip]));
+          for (const chip of msg.chips || []) chips.set(chip.id, chip);
+          composerDrafts.set(msg.sessionId, {
+            text: [draft?.text, msg.text].filter(Boolean).join("\n\n"), chips: [...chips.values()],
+          });
+          break;
+        }
         // Edit-and-resend (#56): the rewound message comes back so it can be
         // fixed and sent again. APPEND rather than overwrite — anything already
         // typed is the user's, and silently destroying it would be the same
         // class of bug as the one Edit exists to fix.
         const existing = input.value.trim();
         input.value = existing ? existing + "\n\n" + (msg.text || "") : (msg.text || "");
+        if (msg.chips) {
+          const merged = new Map(composerRestoredChips.map((chip) => [chip.id, chip]));
+          for (const chip of msg.chips) merged.set(chip.id, chip);
+          setComposerRestoredChips([...merged.values()]);
+        }
         input.focus();
         updateSlash();
         updateMention();
@@ -19889,7 +20257,11 @@
         renderCodexUpdateNudge();
         if (state.railTransition?.kind === "new") renderRail();
         state.isWorktree = !!msg.worktree; // gates the gear Apply/Remove worktree items
-        state.availableModels = (msg.models || []).filter(m => (m.provider || msg.provider) !== "muse" || museAvailable);
+        // Untagged rows from older hosts belong to THIS session frame, not to
+        // whichever provider a later optimistic model pick happens to select.
+        state.availableModels = (msg.models || [])
+          .map(m => ({ ...m, provider: m.provider || state.activeProvider }))
+          .filter(m => m.provider !== "muse" || museAvailable);
         // The live session's resolved effort outranks both the spawn preference
         // and cached catalog metadata. Older hosts send only the catalog value.
         if (typeof msg.effort === "string") {
@@ -19925,6 +20297,7 @@
           && (prev.repoCwd || "") === (next.repoCwd || ""));
         state.sessionName = next;
         // Host-confirmed identity only. Optimistic rail clicks never write here.
+        confirmComposerSession(msg.sessionId);
         state.activeSessionId = msg.sessionId;
         // May complete a resume (id match) or bind a new-session resolved id.
         noteRailTransitionSessionName(msg);
@@ -19966,9 +20339,11 @@
       case "modeChanged":
         state.currentModeId = msg.modeId;
         state.offeredModes = Array.isArray(msg.modes)
-          ? msg.modes.filter((id) => Object.hasOwn(modeMeta(), id))
+          ? msg.modes.filter((id) => Object.hasOwn(MODE_META, id) || Object.hasOwn(MUSE_MODE_META, id))
           : null;
+        state.disabledModes = msg.disabledModes && typeof msg.disabledModes === "object" ? msg.disabledModes : {};
         updateModeBtn(msg.modeId);
+        if (!modePopover.hidden) { modePopover.hidden = true; openModePopover(); }
         break;
       case "modePolicy":
         state.yoloDisabled = !!msg.yoloDisabled;
@@ -20099,7 +20474,9 @@
         setMic("error");
         break;
       case "chips":
-        state.chips = msg.chips;
+        state.chips = composerRestoredChips.length
+          ? [...msg.chips.filter((chip) => !composerRestoredChips.some((c) => c.id === chip.id)), ...composerRestoredChips]
+          : msg.chips;
         renderChips();
         updateSendButton();
         break;
@@ -20371,7 +20748,7 @@
         syncWorkflowLaunchRows();
         // Reads replay as a completed tool_call with the file text in `content`.
         // Shell rows wait for host `commandOutput` (grok) or a later update (Claude).
-        if (isReadTool(msg.call)) maybeAttachToolResultOutput(msg.call);
+        if (isReadTool(msg.call) && !toolFailureText(msg.call)) maybeAttachToolResultOutput(msg.call);
         // On session/load a completed edit replays as a single `tool_call` that
         // already carries its diff (no follow-up update) — attach the preview here
         // or the restored edit has no "open diff →" (#30).
@@ -21157,6 +21534,7 @@
           // Still an identity frame for the rail transition — activeId is this
           // tab's, even when the popover is about to re-request a filtered page.
           if (msg.activeId !== undefined) {
+            confirmComposerSession(msg.activeId || null);
             state.activeSessionId = msg.activeId || null;
             noteRailTransitionSessions(msg, entries);
             noteHostIdentityKnown(msg.activeId || null);
@@ -21190,6 +21568,7 @@
           // noteHostIdentityKnown is deliberately NOT here — this handler's
           // noteRailTransitionSessions runs at the end (it needs the adopted
           // rows), and the latch has to be read after it. See below.
+          confirmComposerSession(msg.activeId || null);
           state.activeSessionId = msg.activeId || null;
           if (state.activeSessionId) {
             const activeEntry = entries.find((entry) => entry.id === state.activeSessionId)
@@ -21373,7 +21752,7 @@
             // the placeholder stays in creating rather than looking stuck on
             // a switch that already completed.
             noteRailTransitionRepos(msg);
-            vscode.postMessage({ type: "newSession" });
+            postNewSession();
           } else {
             noteRailTransitionRepos(msg);
           }
@@ -22413,12 +22792,16 @@
       // yields, and exactly what belongs back in the composer. NOT the rewind
       // result's `prompt_text` — that IS this message, but in raw wire form
       // (envelope + tags still attached).
-      vscode.postMessage({
+      const editMsg = {
         type: "editLastMessage",
         userBubbleIndex: idx,
         text: (msgEl && msgEl._copyText) || "",
         totalUserBubbles: visibleUserBubbleCount(),
-      });
+      };
+      if (msgEl && msgEl._chips && msgEl._chips.length) {
+        editMsg.chips = msgEl._chips;
+      }
+      vscode.postMessage(editMsg);
       return;
     }
     closePopovers();

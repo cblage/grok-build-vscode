@@ -119,6 +119,8 @@ export interface RemoteUplinkOptions {
   auth: RemoteUplinkAuth;
   /** The uplink socket opened and sent hello (including reconnects). */
   onConnected?: () => void;
+  /** Host-local handoff identity / viewer presence changed. Never mirrored. */
+  onStatusChanged?: () => void;
   /** A browser connection is ready to receive its client-specific snapshot. */
   onClientReady?: (clientId: string, tabToken?: string) => void;
   /** A specific browser connection has left the relay. */
@@ -152,6 +154,12 @@ export function filterAuthorizedOutbound(
 
 export class RemoteUplink {
   private ws?: WebSocket;
+  deviceId?: string;
+  viewerCount = 0;
+  /** Refused past the grace window: another host (another IDE window) holds this link. */
+  heldElsewhere = false;
+  /** Any refusal since the last admission: the link may belong to another window, so no code yet. */
+  get refused(): boolean { return this.refusedSince > 0; }
   private backoff = INITIAL_BACKOFF_MS;
   /** When the current run of 4002 refusals began; 0 when there is none. */
   private refusedSince = 0;
@@ -410,9 +418,16 @@ export class RemoteUplink {
       this.opts.onConnected?.();
     });
     ws.on("message", (raw) => {
+      if (this.disposed || this.ws !== ws) return;
       const frame = parseRelayFrame(raw.toString());
       if (!frame) return;
       switch (frame.t) {
+        case "self":
+          this.deviceId = frame.deviceId;
+          this.heldElsewhere = false;
+          this.refusedSince = 0;
+          this.opts.onStatusChanged?.();
+          return;
         case "client-ready":
           // The relay-side twin of the LAN bridge's ready->snapshot: catch this
           // one browser client up, routed back through the relay by clientId.
@@ -443,6 +458,8 @@ export class RemoteUplink {
           this.reconnectRoster?.clientIds.delete(frame.clientId);
           return;
         case "clients":
+          this.viewerCount = frame.count;
+          this.opts.onStatusChanged?.();
           this.opts.log(`[remote] relay clients: ${frame.count}`);
           if (this.awaitingRosterCount) {
             this.awaitingRosterCount = false;
@@ -456,6 +473,9 @@ export class RemoteUplink {
     });
     ws.on("close", (code) => {
       if (this.disposed) return;
+      this.deviceId = undefined;
+      this.viewerCount = 0;
+      this.opts.onStatusChanged?.();
       // 4001 = relay rejected the token — retrying with the same token is
       // pointless; the user must re-link. Stop, loudly.
       if (code === CLOSE_BAD_TOKEN) {
@@ -479,15 +499,24 @@ export class RemoteUplink {
       // past the window the refusal is a real rival, and ordinary backoff
       // takes over with the delay it already had. See `refusalRetryMs`.
       if (code === CLOSE_DEVICE_BUSY) {
-        if (!this.refusedSince) this.refusedSince = Date.now();
+        if (!this.refusedSince) {
+          this.refusedSince = Date.now();
+          // Not ours until admitted: a remembered device id must not draw a code yet.
+          this.opts.onStatusChanged?.();
+        }
         const soon = refusalRetryMs(Date.now() - this.refusedSince);
         if (soon !== undefined) {
           this.opts.log(`[remote] uplink refused (device still held); retrying in ${(soon / 1000).toFixed(1)}s`);
           this.reconnectTimer = setTimeout(() => this.connect(), soon);
           return;
         }
+        if (!this.heldElsewhere) {
+          this.heldElsewhere = true;
+          this.opts.onStatusChanged?.();
+        }
       } else {
         this.refusedSince = 0;
+        this.heldElsewhere = false;
       }
       if (connectionWasHealthy(connectedMs)) this.backoff = INITIAL_BACKOFF_MS;
       this.opts.log(`[remote] uplink disconnected (code ${code}); retrying in ${Math.round(this.backoff / 1000)}s`);

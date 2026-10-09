@@ -508,6 +508,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   setExpandCommandOutputs: "host-local",
   setSteerByDefault: "host-local",
   setPromptNav: "host-local",
+  setMuseSetting: "host-local",
   setPinLiveWorkflows: "host-local",
   setExpandDiffCard: "host-local",
   setSoundNotifications: "host-local",
@@ -550,6 +551,8 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // relay account actions (link/unlink/portal) manage THIS machine's device
   // token — only the local webview may drive them
   remoteSignIn: "host-local",
+  remoteHandoff: "host-local",
+  showRemoteHandoff: "host-local",
   remoteSignOut: "host-local",
   // Desktop gear unlink — native confirm then drop THIS machine's device token.
   // A remote must never be able to unlink the desk it is driving.
@@ -698,6 +701,7 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   setExpandCommandOutputs: false,
   setSteerByDefault: false,
   setPromptNav: false,
+  setMuseSetting: false,
   setPinLiveWorkflows: false,
   setExpandDiffCard: false,
   setSoundNotifications: false,
@@ -720,6 +724,8 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   requestImageOriginal: true,
   composerFocus: false,
   remoteSignIn: false,
+  remoteHandoff: false,
+  showRemoteHandoff: false,
   remoteSignOut: false,
   unlinkRemoteDevice: false,
   openRemotePortal: false,
@@ -1011,6 +1017,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   // Conversation names are already exposed in the remote history list, so
   // the focused-name update has the same display-only sensitivity.
   sessionName: "mirror",
+  composerDraftSession: "mirror",
   sessionRemoved: "mirror",
   modelChanged: "mirror",
   modeChanged: "mirror",
@@ -1078,6 +1085,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   // Not mirrored: a remote holds its OWN Previous-prompt preference in its
   // own storage, so the desk's value would silently overwrite the phone's.
   promptNav: "host-local",
+  museSettings: "host-local",
   pinLiveWorkflows: "host-local",
   // The phone owns its diff-card default too; never overwrite it from desk.
   expandDiffCard: "host-local",
@@ -1093,6 +1101,8 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   imageOriginal: "mirror",
   moveComposerCaret: "host-local",
   remoteStatus: "host-local",
+  remoteHandoff: "host-local",
+  showRemoteHandoff: "host-local",
   setAllToolDetails: "mirror",
   focusInput: "mirror",
   // Desk/VS Code only — a phone opens find from its own ⋯, and a palette
@@ -1172,6 +1182,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   expandCommandOutputs: "none",
   steerByDefault: "none",
   promptNav: "none",
+  museSettings: "none",
   pinLiveWorkflows: "none",
   expandDiffCard: "none",
   soundNotifications: "none",
@@ -1180,6 +1191,8 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   summarizeRepliesAloud: "none",
   moveComposerCaret: "none",
   remoteStatus: "none",
+  remoteHandoff: "none",
+  showRemoteHandoff: "none",
   error: "none",
   hostNotice: "none",
   focusInput: "none",
@@ -1209,6 +1222,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   pinnedSessions: "entries",
   repoSessions: "message-cwd",
   sessionName: "message-cwd",
+  composerDraftSession: "scope",
   sessionRemoved: "message-cwd",
   // Session-scoped live + restore payload — requires authorized session/repo cwd.
   session: "scope",
@@ -1583,7 +1597,7 @@ export function transformHostMsgForRemote(msg: HostMsg, deps: MediaInlineDeps): 
   if (msg.type === "chips") {
     return { ...msg, chips: msg.chips.map((chip) => inlineChipPreviewForRemote(chip, deps)) };
   }
-  if (msg.type === "userMessage") {
+  if (msg.type === "userMessage" || msg.type === "restoreComposer") {
     return {
       ...msg,
       ...(msg.chips ? { chips: msg.chips.map((chip) => inlineChipPreviewForRemote(chip, deps)) } : {}),

@@ -1,3 +1,5 @@
+import { remoteHandoffUrl, remoteHandoffQr, type HandoffSession } from "./remote-handoff";
+import type { RemoteHandoffSource } from "./protocol";
 import { CloudHostUpdate, cloudHostIsIdle, cloudHostBootSupportsUpdate, cloudLiveWorkflowRuns, installedCloudHostVersion, parseCloudHostUpdateAttempt, removeCloudHostUpdateStamps, CLOUD_UPDATE_REFUSAL } from "./cloud-host-update";
 import { MuseBackend, withMuseCredentialBackend } from "./muse-backend";
 import { locateMuseCli, parseMuseVersionOutput } from "./muse-cli-locator";
@@ -87,6 +89,7 @@ import {
   sessionHasWorkInFlight,
   sessionReadyForPrompt,
   sessionUiSnapshot,
+  sessionModeMessage,
   turnIsInFlight,
 } from "./session";
 import { buildReapCandidates, selectReapable, computeDot, Dot } from "./session-pool";
@@ -99,7 +102,8 @@ import { summarizeForSpeech } from "./speech-summary";
 import type { PromptResultMeta, PromptUsage, SessionInfoContext } from "./acp-dispatch";
 import { MediaRef, adapterCompactSignal, adapterContextOccupancy, agentTimestampMsFromMeta, autoCompactStartedNote, childStreamFromRoute, commandOutputForToolCall, commandOutputFromLiveTerminal, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isResumeNotFound, isRateLimitError, isSubagentLifecycleUpdate, occupancyFromAdapterTurn, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sessionInfoCacheFresh, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement, type UpdateRoute } from "./acp-dispatch";
 import { createMcpPrepareState, prepareMcpToolCall } from "./mcp-tool";
-import { EFFORT_PREFS_KEY, configWriteTarget, modeToRemember, rememberedEffort, sessionModes, startsInYolo, type EffortPrefs } from "./mode-prefs";
+import { EFFORT_PREFS_KEY, MUSE_MODE_PREF_KEY, MUSE_ON_REQUEST_UNAVAILABLE, MUSE_CLOUD_ON_REQUEST_UNAVAILABLE, configWriteTarget, isMuseModeId, modeToRemember, rememberedEffort, sessionModes, startsInYolo, musePosture, museShellSandboxEnabled, usesClientAutoAccept, type ModeId, type MuseSettings, type EffortPrefs } from "./mode-prefs";
+import { supportsApprovalModeSwitching } from "./acp-backend";
 import { beginAuthRecovery, oauthShadowsXaiApiKey } from "./auth-recovery";
 import {
   WELCOME_TIPS_KEY,
@@ -167,6 +171,7 @@ import {
   APTABASE_APP_KEY_PROD,
   buildSessionStartEvent,
   buildRemotePortalOpenedEvent,
+  buildRemoteHandoffEvent,
   buildSessionRemoteStartedEvent,
   nextTelemetrySession,
   osNameFromPlatform,
@@ -1058,6 +1063,7 @@ export class GrokSidebar {
     "setExpandCommandOutputs",
     "setSteerByDefault",
     "setPromptNav",
+    "setMuseSetting",
     "setPinLiveWorkflows",
     "setExpandDiffCard",
     "setSoundNotifications",
@@ -1101,6 +1107,7 @@ export class GrokSidebar {
     "updateCodex",
     "updateClaude",
     "openRemotePortal",
+    "showRemoteHandoff",
     "remoteSignIn",
     "unlinkRemoteDevice",
   ]);
@@ -1842,10 +1849,29 @@ export class GrokSidebar {
       .flatMap(provider => [...(this.adapterHistory(provider)?.cache?.values() ?? [])]);
   }
 
+  private museSettings(): MuseSettings {
+    const cfg = this.host.getConfiguration("grok");
+    const network = cfg.get<string>("museSandboxNetwork", "proxy-only");
+    return {
+      shellSandbox: cfg.get<boolean>("museShellSandbox", true),
+      sandboxNetwork: network === "restricted" || network === "enabled" ? network : "proxy-only",
+      trustWorkspaces: cfg.get<boolean>("museTrustWorkspaces", false),
+    };
+  }
+
+  private async rememberMusePosture(session: Session, resumeId?: string): Promise<void> {
+    const id = resumeId ?? session.client?.sessionId ?? session.activeSessionId;
+    const posture = session.musePosture;
+    if (!id || session.provider !== "muse" || !posture) return;
+    await this.updateSessionMeta(current => ({
+      ...current, [id]: { ...current[id], musePosture: posture },
+    }));
+  }
+
   private createProviderBackend(provider: AcpProvider): CodexBackend | ClaudeBackend | MuseBackend | undefined {
     if (provider === "codex") return new CodexBackend();
     if (provider === "claude") return new ClaudeBackend();
-    if (provider === "muse") return new MuseBackend();
+    if (provider === "muse") return new MuseBackend(undefined, isCloudEnvironment());
     return undefined;
   }
 
@@ -2973,6 +2999,7 @@ export class GrokSidebar {
       // Staging + grok home are genuinely local disk paths → Uri.file.
       localResourceRoots: this.chatLocalResourceRoots(),
     };
+    this.chatReadyForHandoff = false;
     view.webview.html = this.getHtml(view.webview);
     // Message handlers run async; without this catch a throw (e.g. an fs error
     // in an image-attach path) becomes a silent unhandled rejection and the
@@ -3052,6 +3079,11 @@ export class GrokSidebar {
           type: "expandDiffCard",
           value: this.host.getConfiguration("grok").get<boolean>("expandDiffCard", false),
         });
+      }
+      if (["museShellSandbox", "museSandboxNetwork", "museTrustWorkspaces"].some(key => e.affectsConfiguration(`grok.${key}`))) {
+        const message: HostMsg = { type: "museSettings", value: this.museSettings() };
+        this.post(message);
+        void this.settingsEditor?.webview.postMessage(message);
       }
       if (e.affectsConfiguration("grok.promptNav")) {
         this.post({
@@ -3374,6 +3406,10 @@ export class GrokSidebar {
         try { await client.deleteSession(discardId); }
         catch (error) { this.host.appendLine(`[${oldProvider}] could not discard empty session ${discardId}: ${(error as Error).message}`); }
       }
+      // Catalog refreshes can run while the preference write/startup awaits.
+      // Retire the old client before its models or callbacks can be attributed
+      // to the replacement provider.
+      await this.detachClient(session)?.dispose();
       session.provider = provider;
       await this.rememberProjectProvider(this.sessionCwd(session), provider, modelId || undefined);
       await this.startSession(undefined, session);
@@ -3545,22 +3581,18 @@ See design doc for the full state machine diagram.`;
   }
 
   /**
-   * The mode the UI should show. Plan and YOLO are *client* states that the CLI
-   * doesn't model (the CLI only knows agent/plan), so we derive the button label
-   * here rather than echoing the CLI's raw mode id.
+   * Muse reports its native approval mode. Other providers combine their CLI
+   * state with the host's Plan and auto-approval flags.
    */
-  private displayMode(session: Session = this.focused): "agent" | "plan" | "yolo" {
+  private displayMode(session: Session = this.focused): string {
+    if (session.provider === "muse") return session.client?.currentModeId ?? session.musePosture?.mode ?? "agent";
     if (session.planActive) return "plan";
     if (session.autoApprove) return "yolo";
     return "agent";
   }
 
   private postMode(session: Session = this.focused): void {
-    const message: HostMsg = {
-      type: "modeChanged",
-      modeId: this.displayMode(session),
-      modes: sessionModes(session.provider),
-    };
+    const message = sessionModeMessage(session, this.displayMode(session));
     if (session === this.focused) this.view?.webview.postMessage(message);
     this.sendRemoteSession(session, message);
   }
@@ -3959,7 +3991,7 @@ Only continue if you trust this code.`,
   }
 
   async setMode(
-    modeId: "agent" | "plan" | "yolo",
+    modeId: ModeId,
     session: Session = this.focused,
     requester?: RemoteRequester,
   ): Promise<void> {
@@ -3971,8 +4003,13 @@ Only continue if you trust this code.`,
     // setMode throws "no session" (and for Plan that error is surfaced to the user).
     // The mode button is disabled while busy; this backstops the toggle-mode command.
     if (!session.client || !session.client.sessionId || session.priming) return;
-    // No CLI mode command (Muse). Agent is that CLI's own default — send nothing.
-    // Auto accept is our flag only. Plan would promise a write block it does not have.
+    if (session.provider === "muse" && session.museCloud && modeId === "onRequest") {
+      this.reportRequester(requester, "warning", MUSE_CLOUD_ON_REQUEST_UNAVAILABLE);
+      return;
+    }
+    // Backstop the picker for stale clients and direct/remote commands.
+    if (!sessionModes(session.provider, session.museCloud).includes(modeId) && modeId !== "plan") return;
+    // Muse switches approval without enabling the Plan path.
     if (!supportsModeSwitching(session.provider)) {
       if (!supportsAutoAccept(session.provider)) return;
       if (modeId === "plan") {
@@ -3984,17 +4021,34 @@ Only continue if you trust this code.`,
         return;
       }
       const remember = modeToRemember(modeId);
-      if (remember) void this.rememberGrokConfig("defaultMode", remember);
-      if (modeId === "yolo") {
-        session.autoApprove = true;
-        this.setPlanActive(session, false);
-        this.autoApprovePendingPermissions(session);
+      const client = session.client;
+      if (modeId === "onRequest" && session.museShellSandbox !== true) {
+        this.reportRequester(requester, "warning", MUSE_ON_REQUEST_UNAVAILABLE);
         return;
       }
-      session.autoApprove = false;
+      if (supportsApprovalModeSwitching(session.provider)) {
+        try {
+          await client.setMode(modeId);
+        } catch (error) {
+          if (session.client !== client) return;
+          this.reportRequester(requester, "error", `Couldn't switch mode: ${(error as Error).message}`);
+          return;
+        }
+      }
+      if (session.client !== client) return;
+      if (remember) void this.rememberGrokConfig("defaultMode", remember);
+      await this.state.update(MUSE_MODE_PREF_KEY, modeId);
+      if (session.client !== client) return;
+      session.autoApprove = modeId === "yolo";
+      if (session.musePosture) {
+        session.musePosture = { ...session.musePosture, mode: modeId };
+        await this.rememberMusePosture(session);
+      }
       this.setPlanActive(session, false);
+      if (session.autoApprove) this.autoApprovePendingPermissions(session);
       return;
     }
+    if (modeId === "onRequest" || modeId === "denyUnmatched") return;
     if (modeId === "plan" && !session.planModeAvailable) {
       // Unverified probe: re-check now rather than forcing a session restart.
       // A verified-old CLI is latched and stays refused.
@@ -4571,7 +4625,7 @@ Only continue if you trust this code.`,
     // Auto accept is not a verdict on a plan-review card. Same rule as
     // autoApprovePendingPermissions, including after a failed mode RPC
     // that already cleared the Plan bit.
-    if (supportsAutoAccept(session.provider) && session.autoApprove && !planActive && !isPlanReviewPermission(req.toolCall?.kind)) {
+    if (supportsAutoAccept(session.provider) && usesClientAutoAccept(session.provider) && session.autoApprove && !planActive && !isPlanReviewPermission(req.toolCall?.kind)) {
       const opt = pickAutoAcceptOption(req.options, session.provider);
       if (opt) { client.respondPermission(req.id, opt.optionId); return; }
     }
@@ -4673,6 +4727,7 @@ Only continue if you trust this code.`,
   private autoApprovePendingPermissions(session: Session): void {
     if (!supportsAutoAccept(session.provider)) return;
     const client = session.client;
+    if (!usesClientAutoAccept(session.provider)) return;
     if (!client || session.pendingPermissions.size === 0) return;
     let resolved = 0;
     // Snapshot first — persistPermissionAnswer mutates pendingPermissions.
@@ -4771,7 +4826,7 @@ Only continue if you trust this code.`,
       // for — re-submitting the queued fallback through the relay would
       // charge it twice. Same for the two fallbacks below.
       if (takeQueue) return;
-      const chips = chipsForQueueSend(session.chips, requestedChips);
+      const chips = this.composerChipsForSend(session, requestedChips);
       if (!authored.trim() && !chips.length) return;
       session.queuedSends = enqueueQueuedSend(session.queuedSends, authored, chips);
       if (chips.length) {
@@ -4796,7 +4851,7 @@ Only continue if you trust this code.`,
       session.queuedSendCommit = undefined;
       this.emitQueuedSends(session);
     } else {
-      const chips = chipsForQueueSend(session.chips, requestedChips);
+      const chips = this.composerChipsForSend(session, requestedChips);
       if (!authored.trim() && !chips.length) return;
       contributions = [{ text: authored, chips }];
       if (chips.length) {
@@ -5263,6 +5318,17 @@ Only continue if you trust this code.`,
       );
     }
     const { client, gen, activeSessionId, userMessageCount } = session;
+    // Capture before rewind truncates the buffer. Webview chips are display
+    // data, never authority to attach a path from the host filesystem.
+    let chips: FileChip[] | undefined;
+    let bubble = userMessageCount;
+    for (let i = session.buffer.length - 1; i >= 0; i--) {
+      const message = session.buffer[i];
+      // Replayed chunks have no host-built chips. Only index the live suffix.
+      if (message.type === "userMessageChunk") break;
+      if (message.type !== "userMessage" || message.steer) continue;
+      if (--bubble === userBubbleIndex) { chips = message.chips?.map(chip => ({ ...chip })); break; }
+    }
     try {
       const points = await client.listRewindPoints();
       if (points === "unsupported") {
@@ -5290,7 +5356,7 @@ Only continue if you trust this code.`,
         // Was a modal offering "Copy text to composer" and awaiting the click.
         // Nobody can click it on a cloud machine, so the handler hung there —
         // and the button was the only sensible answer anyway. Do it, and say so.
-        this.restoreComposerFor(session, requester, text);
+        this.restoreComposerFor(session, requester, text, chips);
         return void this.reportRequester(
           requester,
           "info",
@@ -5349,7 +5415,7 @@ Only continue if you trust this code.`,
       const surviving = survivingUserMessagesAfterRewind(points, target);
       await this.truncateSessionCardsAfterRewind(resumeId, surviving);
       this.applyRewindToView(session, surviving);
-      this.restoreComposerFor(session, requester, text);
+      this.restoreComposerFor(session, requester, text, chips);
       if (reportedFiles > 0) {
         this.reportRequester(
           requester,
@@ -5390,9 +5456,14 @@ Only continue if you trust this code.`,
     session: Session,
     requester: RemoteRequester | undefined,
     text: string,
+    chips?: FileChip[],
   ): void {
-    if (!text) return;
-    const message: HostMsg = { type: "restoreComposer", text };
+    if (!text && (!chips || !chips.length)) return;
+    
+    const message: HostMsg = { type: "restoreComposer", text, sessionId: session.activeSessionId || undefined, ...(chips ? { chips } : {}) };
+    const retainChips = () => {
+      if (chips) session.restoredChips = restoreQueuedChips(session.restoredChips, [{ text, chips }]);
+    };
     if (requester) {
       // Resolve through the tab, so a phone that reconnected while the rewind
       // was in flight still receives its own text — then check the tab is still
@@ -5400,13 +5471,15 @@ Only continue if you trust this code.`,
       // whatever that tab is showing NOW.
       const clientId = this.resolveRemoteRequester(requester);
       if (clientId && this.remoteClients.active(clientId) === session) {
+        retainChips();
         this.sendRemoteClient(clientId, message);
         return;
       }
     } else if (this.focused === session) {
       // Same check for the desk: postLocal posts to the focused webview
       // whatever it is displaying.
-      this.postLocal(message);
+      retainChips();
+      this.postLocal(this.view ? this.localizeHistoryMessage(message, this.view.webview) : message);
       return;
     }
     // The asking surface has moved to another conversation. Refusing to deliver
@@ -5425,8 +5498,7 @@ Only continue if you trust this code.`,
     // The webview's own `restoreComposer` appends for exactly this reason
     // ("anything already typed is the user's"); the store follows the same rule
     // rather than being the one place that silently drops a message.
-    const parked = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]?.queuedDraft;
-    void this.rememberQueuedDraft(id, parked ? `${parked}\n\n${text}` : text);
+    void this.rememberQueuedDraft(id, text, chips ?? [], true);
   }
 
   /** See {@link editLastMessage} for why `session` and `requester` are explicit. */
@@ -8509,33 +8581,50 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Park a composer draft on the conversation it was typed into, because that
    *  conversation is the only place it can be handed back without guessing who
    *  is watching what. */
-  private rememberQueuedDraft(id: string, text: string): Promise<void> {
-    if (!text) return Promise.resolve();
-    return this.updateSessionMeta((current) => ({
-      ...current,
-      [id]: { ...(current[id] ?? {}), queuedDraft: text },
-    }));
+  private rememberQueuedDraft(id: string, text: string, chips?: FileChip[], append = false): Promise<void> {
+    if (!text && !chips?.length) return Promise.resolve();
+    return this.updateSessionMeta((current) => {
+      const { queuedDraftChips: previousChips, ...previous } = current[id] ?? {};
+      return {
+        ...current,
+        [id]: {
+          ...previous,
+          queuedDraft: append && previous?.queuedDraft ? `${previous.queuedDraft}\n\n${text}` : text,
+          ...(chips || (append && previousChips) ? {
+            queuedDraftChips: restoreQueuedChips(append ? previousChips ?? [] : [], [{ text, chips: chips ?? [] }]),
+          } : {}),
+        },
+      };
+    });
   }
 
   /** Hand a parked draft back to this session's live composer, exactly once.
    *  Detached tabs keep META untouched until reattachment because
    *  `restoreComposer` is transient and has no recipient while detached. */
-  private restorePersistedDraft(session: Session): void {
-    const hasComposer =
-      (session === this.focused && this.view !== undefined) ||
-      this.remoteClients.isActiveValueVisible(session);
-    if (!hasComposer || session.needsProvider) return;
+  private restorePersistedDraft(session: Session, recipient?: RemoteRequester | "local"): void {
     const id = session.activeSessionId;
     if (!id) return;
-    const draft = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]?.queuedDraft;
-    if (!draft) return;
     void this.updateSessionMeta((current) => {
+      const hasComposer =
+        (session === this.focused && this.view !== undefined) ||
+        this.remoteClients.isActiveValueVisible(session);
+      if (!hasComposer || session.needsProvider || session.activeSessionId !== id) return null;
       const meta = current[id];
-      if (!meta?.queuedDraft) return null;
-      const { queuedDraft: _restored, ...rest } = meta;
+      if (!meta?.queuedDraft && !meta?.queuedDraftChips?.length) return null;
+      if (recipient && recipient !== "local") {
+        const clientId = this.resolveRemoteRequester(recipient);
+        if (!clientId || this.remoteClients.active(clientId) !== session) return null;
+      } else if (recipient === "local" && (session !== this.focused || !this.view)) return null;
+      const draft = meta.queuedDraft ?? "";
+      if (recipient || meta.queuedDraftChips) {
+        const clientId = this.remoteClients.clientsForActiveValue(session)[0];
+        const requester = recipient === "local" ? undefined : recipient ??
+          (session === this.focused && this.view ? undefined : clientId ? { clientId } : undefined);
+        this.restoreComposerFor(session, requester, draft, meta.queuedDraftChips);
+      } else this.emit(session, { type: "restoreComposer", text: draft });
+      const { queuedDraft: _restored, queuedDraftChips: _chips, ...rest } = meta;
       return { ...current, [id]: rest };
     });
-    this.emit(session, { type: "restoreComposer", text: draft });
   }
 
   /** Restore a replacement's captured draft only after its provider start
@@ -10516,6 +10605,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     const disposeMs = replacedClient ? clock.elapsed(disposeAt) : 0;
     clock.record("dispose", disposeMs);
+    if (session.provider === "muse" && resumeId) {
+      await this.sessionMetaWrites;
+      if (gen !== session.gen) return undefined;
+    }
     // A brand-new session starts in the remembered mode (#25) immediately, so the
     // toolbar shows the right one from the first paint — no Agent → Auto accept
     // flash while the session spins up and primes. Resumed sessions stay
@@ -10538,7 +10631,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // for honesty (CLI will auto-approve anyway). grok's config.toml only means
     // something for a grok session — Codex has no such file to misread.
     const configAutoApprove = session.provider === "grok" && this.configForcesAutoApprove(this.sessionCwd(session));
-    session.autoApprove = rememberedYolo || configAutoApprove;
+    session.museCloud = session.provider === "muse" && isCloudEnvironment();
+    session.musePosture = session.provider === "muse" ? musePosture(
+      this.state.get<string>(MUSE_MODE_PREF_KEY) ?? (rememberedYolo ? "yolo" : "agent"), !!resumeId,
+      resumeId ? this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[resumeId]?.musePosture : undefined,
+      this.museSettings(),
+      session.museCloud,
+    ) : undefined;
+    session.museShellSandbox = session.musePosture ? museShellSandboxEnabled(session.musePosture, session.museCloud) : undefined;
+    session.autoApprove = session.musePosture ? session.musePosture.mode === "yolo" : rememberedYolo || configAutoApprove;
     session.planActive = false;
     session.hasHistory = !!resumeId;
     session.suppressContent = false;
@@ -10581,11 +10682,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // calls startSession as its own retry, and a reset would let an entitlement
     // failure (#58) pay a full restart+resend cycle on every prompt. Only a clean
     // turn re-arms it.
-    this.emit(session, {
-      type: "modeChanged",
-      modeId: session.autoApprove ? "yolo" : "agent",
-      modes: sessionModes(session.provider),
-    });
+    this.emit(session, sessionModeMessage(session, session.musePosture?.mode ?? (session.autoApprove ? "yolo" : "agent")));
     this.postModePolicy();
     if (session.provider === "grok") this.postSandboxState(process.env);
     if (configAutoApprove) this.noticeAlwaysApproveOnce(this.sessionCwd(session));
@@ -10743,7 +10840,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       mcpServers: (onDispose) => supportsClientMcpServers(session.provider) ? this.hostMcpServersFor(session, onDispose) : [],
       ...(session.provider === "grok"
         ? { grokVersion: grokHandshakeVersion, grokVersionVerified }
-        : { backend: this.createProviderBackend(session.provider) }),
+        : { backend: session.provider === "muse" ? new MuseBackend(session.musePosture, session.museCloud) : this.createProviderBackend(session.provider) }),
     });
     brokerClient = client;
     session.client = client;
@@ -10812,6 +10909,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("session", (res) => {
       if (gen !== session.gen) return;
+      const posture = session.musePosture;
       if (res?.sessionId) session.activeSessionId = res.sessionId;
       this.cacheProviderModels(session.provider, client.availableModels, client.currentModelId);
       if (res?.sessionId) {
@@ -10821,6 +10919,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             ...(current[res.sessionId] ?? {}),
             provider: session.provider,
             providerCwd: cwd,
+            ...(posture ? { musePosture: posture } : {}),
           },
         }));
       }
@@ -10860,6 +10959,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("modeChanged", (id) => {
       if (gen !== session.gen) return;
+      if (session.provider === "muse" && isMuseModeId(id)) {
+        session.autoApprove = id === "yolo";
+        if (session.musePosture) session.musePosture = { ...session.musePosture, mode: id };
+        void this.rememberMusePosture(session, resumeId);
+        this.setPlanActive(session, false);
+        return;
+      }
       if (id === "plan") {
         // Raise the safety gate synchronously for every Plan transition. During
         // session/load, current_mode_update events replay before AcpClient has a
@@ -11804,7 +11910,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           this.host.webviewReloadsUnderLiveSession,
           !!this.focused.client,
         );
+        this.chatReadyForHandoff = true;
         this.postInitialState();
+        if (this.pendingRemoteHandoff) {
+          this.postLocal(this.pendingRemoteHandoff);
+          this.pendingRemoteHandoff = undefined;
+        }
         // Rehydrate already posts catalog + sessions. Cold start needs an early
         // disk list so the rail is not empty while startSession runs — but the
         // catalog scan is deferred so ready returns and the UI paints first
@@ -11923,17 +12034,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           // A phone can take over a running turn: its send may be queued before
           // handleSend reaches the prompt commit point. Receipt is remote use.
           if (session.hasHistory) this.reportRemoteMessage(session, origin);
-          await this.handleSend(msg.text, msg.bare === true, session, origin, queuedSendCommit, msg.submissionId);
+          await this.handleSend(msg.text, msg.bare === true, session, origin, queuedSendCommit, msg.submissionId, undefined, msg.chips);
         } finally {
           if (queuedSendCommit) finishQueuedSendCommit(session, queuedSendCommit, false);
         }
         break;
-      case "newSession":
+      case "newSession": {
+        const onCreated = this.composerDraftReply(msg.draftId, requester);
         // A remote's cwd is deliberately not forwarded: newRemoteSession starts
         // in that tab's own repo, which is the only project it is entitled to.
-        if (origin === "remote" && clientId) await this.newRemoteSession(clientId);
-        else await this.newFocusedSession(origin, msg.cwd);
+        if (origin === "remote" && clientId) await this.newRemoteSession(clientId, true, onCreated);
+        else await this.newFocusedSession(origin, msg.cwd, onCreated);
         break;
+      }
       case "cancel": {
         const cancelled = session.turnToken;
         this.clearPendingHumanRequests(session);
@@ -11949,7 +12062,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // messages survive focus switches and flush even while backgrounded.
         const s = session;
         const text = typeof msg.text === "string" ? msg.text : "";
-        const chips = chipsForQueueSend(s.chips, msg.chips);
+        const chips = this.composerChipsForSend(s, msg.chips);
         if (text.trim() || chips.length) {
           if (s.hasHistory) this.reportRemoteMessage(s, origin);
           s.queuedSendDispatch = undefined;
@@ -12026,8 +12139,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (this.refuseMismatchedSessionId(msg.sessionId, session, requester)) break;
         await this.removeFocusedWorktree(session, true);
         break;
+      case "showRemoteHandoff":
+        await this.continueOnPhone(msg.source, msg.sessionId, msg.repoCwd, msg.explain);
+        break;
+      case "remoteHandoff":
+        await this.replyRemoteHandoff(msg);
+        break;
       case "remoteSignIn":
-        await this.linkRemoteDevice();
+        await this.linkRemoteDevice(msg.source);
         break;
       case "remoteSignOut":
       case "unlinkRemoteDevice": {
@@ -12047,7 +12166,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "openRemotePortal":
-        this.reportRemotePortalOpened(msg.withHint === true);
+        this.reportRemotePortalOpened(msg.withHint === true, msg.source);
         void this.host.openExternal(httpBaseFromRelayUrl(this.relayUrl()) + (msg.withHint ? "/?remoteHint=1" : ""));
         break;
       case "rewindSession":
@@ -12580,6 +12699,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await this.host.getConfiguration("grok")
           .update("expandDiffCard", !!msg.value, "global");
         break;
+      case "setMuseSetting": {
+        if (origin === "remote") break;
+        const valid = msg.key === "museSandboxNetwork"
+          ? ["proxy-only", "restricted", "enabled"].includes(msg.value)
+          : (msg.key === "museShellSandbox" || msg.key === "museTrustWorkspaces") && typeof msg.value === "boolean";
+        if (!valid) break;
+        const cfg = this.host.getConfiguration("grok");
+        await cfg.update(msg.key, msg.value, configWriteTarget(cfg.inspect(msg.key)));
+        break;
+      }
       case "setPromptNav":
         await this.host.getConfiguration("grok")
           .update("promptNav", !!msg.value, "global");
@@ -15950,11 +16079,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
   }
 
-  private reportRemotePortalOpened(withHint: boolean): void {
+  private reportRemotePortalOpened(withHint: boolean, source: RemoteHandoffSource = "topbar"): void {
     this.reportTelemetry((sys, sessionId, timestamp) => buildRemotePortalOpenedEvent({
       installId: this.installId(),
       hostKind: sessionStartHostKind(this.host.canSwitchWorkspaceFolder, isCloudEnvironment()),
-      withHint,
+      withHint, source,
     }, sys, sessionId, timestamp));
   }
 
@@ -17577,18 +17706,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     queuedSendCommit?: { text: string; items: QueuedSendEntry[] },
     submissionId?: string,
     onStarted?: () => void,
+    requestedChips?: FileChip[],
   ): Promise<void> {
     if (this.cloudHostUpdate && !this.cloudHostUpdate.admitting) {
       this.emit(target ?? this.focused, { type: "error", text: CLOUD_UPDATE_REFUSAL });
       return;
     }
-    await this.withCloudHostWork(() => this.handleAdmittedSend(text, bare, target, origin, queuedSendCommit, submissionId, onStarted));
+    await this.withCloudHostWork(() => this.handleAdmittedSend(text, bare, target, origin, queuedSendCommit, submissionId, onStarted, requestedChips));
   }
 
   private async handleAdmittedSend(
     text: string, bare: boolean, target: Session | undefined, origin: MsgOrigin,
     queuedSendCommit?: { text: string; items: QueuedSendEntry[] }, submissionId?: string,
     onStarted?: () => void,
+    requestedChips?: FileChip[],
   ): Promise<void> {
     // `target` lets a queued-send flush fire into a BACKGROUNDED session (its
     // turn ended while another was focused). Only the focused session may spawn
@@ -17620,7 +17751,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // maybeFlushQueuedSends can never re-enter this branch: it only flushes
     // when the turn is over (queuedSendReadyText).
     if (this.turnInFlight(session)) {
-      if (!queuedSendCommit) this.divertRacingSend(session, text, bare);
+      if (!queuedSendCommit) this.divertRacingSend(session, text, bare, this.composerChipsForSend(session, requestedChips));
       return;
     }
     // Priming is latched before a client exists (sign-out replacements start
@@ -17628,14 +17759,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // race the planned replace. Queue whenever startup already owns this
     // session — not only when a client is sitting without a session id.
     if (session.priming || (session.client && !sessionReadyForPrompt(session))) {
-      if (!queuedSendCommit) this.divertRacingSend(session, text, bare);
+      if (!queuedSendCommit) this.divertRacingSend(session, text, bare, this.composerChipsForSend(session, requestedChips));
       return;
     }
     const client = session.client ?? await this.ensureClient(session);
     if (!client) return;
     // ensureClient may return mid-startSession; re-check before committing work.
     if (!sessionReadyForPrompt(session)) {
-      if (!queuedSendCommit) this.divertRacingSend(session, text, bare);
+      if (!queuedSendCommit) this.divertRacingSend(session, text, bare, this.composerChipsForSend(session, requestedChips));
       return;
     }
     const gen = session.gen;
@@ -17681,7 +17812,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       chips = [...queuedChips, ...implicitChips];
     } else {
-      chips = [...session.chips];
+      chips = requestedChips === undefined ? [...session.chips]
+        : [...this.composerChipsForSend(session, requestedChips), ...implicitChips];
     }
 
     // Pre-read every visible image BEFORE anything is cleared or sent. Any
@@ -18155,6 +18287,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       steerByDefault: cfg.get("steerByDefault", false),
       expandDiffCard: cfg.get("expandDiffCard", false),
       promptNav: cfg.get("promptNav", true),
+      museSettings: this.museSettings(),
       pinLiveWorkflows: cfg.get("pinLiveWorkflows", true),
       soundNotifications: cfg.get("soundNotifications", false),
       processingSound: cfg.get("processingSound", false),
@@ -18407,6 +18540,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
   }
 
+  private composerChipsForSend(session: Session, requested?: FileChip[]): FileChip[] {
+    // Only the recipient's explicit ids can opt restored attachments into a
+    // send. Other surfaces (including old clients) see only shared chips.
+    return chipsForQueueSend(requested === undefined ? session.chips :
+      restoreQueuedChips(session.chips, [{ text: "", chips: session.restoredChips }]), requested);
+  }
+
   private postChips(session: Session = this.focused): void {
     const remoteMessage: HostMsg = { type: "chips", chips: session.chips };
     if (session === this.focused && this.view) {
@@ -18425,7 +18565,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private localizeHistoryMessage(message: HostMsg, webview: HostWebview): HostMsg {
-    if (message.type === "userMessage" && message.chips) {
+    if ((message.type === "userMessage" || message.type === "restoreComposer") && message.chips) {
       return { ...message, chips: message.chips.map((chip) => isImageChip(chip)
         ? { ...chip, ...(fs.existsSync(chip.path)
           ? { previewSrc: webview.asWebviewUri(Uri.file(chip.path)), fullId: this.registerFullImage(chip.path) }
@@ -18516,6 +18656,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     "cancelDeviceLogin",
     "listSessions",
     "listRepoSessions",
+    "showRemoteHandoff",
     "selectRepo",
     "resumeSession",
     "newSession",
@@ -19487,8 +19628,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // the small frame the client actually needs, instead of rebuilding a list
     // that has not changed.
     this.postSessionName(session);
-    // Same as the remote path, and for the same reason: restorePersistedDraft
-    // broadcasts, so it is not called here.
+    this.restorePersistedDraft(session, "local");
   }
 
   /**
@@ -20542,7 +20682,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   /** Start a brand-new session, keeping the current one alive in the background. */
-  private async newFocusedSession(origin: MsgOrigin, requestedCwd?: string): Promise<void> {
+  private async newFocusedSession(origin: MsgOrigin, requestedCwd?: string, onCreated?: (id: string) => void): Promise<void> {
     // The answer to a CLI update belongs to the update, not to every
     // conversation opened afterwards. This lives in the two session
     // constructors rather than in `case "newSession"` because a remote's
@@ -20581,6 +20721,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const leavingId = this.focused.activeSessionId;
     this.parkFocused();
     const unused = this.findUnusedEmptySession(targetCwd, "local", leavingId);
+    if (unused) onCreated?.(unused.id);
     if (unused?.session?.client) {
       this.focusSession(unused.session);
     } else if (unused?.session) {
@@ -20599,7 +20740,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // the old transcript stayed onscreen under the fresh session. (The toolbar
       // path just clears twice, a no-op.)
       this.emit(this.focused, { type: "clearMessages" });
-      await this.startSession();
+      const created = this.focused;
+      await this.startSession(undefined, created);
+      if (created.activeSessionId) onCreated?.(created.activeSessionId);
     }
     await this.persistWorktreeBinding(this.focused);
     this.sweepEmptySessions(this.sessionCwd(this.focused));
@@ -20634,15 +20777,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // name has to be re-announced here or the header loses its rename affordance
     // until something unrelated refreshes it.
     this.postSessionName(session);
-    // NOT restorePersistedDraft. It hands the draft back with session-wide
-    // `emit`, which appends it to every surface viewing the conversation — so
-    // calling it here re-created, on the switch-back, the desk-composer
-    // pollution this whole sequence removed. Parked text therefore returns on
-    // the next load of the conversation rather than the instant you switch to
-    // it. That is a narrower promise, kept, instead of a wider one that leaks.
+    this.restorePersistedDraft(session, { clientId });
   }
 
-  private async newRemoteSession(clientId: string, notifyCatalog = true): Promise<void> {
+  /** Names a New's composer draft back to the surface that asked, once the host has its id. */
+  private composerDraftReply(draftId: unknown, requester?: RemoteRequester): ((sessionId: string) => void) | undefined {
+    if (typeof draftId !== "string") return undefined;
+    return (sessionId) => {
+      const reply: HostMsg = { type: "composerDraftSession", draftId, sessionId };
+      if (requester) this.sendRemoteRequester(requester, reply);
+      else this.postLocal(reply);
+    };
+  }
+
+  private async newRemoteSession(clientId: string, notifyCatalog = true, onCreated?: (id: string) => void): Promise<void> {
     this.clearSettledCliUpdates();
     const ownerTabToken = this.remoteClients.tabToken(clientId);
     const cwd = this.remoteClients.cwd(clientId);
@@ -20650,6 +20798,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.parkRemoteSession(clientId);
     this.dropRemoteVoice(clientId);
     const unused = this.findUnusedEmptySession(cwd, "remote", leavingId);
+    if (unused) onCreated?.(unused.id);
     if (unused?.session?.client) {
       this.focusRemoteSession(clientId, unused.session, notifyCatalog);
       return;
@@ -20674,6 +20823,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.remoteClients.setActive(clientId, session);
     this.emit(session, { type: "clearMessages" });
     await this.startSession(undefined, session);
+    if (session.activeSessionId) onCreated?.(session.activeSessionId);
     await this.persistWorktreeBinding(session);
     this.sweepEmptySessions(this.sessionCwd(session));
     if (notifyCatalog) this.postRepoCatalog();
@@ -21690,7 +21840,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       const requester = this.captureRemoteRequester(clientId);
       const transition = async (currentClientId: string) => {
         if (m.type === "newSession") {
-          await this.newRemoteSession(currentClientId);
+          await this.newRemoteSession(currentClientId, true, this.composerDraftReply(m.draftId, requester));
         } else if (m.type === "resumeSession") {
           await this.openRemoteSession(currentClientId, m.id, m.cwd, true, m.claim === true);
         } else if (m.type === "selectRepo") {
@@ -21824,6 +21974,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (this.uplink) return;
     const token = await this.readDeviceToken();
     if (!token) return; // not linked yet — the link command starts the uplink itself
+    this.linkedDeviceId ??= this.state.get<string>(GrokSidebar.REMOTE_DEVICE_ID_KEY) || undefined;
     const uplink = new RemoteUplink({
       relayUrl: this.relayUrl(),
       token,
@@ -21858,6 +22009,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         sameCwd: pathsEqual,
       },
       onConnected: () => this.cloudHostUpdate?.connected(),
+      onStatusChanged: () => {
+        if (this.uplink !== uplink) return;
+        if (uplink.deviceId && uplink.deviceId !== this.linkedDeviceId) this.rememberRemoteDeviceId(uplink.deviceId);
+        void this.postRemoteStatus();
+      },
       onClientReady: (clientId, tabToken) => this.handleRemoteClientReady(clientId, tabToken),
       onClientLeft: (clientId) => {
         this.releaseRemoteClient(clientId);
@@ -21901,7 +22057,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (this.uplink !== revokedUplink || storedToken !== revokedToken) return;
 
     this.clearRemoteRuntime();
-    this.post({ type: "remoteStatus", linked: false });
+    this.publishRemoteStatus(false);
     try {
       await this.context.secrets.delete(GrokSidebar.DEVICE_TOKEN_SECRET);
     } catch (e) {
@@ -21928,6 +22084,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private clearRemoteRuntime(): void {
     this.uplink?.dispose();
     this.uplink = undefined;
+    this.rememberRemoteDeviceId(undefined);
     this.stopVoiceInput();
     this.remoteClients.clear();
     this.refreshKeepAwake();
@@ -21985,7 +22142,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  edge: start a link, open the browser for the (mock for now) approval, poll
    *  until the relay hands back a long-lived device token, store it in secrets,
    *  connect. Mirrors how a CLI links to a web account. */
-  async linkRemoteDevice(): Promise<void> {
+  async linkRemoteDevice(source: RemoteHandoffSource = "palette"): Promise<void> {
+    this.reportHandoffEvent("remote_link_started", { source });
     const base = httpBaseFromRelayUrl(this.relayUrl());
     try {
       // Already persisted by the time this returns — getOrCreate writes the file
@@ -22015,34 +22173,39 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (!startRes.ok) throw new Error(`link/start ${startRes.status}`);
       const { code } = (await startRes.json()) as { code: string };
       void this.host.openExternal(`${base}/link?code=${encodeURIComponent(code)}`);
-      const token = await this.host.withProgress(
+      const approved = await this.host.withProgress(
         { title: `Approve this device in the browser (code ${code})…`, cancellable: true },
         (cancel) => this.pollLinkApproval(base, code, cancel),
       );
-      if (!token) return; // cancelled / expired — poll loop already surfaced why
-      await this.context.secrets.store(GrokSidebar.DEVICE_TOKEN_SECRET, token);
+      if (!approved) return; // cancelled / expired — poll loop already surfaced why
+      await this.context.secrets.store(GrokSidebar.DEVICE_TOKEN_SECRET, approved.token);
       this.uplink?.dispose();
       this.uplink = undefined;
+      // An older relay omits it; the uplink's `self` frame then supplies it.
+      this.rememberRemoteDeviceId(approved.deviceId);
       await this.maybeStartUplink();
-      this.post({ type: "remoteStatus", linked: true });
+      this.publishRemoteStatus(true);
+      this.reportHandoffEvent("remote_link_completed", {});
       void this.host.showInformationMessage("Remote device linked — this workspace is now reachable from the web client.");
     } catch (e) {
       void this.host.showErrorMessage(`Remote link failed: ${(e as Error)?.message ?? String(e)}`);
     }
   }
 
-  private async pollLinkApproval(base: string, code: string, cancel: HostCancellationToken): Promise<string | undefined> {
+  private async pollLinkApproval(base: string, code: string, cancel: HostCancellationToken): Promise<{ token: string; deviceId?: string } | undefined> {
     const deadline = Date.now() + 5 * 60_000;
     while (Date.now() < deadline && !cancel.isCancellationRequested) {
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 1000));
       const res = await fetch(`${base}/api/link/poll`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ code }),
       });
       if (!res.ok) continue;
-      const body = (await res.json()) as { status: string; token?: string };
-      if (body.status === "approved" && body.token) return body.token;
+      const body = (await res.json()) as { status: string; token?: string; deviceId?: unknown };
+      if (body.status === "approved" && body.token) {
+        return { token: body.token, deviceId: typeof body.deviceId === "string" && body.deviceId ? body.deviceId : undefined };
+      }
       if (body.status === "expired" || body.status === "unknown") {
         void this.host.showErrorMessage("Remote link code expired — run the link command again.");
         return undefined;
@@ -22081,15 +22244,101 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // Still tear the runtime down so the machine stops advertising.
     }
     this.clearRemoteRuntime();
-    this.post({ type: "remoteStatus", linked: false });
+    this.publishRemoteStatus(false);
     void this.host.showInformationMessage("Remote device unlinked.");
   }
 
-  /** Tell the webview whether this machine holds a relay device token (drives
-   *  the gear "AFK Pilot" section's sign-in vs account/sign-out items). */
+  private remoteStatusRevision = 0;
+  /** The linked device's id, from the link reply or the uplink's `self` frame, kept with the link so the phone
+   *  code never waits for a reconnect (after sleep, a network change or a relay deploy). Fixed for a token's life. */
+  private linkedDeviceId?: string;
+  private static readonly REMOTE_DEVICE_ID_KEY = "grok.remote.deviceId";
+
+  private rememberRemoteDeviceId(deviceId: string | undefined): void {
+    this.linkedDeviceId = deviceId;
+    void this.state.update(GrokSidebar.REMOTE_DEVICE_ID_KEY, deviceId);
+  }
+
+  /** Undefined while this window's connection is being refused: another window may hold the link, and a code
+   *  from here would open that window's host. A refusal that outlasts the grace window becomes `heldElsewhere`. */
+  private remoteDeviceId(): string | undefined {
+    if (this.uplink?.refused || this.uplink?.heldElsewhere) return undefined;
+    return this.uplink?.deviceId ?? this.linkedDeviceId;
+  }
+
+  private publishRemoteStatus(linked: boolean): void {
+    this.remoteStatusRevision = (this.remoteStatusRevision ?? 0) + 1;
+    const msg: HostMsg = { type: "remoteStatus", linked,
+      handoffReady: linked && !!this.remoteDeviceId(),
+      ...(linked && this.uplink?.heldElsewhere ? { heldElsewhere: true } : {}),
+      viewerCount: linked ? this.uplink?.viewerCount ?? 0 : 0 };
+    this.post(msg);
+    void this.settingsEditor?.webview.postMessage(msg);
+  }
+
   private async postRemoteStatus(): Promise<void> {
+    const revision = this.remoteStatusRevision ?? 0;
     const token = await this.readDeviceToken();
-    this.post({ type: "remoteStatus", linked: !!token });
+    if ((this.remoteStatusRevision ?? 0) === revision) this.publishRemoteStatus(!!token);
+  }
+
+  private reportHandoffEvent(
+    name: "remote_handoff_shown" | "remote_link_started" | "remote_link_completed",
+    props: { source?: RemoteHandoffSource; linked?: boolean },
+  ): void {
+    this.reportTelemetry((sys, sessionId, timestamp) => buildRemoteHandoffEvent(name, {
+      installId: this.installId(),
+      hostKind: sessionStartHostKind(this.host.canSwitchWorkspaceFolder, isCloudEnvironment()),
+      ...props,
+    }, sys, sessionId, timestamp));
+  }
+
+  private pendingRemoteHandoff?: Extract<HostMsg, { type: "showRemoteHandoff" }>;
+  private chatReadyForHandoff = false;
+
+  async continueOnPhone(source: RemoteHandoffSource = "palette", sessionId?: string, repoCwd?: string, explain?: boolean): Promise<void> {
+    const msg: Extract<HostMsg, { type: "showRemoteHandoff" }> = { type: "showRemoteHandoff", source, sessionId, repoCwd, explain };
+    this.pendingRemoteHandoff = msg;
+    await this.host.revealChatView();
+    if (this.chatReadyForHandoff && this.pendingRemoteHandoff === msg) {
+      this.pendingRemoteHandoff = undefined;
+      this.postLocal(msg);
+    }
+  }
+
+  /** Resolve the row against host-owned catalogs; never substitute the focused chat for a missing id. */
+  private handoffSession(sessionId?: string, repoCwd?: string): HandoffSession | undefined {
+    const id = sessionId || this.focused.activeSessionId;
+    if (!id) return undefined;
+    const live = [...this.pool, this.focused].find((s) => s.activeSessionId === id);
+    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const cached = this.sessionCache.get(id)?.entry
+      ?? [...this.allAdapterCatalogs()].flat().find((s) => s.id === id);
+    const cwd = live ? this.sessionCwd(live) : cached?.cwd;
+    if (!cwd) return undefined;
+    const named = repoCwd ? this.localRepoCatalogEntries().find((r) => r.available && pathsEqual(r.cwd, repoCwd)) : undefined;
+    const repo = named && this.sessionCwdsForRepo(named.cwd, overrides).some((c) => pathsEqual(c, cwd))
+      ? named : this.resolveLocalRepoTarget(cwd);
+    if (!repo || (repoCwd && repo !== named)) return undefined;
+    const title = live ? this.sessionDisplayName(live) : cached?.displayName;
+    return { id, repoCwd: repo.cwd, cwd, title: title || "this conversation" };
+  }
+
+  private async replyRemoteHandoff(msg: Extract<WebviewMsg, { type: "remoteHandoff" }>): Promise<void> {
+    const linked = !!await this.readDeviceToken();
+    if (!msg.action || msg.action === "show") this.reportHandoffEvent("remote_handoff_shown", { source: msg.source, linked });
+    const session = this.handoffSession(msg.sessionId, msg.repoCwd);
+    const url = linked ? remoteHandoffUrl(this.relayUrl(), this.remoteDeviceId(), session) : undefined;
+    if (msg.action === "open") {
+      this.reportRemotePortalOpened(!url, msg.source);
+      void this.host.openExternal(url ?? `${httpBaseFromRelayUrl(this.relayUrl())}/?remoteHint=1`);
+      return;
+    }
+    let qrSvg: string | undefined;
+    if (url) {
+      try { qrSvg = remoteHandoffQr(url); } catch { /* Oversized link: Copy/Open still work. */ }
+    }
+    this.postLocal({ type: "remoteHandoff", requestId: msg.requestId, url, qrSvg, title: session?.title || "this conversation" });
   }
 
   /** Ordered catch-up built from this client's cwd and active remote session. */
@@ -22253,7 +22502,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /**
    * Open the shared settings surface as a VS Code editor tab.
    *
-   * Snapshot-on-open: the tab does not subscribe to live chat updates. Every
+   * Settings receives host-local status updates while open. Every
    * change still posts an existing set-/open- message, so the sidebar and
    * chat webview stay in sync through the same handlers the gear uses.
    */
@@ -22294,6 +22543,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private async onSettingsPanelMessage(msg: WebviewMsg): Promise<void> {
+    if (msg.type === "ready") {
+      await this.postRemoteStatus();
+      return;
+    }
     if (!GrokSidebar.SETTINGS_PANEL_TYPES.has(msg.type)) {
       this.host.appendLine(`[settings] ignored ${msg.type}`);
       return;
@@ -22317,6 +22570,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         steerByDefault: cfg.get("steerByDefault", false),
         expandDiffCard: cfg.get("expandDiffCard", false),
         promptNav: cfg.get("promptNav", true),
+        museSettings: this.museSettings(),
         pinLiveWorkflows: cfg.get("pinLiveWorkflows", true),
         fontScale: this.chatFontScale(),
         soundNotifications: cfg.get("soundNotifications", false),
@@ -22361,6 +22615,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         steerSupported: true,
         providersKnown: true,
         remoteLinked: opts.remoteLinked,
+        remoteHandoffSupported: true,
+        remoteViewerCount: this.uplink?.viewerCount ?? 0,
         hostCaps: {
           relocateView: this.host.canRelocateView,
           secondarySideBar: this.host.canUseSecondarySideBar,
@@ -22412,6 +22668,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       window.addEventListener("message", function (e) {
         var msg = e.data;
         if (!msg || !msg.type || !surface) return;
+        if (msg.type === "remoteStatus") {
+          surface.update({}, { remoteLinked: !!msg.linked, remoteViewerCount: msg.viewerCount || 0,
+            remoteHandoffSupported: typeof msg.handoffReady === "boolean" });
+        }
+        if (msg.type === "museSettings") surface.update({ museSettings: msg.value });
         if (msg.type === "voiceConfigured") {
           surface.update({ voiceConfigured: !!msg.value, voiceBackendState: msg.backendState,
             voiceSendPhrase: msg.sendPhrase, voiceKeyterms: msg.keyterms });
@@ -22460,6 +22721,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         if (msg.type === "settingsCategory" && msg.category) surface.setCategory(msg.category);
       });
+      vscode.postMessage({ type: "ready" });
     })();
   </script>
 </body>
@@ -22583,7 +22845,7 @@ ${openMain}
       <button id="session-name-edit" class="session-name-edit icon-btn" type="button" hidden></button>
     </div>
     <button id="repo-btn" class="repo-chip" type="button" title="Choose repository"></button>
-    <button id="remote-btn" class="icon-btn remote-btn" title="Continue remotely" hidden></button>
+    <button id="remote-btn" class="icon-btn remote-btn" title="Remote control" hidden></button>
     <button id="history-btn" class="icon-btn" title="Session history"></button>
     <button id="new-btn" class="icon-btn" title="New session"></button>
     ${this.host.canSwitchWorkspaceFolder ? `<div id="session-head-actions"></div>` : ""}

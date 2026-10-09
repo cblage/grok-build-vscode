@@ -79,6 +79,25 @@ const usableItem = (menu: Element, label: string) => {
 };
 
 describe("projects rail", () => {
+  it("offers phone handoff for a nonfocused desktop worktree row, never for remotes", () => {
+    for (const remote of [false, true]) {
+      const { window, doc, posted } = bootWebview({ remote, beforeScripts: withRail });
+      dispatch(window, { type: "initialState", capabilities: { relocateView: false, showOutput: false } });
+      dispatch(window, { type: "repos", entries: repos, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
+      dispatch(window, { type: "remoteStatus", linked: true, handoffReady: true });
+      dispatch(window, { ...sessionsFrame([row("focused", "/work/alpha", "Focused"), row("other", "/work/alpha-tree", "Other")]), activeId: "focused" });
+      const el = doc.querySelector('.rail-session[data-session-id="other"]')!;
+      const menu = openMenu(window, el);
+      const action = menuItem(menu, "Continue on phone…");
+      if (remote) expect(action).toBeUndefined();
+      else {
+        expect(action).toBeTruthy();
+        click(window, action!);
+        expect(posted).toContainEqual(expect.objectContaining({ type: "remoteHandoff", source: "rail", sessionId: "other", repoCwd: "/work/alpha" }));
+        expect(posted.some((m) => m.type === "resumeSession")).toBe(false);
+      }
+    }
+  });
   it("removes a known session from history, selected rows, previews and pins without requesting a list", () => {
     const { doc, window, posted } = boot();
     const empty = { ...row("empty", "/work/alpha", "Abandoned empty"), numMessages: 0, pinned: true };
@@ -1035,7 +1054,7 @@ describe("projects rail", () => {
     it("starts directly in the repo already selected", () => {
       const { doc, window, posted } = boot("/work/alpha");
       click(window, addFor(doc, "alpha") as HTMLElement);
-      expect(posted.filter((p) => p.type === "newSession")).toEqual([{ type: "newSession" }]);
+      expect(posted.filter((p) => p.type === "newSession")).toEqual([{ type: "newSession", draftId: expect.any(String) }]);
       expect(posted.filter((p) => p.type === "selectRepo")).toEqual([]);
     });
 

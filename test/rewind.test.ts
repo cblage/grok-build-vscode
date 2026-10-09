@@ -62,12 +62,124 @@ function makeRewindSidebar(hasFiles = true) {
     showInformationMessage: vi.fn(), showErrorMessage: vi.fn(),
   };
   sidebar.sendRemoteClient = vi.fn();
+  sidebar.postLocal = vi.fn();
+  const store: Record<string, any> = {};
+  sidebar.state = { get: (key, fallback) => store[key] ?? fallback, update: async (key, value) => { store[key] = value; } };
+  sidebar.sessionMetaWrites = Promise.resolve();
   vi.spyOn(sidebar, "reportRequester");
   sidebar.applyRewindToView = vi.fn();
   sidebar.restoreComposerFor = vi.fn();
   sidebar.truncateSessionCardsAfterRewind = vi.fn();
   return { sidebar, session, original, replacement, points, confirmation };
 }
+
+it.each(["local", "remote"] as const)("Edit restores only host-recorded chips through the %s handler", async source => {
+  const { sidebar, session, original } = makeRewindSidebar(false);
+  const chip = { id: "recorded", path: "/repo/recorded.txt", relPath: "recorded.txt", kind: "file" as const };
+  const forged = { ...chip, id: "forged", path: "/outside/private.txt" };
+  // A replayed prefix must not prevent restoring the newest live bubble.
+  session.buffer = [{ type: "userMessageChunk", text: "older message" },
+    { type: "userMessage", text: "latest", chips: [chip] },
+    { type: "userMessage", text: "steering", chips: [forged], steer: true }];
+  original.executeRewind.mockResolvedValueOnce({ success: true, targetPromptIndex: 1, revertedFiles: [] } as any);
+  sidebar.restoreComposerFor = (GrokSidebar.prototype as any).restoreComposerFor;
+  sidebar.refreshImplicitChip = vi.fn();
+  sidebar.postChips = vi.fn();
+  // The real rewind discards the record before restoring the composer.
+  sidebar.applyRewindToView = vi.fn(() => { session.buffer = []; });
+  await sidebar.onMessage({ type: "editLastMessage", userBubbleIndex: 1, totalUserBubbles: 2, text: "latest", chips: [forged] }, source,
+    source === "remote" ? "browser-view" : undefined);
+  expect(original.executeRewind).toHaveBeenCalledOnce();
+  expect(session.chips).toEqual([]);
+  expect(session.restoredChips).toEqual([chip]);
+  expect(session.restoredChips.some(c => c.path === forged.path)).toBe(false);
+  const message = { type: "restoreComposer", text: "latest", sessionId: session.activeSessionId, chips: [chip] };
+  if (source === "remote") {
+    expect(sidebar.sendRemoteClient).toHaveBeenCalledWith("browser-view", message);
+    expect(sidebar.postLocal).not.toHaveBeenCalled();
+  } else {
+    expect(sidebar.postLocal).toHaveBeenCalledWith(message);
+    expect(sidebar.sendRemoteClient).not.toHaveBeenCalled();
+  }
+  expect(sidebar.postChips).not.toHaveBeenCalled();
+  // The other surface's existing text cannot acquire this file on Send.
+  expect(sidebar.composerChipsForSend(session)).toEqual([]);
+  expect(sidebar.composerChipsForSend(session, [])).toEqual([]);
+  expect(sidebar.composerChipsForSend(session, [forged, { ...chip, path: forged.path }])).toEqual([chip]);
+});
+
+it.each(["local", "remote"] as const)("parks Edit text and files together when the %s leaves during rewind, then restores on focus", async source => {
+  const { sidebar, session, original } = makeRewindSidebar(false);
+  const chip = { id: "file", path: "/repo/file.txt", relPath: "file.txt", kind: "file" as const };
+  session.buffer = [{ type: "userMessage", text: "first" }, { type: "userMessage", text: "latest", chips: [chip] }];
+  const execution = deferred<any>();
+  original.executeRewind.mockReturnValueOnce(execution.promise);
+  sidebar.restoreComposerFor = (GrokSidebar.prototype as any).restoreComposerFor;
+  sidebar.view = { webview: { postMessage: vi.fn() } };
+  const pending = sidebar.onMessage({ type: "editLastMessage", userBubbleIndex: 1, totalUserBubbles: 2, text: "latest" }, source,
+    source === "remote" ? "browser-view" : undefined);
+  await vi.waitFor(() => expect(original.executeRewind).toHaveBeenCalledOnce());
+  const other = new Session();
+  other.activeSessionId = "other";
+  if (source === "remote") sidebar.remoteClients.setActive("browser-view", other);
+  else sidebar.focused = other;
+  execution.resolve({ success: true, targetPromptIndex: 1, revertedFiles: [] });
+  await pending;
+  await sidebar.sessionMetaWrites;
+  expect(session.chips).toEqual([]);
+  expect(session.restoredChips).toEqual([]);
+  expect(sidebar.postLocal).not.toHaveBeenCalled();
+  expect(sidebar.sendRemoteClient).not.toHaveBeenCalled();
+  expect(sidebar.state.get("grok.sessionMeta", {})[session.activeSessionId]).toMatchObject({ queuedDraft: "latest", queuedDraftChips: [chip] });
+
+  sidebar.touch = vi.fn();
+  sidebar.markRead = vi.fn();
+  sidebar.refreshWorkflowCompletions = vi.fn();
+  sidebar.sessionIdentityFrame = () => undefined;
+  sidebar.displayMode = () => "agent";
+  sidebar.postMode = vi.fn();
+  sidebar.postRepoCatalog = vi.fn();
+  sidebar.postSessionName = vi.fn();
+  sidebar.buildSessionsList = () => ({ type: "sessions", entries: [], activeId: session.activeSessionId });
+  if (source === "remote") sidebar.focusRemoteSession("browser-view", session);
+  else sidebar.focusSession(session);
+  // A second focus request before META's async write settles must not append twice.
+  sidebar.restorePersistedDraft(session, source === "remote" ? { clientId: "browser-view" } : "local");
+  await sidebar.sessionMetaWrites;
+  const message = { type: "restoreComposer", text: "latest", sessionId: session.activeSessionId, chips: [chip] };
+  if (source === "remote") {
+    expect(sidebar.sendRemoteClient).toHaveBeenCalledWith("browser-view", message);
+    expect(sidebar.sendRemoteClient.mock.calls.filter(([, msg]) => msg.type === "restoreComposer")).toHaveLength(1);
+    expect(sidebar.postLocal).not.toHaveBeenCalled();
+  } else {
+    expect(sidebar.postLocal).toHaveBeenCalledWith(message);
+    expect(sidebar.postLocal).toHaveBeenCalledOnce();
+  }
+  expect(sidebar.emit).not.toHaveBeenCalledWith(session, expect.objectContaining({ type: "restoreComposer" }));
+  expect(session.chips).toEqual([]);
+  expect(session.restoredChips).toEqual([chip]);
+  expect(sidebar.state.get("grok.sessionMeta", {})[session.activeSessionId]).not.toHaveProperty("queuedDraft");
+  expect(sidebar.state.get("grok.sessionMeta", {})[session.activeSessionId]).not.toHaveProperty("queuedDraftChips");
+});
+
+it("appends multiple parked Edit messages and their files atomically", async () => {
+  const { sidebar, session } = makeRewindSidebar(false);
+  sidebar.focused = new Session();
+  const chips = ["one", "two"].map(id => ({ id, path: `/repo/${id}.txt`, relPath: `${id}.txt`, kind: "file" as const }));
+  for (const chip of chips) (GrokSidebar.prototype as any).restoreComposerFor.call(sidebar, session, undefined, chip.id, [chip]);
+  await sidebar.sessionMetaWrites;
+  expect(sidebar.state.get("grok.sessionMeta", {})[session.activeSessionId]).toMatchObject({
+    queuedDraft: "one\n\ntwo", queuedDraftChips: expect.arrayContaining(chips),
+  });
+});
+
+it("Edit never restores a supplied chip when the host has no attachment record", async () => {
+  const { sidebar, session, original } = makeRewindSidebar(false);
+  original.executeRewind.mockResolvedValueOnce({ success: true, targetPromptIndex: 1, revertedFiles: [] } as any);
+  await sidebar.onMessage({ type: "editLastMessage", userBubbleIndex: 1, totalUserBubbles: 2, text: "latest",
+    chips: [{ id: "forged", path: "/outside/private.txt", kind: "file" }] }, "local");
+  expect(sidebar.restoreComposerFor).toHaveBeenCalledWith(session, undefined, "latest", undefined);
+});
 
 describe.each(["editLastMessage", "rewindSession"] as const)("%s lifecycle", (type) => {
   const request = { type, userBubbleIndex: 0, text: "original draft", totalUserBubbles: 2 };

@@ -1,3 +1,5 @@
+export type RemoteHandoffSource = "topbar" | "rail" | "projects" | "settings" | "palette";
+
 import type { AcpProvider } from "./acp-backend";
 // Single source of truth for the host <-> webview message contract.
 //
@@ -29,6 +31,7 @@ import type { SeatbeltBuiltinProfile } from "./seatbelt-policy";
 import type { SttPreference, VoiceBackendState } from "./voice";
 import type { RepoListEntry, SessionListEntry } from "./sessions";
 import type { Dot } from "./session-pool";
+import type { ModeId, MuseSettings } from "./mode-prefs";
 import type { RunProgressUpdate } from "./run-progress";
 import type { McpServerView } from "./mcp";
 import type { ConnectorView } from "./mcp-connectors";
@@ -92,6 +95,7 @@ export interface SandboxProfileRules {
 
 /** host -> webview */
 export const HOST_CAPABILITIES = {
+  museNativeModes: true,
   // A distinct message: old runInstallCmd hosts always install Grok.
   installMuse: true,
   uploadFile: true,
@@ -156,6 +160,10 @@ export const HOST_CAPABILITIES = {
   // Backend steering dispatch and its per-session capability. Older hosts
   // route Codex to Grok's method, so remotes must require this field.
   remoteSteering: true,
+  // `newSession.draftId` is answered with `composerDraftSession`. OPT-IN: an
+  // older host opens the conversation but never names the draft back, so a
+  // client that keyed a New's text to a private token would strand it there.
+  composerDraftSession: true,
 } as const;
 
 /** Device-code GitHub sign-in carried on `projectSetup`. Additive. */
@@ -209,6 +217,7 @@ export type HostErrorCode =
 
 /** Host-kind affordances merged into `initialState.capabilities` at post time. */
 export type HostUiCapabilities = {
+  museNativeModes?: boolean;
   /** Desk-only fixed Muse installer. Absent/false hides the install button. */
   installMuse?: boolean;
   uploadFile: boolean;
@@ -271,6 +280,11 @@ export type HostUiCapabilities = {
   remoteRewind?: boolean;
   /** Backend steering is wired on this host. Absent/false hides remote Steer. */
   remoteSteering?: boolean;
+  /**
+   * `newSession.draftId` is answered with `composerDraftSession`. Absent/false
+   * = the client binds a New's composer on the first identity frame instead.
+   */
+  composerDraftSession?: boolean;
   /**
    * Whether a remote may sign an agent OUT on this host.
    *
@@ -417,6 +431,7 @@ export type HostMsg =
       /** VS Code language id for command View all, from the host shell dialect.
        *  Absent on older hosts — View all then omits language. */
       commandLanguage?: string;
+      museSettings?: MuseSettings;
       /** Which GUI is on the other end. A phone is looking at neither the
        *  extension nor the desktop app, so it cannot infer this, and its
        *  About page has to name what it is connected to. Optional and
@@ -585,9 +600,11 @@ export type HostMsg =
   | { type: "summarizeRepliesAloud"; value: boolean }
   | { type: "speechSummary"; requestId: number; text: string }
   | { type: "moveComposerCaret"; direction: "forward" | "previousLine" }
-  // Whether this machine holds a relay device token (gear "AFK Pilot" section).
+  // Device linking, handoff readiness and presence for the desk's remote button.
   // Local-webview chrome — never mirrored to remotes.
-  | { type: "remoteStatus"; linked: boolean }
+  | { type: "remoteStatus"; linked: boolean; handoffReady?: boolean; viewerCount?: number; heldElsewhere?: boolean }
+  | { type: "showRemoteHandoff"; source: RemoteHandoffSource; sessionId?: string; repoCwd?: string; explain?: boolean }
+  | { type: "remoteHandoff"; requestId: number; url?: string; qrSvg?: string; title: string }
   /**
    * The connection carrying this webview's messages ended, and a new one is up.
    *
@@ -644,10 +661,13 @@ export type HostMsg =
   // another project's name, it presents one project's conversation as another's.
   // Optional and additive: a client that never sees it keeps its old fallback.
   | { type: "sessionName"; sessionId: string; name: string; cwd: string; repoCwd?: string }
+  | { type: "composerDraftSession"; draftId: string; sessionId: string }
   | { type: "modelChanged"; modelId: string }
   // `modes` is the set this session offers. Absent on an older host: the page
   // keeps its previous rule (Muse's button hidden, Codex without Plan).
-  | { type: "modeChanged"; modeId: string; modes?: Array<"agent" | "plan" | "yolo"> }
+  // Muse's native-id advertisement (three on cloud, four on desk) gates its names and new setMode values;
+  // disabledModes adds launch restrictions without removing the choices.
+  | { type: "modeChanged"; modeId: string; modes?: ModeId[]; disabledModes?: Partial<Record<ModeId, string>> }
   /** YOLO/Auto-accept blocked when config has disable_bypass_permissions_mode. */
   | { type: "modePolicy"; yoloDisabled: boolean; yoloDisabledReason?: string }
   /** Effective sandbox for the next spawn + profiles available in the dropdown. */
@@ -985,6 +1005,7 @@ export type HostMsg =
   // only: a remote keeps its own per-device preference, so this frame is
   // `host-local` outbound and never crosses the relay.
   | { type: "promptNav"; value: boolean }
+  | { type: "museSettings"; value: MuseSettings }
   | { type: "pinLiveWorkflows"; value: boolean }
   // Host-backed on desk; a remote keeps its own default (host-local outbound).
   | { type: "expandDiffCard"; value: boolean }
@@ -1002,7 +1023,7 @@ export type HostMsg =
   | { type: "findInSession" }
   /** Put text back in the composer (Edit-and-resend, #56). Posted after the
    *  rewind + reload so it survives the clearMessages/replay that follows. */
-  | { type: "restoreComposer"; text: string }
+  | { type: "restoreComposer"; text: string; chips?: FileChip[]; sessionId?: string }
   /** Drop everything after the Nth visible user message (rewind/edit, P2-9).
    *  Replaces the old clearMessages + full reload, which blanked the panel to
    *  the welcome logo and re-rendered the whole conversation. */
@@ -1112,10 +1133,10 @@ export type WebviewMsg =
   // omitted, the host starts in its own scope exactly as before. The host
   // resolves it through the catalog and ignores anything unknown, and a remote's
   // value is discarded outright (`newRemoteSession` starts in that tab's repo).
-  | { type: "newSession"; cwd?: string }
+  | { type: "newSession"; cwd?: string; draftId?: string }
   | { type: "cancel" }
   | { type: "pickModel" }
-  | { type: "setMode"; modeId: "agent" | "plan" | "yolo" }
+  | { type: "setMode"; modeId: ModeId }
   /** Pick a sandbox profile ("off" = unsandboxed). Requires session restart. */
   | { type: "setSandbox"; profile: string }
   | { type: "removeChip"; id: string }
@@ -1268,6 +1289,8 @@ export type WebviewMsg =
   | { type: "setExpandCommandOutputs"; value: boolean }
   | { type: "setSteerByDefault"; value: boolean }
   | { type: "setPromptNav"; value: boolean }
+  | { type: "setMuseSetting"; key: "museShellSandbox" | "museTrustWorkspaces"; value: boolean }
+  | { type: "setMuseSetting"; key: "museSandboxNetwork"; value: MuseSettings["sandboxNetwork"] }
   | { type: "setPinLiveWorkflows"; value: boolean }
   | { type: "setExpandDiffCard"; value: boolean }
   /** Persist `grok.voiceSendPhrase`. Empty disables hands-free send. */
@@ -1530,7 +1553,7 @@ export type WebviewMsg =
   | { type: "rewindSession"; userBubbleIndex?: number; text?: string; totalUserBubbles?: number }
   /** Edit-and-resend (#56): rewind past this (latest) user message and hand its
    *  text back to the composer. `text` is the bubble's own cleaned copy text. */
-  | { type: "editLastMessage"; userBubbleIndex: number; text: string; totalUserBubbles?: number }
+  | { type: "editLastMessage"; userBubbleIndex: number; text: string; chips?: FileChip[]; totalUserBubbles?: number }
   /** Reply to `uiConfirmRequest`. Answerable by whichever client was shown the
    *  dialog, remote included, since 2026-09-01: the confirm moved in-chat in
    *  2.0.0, so `host-local` here did not buy a more careful check — it meant a
@@ -1542,13 +1565,15 @@ export type WebviewMsg =
   /** Read-only Grok context snapshot for the open donut popover. */
   | { type: "refreshContextDetails" }
   | { type: "refreshSubscriptionUsage" }
-  // Relay account (gear "AFK Pilot" section, local webview only): start the
+  // Relay account (remote popover / Settings, local webview only): start the
   // device-link flow / drop the device token / open the relay web portal.
-  | { type: "remoteSignIn" }
+  | { type: "remoteSignIn"; source?: RemoteHandoffSource }
+  | { type: "showRemoteHandoff"; source: RemoteHandoffSource; sessionId?: string; repoCwd?: string; explain?: boolean }
+  | { type: "remoteHandoff"; requestId: number; source: RemoteHandoffSource; sessionId?: string; repoCwd?: string; action?: "show" | "refresh" | "open" }
   | { type: "remoteSignOut" }
-  /** Desktop gear "Unlink this device…" — host confirms natively, then unlinks. */
+  /** Desktop Settings "Unlink this device…" — host confirms natively, then unlinks. */
   | { type: "unlinkRemoteDevice" }
-  | { type: "openRemotePortal"; withHint?: boolean }
+  | { type: "openRemotePortal"; withHint?: boolean; source?: RemoteHandoffSource }
   /** Open the desktop release page from the update notice. Host-local — a phone
    *  cannot update the desk. */
   | { type: "openUpdateRelease"; url: string }
@@ -1560,10 +1585,10 @@ export type WebviewMsg =
 // error). The runtime arrays are just the keys, so they can never drift from the
 // union without failing the build.
 const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
+  museSettings: true,
   cloudHostUpdateState: true, initialState: true, moveViewHint: true, welcomeTips: true, projectSetup: true, githubState: true, githubRepos: true, providerState: true, mcpServers: true, mcpConnectors: true, mcpConnectorAuthorization: true, routines: true, codexInstallProgress: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true, updateReady: true, telemetryEnabled: true, thumbsFeedback: true,
-  initialized: true, cliUpdating: true, session: true, sessionName: true, modelChanged: true,
-  modeChanged: true, modePolicy: true, sandboxState: true, openModePopover: true,
-  voiceState: true, voiceConfigured: true,
+  initialized: true, cliUpdating: true, session: true, sessionName: true, composerDraftSession: true, modelChanged: true,
+  modeChanged: true, modePolicy: true, sandboxState: true, openModePopover: true, voiceState: true, voiceConfigured: true,
   voicePartial: true, voiceSubmit: true, voiceTranscript: true, voiceError: true,
   chips: true, commandsUpdate: true, mentionResults: true, projectDirListing: true, projectFileContent: true, projectFileWriteResult: true, gitStatusResult: true, gitFileDiffResult: true, turnFileDiffResult: true, turnDiffBaseline: true, gitRunResult: true, userMessage: true, agentStart: true,
   providerConfigContent: true, providerConfigWriteResult: true,
@@ -1576,13 +1601,14 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   agentError: true, agentEnd: true, exit: true, setBusy: true, summarizing: true,
   sessionContext: true, clearMessages: true, onboarding: true, error: true, hostNotice: true,
   xaiNotification: true, subagentUpdate: true, childStream: true, runProgress: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true, promptNav: true, pinLiveWorkflows: true, expandDiffCard: true,
-  soundNotifications: true, processingSound: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, imageFull: true, imageOriginal: true, moveComposerCaret: true, remoteStatus: true, hostReachable: true, hostLink: true,
+  soundNotifications: true, processingSound: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, imageFull: true, imageOriginal: true, moveComposerCaret: true, remoteStatus: true, showRemoteHandoff: true, remoteHandoff: true, hostReachable: true, hostLink: true,
   setAllToolDetails: true, focusInput: true, findInSession: true, restoreComposer: true, truncateMessages: true, uiConfirmRequest: true, uiConfirmResolved: true,
   sessions: true, sessionRemoved: true, repoSessions: true, pinnedSessions: true, repos: true, sessionDot: true, queuedSends: true, submitQueuedSend: true,
   steerUnavailable: true, feedbackAvailability: true, turnFeedbackAck: true, usage: true,
 };
 
 const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
+  setMuseSetting: true,
   ready: true, remotePreferences: true, send: true, newSession: true, cancel: true, pickModel: true,
   setMode: true, setSandbox: true, removeChip: true, toggleChip: true, openFile: true, showInFolder: true, openUrl: true,
   openText: true, openDiff: true, exportExpr: true, setEffort: true, openGlobalConfig: true, openProviderConfig: true,
@@ -1610,7 +1636,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   rewindSession: true, editLastMessage: true, uiConfirmAnswer: true, workflowControl: true,
   refreshContextDetails: true,
   refreshSubscriptionUsage: true,
-  remoteSignIn: true, remoteSignOut: true, unlinkRemoteDevice: true, openRemotePortal: true,
+  remoteSignIn: true, showRemoteHandoff: true, remoteHandoff: true, remoteSignOut: true, unlinkRemoteDevice: true, openRemotePortal: true,
   cloudHostUpdate: true, openUpdateRelease: true, restartToUpdate: true,
 };
 

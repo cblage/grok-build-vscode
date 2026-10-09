@@ -57,6 +57,32 @@ describe("Edit on the latest user message (#56)", () => {
     });
   });
 
+  it("posts attached chips with editLastMessage when the message has attachments", () => {
+    const { window, posted, doc } = bootWebview();
+    const chip = {
+      id: "image:/s/test.png:1:1",
+      path: "/s/test.png",
+      relPath: "Image #1",
+      hidden: false,
+      imageIndex: 1,
+      mimeType: "image/png",
+    };
+    dispatch(window, {
+      type: "userMessage",
+      text: "with image",
+      chips: [chip],
+    });
+
+    click(window, editBtn(userBubbles(doc)[0]));
+    expect(posted.find((m: any) => m.type === "editLastMessage")).toEqual({
+      type: "editLastMessage",
+      userBubbleIndex: 0,
+      text: "with image",
+      chips: [expect.objectContaining({ id: chip.id })],
+      totalUserBubbles: 1,
+    });
+  });
+
   it("does nothing mid-turn — the rewind underneath needs a settled session", () => {
     const { window, posted, doc } = bootWebview();
     send(window, "go");
@@ -76,6 +102,39 @@ describe("Edit on the latest user message (#56)", () => {
 
 describe("restoreComposer (#56)", () => {
   const input = (doc: Document) => doc.querySelector("#input") as HTMLTextAreaElement;
+
+  it.each([false, true])("keeps restored files with the draft across chip refreshes, switches and Send (remote: %s)", remote => {
+    const { window, doc, posted } = bootWebview({ remote });
+    const focus = (sessionId: string) => dispatch(window, { type: "sessionName", sessionId, name: sessionId, cwd: "/repo" });
+    const chip = { id: "file", path: "/repo/file.txt", relPath: "file.txt", kind: "file", hidden: false };
+    focus("a");
+    dispatch(window, { type: "restoreComposer", text: "edit me", chips: [chip] });
+    dispatch(window, { type: "chips", chips: [] });
+    expect(doc.getElementById("attachments")!.textContent).toContain("file.txt");
+    focus("b");
+    expect(input(doc).value).toBe("");
+    expect(doc.getElementById("attachments")!.textContent).not.toContain("file.txt");
+    focus("a");
+    expect(input(doc).value).toBe("edit me");
+    expect(doc.getElementById("attachments")!.textContent).toContain("file.txt");
+    click(window, doc.getElementById("send-btn")!);
+    expect(posted).toContainEqual(expect.objectContaining({ type: "send", text: "edit me", chips: [chip] }));
+    focus("b");
+    focus("a");
+    expect(input(doc).value).toBe("");
+    expect(doc.getElementById("attachments")!.textContent).not.toContain("file.txt");
+  });
+
+  it("can remove a restored attachment without mutating the shared composer", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "restoreComposer", text: "keep text", chips: [
+      { id: "file", path: "/repo/file.txt", relPath: "file.txt", kind: "file", hidden: false },
+    ] });
+    click(window, doc.querySelector(".attachment-remove")!);
+    expect(doc.getElementById("attachments")!.textContent).not.toContain("file.txt");
+    expect(input(doc).value).toBe("keep text");
+    expect(posted.some(m => m.type === "removeChip")).toBe(false);
+  });
 
   it("puts the rewound text back in the composer and focuses it", () => {
     const { window, doc } = bootWebview();
