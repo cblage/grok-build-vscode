@@ -604,6 +604,11 @@
     effort: "",
     cwd: "",
     contextWindow: 200000,
+    contextWindowSelection: undefined,
+    contextSelectionSessionId: undefined,
+    // The size this webview asked for, shown in the popup's dropdown while the
+    // host confirms it. Only a `changing` selection reads it.
+    contextWindowRequest: undefined,
     usedTokens: 0,
     useCtrlEnter: false,
     commands: [],
@@ -2561,7 +2566,18 @@
   }
 
   function renderContextPopover() {
-    contextPopover.innerHTML = "";
+    // A native <select> closes its open list the moment it leaves the document,
+    // and this popup rebuilds on every usage frame -- including the replies to
+    // the refreshes its own opening requests, which land just as a person may be
+    // reaching for the size dropdown. So a size control that would be redrawn
+    // identically, and still shows what it was drawn with, stays in place while
+    // everything around it is rebuilt.
+    const sizeControl = contextWindowControl();
+    const prior = contextPopover.querySelector(".context-window-control");
+    const priorSelect = prior && prior.querySelector("select");
+    const keep = sizeControl && prior && prior.dataset.key === sizeControl.dataset.key
+      && (!priorSelect || priorSelect.value === sizeControl.querySelector("select").value) ? prior : null;
+    for (const node of [...contextPopover.childNodes]) if (node !== keep) node.remove();
     // A `↳ ` label marks a sub-row (a component of the line above it) — indented
     // via CSS rather than padding the string, so the value column stays aligned.
     const info = (label, value, parent) => {
@@ -2625,11 +2641,14 @@
       }).format(usd);
     };
 
+    // Built apart so it can go in ahead of a kept size control.
+    const lead = document.createDocumentFragment();
     const used = state.usedTokens || 0;
     const pct = Math.min(100, Math.round((used / state.contextWindow) * 100));
     info(
       "Context used",
       `${tok(used)} / ${tok(state.contextWindow)} (${pct}%)`,
+      lead,
     );
 
     const bar = document.createElement("div");
@@ -2643,7 +2662,7 @@
     fill.style.width = pct + "%";
     fill.style.setProperty("--context-fill", contextFullnessColor(pct));
     bar.appendChild(fill);
-    contextPopover.appendChild(bar);
+    lead.appendChild(bar);
 
     const act = document.createElement("button");
     act.type = "button";
@@ -2658,7 +2677,9 @@
         closePopovers();
       };
     }
-    if (globalThis.GrokWebviewHelpers.providerSupports(state.activeProvider, "compact")) contextPopover.appendChild(act);
+    if (globalThis.GrokWebviewHelpers.providerSupports(state.activeProvider, "compact")) lead.appendChild(act);
+    contextPopover.insertBefore(lead, keep);
+    if (!keep && sizeControl) contextPopover.appendChild(sizeControl);
 
     const subscription = document.createElement("section");
     subscription.className = "subscription-usage";
@@ -4302,6 +4323,140 @@
     });
   }
 
+  /** The selection a switch would change, for the model on screen. No picker
+   *  preview is ever pending here: opening the popup closes the picker, and
+   *  every way a typed or dictated `/context-window` is sent commits the
+   *  picker first, so a model on screen but not yet confirmed has no
+   *  selection, and the host refuses the size while that change runs. */
+  function sessionContextWindowSelection() {
+    const selection = state.contextWindowSelection;
+    return state.activeProvider === "grok" && selection && selection.modelId === state.currentModelId ? selection : undefined;
+  }
+
+  function contextWindowLocked(selection) {
+    return !!(state.busy || state.startingPhase || selection.changing);
+  }
+
+  /** Re-checks the lock at the moment of choosing; a rendered control can be a
+   *  frame older than the turn that just started. */
+  function chooseContextWindow(selection, size) {
+    if (state.busy || state.startingPhase || state.contextWindowSelection?.changing) return false;
+    vscode.postMessage({ type: "setContextWindow", sessionId: selection.sessionId, modelId: selection.modelId, generation: selection.generation, size });
+    return true;
+  }
+
+  /** Runs `proceed` now, or once the person agrees to a switch down that can
+   *  cost this conversation an auto-compact (contextWindowShrinkRisk) -- the
+   *  CLI takes the smaller window without a word and compacts before the next
+   *  turn. `declined` runs if they cancel; nothing is sent then. Both ways of
+   *  switching come through here: the popup's dropdown and a typed
+   *  `/context-window <size>`. */
+  function afterShrinkConfirmed(selection, size, proceed, declined = () => {}) {
+    const current = selection.selectedSize ?? state.contextWindow;
+    const risk = globalThis.GrokWebviewHelpers.contextWindowShrinkRisk(state.usedTokens, size, current);
+    if (!risk) { proceed(); return; }
+    const target = compactTokens(size);
+    // No usage figure in the sentence: rounded, 256,400 tokens reads "256K"
+    // beside "more than 256K", while the band itself is exact.
+    uiConfirm({
+      title: `Switch to ${target}?`,
+      body: risk === "will"
+        ? `This conversation no longer fits in ${target}, so switching will trigger auto-compact on your next message.`
+        : `This conversation already fills more than 70% of ${target}, so switching may trigger auto-compact on your next message.`,
+      confirmLabel: `Switch to ${target}`,
+    }).then((ok) => (ok ? proceed() : declined()));
+  }
+
+  /** A typed `/context-window`. Bare, it opens the context popup, the one
+   *  place a size is chosen. With a size, the host parses and applies it, but
+   *  a size that switches down asks here first, like the dropdown does.
+   *  Anything this cannot judge -- an unreadable size, one not offered, a
+   *  locked session the host will refuse anyway -- goes to the host as before. */
+  function sendContextWindowCommand(text) {
+    const argument = text.replace(/^\/context-window/i, "");
+    if (!argument.trim()) { openContextPopover(); return; }
+    const send = () => vscode.postMessage({ type: "send", text, bare: true });
+    const selection = sessionContextWindowSelection();
+    const size = globalThis.GrokWebviewHelpers.parseContextWindowSize(argument);
+    if (!selection || !selection.available || contextWindowLocked(selection) || !selection.sizes.includes(size)) { send(); return; }
+    afterShrinkConfirmed(selection, size, send);
+  }
+
+  /** The one place a size is chosen: a row in the context popup, a label and
+   *  the same native <select> Settings uses, placed after the occupancy block
+   *  because it is rarely changed. A model change only changes the model; a
+   *  bare `/context-window` opens this popup.
+   *
+   *  `dataset.key` names everything the control draws, so a rebuild of the
+   *  popup can keep a control that would come out identical (see
+   *  renderContextPopover). */
+  function contextWindowControl() {
+    const selection = sessionContextWindowSelection();
+    if (!selection) return null;
+    const wrap = document.createElement("div");
+    wrap.className = "context-window-control";
+    const note = (text) => {
+      const el = document.createElement("div");
+      el.className = "popover-fineprint";
+      el.textContent = text;
+      wrap.appendChild(el);
+    };
+    if (!selection.available) {
+      note(selection.reason || "Native selection is unavailable in this session.");
+      wrap.dataset.key = JSON.stringify([selection.sessionId, selection.modelId, selection.generation, wrap.innerHTML]);
+      return wrap;
+    }
+    // While the host confirms, show the size that was asked for rather than
+    // flicking back to the old one; the note underneath says it is pending.
+    const request = state.contextWindowRequest;
+    const shown = selection.changing && request && request.sessionId === selection.sessionId && request.modelId === selection.modelId
+      ? request.size : selection.selectedSize;
+    const row = document.createElement("div");
+    row.className = "popover-info context-window-row";
+    const label = document.createElement("label");
+    label.htmlFor = "context-window-select";
+    label.textContent = "Context window";
+    const select = document.createElement("select");
+    select.id = "context-window-select";
+    select.className = "settings-select context-window-select";
+    select.disabled = contextWindowLocked(selection);
+    select.title = "Applies to this session; server access limits still apply.";
+    // A size nothing has confirmed, or one the model does not offer, gets a
+    // placeholder rather than letting the first choice claim to be the window.
+    const offered = selection.sizes.includes(shown);
+    if (!offered) {
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.disabled = true;
+      placeholder.textContent = shown === undefined ? "—" : compactTokens(shown);
+      select.appendChild(placeholder);
+    }
+    for (const size of selection.sizes) {
+      const option = document.createElement("option");
+      option.value = String(size);
+      option.textContent = compactTokens(size) + (size === selection.defaultSize ? " · CLI default" : "") + (size < state.usedTokens ? " · will compact" : "");
+      select.appendChild(option);
+    }
+    const value = offered ? String(shown) : "";
+    select.value = value;
+    select.onchange = () => {
+      const size = Number(select.value);
+      const putBack = () => { select.value = value; };
+      afterShrinkConfirmed(selection, size, () => {
+        if (chooseContextWindow(selection, size)) state.contextWindowRequest = { sessionId: selection.sessionId, modelId: selection.modelId, size };
+        else putBack();
+      }, putBack);
+    };
+    row.append(label, select);
+    wrap.appendChild(row);
+    // The standing disclaimer lives in the tooltip; only a state that needs
+    // reading takes a line.
+    if (selection.changing) note("Waiting for native confirmation…");
+    else if (selection.stale) note("Last confirmed selection; native state needs a refresh.");
+    wrap.dataset.key = JSON.stringify([selection.sessionId, selection.modelId, selection.generation, value, wrap.innerHTML]);
+    return wrap;
+  }
+
   function renderModelPicker() {
     const scroll = gearPopover.querySelector(".model-picker-list")?.scrollTop || 0;
     state.gearView = "model";
@@ -4996,6 +5151,7 @@
   }
 
   function modelSelectionLocked() {
+    if (state.activeProvider === "grok" && (state.busy || state.contextWindowSelection?.changing)) return true;
     return state.busy || !currentModel() || (state.providersKnown
       && !state.providers.some((p) => p.connected && !p.needsLogin));
   }
@@ -18063,6 +18219,10 @@
   }
 
   function updateSendButton() {
+    if (state.contextControlsBusy !== state.busy) {
+      state.contextControlsBusy = state.busy;
+      if (!contextPopover.hidden) renderContextPopover();
+    }
     // Four states:
     //  - idle (!busy): send icon, enabled, click → send the typed message.
     //  - busy + locked: spinner icon, disabled, no click action. Used for
@@ -18362,7 +18522,7 @@
       actualIds.every((id, index) => id === expectedIds[index]);
   }
 
-  function sendOrStop() {
+  function sendOrStop(event) {
     // A model or effort the picker is still SHOWING belongs to this send. The
     // document's own click listener flushes on the way out, but it sits on the
     // bubble phase -- this button's handler runs first, so without this line
@@ -18373,7 +18533,21 @@
     // corner. Committing here is also what gives the host a `pickerChange` for
     // `handleSend` to wait on. Idempotent: the close that follows posts
     // nothing, and a flush with nothing pending posts nothing either.
+    //
+    // First, ahead of `/context-window` too. Sent before the model it was
+    // typed beside, a size started a context change, and the host then
+    // dropped the `setModel` behind it: the chip showed the new model while
+    // the CLI kept the old one. Committed first, the size meets the host's
+    // `pickerChange` and is refused with its visible wait message.
     flushPicker();
+    if (/^\/context-window(?:\s|$)/i.test(input.value.trim())) {
+      sendContextWindowCommand(input.value.trim());
+      // A bare command opens the context popup; the Send click that did it
+      // must not close it again on its way to the document's closer.
+      if (event && !contextPopover.hidden) event.stopPropagation();
+      return;
+    }
+    if (state.contextWindowSelection?.changing) return;
     if (state.sessionSuperseded) return;
     if (state.onboardingMode === "no-project") return;
     if (state.busy) {
@@ -18907,6 +19081,10 @@
   // ("grok send"), whose composer is cleared separately so the mic can keep
   // listening for the next utterance.
   function submitMessage(text) {
+    if (/^\/context-window(?:\s|$)/i.test((text || "").trim())) {
+      sendContextWindowCommand((text || "").trim());
+      return;
+    }
     const t = (text || "").trim();
     if (!t) return;
     state.busy = true;
@@ -20668,7 +20846,23 @@
         if (!welcomeHoldActive()) setWelcomeStatus("Updating Grok Build CLI", true);
         break;
       }
+      case "contextWindowSelection": {
+        const selection = msg.selection;
+        if (state.contextSelectionSessionId && selection.sessionId !== state.contextSelectionSessionId) break;
+        if (selection.modelId !== state.currentModelId) break;
+        if (state.contextWindowSelection?.sessionId === selection.sessionId && state.contextWindowSelection.generation > selection.generation) break;
+        state.contextWindowSelection = selection;
+        if (!selection.changing) state.contextWindowRequest = undefined;
+        // State only. An unreleased host also sent `openPicker` here to pop a
+        // size picker after a model change; nothing opens on its own now, so
+        // that field is ignored.
+        if (!contextPopover.hidden) renderContextPopover();
+        break;
+      }
       case "session": {
+        if (state.contextSelectionSessionId !== msg.sessionId) state.contextWindowSelection = undefined;
+        state.contextSelectionSessionId = msg.sessionId;
+
         state.subscriptionWindows = [];
         state.currentModelId = msg.currentModelId;
         state.activeProvider = msg.provider === "codex" || msg.provider === "claude" || msg.provider === "muse" && museAvailable ? msg.provider : "grok";
@@ -20854,6 +21048,20 @@
           ? composeVoiceInsertion(state.voiceBefore, msg.text || "", state.voiceAfter).value
           : (msg.text || "");
         const t = composed.trim();
+        // A context-window change refuses sends, and it is not a busy turn,
+        // so nothing below would send or queue these words. Leave them in the
+        // composer as ordinary text, as a typed send meeting the same lock
+        // does, and end this insertion: the next utterance anchors afresh on
+        // whatever the composer holds then, corrections and the draft of a
+        // conversation opened meanwhile included.
+        if (t && !state.busy && state.contextWindowSelection?.changing) {
+          input.value = composed;
+          input.setSelectionRange(composed.length, composed.length);
+          state.voiceLive = false;
+          clearVoiceInsertion();
+          renderInputHighlight();
+          break;
+        }
         state.voiceBefore = "";
         state.voiceAfter = "";
         state.voiceInsertionActive = true;
@@ -21732,6 +21940,7 @@
         // CLI work.
         if (!msg.value) { state.startupStatus = null; renderStartupStatus(); }
         state.busy = !!msg.value;
+        if (!contextPopover.hidden) renderContextPopover();
         state.busyLocked = !!msg.locked;
         if (!state.busy && !state.replaying) {
           state.repoSwitchPending = false;

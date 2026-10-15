@@ -4529,8 +4529,11 @@ textarea#input {
 .context-compact {
   display: block; width: calc(100% - 16px); margin: 2px 8px 8px;
   text-align: center; padding: 0 10px; height: 28px; border: 0; border-radius: 4px;
-  background: var(--vscode-button-secondaryBackground, #3a3d41);
-  color: var(--vscode-button-secondaryForeground, #fff);
+  /* The theme's PRIMARY button, like the composer's send. The secondary
+     colours are the popup's own colour in some themes, which left this reading
+     as plain text. */
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
   font: inherit; font-weight: 500; cursor: pointer;
 }
 #sandbox-btn.disabled {
@@ -4543,9 +4546,9 @@ textarea#input {
   opacity: 0.85;
   background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08));
 }
-.context-compact:hover { background: var(--vscode-button-secondaryHoverBackground, #45494e); }
+.context-compact:hover { background: var(--vscode-button-hoverBackground, #1177bb); }
 .context-compact:disabled { opacity: .5; cursor: default; }
-.context-compact:disabled:hover { background: var(--vscode-button-secondaryBackground, #3a3d41); }
+.context-compact:disabled:hover { background: var(--vscode-button-background, #0e639c); }
 @media (hover: none), (pointer: coarse) { .context-compact { height: 38px; } }
 
 /* ---- mode / section popover extras ---- */
@@ -7063,3 +7066,11 @@ body.host-wait-visible .gfp-panel.gfp-overlay { bottom: var(--host-wait-height, 
 .remote-handoff-qr-pending .host-wait-spinner { width: 20px; height: 20px; }
 .remote-handoff-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .remote-handoff-popover > .confirm-btn { margin: 4px 6px 0 0; }
+
+/* The context popup's size control is the Settings dropdown (.settings-select,
+   whose tokens and focus ring it keeps), sized for a popover row: no 160px
+   floor, row-height padding, and a thumb-sized target where the Compact button
+   above it grows to one too. Id weight, because settings.css loads after this. */
+#context-popover .context-window-select { min-width: 0; padding: 2px 6px; }
+#context-popover .context-window-select:disabled { opacity: .6; cursor: default; }
+@media (hover: none), (pointer: coarse) { #context-popover .context-window-select { min-height: 36px; } }

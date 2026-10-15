@@ -1,5 +1,8 @@
 # Architecture
 
+Grok session context-window choices use `AcpClient.contextWindowSelection` and the identity-checked `setContextWindow` control. A size is chosen in the context popup's dropdown or with host-routed `/context-window <size>`; both track the last size `session/info` confirmed, except that while a change is in flight the dropdown shows the size just requested. A model change only changes the model. See [native context-window selection](../research/context-window-selection.md).
+
+
 How the Grok Build VS Code and desktop clients are put together, and the places
 they deliberately stop being "thin." For day-to-day usage see the
 [README](../README.md); for the test layers see [TESTS.md](../TESTS.md).

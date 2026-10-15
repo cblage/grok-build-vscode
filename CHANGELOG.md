@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.14.3-sandbox.1 — 2026-10-15
+## 4.14.4-sandbox.1 — 2026-10-15
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.14.2.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.14.3.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,18 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.14.3 — 2026-10-14
+
+**Choose how much context Grok keeps.**
+
+### Added
+
+- **Grok's context window (#202).** In a Grok conversation, the context popup has a **Context window** dropdown with the sizes the Grok CLI offers — 256K or 500K for Grok 4.7 — and `/context-window 500k` does the same (`/context-window` alone opens the popup). Switching to a smaller size the conversation already fills past 70% asks first: Grok will auto-compact the conversation on your next message if it no longer fits, and may if it is close. It appears when the model offers more than one size, with Grok CLI 1.0.46 or newer. Thanks to [@zfzfg](https://github.com/zfzfg) ([#205](https://github.com/phuryn/grok-build-vscode/pull/205)), and to [@FireInWinter](https://github.com/FireInWinter) for finding the CLI feature.
+
+### Changed
+
+- **Compact conversation** in the context popup is a primary button, so it reads as the popup's action in every theme.
 
 ## 4.14.2 — 2026-10-13
 
