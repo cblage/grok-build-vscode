@@ -25,6 +25,7 @@ const startControl = {
   museFailsAfterReplay: false,
   catalogs: {} as Record<string, { modelId: string; name: string }[]>,
   startWait: undefined as Promise<void> | undefined,
+  startupAuths: [] as unknown[],
 };
 
 vi.mock("../src/acp", async (importOriginal) => {
@@ -41,8 +42,9 @@ vi.mock("../src/acp", async (importOriginal) => {
     fsRead?: unknown;
     fsWrite?: unknown;
     terminal?: unknown;
-    constructor(opts: { log: (msg: string) => void; effort?: string; backend?: any }) {
+    constructor(opts: { log: (msg: string) => void; effort?: string; backend?: any; startupAuth?: unknown }) {
       super();
+      startControl.startupAuths.push(opts.startupAuth);
       this.provider = opts.backend?.provider ?? "grok";
       this.availableModels = startControl.catalogs[this.provider] ?? [];
       this.currentModelId = this.availableModels[0]?.modelId ?? "fake-model";
@@ -814,6 +816,36 @@ describe("startSession bounded spawn retry", () => {
     expect(sidebar.posted.at(-1)).toMatchObject({
       type: child ? "childStream" : "toolCall", call: { toolCallId: "real-1" },
     });
+  });
+
+  // Every Antigravity start authenticates with the way the person chose, and
+  // with nothing stored for it starts no server: `authenticate` and the
+  // server's own session/new would open Google's sign-in at an empty desk.
+  it.each([true, false])("starts an Antigravity server only with its chosen credential (stored=%s)", async stored => {
+    const sidebar = makeSidebar("/repo");
+    sidebar.providerConnectionState = { agy: true };
+    sidebar.connectedProviders = vi.fn(() => ["agy"]);
+    sidebar.usableProviders = vi.fn(() => ["agy"]);
+    sidebar.focused.provider = "agy";
+    const auth = { methodId: "gemini-api-key", meta: { "api-key": "key-1" } };
+    sidebar.agyStartupAuthFor = vi.fn(async () => stored ? auth : undefined);
+    sidebar.rejectAgyCredential = vi.fn(async () => {});
+    startControl.startupAuths = [];
+    const client = await sidebar.startSession(undefined, sidebar.focused);
+    if (stored) {
+      expect(client?.provider).toBe("agy");
+      expect(startControl.starts).toBe(1);
+      expect(startControl.startupAuths).toEqual([auth]);
+      // A refusal reported mid-turn goes back to the choice of how to sign in.
+      sidebar.focused.client.emit("credentialRejected");
+      expect(sidebar.rejectAgyCredential).toHaveBeenCalledTimes(1);
+      return;
+    }
+    expect(client).toBeUndefined();
+    expect(startControl.starts).toBe(0);
+    expect(sidebar.setProviderNeedsLogin).toHaveBeenCalledWith("agy", true);
+    expect(onboardings(sidebar)).toEqual([expect.objectContaining({ state: "agy-login", provider: "agy" })]);
+    expect(startErrors(sidebar)).toEqual([]);
   });
 
   it("emits onboarding on the first credential failure and does not retry", async () => {

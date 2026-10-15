@@ -2,7 +2,7 @@ import type { EffortLevel, PromptContentBlock } from "./acp";
 
 export const ACP_PROVIDERS = ["grok", "codex", "claude"] as const;
 // The legacy wire vocabulary above stays frozen for older receivers.
-export const INTERNAL_PROVIDERS = [...ACP_PROVIDERS, "muse"] as const;
+export const INTERNAL_PROVIDERS = [...ACP_PROVIDERS, "muse", "agy"] as const;
 export type LegacyAcpProvider = (typeof ACP_PROVIDERS)[number];
 export type AcpProvider = (typeof INTERNAL_PROVIDERS)[number];
 
@@ -26,6 +26,7 @@ const PROVIDER_ACTIONS: Record<AcpProvider, {
   codex: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: true, clientMcp: true },
   claude: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: true, clientMcp: true },
   muse: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: true, autoAccept: true, perCallContext: false, clientMcp: false },
+  agy: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: false, autoAccept: true, perCallContext: false, clientMcp: false },
 };
 
 /**
@@ -133,6 +134,9 @@ export interface BackendUpdate {
    * for occupancyFromAdapterTurn, not occupancy by themselves.
    */
   usageUpdateUsed?: number;
+  /** The agent reported mid-turn that its credential was refused -- in-band,
+   *  as text, with no RPC error for the host to classify. */
+  credentialRejected?: true;
 }
 
 export interface BackendSessionListEntry {
@@ -188,4 +192,11 @@ export interface AcpBackend<Provider extends string = AcpProvider> {
     platform: NodeJS.Platform,
   ): Promise<BackendSessionListResult>;
   isCredentialError(error: unknown): boolean;
+  /** Extra `session/new` and `session/load` params beyond cwd and mcpServers. */
+  sessionParams?(cwd: string): Record<string, unknown>;
+  /**
+   * Ask the spawned process to exit cleanly, in place of waiting for it to
+   * notice stdin closing. Dispose still kills it if it has not exited in time.
+   */
+  stopProcess?(pid: number, command: string): Promise<void>;
 }

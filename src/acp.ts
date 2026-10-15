@@ -117,6 +117,12 @@ export interface AcpClientOptions {
    */
   timeouts?: AcpTimeoutInput;
   /**
+   * `authenticate` sent right after `initialize`, before any session is opened
+   * or loaded. For agents whose shared settings file another client can
+   * rewrite, so each process states its method itself.
+   */
+  startupAuth?: { methodId: string; meta?: Record<string, unknown> };
+  /**
    * Host-owned MCP servers for `session/new` and `session/load`. A getter is
    * read at request time so a Connect that lands after construct still applies.
    * The getter may be async so a host can re-read its own secrets first.
@@ -245,11 +251,25 @@ type Pending = {
 export { buildGrokAgentArgs } from "./grok-backend";
 
 export type AcpClientCapabilities = {
-  fs: { readTextFile?: true; writeTextFile: true };
-  terminal: true;
+  fs: { readTextFile?: boolean; writeTextFile: boolean };
+  terminal: boolean;
   subagents?: Record<string, never>;
   _meta?: { jetbrains: { air: { version: number; capabilities: string[] } } };
 };
+
+/**
+ * Antigravity executes its own tools. Advertising client fs swaps its file
+ * tools for callbacks into ours, which is a different server than the one
+ * measured; the edit-card normalization in agy-backend.ts is for this one.
+ */
+export const ACP_SERVER_EXECUTED_CAPABILITIES: AcpClientCapabilities = {
+  fs: { readTextFile: false, writeTextFile: false },
+  terminal: false,
+};
+
+/** Teardown budget for a backend with `stopProcess`; it is only reached by a
+ *  process that would not stop, and then the usual tree kill follows. */
+export const STOP_PROCESS_BUDGET_MS = 10_000;
 
 /** Handshake every provider used before grok 1.0 — client-delegated fs. */
 export const ACP_DELEGATED_FS_CAPABILITIES: AcpClientCapabilities = {
@@ -302,6 +322,7 @@ export function acpClientCapabilities(
     _meta: { jetbrains: { air: { version: 1, capabilities: ["nativeSubagentSessions"] } } } };
   if (provider === "claude") return { ...ACP_DELEGATED_FS_CAPABILITIES,
     _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } } };
+  if (provider === "agy") return ACP_SERVER_EXECUTED_CAPABILITIES;
   if (provider !== "grok") return ACP_DELEGATED_FS_CAPABILITIES;
   if (!versionVerified) return ACP_DELEGATED_FS_CAPABILITIES;
   const parsed = parseGrokVersion(grokVersion ?? "");
@@ -574,6 +595,8 @@ export class AcpClient extends EventEmitter {
     });
     this.steering = this.backend.steeringCapabilities(init, this.opts);
     this.emit("initialized", init);
+    const auth = this.opts.startupAuth;
+    if (auth) await this.authenticate(auth.methodId, this.timeouts.requestTimeoutMs, auth.meta);
   }
 
   private async mcpServersForSession(): Promise<AcpMcpStdioServer[]> {
@@ -601,6 +624,7 @@ export class AcpClient extends EventEmitter {
     const raw = await this.request("session/new", {
       cwd: this.opts.cwd,
       mcpServers: await this.mcpServersForSession(),
+      ...this.backend.sessionParams?.(this.opts.cwd),
     });
     const res = this.backend.normalizeSessionResponse(raw);
     this.sessionId = res.sessionId;
@@ -689,7 +713,7 @@ export class AcpClient extends EventEmitter {
     this.loadingChildSessionIds = new Set();
     let raw: any;
     try {
-      raw = await this.request("session/load", { sessionId, cwd: this.opts.cwd, mcpServers });
+      raw = await this.request("session/load", { sessionId, cwd: this.opts.cwd, mcpServers, ...this.backend.sessionParams?.(this.opts.cwd) });
     } finally {
       this.loadingChildSessionIds = undefined;
     }
@@ -911,6 +935,17 @@ export class AcpClient extends EventEmitter {
 
   isCredentialError(error: unknown): boolean {
     return this.backend.isCredentialError(error);
+  }
+
+  /** ACP `authenticate`. Interactive methods wait on a person, so the caller
+   *  sets the wait rather than the ordinary request cap. */
+  authenticate(methodId: string, timeoutMs: number, meta?: Record<string, unknown>): Promise<any> {
+    return this.request("authenticate", { methodId, ...(meta ? { _meta: meta } : {}) }, undefined, timeoutMs);
+  }
+
+  /** ACP `logout`: the agent clears its own stored credentials. */
+  async logout(): Promise<void> {
+    await this.request("logout", {});
   }
 
   /**
@@ -1308,6 +1343,9 @@ export class AcpClient extends EventEmitter {
       return this.disposeExecutionBackend();
     }
     if (this.provider !== "grok") {
+      // A backend that can be asked to exit cleanly gets the time to do it.
+      const stop = this.backend.stopProcess;
+      const budget = stop ? Math.max(timeoutMs, STOP_PROCESS_BUDGET_MS) : timeoutMs;
       const processExit = new Promise<void>((resolve) => {
         let done = false;
         const finish = () => {
@@ -1327,9 +1365,13 @@ export class AcpClient extends EventEmitter {
             try { proc.kill(); } catch { /* already gone */ }
           }
         };
-        const timer = setTimeout(() => { abruptKill(); finish(); }, timeoutMs);
+        const timer = setTimeout(() => { abruptKill(); finish(); }, budget);
         proc.once("exit", finish);
         try { proc.stdin.end(); } catch { abruptKill(); }
+        if (stop && proc.pid !== undefined) {
+          stop.call(this.backend, proc.pid, this.opts.cliPath).catch((error) =>
+            this.opts.log(`[acp] ${this.backend.processName} clean stop failed: ${(error as Error).message}`));
+        }
       });
       return Promise.all([processExit, this.disposeExecutionBackend()]).then(() => undefined);
     }
@@ -1398,6 +1440,7 @@ export class AcpClient extends EventEmitter {
     method: string,
     params: any,
     onResolve?: (value: any) => void,
+    timeoutMs?: number,
   ): Promise<any> {
     if (this.opts.signal?.aborted) return Promise.reject(this.opts.signal.reason);
     const id = this.nextId++;
@@ -1436,7 +1479,7 @@ export class AcpClient extends EventEmitter {
           });
           if (!Number.isFinite(waitMs)) return;
         } else {
-          waitMs = this.timeouts.requestTimeoutMs;
+          waitMs = timeoutMs ?? this.timeouts.requestTimeoutMs;
         }
         entry.timer = setTimeout(() => {
           if (this.pending.delete(id)) {
@@ -1536,6 +1579,7 @@ export class AcpClient extends EventEmitter {
     if (!foreign) {
       if (normalized.workflowUpdate) this.emit("subagentLifecycle", normalized.workflowUpdate, meta);
       if (normalized.notice) this.emit("notice", normalized.notice);
+      if (normalized.credentialRejected) this.emit("credentialRejected");
       if (this.provider === "claude") {
         const windows = claudeSubscriptionWindows(normalized.update);
         if (windows !== undefined) this.emit("subscriptionUsage", windows);
