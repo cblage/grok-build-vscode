@@ -1,10 +1,10 @@
 # Changelog
 
-## 4.14.2-sandbox.1 — 2026-10-09
+## 4.14.3-sandbox.1 — 2026-10-15
 
 ### Added
 
-- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.14.1.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
+- **Native macOS sandboxing for Grok sessions, carried forward onto upstream v4.14.2.** The extension applies Grok-compatible Seatbelt protection to the complete session: the selected profile is passed to Grok's own process-lifetime sandbox and mirrored for delegated ACP filesystem operations, terminal commands, and their descendants.
   - **Built-in profiles:** `workspace` can write the project, all of `$GROK_HOME`, and trusted temporary storage; `devbox` can write existing top-level trees except `/data` and virtual filesystems; `read-only` can write only `$GROK_HOME` and temporary storage; and `strict` additionally limits reads to the project and essential runtime paths. As in Grok itself, child-network restriction is a no-op on macOS.
   - **Grok-spec profile loading:** built-in and custom profiles are discovered and resolved according to Grok's own sandbox specification. Custom definitions load from `$GROK_HOME/sandbox.toml` or project `.grok/sandbox.toml`, derive from `workspace`, `devbox`, `read-only`, or `strict`, and support additional read-only paths, writable paths, network intent, and kernel-enforced exact or glob denies. Project definitions replace same-name user definitions, built-in names remain reserved, profile names are case-sensitive, and only exact lowercase `off` disables sandboxing.
   - **Complete delegated-operation enforcement:** a fail-closed Seatbelt broker owns ACP filesystem calls and shell children, uses a standalone Node runtime when available, and grants only exact ancestor-directory traversal needed to reach strict-profile roots without exposing sibling contents. Additive `read_only` paths preserve writable descendants inherited from the base profile, including explicit cache paths and other custom grants.
@@ -21,6 +21,20 @@
 - **A resumed session now restores its own effective reasoning effort in the UI.** Creating, reloading, or switching to a session applies the effort reported by that live session instead of leaving the selector on a stale global extension preference. Project-level defaults such as `xhigh` therefore remain visible and accurate after the session opens.
 
 ---
+
+## 4.14.2 — 2026-10-13
+
+**Disconnect an agent without signing its CLI out, and a context meter that remembers a compaction.**
+
+### Changed
+
+- **Settings → Providers → Disconnect (#203).** On your own machine, the button for a connected agent now turns it off in this app and leaves its CLI signed in, so Connect brings it back without signing in again. It asks first only while that agent is replying. To sign a CLI out, for example to switch accounts, use **Grok: Log Out** in VS Code or the CLI's own logout command. On a cloud environment the button still reads **Sign out** and clears the CLI's sign-in, because nothing else on that machine will.
+
+### Fixed
+
+- **The context meter after `/compact` (#195).** In Codex and Claude Code conversations the meter drops to the compacted size when the compaction finishes and keeps it after a reload; before, it stayed at the old figure until the next turn. A Grok conversation no longer shows its pre-compact figure first when it reopens.
+- **Quotes, dividers and more heading levels render (#198).** `>` quote lines (nested ones too), `---` dividers, headings underlined with `===` or `---`, and `#####` / `######` headings render in replies, plans and workflow output and in the desktop file preview, instead of showing their raw characters. Thanks to [@wayneadams](https://github.com/wayneadams) and [@zfzfg](https://github.com/zfzfg) ([#201](https://github.com/phuryn/grok-build-vscode/pull/201)).
+- **Linux: "OS secure storage is unavailable" says why (#209).** In Grok Build Desktop the error now names the password store Electron picked and your `XDG_CURRENT_DESKTOP`, and suggests starting the app with `--password-store=gnome-libsecret` (GNOME) or `--password-store=kwallet6` / `kwallet5` (KDE).
 
 ## 4.14.1 — 2026-09-29
 
